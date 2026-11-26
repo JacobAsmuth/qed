@@ -33,7 +33,8 @@ private def relevantAppLemmas (env : Environment) (cs : Std.HashSet Name) : Arra
   collectTriggered env cs #[``InvTarget.proj_id, ``InvTarget.proj_fst] #[
     (appWrapperBases ++ #[`Qed.App.init, `Qed.App.update], appProjSimpNames env #["init", "update"] ++
       #[`Qed.Query.boot, `Qed.Query.wrap, `Qed.Resource.query, `Qed.Resource.rpcQuery, `Qed.Subscription.boot, `Qed.Subscription.wrap, `Qed.Subscription.boot_state_eq]),
-    (#[`Qed.Cached.activate, `Qed.Cached.all], #[`Qed.Cached.activate, `Qed.Cached.all_empty])]
+    (#[`Qed.Cached.activate, `Qed.Cached.all, `Qed.Cached.markRefetch, `Qed.Cached.invalidateAll],
+     #[`Qed.Cached.activate, `Qed.Cached.all_empty, `Qed.Cached.all_markRefetch, `Qed.Cached.all_invalidateAll])]
 
 private def relevantOptResLemmas (env : Environment) (cs : Std.HashSet Name) : Array Name :=
   collectTriggered env cs #[] #[
@@ -166,8 +167,9 @@ private def runCloseCachedPut (extraL : Array Term) : TacticM Unit := do
       let tgt ← g.withContext (instantiateMVars (← g.getType))
       if tgt.isAppOfArity ``And 2 && tgt.getUsedConstants.contains `Qed.Cached.all then
         evalTactic (← `(tactic| apply And.intro)); progressedRef.set true
-      else if tgt.isAppOfArity `Qed.Cached.all 3 && tgt.getAppArgs[2]!.consumeMData.isAppOfArity `Qed.Cached.put 5 then
-        let allPutId := mkIdent `Qed.Cached.all_put; let stripImpId := mkIdent `Qed.Resource.all_stripEnsured_of_imp
+      else if tgt.isAppOfArity `Qed.Cached.all 3 && (tgt.getAppArgs[2]!.consumeMData.isAppOfArity `Qed.Cached.put 5 || tgt.getAppArgs[2]!.consumeMData.isAppOfArity `Qed.Cached.putRev 5) then
+        let isRev := tgt.getAppArgs[2]!.consumeMData.isAppOfArity `Qed.Cached.putRev 5
+        let allPutId := mkIdent (if isRev then `Qed.Cached.all_putRev else `Qed.Cached.all_put); let stripImpId := mkIdent `Qed.Resource.all_stripEnsured_of_imp
         if ← tryRestoreM false id do
             evalTactic (← `(tactic| apply $allPutId))
             let [gHall, gHr] ← getGoals | return false
@@ -307,9 +309,11 @@ private abbrev fExpr : Parser := categoryParser `qedExpr 0
 private abbrev fType : Parser := categoryParser `qedType 0
 private abbrev fContract : Parser := categoryParser `qedFnContract 0
 
-def fnParam : Parser := node `Qed.fnParam (ident >> ":" >> fType)
+def fnParam : Parser := node `Qed.fnParam (ident >> ":" >> fType >> optional ("=" >> fExpr))
 def fnBlindTarget : Parser := node `Qed.fnBlindTarget (ident >> optional (checkNoWsBefore "" >> ".{" >> sepBy1 ident "," >> "}"))
-def fnOptProof : Parser := optional (":=" >> kw "by" >> Parser.Tactic.tacticSeq)
+def fnProofBy : Parser := node `Qed.fnProofBy (":=" >> kw "by" >> Parser.Tactic.tacticSeq)
+def fnProofProve : Parser := node `Qed.fnProofProve (atomic (checkColGt "expected indented `prove:` block" >> identEq `prove >> ":") >> checkColGt "expected indented proof tactics" >> Parser.Tactic.tacticSeq)
+def fnOptProof : Parser := optional (fnProofBy <|> fnProofProve)
 
 @[qedFnContract_parser] def fnRequiresClause : Parser := leading_parser
   withPosition (atomic (identEq `requires) >> sepBy1 fExpr ",")
@@ -398,6 +402,13 @@ partial def lowerPureFnStmts (fnDesc : String) (stmts : List Syntax)
             `(let $lId:ident : $lTy := $rhsT; $cont)
           else `(let $lId:ident := $rhsT; $cont)
         else `(let _ := $rhsT; $cont)
+      else if sk == ``qedStmtLetElse then
+        let pat ← liftMacroM (lowerQedPat (s.getArg 1))
+        let scrut ← lowerVal (s.getArg 3)
+        let elseStmts := extractLetElseStmts s
+        let elseT ← lowerPureFnStmts fnDesc elseStmts.toList lowerVal lowerGuard
+        let thenT ← lowerPureFnStmts fnDesc rest lowerVal lowerGuard
+        `(match $(mkIdent `_qedLetElse):ident : $scrut:term with | $pat:term => $thenT | _ => $elseT)
       else if sk == ``qedStmtIf then
         let cond ← lowerGuard (s.getArg 1)
         let thenT ← lowerPureFnStmts fnDesc ((suiteStmts (s.getArg 3)).toList ++ rest) lowerVal lowerGuard
@@ -443,8 +454,11 @@ private structure ParsedFnContracts where
   ensures  : Array ParsedFnEnsures := #[]
   blinds   : Array ParsedFnBlindTo := #[]
 
-private def parseOptTacSeq (optNode : Syntax) : Option (TSyntax ``Lean.Parser.Tactic.tacticSeq) :=
-  if optNode.getNumArgs == 3 then some ⟨optNode.getArg 2⟩ else none
+def parseOptTacSeq (optNode : Syntax) : Option (TSyntax ``Lean.Parser.Tactic.tacticSeq) :=
+  if optNode.getNumArgs == 1 then
+    let inner := optNode.getArg 0
+    if inner.getKind == `Qed.fnProofBy || inner.getKind == `Qed.fnProofProve then some ⟨inner.getArg 2⟩ else none
+  else none
 
 private def parseBlindTarget (stx : Syntax) : CommandElabM ParsedBlindTarget := do
   let rawId : Ident := ⟨stx.getArg 0⟩
@@ -564,18 +578,27 @@ def elabPureFnContracts (thmBaseId fnConstId : Ident) (paramIds : Array Ident) (
   let fnId : Ident := ⟨stx.getArg 2⟩
   let rawParams := (stx.getArg 4).getSepArgs
   let mut paramIds : Array Ident := #[]; let mut paramTys : Array Term := #[]
+  let mut defBinders : Array (TSyntax `Lean.Parser.Term.bracketedBinder) := #[]; let mut seenDefault := false
   for rp in rawParams do
     let pid : Ident := ⟨rp.getArg 0⟩
     if paramIds.any (·.getId.eraseMacroScopes == pid.getId.eraseMacroScopes) then
       throwErrorAt pid s!"duplicate parameter `{pid.getId}` in `fn {fnId.getId}`"
     let pty ← liftMacroM (return (← lowerQedType (rp.getArg 2) false).1)
+    let optDef := rp.getArg 3
+    if optDef.getNumArgs == 2 then
+      seenDefault := true
+      let defT ← liftMacroM (lowerSimpleQedExpr .val (optDef.getArg 1))
+      defBinders := defBinders.push (← `(bracketedBinder| ($pid:ident : $pty := $defT)))
+    else
+      if seenDefault then throwErrorAt pid s!"non-default parameter `{pid.getId}` cannot follow a parameter with a default value in `fn {fnId.getId}`"
+      defBinders := defBinders.push (← `(bracketedBinder| ($pid:ident : $pty)))
     paramIds := paramIds.push pid; paramTys := paramTys.push pty
   let retTy ← liftMacroM (return (← lowerQedType (stx.getArg 7) false).1)
   let contracts := (stx.getArg 9).getArgs
   let bodyStmts := (stx.getArg 10).getArgs
   let bodyTerm ← lowerPureFnStmts s!"fn {fnId.getId}" bodyStmts.toList
   elabCommand (← `(command|
-    $[$doc?:docComment]? def $fnId $[($paramIds:ident : $paramTys:term)]* : $retTy := $bodyTerm))
+    $[$doc?:docComment]? def $fnId $[$defBinders:bracketedBinder]* : $retTy := $bodyTerm))
   elabPureFnContracts fnId fnId paramIds paramTys retTy contracts
 
 end FnElab

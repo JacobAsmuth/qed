@@ -1,10 +1,10 @@
-import Tests.Native.Harness
+import QedTests.Native.Harness
 import Examples.LiveRoom
 import Qed.Server.Http
 import Qed.Socket.Basic
 open Qed Qed.Server Qed.Server.Http
 
-namespace Tests.Native.WebSocket
+namespace QedTests.Native.WebSocket
 
 private def encodeClientWsFrame (opcode : UInt8) (payload : ByteArray) : ByteArray := Id.run do
   let (len, mask) := (payload.size, (#[0x37, 0xFA, 0x21, 0x3D] : Array UInt8))
@@ -116,4 +116,4 @@ def run : IO Bool := do
         match ← wsAnon.recvMux with | some (.err sid _) => c.checkEq "unauth room subscribe rejected with mux err" sid 9 | _ => c.check "unauth room subscribe rejected" false
   c.finish
 
-end Tests.Native.WebSocket
+end QedTests.Native.WebSocket

@@ -107,6 +107,7 @@ function mountApp(app, isTimeTravel = false) {
       case 'storage.set': case 'storage.remove': case 'storage.clear':
         tryRun(() => kind.endsWith('t') ? localStorage.setItem(a, b) : kind.endsWith('e') ? localStorage.removeItem(a) : localStorage.clear()); break;
       case 'history.replace': history.replaceState({}, '', a); urlChanged(a); break;
+      case 'location.assign': if (/^(?:https?:\/\/|mailto:|tel:|\/(?![/\\])|[#?])/.test(a)) location.assign(a); break;
       case 'history.back': case 'history.forward': history[kind.slice(8)](); break;
       case 'clipboard.write': navigator.clipboard?.writeText(a).catch(() => {}); break;
       case 'dom.focus': case 'dom.blur': case 'dom.select': document.getElementById(a)?.[kind.slice(4)]?.(); break;

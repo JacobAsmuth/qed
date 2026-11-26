@@ -93,6 +93,9 @@ def parseQueryParams (q : String) : List (String × String) :=
     if pair.isEmpty then none
     else let (k, v) := splitFirstEq pair.toList []; some (urlDecodeComponent k, urlDecodeComponent v)
 
+def encodeFormBody (pairs : List (String × String)) : String :=
+  "&".intercalate (pairs.map fun (k, v) => encodeSeg k ++ "=" ++ encodeSeg v)
+
 def joinSlash : List String → String
   | [] => "" | [s] => s | s :: ss => s ++ "/" ++ joinSlash ss
 theorem joinSlash_all (p : Char → Bool) (hslash : p '/' = true) :

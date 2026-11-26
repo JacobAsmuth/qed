@@ -25,6 +25,7 @@ private structure ParsedClaimDecl where
 private def parseClaimDecl (stx : Syntax) : CommandElabM ParsedClaimDecl := do
   let id : Ident := ⟨stx.getArg 0⟩; let name := id.getId.eraseMacroScopes.toString
   if name == "id" then throwErrorAt id "claim name `id` is reserved for the OIDC `sub` subject identifier"
+  if name == "emailVerified" then throwErrorAt id "claim name `emailVerified` is built-in on `<Auth>.User` (populated from OIDC `email_verified`)"
   let tyStx := stx.getArg 2; let tyRepr := ((tyStx.reprint.getD "").replace " " "").trimAscii.toString
   let (kind, typeName, tyTm, defStr0, defTm0) ← match tyRepr with
     | "String" => pure (.str, "String", ← `(String), "\"\"", ← `(("")))
@@ -98,12 +99,18 @@ def elabAuthCmd : CommandElab := fun stx => do
     else throwErrorAt c s!"unexpected clause in `auth {authShort}`"
 
   let userTyId := mkSub `User
-  let mut fieldStxs : Array (TSyntax `Lean.Parser.Command.structSimpleBinder) := #[← `(Lean.Parser.Command.structSimpleBinder| id : String := "")]
-  let mut tupleTy : Term ← `(String); let mut toTuple : Term ← `(u.id); let mut tuplePat : Term := mkIdent `_f0
-  let mut fieldInits : Array (TSyntax `Lean.Parser.Term.structInstField) := #[← `(Lean.Parser.Term.structInstField| id := $(mkIdent `_f0))]
-  let mut lookupInits : Array (TSyntax `Lean.Parser.Term.structInstField) := #[← `(Lean.Parser.Term.structInstField| id := uid)]
+  let mut fieldStxs : Array (TSyntax `Lean.Parser.Command.structSimpleBinder) := #[
+    ← `(Lean.Parser.Command.structSimpleBinder| id : String := ""),
+    ← `(Lean.Parser.Command.structSimpleBinder| emailVerified : Bool := false)]
+  let mut tupleTy : Term ← `(String × Bool); let mut toTuple : Term ← `((u.id, u.emailVerified)); let mut tuplePat : Term ← `(($(mkIdent `_f0), $(mkIdent `_f1)))
+  let mut fieldInits : Array (TSyntax `Lean.Parser.Term.structInstField) := #[
+    ← `(Lean.Parser.Term.structInstField| id := $(mkIdent `_f0)),
+    ← `(Lean.Parser.Term.structInstField| emailVerified := $(mkIdent `_f1))]
+  let mut lookupInits : Array (TSyntax `Lean.Parser.Term.structInstField) := #[
+    ← `(Lean.Parser.Term.structInstField| id := uid),
+    ← `(Lean.Parser.Term.structInstField| emailVerified := Qed.Auth.parseBoolClaim (lookup "email_verified") false)]
   for (cl, idx) in claims.zipIdx do
-    let (fId, v) := (mkIdentFrom cl.ident cl.ident.getId.eraseMacroScopes, mkIdent (Name.mkSimple s!"_f{idx + 1}"))
+    let (fId, v) := (mkIdentFrom cl.ident cl.ident.getId.eraseMacroScopes, mkIdent (Name.mkSimple s!"_f{idx + 2}"))
     fieldStxs := fieldStxs.push (← `(Lean.Parser.Command.structSimpleBinder| $fId:ident : $(cl.tyTm) := $(cl.defaultTm)))
     tupleTy ← `($tupleTy × $(cl.tyTm)); toTuple ← `(($toTuple, u.$fId)); tuplePat ← `(($tuplePat, $v))
     fieldInits := fieldInits.push (← `(Lean.Parser.Term.structInstField| $fId:ident := $v))
@@ -118,6 +125,8 @@ def elabAuthCmd : CommandElab := fun stx => do
   elabCommand (← `(command| def $fromClaimsId (c : Qed.Auth.JwtClaims) : $userTyId := $fromLookupId c.sub c.claim))
   elabCommand (← `(command| def $fromCtxId (ctx : Qed.Server.RequestCtx) : Option $userTyId := ctx.userId.map ($fromLookupId · ctx.claim)))
   elabCommand (← `(command| theorem $(mkSub `fromCtx_userId) (ctx : Qed.Server.RequestCtx) (u : $userTyId) (h : $fromCtxId ctx = some u) : some u.id = ctx.userId := by
+    unfold $fromCtxId at h; cases hUid : ctx.userId <;> simp [hUid] at h; cases h; rfl))
+  elabCommand (← `(command| theorem $(mkSub `fromCtx_emailVerified) (ctx : Qed.Server.RequestCtx) (u : $userTyId) (h : $fromCtxId ctx = some u) : u.emailVerified = Qed.Auth.parseBoolClaim (ctx.claim "email_verified") false := by
     unfold $fromCtxId at h; cases hUid : ctx.userId <;> simp [hUid] at h; cases h; rfl))
   for (fnLeaf, pfx) in [(`loginUrl, "/_qed/auth/login?returnTo="), (`logoutUrl, "/_qed/auth/logout?returnTo=")] do
     elabCommand (← `(command| def $(mkSub fnLeaf) (returnTo : Qed.HrefTarget := Qed.HrefTarget.root) : Qed.Url :=

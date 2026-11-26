@@ -1,10 +1,10 @@
-import Tests.Native.Harness
+import QedTests.Native.Harness
 import Cli.Watch
 import Js.Backend
 open System (FilePath)
 open Qed.Server Qed.Cli.Watch
 
-namespace Tests.Native.CliScaffold
+namespace QedTests.Native.CliScaffold
 
 private def isHashedMjs (prefixStr s : String) : Bool :=
   s.startsWith s!"/{prefixStr}." && s.endsWith ".mjs" && s.length == prefixStr.length + 18
@@ -117,4 +117,4 @@ def run : IO Bool := do
       c.check label ((code == 0) == wantOk && (wantSub.isEmpty || combined.contains wantSub)) combined
   c.finish
 
-end Tests.Native.CliScaffold
+end QedTests.Native.CliScaffold

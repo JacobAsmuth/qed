@@ -6,9 +6,9 @@ import Qed.Proofs.ViewPatch
 import Qed.Proofs.KeyedReconcile
 import Qed.Proofs.Hydration
 import Js.Proofs
-import Tests.AxiomFixtures
-import Tests.DbChecks
-import Tests.AuthChecks
+import QedTests.AxiomFixtures
+import QedTests.DbChecks
+import QedTests.AuthChecks
 import Examples.Counter
 import Examples.Todo
 import Examples.Signup

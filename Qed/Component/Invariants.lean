@@ -115,7 +115,7 @@ def elabInlineInvariantsPhase (spec : ComponentSpec) (wantView : Bool) : Command
     if invStx.getKind == ``compExampleClause then continue
     if invStx.getKind == ``compForEachInvClause then
       let isStyled ← isForEachStyled invStx
-      if isStyled == wantView then if let some pred ← elabForEachInlineInv spec invStx isStyled then statePreds := statePreds.push (pred, none)
+      if isStyled == wantView then if let some pred ← withRef invStx (elabForEachInlineInv spec invStx isStyled) then statePreds := statePreds.push (pred, none)
       continue
     let rawClauses ← (invStx.getArg 2).getSepArgs.mapM rwRawClause
     let hasHoldsIn := (invStx.getArg 3).getNumArgs > 0
@@ -135,9 +135,9 @@ def elabInlineInvariantsPhase (spec : ComponentSpec) (wantView : Bool) : Command
       let invId := resolveInvIdent invStx spec.t.getId
       if isView then
         if prove?.isSome then throwErrorAt (invStx.getArg 5) "per-action `prove:` applies to state invariants, not `view` styling invariants"
-        elabViewInlineInv spec invStx invId rawClauses (← valClauses?.getDM (rawClauses.mapM (lowerCompExpr .val))) assume? pf?
+        withRef invStx <| elabViewInlineInv spec invStx invId rawClauses (← valClauses?.getDM (rawClauses.mapM (lowerCompExpr .val))) assume? pf?
       else
-        let pred ← elabStateInlineInv spec invId (← rawClauses.mapM (lowerCompExpr .propInv)) using? prove? pf?
+        let pred ← withRef invStx <| elabStateInlineInv spec invId (← rawClauses.mapM (lowerCompExpr .propInv)) using? prove? pf?
         statePreds := statePreds.push (pred, if !spec.hasProps && spec.mountable then some invId else none)
   return statePreds
 

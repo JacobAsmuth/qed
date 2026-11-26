@@ -8,8 +8,8 @@ def cmdTest : IO UInt32 := do
   if !(← verify) then IO.eprintln (red "✗ verification failed"); return 1
   step "building native test runner"
   let targets := #["qedtest", "qed/QedServer:static", "qed/Qed:static", "qed/libqed_server"] ++
-    (if ← isInRepo then #["+Tests.CheckHelper:c.o", "+Tests.ServerChecks:c.o", "+Tests.AuthChecks:c.o",
-      "+Tests.DbChecks:c.o", "+Tests.WebEssentialsFixture:c.o", "+Examples.CloudBooks:c.o", "+Examples.LiveRoom:c.o"] else #[])
+    (if ← isInRepo then #["+QedTests.CheckHelper:c.o", "+QedTests.ServerChecks:c.o", "+QedTests.AuthChecks:c.o",
+      "+QedTests.DbChecks:c.o", "+QedTests.WebEssentialsFixture:c.o", "+Examples.CloudBooks:c.o", "+Examples.LiveRoom:c.o"] else #[])
   if (← shLakeBuild (#["build"] ++ targets)) != 0 then IO.eprintln (red "✗ failed to build native test runner"); return 1
   step "running tests"
   let some lp ← lakeEnvLeanPath | return 1

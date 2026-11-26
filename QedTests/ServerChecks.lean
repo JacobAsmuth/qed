@@ -1,6 +1,6 @@
 import Qed
 import Qed.Server.Http
-import Tests.CheckHelper
+import QedTests.CheckHelper
 open Qed
 
 namespace ServerChecks
@@ -354,10 +354,20 @@ server GuardedApi:
   fn formatGreeting(who: String) -> String:
     return f"hi {who}"
 
+  read_only fn readHitsHelper() -> Nat!:
+    atomic:
+      return hits
+
   fn mintAndHash(uid: String) -> (String, String)!:
     let tok = await Qed.Server.mintBearerToken(uid, 3600)?
     let digest = await Qed.Server.hashBearerToken(tok)?
     return (tok, digest)
+
+  read_only rpc readHits() -> Nat!:
+    return await readHitsHelper()?
+
+  read_only rpc billingUrl() -> Qed.Url:
+    return url("https://billing.example.com/portal")
 
   rpc hello() -> String!:
     requires auth
@@ -400,6 +410,8 @@ server GuardedApi:
   GuardedApi.methods.contains "hello" &&
   GuardedApi.methods.contains "whoNamed" &&
   GuardedApi.methods.contains "createToken" &&
+  GuardedApi.readOnlyMethods.contains "readHits" &&
+  GuardedApi.readOnlyMethods.contains "billingUrl" &&
   (Qed.Server.ApiError.internal "pg password leaked").wireMessage false == "internal server error" &&
   (Qed.Server.ApiError.internal "pg password leaked").wireMessage true == "pg password leaked" &&
   (Qed.Server.ApiError.forbidden "nope").wireMessage false == "nope" &&
@@ -411,5 +423,160 @@ server GuardedApi:
   ({ query := "?a=1&tag=hi+qed", body := "{\"msg\":\"yo\"}" : Qed.Server.RequestCtx }).queryParam "tag" == some "hi qed"
 
 example := @Qed.Server.ApiError.wireMessage_prod_5xx
+
+expect_err "`read_only rpc badMut` is not read-only: it mutates server state" in
+server BadReadOnlyMutSrv:
+  state x : Nat = 0
+  read_only rpc badMut() -> Nat:
+    x += 1
+    return x
+
+expect_err "`read_only rpc badCookie` is not read-only: it sets or clears cookies" in
+server stateless BadReadOnlyCookieSrv:
+  read_only rpc badCookie() -> Unit:
+    setCookie("a", "b")
+
+/-! ## Phase 3 Tests: Richer `external`, `service`, `Crypto`/`Time`/`Random`/`secret`, Default Params, Guard-`let`, `prove:` -/
+
+schema StripeCheckoutReq:
+  mode       : String
+  successUrl : String
+  quantity   : Nat
+  coupon     : String?
+
+external SecretManagerApi:
+  base "https://secretmanager.googleapis.com"
+  auth gcpMetadata
+  ssrf_guard
+  post "/v1/projects/{project}/secrets" createSecret(project: String, query("secretId") secretId: String, body: Json) -> Json ok [200, 201, 409]
+  post "/v1/projects/{project}/secrets/{id}:addVersion" addVersion(project: String, id: String, body: Json) -> Json
+  get "/v1/projects/{project}/secrets" listSecrets(project: String, query pageSize: Nat?, query filter: String?) -> Json
+
+external StripeFormApi:
+  base "https://api.stripe.com"
+  auth bearer(secret("STRIPE_API_KEY"))
+  post "/v1/checkout/sessions" createSession(header("Idempotency-Key") idemKey: String?, body: Form(StripeCheckoutReq)) -> Json
+  get "/v1/customers" listCustomers(query("starting_after") after: String?, query limit: Nat?) -> Json
+
+external GuardedLocalApi:
+  base "http://127.0.0.1:1"
+  get "/ping" ping() -> String
+
+external UnguardedLocalApi:
+  base "http://127.0.0.1:1"
+  ssrf_guard false
+  get "/ping" ping() -> String
+
+expect_err "`Form(T)` is only supported for HTTP request body parameters, not response types" in
+external BadFormRetApi:
+  base "https://api.example.com"
+  get "/bad" bad() -> Form(StripeCheckoutReq)
+
+expect_err "HTTP status code `999` in `ok [...]` must be between 100 and 599" in
+external BadOkStatusApi:
+  base "https://api.example.com"
+  get "/bad" bad() -> String ok [200, 999]
+
+private def doublePlus (n : Nat) : Nat := n + n + 1
+private theorem doublePlus_odd (n : Nat) : doublePlus n % 2 = 1 := by unfold doublePlus; omega
+
+fn checkPureGuardAndProve(opt: (Nat, Nat)?, bonus: Nat = 1) -> Nat:
+  ensures result % 2 == 1
+    prove:
+      dsimp only [checkPureGuardAndProve]
+      cases opt with
+      | none => simp [doublePlus_odd]
+      | some p => simp [doublePlus_odd]
+  let some((a, b)) = opt else return doublePlus(bonus)
+  return doublePlus(a + b + bonus)
+
+service Webhooks:
+  secret signingKey = "WEBHOOK_SECRET"
+  env region = "APP_REGION" ?? "us-central1"
+
+  fn parseSigHeader(hdr: String) -> (Nat, String)?:
+    let parts = hdr.splitOn(",")
+    match parts:
+      case [tsStr, sig]:
+        let some(ts) = tsStr.toNat? else return none
+        return some((ts, sig))
+      case _:
+        return none
+
+  read_only fn verifyWithKey(key: Secret, payload: String, sigHeader: String, toleranceSec: Nat = 300) -> Bool:
+    let some((ts, v1)) = parseSigHeader(sigHeader) else return false
+    let now = await Time.nowSec()
+    if absDiff(now, ts) > toleranceSec:
+      return false
+    let expected = await Crypto.hmacSha256Hex(key, f"{ts}.{payload}")
+    return await Crypto.constEq(v1, expected)
+
+  read_only fn verifyStripe(payload: String, sigHeader: String, toleranceSec: Nat = 300) -> Bool!:
+    return await verifyWithKey(signingKey, payload, sigHeader, toleranceSec)
+
+  read_only fn issueNonce(seed: Nat) -> Nat!:
+    ensures result % 2 == 1
+      prove:
+        exact doublePlus_odd seed
+    let _tok = await Random.hex(16)
+    let _uid = await Random.uuid()
+    let _b64 = Base64.encodeString(region)
+    return doublePlus(seed)
+
+service BillingSvc:
+  use hooks : Webhooks
+
+  read_only fn checkEvent(payload: String, sig: String) -> Bool!:
+    return await hooks.verifyStripe(payload, sig)?
+
+  fn syncSecret(project: String, id: String, raw: String) -> Json!:
+    let _ = await SecretManagerApi.createSecret(project, id, Json.obj([].toList))?
+    let payload = Json.obj([("payload", Json.obj([("data", Json.str(Base64.encodeString(raw)))].toList))].toList)
+    return await SecretManagerApi.addVersion(project, id, payload)?
+
+  fn openCheckout(req: StripeCheckoutReq, idem: String? = none) -> Json!:
+    return await StripeFormApi.createSession(idem, req)?
+
+server stateless ServiceHost:
+  use billing : BillingSvc
+  use hooks : Webhooks
+
+  read_only rpc verifyWebhook(payload: String, sig: String) -> Bool!:
+    return await billing.checkEvent(payload, sig)?
+
+  read_only rpc getOddToken(n: Nat) -> Nat!:
+    ensures result % 2 == 1
+      prove:
+        exact doublePlus_odd n
+    let _ = await hooks.issueNonce(n)?
+    return doublePlus(n)
+
+  rpc createCheckout(req: StripeCheckoutReq) -> String!:
+    let res = await billing.openCheckout(req)?
+    return res.render
+
+  rpc rotateSecret(project: String, id: String, raw: String) -> String!:
+    let res = await billing.syncSecret(project, id, raw)?
+    return res.render
+
+#guard
+  Webhooks.secrets == #["WEBHOOK_SECRET"] &&
+  ServiceHost.secrets.contains "WEBHOOK_SECRET" &&
+  ServiceHost.secrets.contains "STRIPE_API_KEY" &&
+  toString (Secret.ofString "super-secret") == "<redacted>" &&
+  checkPureGuardAndProve none == 3 &&
+  checkPureGuardAndProve (some (2, 3)) 4 == 19 &&
+  Webhooks.parseSigHeader "1700000000,deadbeef" == some (1700000000, "deadbeef") &&
+  Webhooks.parseSigHeader "bad" == none &&
+  absDiff (10 : Nat) 3 == 7 && absDiff (3 : Nat) 10 == 7 &&
+  Base64.decodeString? (Base64.encodeString "qed-ok") == some "qed-ok" &&
+  (Qed.Server.buildExternalSuffix
+    [.lit "v1", .lit "projects", .seg "p1", .lit "secrets", .compound [.param "my-sec", .lit ":addVersion"]]
+    [("pageSize", .omit), ("filter", .omit)]).toOption == some "v1/projects/p1/secrets/my-sec:addVersion" &&
+  (Qed.Server.buildExternalSuffix [.lit "v1", .lit "customers"]
+    [("starting_after", Qed.Server.ToQueryVal.toQueryVal (none : Option String)), ("limit", Qed.Server.ToQueryVal.toQueryVal (some (25 : Nat)))]).toOption ==
+    some "v1/customers?limit=25" &&
+  String.fromUTF8? (Qed.Server.encodeFormBodyOf ({ mode := "payment", successUrl := "https://a.test/ok", quantity := 2, coupon := none : StripeCheckoutReq })) ==
+    some "mode=payment&successUrl=https%3A%2F%2Fa.test%2Fok&quantity=2"
 
 end ServerChecks

@@ -8,6 +8,7 @@ deriving Inhabited, Repr
 structure Cached (α : Type) where
   state : Resource α := .idle
   seen  : List (String × α) := []
+  rev   : Nat := 0
 deriving Inhabited
 inductive RpcOutcome (ε α : Type) where
   | ok (val : α) | err (tag : ε) (message : String) | failed (message : String)

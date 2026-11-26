@@ -1,5 +1,5 @@
 import Qed
-import Tests.CheckHelper
+import QedTests.CheckHelper
 open Qed
 
 namespace CssChecks

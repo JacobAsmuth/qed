@@ -212,4 +212,22 @@ qed_proto_fields% [α] (List α, encodeRepeatedField1, decodeRepeatedField1,
 
 qed_equiv_codec% proto [α] (Array α, Array.toList, List.toArray, fun ⟨_⟩ => rfl)
 
+/-! ## Verified JSON & Protobuf Codecs for `Qed.Url` (Re-verifies `isSafeUrl` on Untrusted Wire Bytes) -/
+
+instance : ToJson Url where toJson u := .str u.raw
+instance : FromJson Url where
+  fromJson
+    | .str s => (Url.parse? s).elim (.error s!"unsafe URL `{s}`") .ok
+    | _ => .error "expected URL string"
+instance : LawfulJson Url where
+  fromJson_toJson u := by simp [ToJson.toJson, FromJson.fromJson, Url.parse?, u.safe]
+instance : NonNullJson Url := ⟨nofun⟩
+
+instance : ToProto Url where toProtoVal u := ToProto.toProtoVal u.raw
+instance : FromProto Url where
+  fromProtoVal w := (FromProto.fromProtoVal (α := String) w).bind fun s =>
+    (Url.parse? s).elim (.error s!"protobuf: unsafe URL `{s}`") .ok
+instance : LawfulProto Url := .ofScalar fun ⟨⟨_, hs⟩, hsafe⟩ => by
+  simp [ToProto.toProtoVal, FromProto.fromProtoVal, String.fromUTF8?, String.toUTF8, hs, String.fromUTF8, Except.bind, Url.parse?, hsafe]
+
 end Qed

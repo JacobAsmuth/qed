@@ -482,7 +482,7 @@ partial def rewriteIn (ctx : RewriteCtx) (inLambda : Bool) (stx : Syntax) : Comm
     Qed.Lang.mkAppTerms (mkIdentFrom evId (ctx.spec.t.getId ++ `Out ++ evName)) argTerms
   let k := stx.getKind
   if k == ``qedRawTerm then return stx
-  else if k == ``qedLam1 || k == ``qedLamN then return Syntax.node .none k (← stx.getArgs.mapM (rewriteIn ctx true))
+  else if k == ``qedLam1 || k == ``qedLamN then return Syntax.node stx.getHeadInfo k (← stx.getArgs.mapM (rewriteIn ctx true))
   else if k == ``qedExprFor then
     let (patStx, collRaw) := (stx.getArg 1, stx.getArg 3)
     let collRewritten ← rewriteIn ctx inLambda collRaw; let mut bodyRewritten ← rewriteIn ctx true (stx.getArg 5)
@@ -491,7 +491,7 @@ partial def rewriteIn (ctx : RewriteCtx) (inLambda : Bool) (stx : Syntax) : Comm
         if let some cInfo ← liftCoreM (lookupComponent? childCompId.getId) then
           if (← liftCoreM getEnv).contains (cInfo.fullName ++ `keyOf) then
             bodyRewritten ← injectAutoKey bodyRewritten cInfo.fullName ⟨patStx.getArg 0⟩
-    return Syntax.node .none k #[stx.getArg 0, patStx, stx.getArg 2, collRewritten, stx.getArg 4, bodyRewritten]
+    return Syntax.node stx.getHeadInfo k #[stx.getArg 0, patStx, stx.getArg 2, collRewritten, stx.getArg 4, bodyRewritten]
   else if k == ``qedExprIf then
     let cond' ← rewriteIn ctx inLambda (stx.getArg 1)
     let then' ← rewriteIn { ctx with guards := ctx.guards.push (.ifCond cond' true) } inLambda (stx.getArg 3)
@@ -532,7 +532,8 @@ partial def rewriteIn (ctx : RewriteCtx) (inLambda : Bool) (stx : Syntax) : Comm
     return Syntax.node stx.getHeadInfo k #[stx.getArg 0, scrutsNode', stx.getArg 2, Syntax.node casesNode.getHeadInfo casesNode.getKind cases']
   else if k == ``qedStmtExpr then
     let e := stx.getArg 0
-    let isHandleOrPush := isCollMutExpr e || isPlainCallTo (ctx.spec.mutFns.map (·.id.getId.eraseMacroScopes)) e || match matchIdentMethodCall? e with
+    let isHandleOrPush := isCollMutExpr e || isPlainCallTo (ctx.spec.mutFns.map (·.id.getId.eraseMacroScopes)) e ||
+      (!ctx.spec.queries.isEmpty && (matchInvalidateCall? e).isSome) || match matchIdentMethodCall? e with
       | some (id, "emit", _) => ctx.hasEv id.getId.eraseMacroScopes
       | some (id, "send", _) => let nm := id.getId.eraseMacroScopes; ctx.hasSub nm || ctx.hasPortOut nm
       | some (id, m, _) => ["refetch", "invalidate", "update", "set"].contains m && ctx.hasQuery id.getId.eraseMacroScopes
@@ -560,7 +561,20 @@ partial def rewriteIn (ctx : RewriteCtx) (inLambda : Bool) (stx : Syntax) : Comm
           let ctor ← registerKeyedSite ctx.accum key s!"q_{qNm}_{qMeth}" fun ctor =>
             { key, ctor, stmts? := some #[Syntax.node stx.getHeadInfo ``qedStmtExpr #[stx]] }
           return mkRawExpr (← wrapMsgArity ctx.wrapMsg? 0 ⟨ctx.spec.msgCtor ctor⟩)
-    | _ => pure ()
+    | _ =>
+        if ctx.allowHoist && !ctx.spec.queries.isEmpty then
+          if let some rawArgs := matchInvalidateCall? stx then
+            let qNames := rawArgs.filterMap fun ra =>
+              if ra.getKind == ``qedCallArgPos && (unwrapParens1 (ra.getArg 0)).getKind == ``qedIdent then
+                let nm := ((unwrapParens1 (ra.getArg 0)).getArg 0).getId.eraseMacroScopes
+                if ctx.hasQuery nm then some nm else none
+              else none
+            if !qNames.isEmpty && qNames.size == rawArgs.size then
+              let joined := String.intercalate "_" (qNames.toList.map toString)
+              let key := s!"qctrl:inv:{joined}"
+              let ctor ← registerKeyedSite ctx.accum key s!"q_inv_{joined}" fun ctor =>
+                { key, ctor, stmts? := some #[Syntax.node stx.getHeadInfo ``qedStmtExpr #[stx]] }
+              return mkRawExpr (← wrapMsgArity ctx.wrapMsg? 0 ⟨ctx.spec.msgCtor ctor⟩)
     if (stx.getArg 0).getKind == ``qedIdent then
       let calleeId : Ident := ⟨(stx.getArg 0).getArg 0⟩
       let cn := calleeId.getId.eraseMacroScopes
@@ -593,8 +607,8 @@ partial def rewriteIn (ctx : RewriteCtx) (inLambda : Bool) (stx : Syntax) : Comm
       if let some (fRef, fname, path) := parseCompLVal? (inner.getArg 1) then
         checkMutableField ctx fRef s!"`{attrName}=\{{stxSnippet (inner.getArg 1)}}`" fname
         let readTerm ← Qed.Server.foldProjTerms fRef ⟨(mkIdentFrom fRef fname).raw⟩ path.toList
-        return Syntax.node .none stx.getKind #[stx.getArg 0, Syntax.node .none valNode.getKind #[valNode.getArg 0, mkJsxAttrValNode (← `(($readTerm, $(← mkSetterHandler ctx fname path))))]]
-    return Syntax.node .none k (← stx.getArgs.mapM (rewriteIn ctx inLambda))
+        return Syntax.node stx.getHeadInfo stx.getKind #[stx.getArg 0, Syntax.node valNode.getHeadInfo valNode.getKind #[valNode.getArg 0, mkJsxAttrValNode (← `(($readTerm, $(← mkSetterHandler ctx fname path))))]]
+    return Syntax.node stx.getHeadInfo k (← stx.getArgs.mapM (rewriteIn ctx inLambda))
   else if k == ``Qed.Jsx.selfClosing || k == ``Qed.Jsx.withChildren then
     let tag := atomStr (stx.getArg 1)
     let kids? ← if k == ``Qed.Jsx.withChildren then some <$> rewriteIn ctx inLambda (stx.getArg 4) else pure none

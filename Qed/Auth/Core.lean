@@ -106,9 +106,11 @@ def parseJwtClaims (j : Json) : Except String JwtClaims := do
   let some sub := j.strAt? "sub" | .error "jwt: missing `sub` claim"
   let aud := match j.get? "aud" with | some (.str s) => [s] | some (.arr xs) => xs.filterMap (·.str?) | _ => []
   let some exp := j.natAt? "exp" | .error "jwt: missing or invalid `exp` claim"
-  let flatClaims := match j with | .obj fs => fs.filterMap fun (k, v) => (jsonToClaimString v).map (k, ·) | _ => []
+  let emailVerified := (j.boolAt? "email_verified").getD false
+  let rawFlat := match j with | .obj fs => fs.filterMap fun (k, v) => if k == "email_verified" then none else (jsonToClaimString v).map (k, ·) | _ => []
+  let flatClaims := rawFlat ++ [("email_verified", if emailVerified then "true" else "false")]
   .ok { iss, sub, aud, exp, nbf? := j.natAt? "nbf", iat? := j.natAt? "iat", nonce? := j.strAt? "nonce",
-        email? := j.strAt? "email", emailVerified := (j.boolAt? "email_verified").getD false, flatClaims }
+        email? := j.strAt? "email", emailVerified, flatClaims }
 
 structure OidcValidationCfg where
   issuer         : String
@@ -208,9 +210,7 @@ def decodeSessionPayloadV2 (b64 : String) : Except String SessionPayloadV2 := do
 abbrev urlEncodeComponent : String → String := Qed.encodeSeg
 abbrev urlDecodeComponent : String → String := Qed.urlDecodeComponent
 abbrev parseQueryParams : String → List (String × String) := Qed.parseQueryParams
-
-def encodeFormBody (pairs : List (String × String)) : String :=
-  "&".intercalate (pairs.map fun (k, v) => urlEncodeComponent k ++ "=" ++ urlEncodeComponent v)
+abbrev encodeFormBody : List (String × String) → String := Qed.encodeFormBody
 
 /-! ### Declarative `auth` Runtime Specification (`OidcAuthSpec`) -/
 

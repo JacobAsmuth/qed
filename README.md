@@ -158,7 +158,7 @@ Hint: Ensure `where = r => ...` (together with `requires` / `if` guards) implies
 - **Parameterized queries:** Query values are always sent as bound parameters, never interpolated into SQL strings.
 - **Swappable backends:** `DATABASE_URL` selects PostgreSQL, embedded SQLite, or HTTP SQL—including Cloudflare D1 and Turso—with the same server code, and tables and indexes are created automatically on startup.
 
-See [DbChecks](Tests/DbChecks.lean) for positive and negative compile-time examples.
+See [DbChecks](QedTests/DbChecks.lean) for positive and negative compile-time examples.
 
 ---
 

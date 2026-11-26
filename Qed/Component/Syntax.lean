@@ -20,10 +20,15 @@ structure ComponentInfo where mk ::
 deriving Inhabited
 
 initialize componentRegistry : Lean.SimplePersistentEnvExtension ComponentInfo (Lean.NameMap ComponentInfo) ← Qed.Diag.mkNameMapExt (·.fullName)
+initialize failedComponentRegistry : Lean.SimplePersistentEnvExtension Lean.Name (Lean.NameMap Lean.Name) ← Qed.Diag.mkNameMapExt id
 
 open Lean in
 def lookupComponent? (cName : Name) : CoreM (Option ComponentInfo) := do
   return Qed.Diag.lookupNameMapExt? componentRegistry (← getEnv) (← getCurrNamespace) (← getOpenDecls) cName (some `view)
+
+open Lean in
+def isFailedComponent (cName : Name) : CoreM Bool := do
+  return (Qed.Diag.lookupNameMapExt? failedComponentRegistry (← getEnv) (← getCurrNamespace) (← getOpenDecls) cName).isSome
 
 /-! ## Component Surface Syntax (Sharing `Qed.Lang` Expressions, Statements & Types) -/
 
@@ -139,6 +144,11 @@ def unpackBindProp (nm : String) (v : Term) : MacroM (Option (String × Term × 
 def isPlainCallTo (names : Array Name) (exprStx : Syntax) : Bool :=
   let u := unwrapParens1 exprStx
   u.getKind == ``qedCall && (u.getArg 0).getKind == ``qedIdent && names.contains (((u.getArg 0).getArg 0).getId.eraseMacroScopes)
+def matchInvalidateCall? (exprStx : Syntax) : Option (Array Syntax) :=
+  let u := unwrapParens1 exprStx
+  if u.getKind == ``qedCall && (u.getArg 0).getKind == ``qedIdent && ((u.getArg 0).getArg 0).getId.eraseMacroScopes == `invalidate then
+    some (u.getArg 2).getSepArgs
+  else none
 def hasEffectStmt (eventNames : Array Name) (stx : Syntax) (pureMutFns : Array Name := #[]) : Bool :=
   stxAny (fun s => (s.getKind == ``qedStmtExpr && !isCollMutExpr (s.getArg 0) && !isEventEmitExpr eventNames (s.getArg 0) && !isPlainCallTo pureMutFns (s.getArg 0)) || isAwaitStmt s) stx
 def hasReturnStmt (stx : Syntax) : Bool := stxAny (·.getKind == ``qedStmtReturn) stx
@@ -179,10 +189,11 @@ def mkJsxAttrValNode (val : Term) : Syntax :=
 def mkJsxAttrExpr (name : String) (val : Term) : Syntax :=
   Syntax.node .none ``Qed.Jsx.attrNamed #[Syntax.node .none `Qed.Jsx.jsxName #[Syntax.atom .none name], Syntax.node .none nullKind #[Syntax.atom .none "=", mkJsxAttrValNode val]]
 def rebuildJsxEl (stx : Syntax) (attrs : Array Syntax) (kids? : Option Syntax) : Syntax :=
-  let aNode := Syntax.node .none nullKind attrs
+  let info := stx.getHeadInfo
+  let aNode := Syntax.node info nullKind attrs
   match kids? with
-  | none    => Syntax.node .none stx.getKind #[stx.getArg 0, stx.getArg 1, aNode, stx.getArg 3]
-  | some kn => Syntax.node .none stx.getKind #[stx.getArg 0, stx.getArg 1, aNode, stx.getArg 3, kn, stx.getArg 5, stx.getArg 6]
+  | none    => Syntax.node info stx.getKind #[stx.getArg 0, stx.getArg 1, aNode, stx.getArg 3]
+  | some kn => Syntax.node info stx.getKind #[stx.getArg 0, stx.getArg 1, aNode, stx.getArg 3, kn, stx.getArg 5, stx.getArg 6]
 
 def mkOutMatchTerm (baseName : Name) (totalCtors : Nat) (arms : Array OutArm) (outVar : Ident) : MacroM Term := do
   let mut alts ← arms.mapM fun arm => do

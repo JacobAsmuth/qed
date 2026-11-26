@@ -185,7 +185,7 @@ private partial def compileStmts (spec : ComponentSpec) (sBase : Term)
     `(let $brId:ident := $subTerm; $rebound)
   match stmts with
   | [] => mkUpdateRet spec (← flushMutated sBase mutated) out? cmds
-  | s :: rest =>
+  | s :: rest => withRef s do
       let sk := s.getKind
       if sk == ``qedStmtPass then compileStmts spec sBase mutated out? cmds rest
       else if sk == ``qedStmtReturn then mkUpdateRet spec (← flushMutated sBase mutated) out? cmds
@@ -239,23 +239,34 @@ private partial def compileStmts (spec : ComponentSpec) (sBase : Term)
               match qMeth with
               | "refetch" | "invalidate" =>
                   let _ ← lowerPosCallArgs exprStx s!"{tname}.{qMeth}()" (some 0) rawArgs
-                  let qkId := mkIdent `_qk
-                  let qFetchCall ← appWithProps spec (mkIdent (queryFetchFnName spec.t.getId q)) #[sFlushed, qkId]
-                  let fetchCmd ← `(if ($qkId:ident).isEmpty then Qed.Cmd.none else ($qFetchCall).getD Qed.Cmd.none)
-                  if qMeth == "refetch" then bindCmd "qRefetch" (← `(let $qkId:ident := $qKeyCall; $fetchCmd))
-                  else
-                    let cmdId := mkIdent (Name.mkSimple s!"_qInv_{cmds.size}")
-                    `(let $qkId:ident := $qKeyCall
-                      let $qId:ident := let _inv := ($qId:ident).invalidateKey $qkId; if ($qkId:ident).isEmpty then _inv else _inv.activate $qkId
-                      let $cmdId:ident := $fetchCmd
-                      $(← compileStmts spec sBase (mutated.push q.id.getId) out? (cmds.push cmdId) rest))
+                  let fnId := mkIdent (if qMeth == "refetch" then `Qed.Cached.markRefetch else `Qed.Cached.invalidateAll)
+                  `(let $qId:ident := $fnId $qId:ident; $(← compileStmts spec sBase (mutated.push q.id.getId) out? cmds rest))
               | "update" | "set" =>
                   let argTs ← lowerPosCallArgs exprStx s!"{tname}.{qMeth}(...)" (some 1) rawArgs
                   let fnId := mkIdent (if qMeth == "update" then `Qed.Cached.updateCurrent else `Qed.Cached.setKey)
                   `(let $qId:ident := $fnId $qId:ident ($qKeyCall) ($(argTs[0]!)); $(← compileStmts spec sBase (mutated.push q.id.getId) out? cmds rest))
-              | _ => bindCmd "cmd" (← `(($(← lowerCompExpr .val exprStx) : Qed.Cmd $(spec.msgId))))
-            else bindCmd "cmd" (← `(($(← lowerCompExpr .val exprStx) : Qed.Cmd $(spec.msgId))))
-        | _ => bindCmd "cmd" (← `(($(← lowerCompExpr .val exprStx) : Qed.Cmd $(spec.msgId))))
+              | _ => withRef s <| bindCmd "cmd" (← `(($(← lowerCompExpr .val exprStx) : Qed.Cmd $(spec.msgId))))
+            else withRef s <| bindCmd "cmd" (← `(($(← lowerCompExpr .val exprStx) : Qed.Cmd $(spec.msgId))))
+        | _ =>
+            if !spec.queries.isEmpty then
+              if let some rawArgs := matchInvalidateCall? exprStx then
+                if rawArgs.isEmpty then throwErrorAt exprStx "`invalidate(...)` requires at least one declared `query` name"
+                let validQs := spec.queries.toList.map (·.id.getId.eraseMacroScopes.toString)
+                let mut qTargets : Array (Ident × Name) := #[]
+                for ra in rawArgs do
+                  if ra.getKind != ``qedCallArgPos then throwErrorAt ra "`invalidate(...)` expects positional `query` names"
+                  let u := unwrapParens1 (ra.getArg 0)
+                  unless u.getKind == ``qedIdent do throwErrorAt ra "`invalidate(...)` arguments must be declared `query` names"
+                  let qRef : Ident := ⟨u.getArg 0⟩; let qNm := qRef.getId.eraseMacroScopes
+                  let some q := spec.queries.find? (·.id.getId.eraseMacroScopes == qNm)
+                    | throwErrorAt qRef s!"unknown `query` `{qNm}` in `invalidate(...)`{Qed.Diag.didYouMean qNm.toString validQs} (declared queries: {String.intercalate ", " validQs})"
+                  qTargets := qTargets.push (mkIdentFrom qRef q.id.getId, q.id.getId)
+                let mut mut' := mutated
+                for (_, qn) in qTargets do mut' := mut'.push qn
+                let tail ← compileStmts spec sBase mut' out? cmds rest
+                let invAllId := mkIdent `Qed.Cached.invalidateAll
+                return ← qTargets.foldrM (init := tail) fun (qId, _) acc => `(let $qId:ident := $invAllId $qId:ident; $acc)
+            withRef s <| bindCmd "cmd" (← `(($(← lowerCompExpr .val exprStx) : Qed.Cmd $(spec.msgId))))
       else if sk == ``qedStmtIf || sk == ``qedStmtIfLet || sk == ``qedStmtMatch then
         let passTail := !rest.isEmpty && hasReturnStmt s; let sFlushed ← flushMutated sBase mutated
         let branchTerm ← lowerControlFlowStmt s (lowerCompExpr .val) fun seq => compileStmts spec sFlushed #[] out? cmds (seq.toList ++ if passTail then rest else [])
@@ -364,7 +375,7 @@ private def mkOwnUpdateArms (spec : ComponentSpec) (sites : Array SetSite) (unch
   for q in spec.queries do
     let keyBound ← appWithProps spec (mkIdent (queryKeyFnName spec.t.getId q)) #[← `(s)]
     let plainRes ← if q.rpc.hasMsgEnsured then `($(mkIdent `Qed.Resource.stripEnsured) _qr) else `(_qr)
-    arms := arms.push (← `(Lean.Parser.Term.matchAltExpr| | $(spec.msgCtor q.ctorName):ident _qk _qr => $(← mkUpdateRet spec (← `({ s with $(q.id):ident := (s.$(q.id):ident).put _qk $plainRes $keyBound })))))
+    arms := arms.push (← `(Lean.Parser.Term.matchAltExpr| | $(spec.msgCtor q.ctorName):ident _qk _qr => $(← mkUpdateRet spec (← `({ s with $(q.id):ident := (s.$(q.id):ident).putRev _qk $plainRes $keyBound })))))
   for sub in spec.subscriptions do arms := arms ++ (← mkSubUpdateArms spec sub unchanged)
   return arms
 

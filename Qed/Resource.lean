@@ -40,10 +40,18 @@ variable {α : Type}
 def lookup (c : Cached α) (key : String) : Option α := (c.seen.find? (·.1 == key)).map (·.2)
 def put (c : Cached α) (issuedKey : String) (r : Resource α) (currentKey : String) : Cached α :=
   { state := if issuedKey == currentKey then r else c.state
-    seen  := match r with | .ok a => ((issuedKey, a) :: c.seen.filter (·.1 != issuedKey)).take 32 | _ => c.seen }
+    seen  := match r with | .ok a => ((issuedKey, a) :: c.seen.filter (·.1 != issuedKey)).take 32 | _ => c.seen
+    rev   := c.rev }
+def lifecycleKey (dataKey : String) (rev : Nat) : String :=
+  if dataKey.isEmpty then "" else if rev == 0 then dataKey else dataKey ++ "#" ++ toString rev
+def putRev (c : Cached α) (issuedKey : String) (r : Resource α) (currentDataKey : String) : Cached α :=
+  let isCur := issuedKey == lifecycleKey currentDataKey c.rev
+  { state := if isCur then r else c.state
+    seen  := match r with | .ok a => if isCur then ((currentDataKey, a) :: c.seen.filter (·.1 != currentDataKey)).take 32 else c.seen | _ => c.seen
+    rev   := c.rev }
 def activate (c : Cached α) (k : String) : Cached α := { c with state := (c.lookup k).elim .loading .ok }
 def map (f : α → β) (c : Cached α) : Cached β :=
-  { state := c.state.map f, seen := c.seen.map fun (k, v) => (k, f v) }
+  { state := c.state.map f, seen := c.seen.map fun (k, v) => (k, f v), rev := c.rev }
 def getD (c : Cached α) (fallback : α) : α := c.state.getD fallback
 def isOk (c : Cached α) : Bool := c.state.isOk
 def isLoading (c : Cached α) : Bool := c.state.isLoading
@@ -54,7 +62,9 @@ def updateCurrent (c : Cached α) (currentKey : String) (f : α → α) : Cached
 def setKey (c : Cached α) (currentKey : String) (val : α) : Cached α :=
   c.put currentKey (.ok val) currentKey
 def invalidateKey (c : Cached α) (currentKey : String) : Cached α :=
-  { state := .idle, seen := c.seen.filter (·.1 != currentKey) }
+  { state := .idle, seen := c.seen.filter (·.1 != currentKey), rev := c.rev }
+def markRefetch (c : Cached α) : Cached α := { c with rev := c.rev + 1 }
+def invalidateAll (c : Cached α) : Cached α := { state := .idle, seen := [], rev := c.rev + 1 }
 def view (c : Cached α) (ready : α → Html msg) (loading : Html msg := .text "Loading…")
     (failed : String → Html msg := fun e => .text e) (idle : Html msg := .text "") : Html msg :=
   c.state.view ready loading failed idle
@@ -84,8 +94,10 @@ def Resource.query {Model Msg α : Type} [FromJson α] (key : Model → String) 
 def Resource.rpcQuery {Model Msg Req α ResMsg : Type} [ToProto Req] (params? : Model → Option Req)
     (fetch : Model → (String → Resource ResMsg → Msg) → String → Option (Cmd Msg))
     (got : String → Resource ResMsg → Msg) (get : Model → Cached α) (set : Cached α → Model → Model) : Query Model Msg :=
-  { key := fun m => rpcQueryKey (params? m)
-    load := fun k m => (fetch m got k).elim (set { get m with state := .idle } m, .none) (set ((get m).activate k) m, ·)
+  { key := fun m => Cached.lifecycleKey (rpcQueryKey (params? m)) (get m).rev
+    load := fun lk m =>
+      let dk := rpcQueryKey (params? m)
+      (fetch m got lk).elim (set { get m with state := .idle } m, .none) (set ((get m).activate dk) m, ·)
     idle := fun m => set { get m with state := .idle } m }
 def Query.boot {Model Msg : Type} (qs : List (Query Model Msg)) (ic : Model × Cmd Msg) : Model × Cmd Msg :=
   KeyedLifecycle.boot (·.key) (fun q k m => let r := q.load k m; (r.1, some r.2)) qs ic
@@ -139,7 +151,7 @@ instance [LawfulJson α] : LawfulJson (Resource α) where
     | .idle | .loading | .failed _ => rfl
     | .ok a => by change (fromJson (toJson a) : Except String α).map Resource.ok = _; rw [LawfulJson.fromJson_toJson a]; rfl
 instance [ToJson α] : NonNullJson (Resource α) := ⟨fun | .idle | .loading | .ok _ | .failed _ => nofun⟩
-qed_equiv_codec% json [α] (Cached α, fun c => (c.state, c.seen), fun p : Resource α × List (String × α) => ⟨p.1, p.2⟩, fun ⟨_, _⟩ => rfl)
+qed_equiv_codec% json [α] (Cached α, fun c => (c.state, c.seen, c.rev), fun p : Resource α × List (String × α) × Nat => ⟨p.1, p.2.1, p.2.2⟩, fun ⟨_, _, _⟩ => rfl)
 private def encodeResourceFields [ToProto α] : Resource α → List (Nat × Proto.WireVal)
   | .idle => [(1, .varint 0)] | .loading => [(1, .varint 1)]
   | .ok a => [(1, .varint 2), (2, ToProto.toProtoVal a)] | .failed e => [(1, .varint 3), (2, ToProto.toProtoVal e)]
@@ -227,6 +239,22 @@ theorem Cached.all_updateCurrent {P : α → Prop} {c : Cached α} {k : String} 
 theorem Cached.all_invalidateKey {P : α → Prop} {c : Cached α} {k : String} (hall : c.all P) :
     (c.invalidateKey k).all P :=
   ⟨trivial, fun kv hkv => hall.2 kv (List.mem_filter.1 hkv).1⟩
+@[simp] theorem Cached.all_markRefetch {P : α → Prop} {c : Cached α} :
+    (c.markRefetch).all P ↔ c.all P := Iff.rfl
+@[simp] theorem Cached.all_invalidateAll {P : α → Prop} {c : Cached α} :
+    (c.invalidateAll).all P := ⟨trivial, fun _ h => nomatch h⟩
+theorem Cached.all_putRev {P : α → Prop} {c : Cached α} {k currentDataKey : String} {r : Resource α} (hall : c.all P) (hr : r.all P) :
+    (c.putRev k r currentDataKey).all P :=
+  ⟨by dsimp only [Cached.putRev]; split <;> first | exact hr | exact hall.1, fun kv hkv => by
+    cases r with
+    | ok _ =>
+        dsimp only [Cached.putRev] at hkv
+        split at hkv
+        · rcases List.mem_cons.1 (List.mem_of_mem_take hkv) with rfl | hflt
+          · exact hr
+          · exact hall.2 kv (List.mem_filter.1 hflt).1
+        · exact hall.2 kv hkv
+    | _ => exact hall.2 kv hkv⟩
 end CachedProofs
 
 section QueryProofs

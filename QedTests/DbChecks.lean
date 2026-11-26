@@ -1,5 +1,5 @@
 import Qed
-import Tests.CheckHelper
+import QedTests.CheckHelper
 open Qed
 
 namespace DbChecks
@@ -66,6 +66,12 @@ server VaultApi:
     requires ctx.userId != none, 1 <= qty <= 50
     ensures result.id == bookId, result.stock <= 10000
     return await db.books.updateOne(where = r => r.id == bookId and r.stock >= qty, set = r => { stock = r.stock - qty })?
+  rpc restockBook(bookId: String, qty: Nat) -> VaultDb.books?!:
+    requires ctx.userId != none, 1 <= qty <= 50
+    return await db.books.updateOne(where = r => r.id == bookId and r.stock + qty <= 10000, set = { stock += qty })?
+  rpc atomicOrderBook(bookId: String, qty: Nat) -> VaultDb.books?!:
+    requires ctx.userId != none, 1 <= qty <= 50
+    return await db.books.updateOne(where = r => r.id == bookId and r.stock >= qty, set = { stock -= qty })?
 component VaultClient:
   session user
   query myNotes = VaultApi.listMyNotes() if user.isSome
@@ -521,8 +527,32 @@ server RoadmapApi:
     return await db.services.insert(slug = s, port = p, altPort = some(ServicePort.make(8443)))?
   rpc registerDefaultService() -> RoadmapDb.services!:
     return await db.services.insert(slug = "api", port = 8080)?
+  rpc idempotentOrg(orgId: String, name: String) -> RoadmapDb.orgs?!:
+    requires 1 <= orgId.length <= 64, 1 <= name.length <= 64
+    return await db.orgs.insertOrIgnore(id = orgId, name = name)?
+  rpc findByTrimmedOwner(rawOwner: String) -> RoadmapDb.projects[]!:
+    let clean = Qed.Str.truncate(Qed.Str.toLower(Qed.Str.trim(rawOwner)), 64)
+    if some(clean) != ctx.userId:
+      return fail(.forbidden)
+    return await db.projects.select(where = r => r.ownerId == clean)?
 
 example : RoadmapDb.Client := RoadmapDb.client
+
+-- Verify `sql!"..."` macro, fail-closed `SqlQuery.select` on empty columns, and explicit `.selectAll`.
+#guard
+  let tbl := sql!"projects"
+  let col := sql!"owner_id"
+  let emptySel := (Qed.Server.Db.SqlQuery.select tbl [] .litTrue).compile .postgres
+  let explicitAll := (Qed.Server.Db.SqlQuery.selectAll tbl .litTrue).compile .postgres
+  let insIgn := (Qed.Server.Db.SqlQuery.insertOrIgnore tbl [(col, .text "a")] [] [col]).compile .postgres
+  !emptySel.1.contains "*" && emptySel.1.contains "0 = 1" &&
+  explicitAll.1 == "SELECT * FROM \"projects\" WHERE TRUE" &&
+  insIgn.1 == "INSERT INTO \"projects\" (\"owner_id\") VALUES ($1) ON CONFLICT DO NOTHING RETURNING \"owner_id\""
+
+bad_db "Nat non-underflow for `books.stock -= ...`" VaultDb :
+  rpc badAtomicDec(bookId: String, qty: Nat) -> VaultDb.books?!:
+    requires ctx.userId != none, 1 <= qty <= 50
+    return await db.books.updateOne(where = r => r.id == bookId, set = { stock -= qty })?
 
 bad_db "Database upsert conflict update policy `RoadmapDb.projects.update` failed in `badUpsert → RoadmapDb.projects.upsert`" RoadmapDb :
   rpc badUpsert(orgId: String, projId: String) -> RoadmapDb.projects!:
@@ -537,5 +567,164 @@ database BadSetNullDb:
   table bad:
     id    : String primary_key
     orgId : String references orgs(id) on_delete set_null
+
+/-! ## Item 6: Encrypted Column Projections (`Meta`, `selectMeta`, `columns = [...]`) & `prevKeys` Rotation -/
+
+database RotatingVaultDb:
+  sqlite ".qed/rotating_vault_checks.db"
+  table entries:
+    id      : Nat primary_key immutable
+    ownerId : String immutable where 1 <= ownerId.length <= 128
+    label   : String where 1 <= label.length <= 120
+    secret  : encrypted(String, key = secret("VAULT_PRIMARY_KEY"), prevKeys = [secret("VAULT_PREV_KEY"), secret("VAULT_LEGACY_KEY")]) where 1 <= secret.length <= 512
+    policy read, write requires some(row.ownerId) == ctx.userId
+
+#guard
+  -- `prevKeys` are optional rotation fallbacks and MUST NOT be required at boot in `.secrets`.
+  RotatingVaultDb.secrets == #["VAULT_PRIMARY_KEY"] &&
+  RotatingVaultDb.entries.metaColNames == ["id", "ownerId", "label"] &&
+  (let m : RotatingVaultDb.entries.Meta := { id := 7, ownerId := "u1", label := "api-key" }
+   (match Qed.fromJson (α := RotatingVaultDb.entries.Meta) (Qed.toJson m) with | .ok m' => m' == m | _ => false) &&
+   (match Qed.Proto.decode (α := RotatingVaultDb.entries.Meta) (Qed.Proto.encode m) with | .ok m' => m' == m | _ => false))
+
+server RotatingVaultApi:
+  use db : RotatingVaultDb
+  rpc save(id: Nat, label: String, secret: String) -> RotatingVaultDb.entries!:
+    requires auth, 1 <= uid.length <= 128, 1 <= label.length <= 120, 1 <= secret.length <= 512
+    return await db.entries.insert(id = id, ownerId = uid, label = label, secret = secret)?
+  rpc get(id: Nat) -> RotatingVaultDb.entries?!:
+    requires auth
+    return await db.entries.findOne(where = r => r.id == id and r.ownerId == uid)?
+  rpc rotateValue(id: Nat, secret: String) -> RotatingVaultDb.entries?!:
+    requires auth, 1 <= secret.length <= 512
+    return await db.entries.updateOne(where = r => r.id == id and r.ownerId == uid, set = { secret = secret })?
+  rpc listMeta() -> RotatingVaultDb.entries.Meta[]!:
+    requires auth
+    return await db.entries.selectMeta(where = r => r.ownerId == uid, orderBy = "id")?
+  rpc getMeta(id: Nat) -> RotatingVaultDb.entries.Meta?!:
+    requires auth
+    return await db.entries.findOneMeta(where = r => r.id == id and r.ownerId == uid)?
+  rpc listLabels() -> (Nat, String)[]!:
+    requires auth
+    return await db.entries.select(columns = ["id", "label"], where = r => r.ownerId == uid, orderBy = "id")?
+  rpc getLabel(id: Nat) -> String?!:
+    requires auth
+    return await db.entries.findOne(columns = ["label"], where = r => r.id == id and r.ownerId == uid)?
+
+bad_db "read policy `RotatingVaultDb.entries.read`" RotatingVaultDb :
+  rpc leakMeta() -> RotatingVaultDb.entries.Meta[]!:
+    requires auth
+    return await db.entries.selectMeta()?
+
+bad_db "unknown column `nope` on table `entries`" RotatingVaultDb :
+  rpc badProjCol() -> String[]!:
+    requires auth
+    return await db.entries.select(columns = ["nope"], where = r => r.ownerId == uid)?
+
+/-! ## Item 4: Cross-Table `any m in tbl:` RLS Policies & Queries -/
+
+database MultiTenantDb:
+  sqlite ".qed/multi_tenant_checks.db"
+  table apps:
+    id      : String primary_key immutable where 1 <= id.length <= 64
+    ownerId : String immutable where 1 <= ownerId.length <= 128
+    orgId   : String?
+    name    : String where 1 <= name.length <= 120
+    policy read requires
+      some(row.ownerId) == ctx.userId or
+      (any m in app_members: m.appId == row.id and some(m.userId) == ctx.userId and m.status == "accepted") or
+      (any om in org_members: some(om.orgId) == row.orgId and some(om.userId) == ctx.userId)
+    policy insert requires some(row.ownerId) == ctx.userId
+    policy update requires
+      some(row.ownerId) == ctx.userId or
+      (any m in app_members: m.appId == row.id and some(m.userId) == ctx.userId and m.status == "accepted" and m.role in ["owner", "admin"])
+    policy delete requires some(row.ownerId) == ctx.userId
+  table app_members:
+    id     : String primary_key immutable where 1 <= id.length <= 64
+    appId  : String immutable references apps(id) on_delete cascade
+    userId : String immutable where 1 <= userId.length <= 128
+    role   : String where 1 <= role.length <= 32
+    status : String where 1 <= status.length <= 32
+    policy read, write requires ctx.userId != none
+  table org_members:
+    id     : String primary_key immutable where 1 <= id.length <= 64
+    orgId  : String immutable where 1 <= orgId.length <= 64
+    userId : String immutable where 1 <= userId.length <= 128
+    policy read, write requires ctx.userId != none
+
+#guard
+  let rls := MultiTenantDb.rlsDdl
+  rls.contains "EXISTS (SELECT 1 FROM \"app_members\" AS \"m\" WHERE" &&
+  rls.contains "\"apps\".\"id\"" &&
+  rls.contains "EXISTS (SELECT 1 FROM \"org_members\" AS \"om\" WHERE" &&
+  rls.contains "\"m\".\"role\" IN ('owner', 'admin')"
+
+server MultiTenantApi:
+  use db : MultiTenantDb
+  rpc createApp(id: String, name: String, orgId: String?) -> MultiTenantDb.apps!:
+    requires auth, 1 <= id.length <= 64, 1 <= name.length <= 120, 1 <= uid.length <= 128
+    return await db.apps.insert(id = id, ownerId = uid, orgId = orgId, name = name)?
+  rpc addMember(id: String, appId: String, userId: String, role: String, status: String) -> MultiTenantDb.app_members!:
+    requires auth, 1 <= id.length <= 64, 1 <= userId.length <= 128, 1 <= role.length <= 32, 1 <= status.length <= 32
+    return await db.app_members.insert(id = id, appId = appId, userId = userId, role = role, status = status)?
+  rpc addOrgMember(id: String, orgId: String, userId: String) -> MultiTenantDb.org_members!:
+    requires auth, 1 <= id.length <= 64, 1 <= orgId.length <= 64, 1 <= userId.length <= 128
+    return await db.org_members.insert(id = id, orgId = orgId, userId = userId)?
+  rpc listOwnedApps() -> MultiTenantDb.apps[]!:
+    requires auth
+    return await db.apps.select(where = r => r.ownerId == uid, orderBy = "id")?
+  rpc listAccessibleApps() -> MultiTenantDb.apps[]!:
+    requires auth
+    return await db.apps.select(where = r =>
+      some(r.ownerId) == ctx.userId or
+      (any m in app_members: m.appId == r.id and some(m.userId) == ctx.userId and m.status == "accepted") or
+      (any om in org_members: some(om.orgId) == r.orgId and some(om.userId) == ctx.userId), orderBy = "id")?
+  rpc listSharedApps() -> MultiTenantDb.apps[]!:
+    requires auth
+    return await db.apps.select(where = r => any m in app_members: m.appId == r.id and some(m.userId) == ctx.userId and m.status == "accepted", orderBy = "id")?
+  rpc renameAppAsAdmin(appId: String, newName: String) -> MultiTenantDb.apps?!:
+    requires auth, 1 <= newName.length <= 120
+    return await db.apps.updateOne(
+      where = r => r.id == appId and (any m in app_members: m.appId == r.id and some(m.userId) == ctx.userId and m.status == "accepted" and m.role in ["owner", "admin"]),
+      set = r => { name = newName })?
+  rpc renameAppAsSpecificAdmin(appId: String, newName: String) -> MultiTenantDb.apps?!:
+    requires auth, 1 <= newName.length <= 120
+    return await db.apps.updateOne(
+      where = r => r.id == appId and (any m in app_members: m.appId == r.id and some(m.userId) == ctx.userId and m.status == "accepted" and m.role == "admin"),
+      set = r => { name = newName })?
+
+bad_db "read policy `MultiTenantDb.apps.read`" MultiTenantDb :
+  rpc leakAllApps() -> MultiTenantDb.apps[]!:
+    requires auth
+    return await db.apps.select()?
+
+bad_db "read policy `MultiTenantDb.apps.read`" MultiTenantDb :
+  rpc leakPendingApps() -> MultiTenantDb.apps[]!:
+    requires auth
+    return await db.apps.select(where = r => any m in app_members: m.appId == r.id and some(m.userId) == ctx.userId and m.status == "pending")?
+
+bad_db "update policy `MultiTenantDb.apps.update`" MultiTenantDb :
+  rpc viewerCannotRename(appId: String, newName: String) -> MultiTenantDb.apps?!:
+    requires auth, 1 <= newName.length <= 120
+    return await db.apps.updateOne(
+      where = r => r.id == appId and (any m in app_members: m.appId == r.id and some(m.userId) == ctx.userId and m.status == "accepted" and m.role == "viewer"),
+      set = r => { name = newName })?
+
+expect_err "unknown table `ghosts` in cross-table `any m in ghosts:`" in
+database BadCrossTableRefDb:
+  sqlite ".qed/bad_cross.db"
+  table apps:
+    id : String primary_key
+    policy read requires any m in ghosts: m.appId == row.id
+
+expect_err "cannot reference encrypted column `secrets.val` inside cross-table `any s in secrets:`" in
+database BadCrossEncDb:
+  sqlite ".qed/bad_cross_enc.db"
+  table apps:
+    id : String primary_key
+    policy read requires any s in secrets: s.val == row.id
+  table secrets:
+    id  : String primary_key
+    val : encrypted(String, key = secret("K"))
 
 end DbChecks

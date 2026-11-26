@@ -394,6 +394,7 @@ private def elabStatefulComponentBody (compNs : Name) (rawSpec : ComponentSpec) 
     let fieldTys := (spec.states ++ spec.props).map fun d => (d.id.getId, d.ty)
     (← mkPureCompFnCmds spec fieldTys).forM elabCommand
   (← mkViewCmds spec rw.body (← mkMsgAndUpdateCmds spec acc.sites)).forM elabCommand
+  if (← getErrorCount) > errsBefore then return
   let (mountCmds, hasStart, hasLocalDef) ← mkCodecAndMountCmds spec rw.starts (Syntax.mkStrLit compNs.toString)
   mountCmds.forM elabCommand
   let isTopMount := spec.mountable && spec.outTy?.isNone && !spec.hasProps && !spec.hasSlotsOrKids
@@ -407,9 +408,10 @@ private def elabStatefulComponentBody (compNs : Name) (rawSpec : ComponentSpec) 
   if (← getErrorCount) == errsBefore then withOpenNs compNs (elabCompReachableAndWitnesses spec)
   verifyPendingRpcChecks spec (activeInvEntries.map (·.1))
   if isTopMount then
-    let (appCmds, eqCmd) ← mkCompAppCmds spec rw.body hasStart activeInvEntries
-    appCmds.forM elabCommand
-    if (← getErrorCount) == errsBefore then elabCommand eqCmd
+    if (← getErrorCount) == errsBefore then
+      let (appCmds, eqCmd) ← mkCompAppCmds spec rw.body hasStart activeInvEntries
+      appCmds.forM elabCommand
+      if (← getErrorCount) == errsBefore then elabCommand eqCmd
   let _ ← withOpenNs compNs (elabInlineInvariantsPhase spec true)
   for (defName, pairs) in #[(`usedRpcs, allUsedRpcs), (`usedChannels, allUsedChannels)] do
     let ts ← pairs.mapM fun (a, b) => `((($(Syntax.mkStrLit a), $(Syntax.mkStrLit b)) : String × String))
@@ -439,7 +441,8 @@ private def elabStatefulComponentBody (compNs : Name) (rawSpec : ComponentSpec) 
     pendingRpcChecks.set #[]; pendingPredictChecks.set #[]; currentCompSessionRef.set none
     let newTasks := (← get).snapshotTasks.extract priorTasks (← get).snapshotTasks.size
     let ok ← okRef.get; let errs ← getErrorCount
-    if !ok || errs > errsInit || newTasks.any (Qed.Diag.snapshotTreeHasErrors 64 ·.get) then setEnv savedEnv
+    if !ok || errs > errsInit || newTasks.any (Qed.Diag.snapshotTreeHasErrors 64 ·.get) then
+      setEnv (failedComponentRegistry.addEntry savedEnv compNs)
 
 end CompElab
 end Qed

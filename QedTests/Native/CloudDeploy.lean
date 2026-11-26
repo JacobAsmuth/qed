@@ -5,10 +5,10 @@ import Qed.Auth.Oidc
 import Cli.Verify
 import Cli.Build
 import Cli.Cloud
-import Tests.Native.Harness
-open Qed Qed.Cloud Qed.Cloud.Protocol Tests.Native
+import QedTests.Native.Harness
+open Qed Qed.Cloud Qed.Cloud.Protocol QedTests.Native
 
-namespace Tests.Native.CloudDeploy
+namespace QedTests.Native.CloudDeploy
 
 private def forbiddenTokenCases : Array (String × Array (Nat × String)) :=
   let hit (n : Nat) (tok := "sorry") (xs : Array String) := xs.map fun s => (s, #[(n, tok)])
@@ -298,7 +298,7 @@ private def testPureCloudValidators (c : TestChecker) (cfg : GcpExecConfig) (pro
 
 private def testCliDeployChecks (c : TestChecker) (baseUrl : String) : IO Unit := do
   let qedBin ← qedBinPath
-  let runDeploy (extra : Array String) : IO (UInt32 × String) := do let (code, o, e) ← runCmd qedBin (#["deploy", "--mod", "Tests.CloudChecks", "--skip-build"] ++ extra); return (code, o ++ e)
+  let runDeploy (extra : Array String) : IO (UInt32 × String) := do let (code, o, e) ← runCmd qedBin (#["deploy", "--mod", "QedTests.CloudChecks", "--skip-build"] ++ extra); return (code, o ++ e)
   for (lbl, args, wantOk, has, omits) in [
       ("qed deploy NotesDeploy --dry-run exits 0 with 4-phase plan", #["--deploy", "NotesDeploy", "--dry-run"], true, ["concurrency=1000", "2000m/4096Mi", "Phase 1", "Phase 3"], []),
       ("StaticShellDeploy --dry-run leaks 0 DBs and 0 secrets", #["--deploy", "StaticShellDeploy", "--dry-run"], true, [], ["ensureSecret", "ensureDb"]),
@@ -796,4 +796,4 @@ private def testCloudProtocolAndCli (c : TestChecker) : IO Unit := do
 
 def run : IO Bool := do let c ← mkChecker "cloud-deploy"; testCloudDeployEndToEnd c; testCloudProtocolAndCli c; c.finish
 
-end Tests.Native.CloudDeploy
+end QedTests.Native.CloudDeploy

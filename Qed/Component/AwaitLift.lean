@@ -187,7 +187,7 @@ private def mkOkPatAndBody (ac : AwaitCallCtx) (prep : PreparedAwait) (bodyIn : 
 private def mkRpcPerformStmt (ctx : RewriteCtx) (st : Syntax) (rpcId : Ident) (srvInfo : ServerInfo)
     (mInfo : ServerMethodInfo) (contCtor : Name) (callArgs rpcCallArgs : Array Term) : CommandElabM Syntax := do
   let cbTerm ← Qed.Lang.mkAppTerms (mkIdentFrom st (ctx.spec.t.getId ++ `Msg ++ contCtor)) callArgs
-  let callTerm ← `(qedCheckRpcCall% $(mkIdentFrom rpcId srvInfo.serverName):ident $(mkIdentFrom rpcId (Name.mkSimple mInfo.name)):ident [$[$rpcCallArgs:term],*] $cbTerm)
+  let callTerm ← withRef rpcId `(qedCheckRpcCall% $(mkIdentFrom rpcId srvInfo.serverName):ident $(mkIdentFrom rpcId (Name.mkSimple mInfo.name)):ident [$[$rpcCallArgs:term],*] $cbTerm)
   return Syntax.node (SourceInfo.fromRef st) ``qedStmtExpr #[mkRawExpr callTerm]
 
 private abbrev LiftRecFn := Array (Ident × Term) → Array (Ident × Term) → Array Name → Array Syntax → CommandElabM (Array Syntax × Option (Array Syntax))

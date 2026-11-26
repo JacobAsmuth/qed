@@ -25,6 +25,8 @@ instance : Nonempty StaticDir := StaticDirPointed.property
 @[extern "qed_server_get_env"]            opaque getEnv           (name : @& String) : IO (Option String)
 @[extern "qed_server_now_ms"]             opaque nowMs            : IO UInt64
 @[extern "qed_server_random_hex"]         opaque randomHex        (numBytes : UInt32) : IO String
+@[extern "qed_server_random_bytes"]       opaque randomBytes      (numBytes : UInt32) : IO ByteArray
+@[extern "qed_server_const_eq"]           opaque constEq          (a b : @& ByteArray) : IO Bool
 @[extern "qed_server_hmac_sha256"]        opaque hmacSha256       (key msg : @& ByteArray) : IO ByteArray
 @[extern "qed_server_hmac_sha256_verify"] opaque hmacSha256Verify (key msg sig : @& ByteArray) : IO Bool
 @[extern "qed_server_rsa_sha256_sign"]    opaque rsaSha256Sign    (pemPrivateKey : @& String) (msg : @& ByteArray) : IO (Except String ByteArray)

@@ -1,11 +1,11 @@
-import Tests.Native.Harness
+import QedTests.Native.Harness
 import Examples.CloudBooks
-import Tests.ServerChecks
+import QedTests.ServerChecks
 import Qed.Server.Native
 open System (FilePath)
 open Qed.Server Qed.Server.Http
 
-namespace Tests.Native.FullstackRpc
+namespace QedTests.Native.FullstackRpc
 
 structure MockExtState where
   tokenExchanges : Nat := 0
@@ -59,7 +59,7 @@ private def checkGzipResp (c : TestChecker) (label : String) (res : Except Strin
     c.expectOk s!"{label} gunzip" (← gunzipBytes r.body) fun raw => c.checkEq s!"{label} decompresses identically" (String.fromUTF8? raw) (some rawWant))
 
 private def runWebEssentialsSuite (c : TestChecker) : IO Unit :=
-  withDevApp c "Tests.WebEssentialsFixture" fun dir => do
+  withDevApp c "QedTests.WebEssentialsFixture" fun dir => do
     let jsContent := String.join (List.replicate 40 "export function qedHello(x) { return 'hello-' + x; }\n")
     let hashedFile := s!"{dir}/bundle.deadbeef.mjs"; IO.FS.writeFile hashedFile jsContent
     let authSecret := "web-essentials-hmac-secret"; let aliceTok ← signSessionToken authSecret "alice"
@@ -84,6 +84,95 @@ private def runWebEssentialsSuite (c : TestChecker) : IO Unit :=
         c.checkHttp "[web-essentials] SSR GET /missing" (← httpReq srv.port "GET" "/missing") (status? := some 404) (contains := ["<title>404 Not Found</title>"])
         c.checkHttp "[web-essentials] SSR GET /old" (← httpReq srv.port "GET" "/old") (status? := some 302) (headers := [("location", some "/new")])
     finally rmRf hashedFile
+
+private def runServiceAndExternalSuite (c : TestChecker) : IO Unit := do
+  let logRef ← IO.mkRef (#[] : Array (String × String × Option String × Option String × String))
+  let ssrfSeenRef ← IO.mkRef false
+  let startMock := startMockHttpServer fun method target hdrs body => do
+    logRef.modify (·.push (method, target, getHeader? hdrs "content-type", getHeader? hdrs "idempotency-key", utf8Str body))
+    let (pathOnly, queryStr) := splitPathQuery target
+    if method == "POST" && pathOnly == "/v1/checkout/sessions" then
+      return jsonStrResp 200 "{\"id\":\"cs_live_1\"}"
+    else if method == "GET" && pathOnly == "/v1/customers" then
+      return jsonStrResp 200 "{\"data\":[]}"
+    else if method == "POST" && pathOnly == "/v1/projects/p1/secrets" && queryStr == "secretId=my-key" then
+      return jsonStrResp 409 "{\"error\":\"ALREADY_EXISTS\"}"
+    else if method == "POST" && pathOnly == "/v1/projects/p1/secrets/my-key:addVersion" then
+      return jsonStrResp 200 "{\"name\":\"projects/p1/secrets/my-key/versions/1\"}"
+    else return txtResp 404 s!"unexpected mock route: {method} {target}"
+  withMockServer c "[svc-ext] start mock" startMock (·.2) fun (port, _) => do
+    let baseInst := Native.mkNativeServerInst none none
+    let envMap : List (String × String) := [("WEBHOOK_SECRET", "whsec_test_key_99"), ("STRIPE_API_KEY", "sk_test_123")]
+    let srvInst : MonadServer IO := { exec := fun
+      | .readEnv v => return envMap.lookup v
+      | .httpCall req => do
+          if req.ssrfGuard then ssrfSeenRef.set true
+          let target := if req.pathAndQuery.startsWith "/" then req.pathAndQuery else "/" ++ req.pathAndQuery
+          let authHdrs := match req.auth with
+            | .bearerSecret k => match envMap.lookup k with | some v => [("Authorization", "Bearer " ++ v)] | none => []
+            | _ => []
+          let hdrs := (authHdrs ++ req.headers).toArray
+          match ← httpReq port req.method target hdrs req.body with
+          | .error e => return .error (ApiError.internal e)
+          | .ok r => return .ok { status := r.status.toUInt32, body := r.body }
+      | eff => baseInst.exec eff }
+    let _ ← (letI : MonadServer IO := srvInst; do
+      -- 1. Intrinsics: Random.uuid v4 format, Time.nowSec, Crypto.hmacSha256Hex, Crypto.constEq
+      let uuid ← Qed.Random.uuid
+      let parts := uuid.splitOn "-"
+      let verChar := uuid.toList[14]?
+      let varChar := uuid.toList[19]?
+      c.check s!"[svc-ext] Random.uuid v4 valid format ({uuid})"
+        (uuid.length == 36 && parts.map (·.length) == [8, 4, 4, 4, 12] && verChar == some '4' &&
+         varChar.any (fun ch => ch == '8' || ch == '9' || ch == 'a' || ch == 'b'))
+      let nowSec ← Qed.Time.nowSec
+      let payload := "{\"type\":\"invoice.paid\"}"
+      let goodSig ← Qed.Crypto.hmacSha256Hex (Qed.Secret.ofString "whsec_test_key_99") s!"{nowSec}.{payload}"
+      let goodHdr := s!"{nowSec},{goodSig}"
+      let badSigHdr := s!"{nowSec},0000000000000000000000000000000000000000000000000000000000000000"
+      let oldTs := if nowSec > 900 then nowSec - 900 else 0
+      let oldSig ← Qed.Crypto.hmacSha256Hex (Qed.Secret.ofString "whsec_test_key_99") s!"{oldTs}.{payload}"
+      let oldHdr := s!"{oldTs},{oldSig}"
+      -- 2. Service dispatch via ServiceHost RPCs (`verifyWebhook`, `getOddToken`, `createCheckout`, `rotateSecret`)
+      let callHost (fn : String) (req : ByteArray) := @ServerChecks.ServiceHost.dispatchM IO _ srvInst {} fn req
+      c.checkProto "[svc-ext] verifyWebhook accepts valid HMAC within tolerance" (← callHost "verifyWebhook" (Qed.Proto.encode (payload, goodHdr))) true
+      c.checkProto "[svc-ext] verifyWebhook rejects tampered HMAC (constEq)" (← callHost "verifyWebhook" (Qed.Proto.encode (payload, badSigHdr))) false
+      c.checkProto "[svc-ext] verifyWebhook rejects replayed timestamp outside tolerance" (← callHost "verifyWebhook" (Qed.Proto.encode (payload, oldHdr))) false
+      c.checkProto "[svc-ext] getOddToken proves ensures via prove: and returns 15" (← callHost "getOddToken" (Qed.Proto.encode (7 : Nat))) (15 : Nat)
+      let checkoutReq : ServerChecks.StripeCheckoutReq := { mode := "payment", successUrl := "https://app.test/ok", quantity := 3, coupon := none }
+      c.checkProtoBy (α := String) "[svc-ext] createCheckout sends Form(T) and returns cs_live_1"
+        (← callHost "createCheckout" (Qed.Proto.encode checkoutReq)) (·.contains "cs_live_1") true
+      -- Direct call with optional header present + optional query param omitted
+      c.expectOk "[svc-ext] StripeFormApi.createSession with Idempotency-Key"
+        (← @ServerChecks.StripeFormApi.createSession IO _ srvInst (some "idem-42") checkoutReq) fun j =>
+          c.check "[svc-ext] createSession response id" (j.render.contains "cs_live_1")
+      c.expectOk "[svc-ext] StripeFormApi.listCustomers omits none query param"
+        (← @ServerChecks.StripeFormApi.listCustomers IO _ srvInst none (some 25)) fun _ => pure ()
+      -- SecretManagerApi: 409 accepted by `ok [200, 201, 409]`, compound `{id}:addVersion`, and `ssrf_guard` flag
+      c.checkProtoBy (α := String) "[svc-ext] rotateSecret accepts 409 on createSecret and hits {id}:addVersion"
+        (← callHost "rotateSecret" (Qed.Proto.encode ("p1", ("my-key", "secret-val")))) (·.contains "versions/1") true
+      c.check "[svc-ext] SecretManagerApi set ssrfGuard=true on OutboundReq" (← ssrfSeenRef.get)
+      -- Default ssrf_guard=true blocks localhost on real Native MonadServer with actionable hint; ssrf_guard false allows it!
+      let nativeInst := Native.mkNativeServerInst none none
+      let blockedRes ← @ServerChecks.GuardedLocalApi.ping IO _ nativeInst
+      c.check "[svc-ext] default ssrf_guard blocks 127.0.0.1 with opt-out hint" (match blockedRes with
+        | .error e => e.message.contains "SSRF blocked:" && e.message.contains "add `ssrf_guard false` to `external GuardedLocalApi`"
+        | .ok _ => false) (match blockedRes with | .error e => e.message | .ok v => s!"unexpected ok: {v}")
+      let unguardedSeenRef ← IO.mkRef true
+      let spyInst : MonadServer IO := { exec := fun
+        | .httpCall req => do unguardedSeenRef.set req.ssrfGuard; return .ok { status := 200, body := "pong".toUTF8 }
+        | eff => baseInst.exec eff }
+      let _ ← @ServerChecks.UnguardedLocalApi.ping IO _ spyInst
+      c.check "[svc-ext] `ssrf_guard false` sets ssrfGuard=false on OutboundReq" (!(← unguardedSeenRef.get))
+      let logs ← logRef.get
+      c.check "[svc-ext] Form(T) sent application/x-www-form-urlencoded with URL-encoded body"
+        (logs.any fun (m, t, ct, _, b) => m == "POST" && t == "/v1/checkout/sessions" &&
+          ct == some "application/x-www-form-urlencoded" && b == "mode=payment&successUrl=https%3A%2F%2Fapp.test%2Fok&quantity=3")
+      c.check "[svc-ext] optional header Idempotency-Key omitted when none and sent when some"
+        (logs.any (fun (_, t, _, ik, _) => t == "/v1/checkout/sessions" && ik.isNone) &&
+         logs.any (fun (_, t, _, ik, _) => t == "/v1/checkout/sessions" && ik == some "idem-42"))
+      c.check "[svc-ext] optional query param omitted when none (`?limit=25` only)"
+        (logs.any fun (m, t, _, _, _) => m == "GET" && t == "/v1/customers?limit=25") : IO Unit)
 
 def run : IO Bool := do
   let c ← mkChecker "fullstack-rpc"
@@ -111,11 +200,26 @@ def run : IO Bool := do
         withSymlink ((← IO.currentDir) / "lakefile.lean").toString s!"{dir}/escape.txt" do
           c.checkHttp "symlink escape check" (← httpReq srv.port "GET" "/escape.txt") (status? := some 404) (notContains := ["lean_lib Qed"])
         let postRpc (m : String) (body : ByteArray) (tok? : Option String := none) := httpRpc srv.port "Catalog" m body tok?
-        let ckHdr := ("Cookie", s!"qed_session={validTok}")
+        let validV2 ← Qed.Auth.Oidc.signSessionCookieV2 authSecret { userId := "alice", claims := [("email_verified", "true")] } 3600
+        let ckHdr := ("Cookie", s!"qed_session={validV2}")
         c.checkStatus "RPC rejects cross-origin Origin with 403" (← httpRpc srv.port "Catalog" "list" ByteArray.empty none #[ckHdr, ("Origin", "https://evil.example.com")]) 403
         c.checkStatus "RPC rejects non-protobuf Content-Type with 415" (← httpReq srv.port "POST" "/_qed/rpc/Catalog/list" #[ckHdr, ("Content-Type", "text/plain")] "a=1".toUTF8) 415
         c.checkStatus "RPC accepts same-origin protobuf with 200" (← httpRpc srv.port "Catalog" "list" ByteArray.empty none #[ckHdr, ("Origin", s!"http://127.0.0.1:{srv.port}"), ("Sec-Fetch-Site", "same-origin")]) 200
         let orderReq (idx qty : Nat) := Qed.Proto.encode (idx, qty)
+        -- Cookie vs Bearer separation + random-JTI v3 bearer tokens
+        c.checkStatus "v1 bearer token in qed_session cookie rejected 401" (← httpRpc srv.port "Catalog" "order" (orderReq 0 99) none #[("Cookie", s!"qed_session={validV1}"), ("Origin", s!"http://127.0.0.1:{srv.port}")]) 401
+        c.checkStatus "legacy HMAC token in qed_session cookie rejected 401" (← httpRpc srv.port "Catalog" "order" (orderReq 0 99) none #[("Cookie", s!"qed_session={validTok}"), ("Origin", s!"http://127.0.0.1:{srv.port}")]) 401
+        c.checkStatus "v2 session cookie in Authorization Bearer rejected 401" (← postRpc "order" (orderReq 0 99) (some validV2)) 401
+        c.checkStatus "v2 session cookie accepted in qed_session (hits requires 400)" (← httpRpc srv.port "Catalog" "order" (orderReq 0 99) none #[ckHdr, ("Origin", s!"http://127.0.0.1:{srv.port}")]) 400
+        let mintInst : MonadServer IO := { exec := fun | .readEnv "QED_AUTH_SECRET" => pure (some authSecret) | eff => (inferInstance : MonadServer IO).exec eff }
+        let mint1 ← @Qed.Server.mintBearerToken IO _ mintInst "alice" 3600 "QED_AUTH_SECRET"
+        let mint2 ← @Qed.Server.mintBearerToken IO _ mintInst "alice" 3600 "QED_AUTH_SECRET"
+        match mint1, mint2 with
+        | .ok t1, .ok t2 =>
+            c.check "mintBearerToken emits distinct random-JTI v3 tokens in same second" (t1.startsWith "v3." && t2.startsWith "v3." && t1 != t2) s!"got {t1} vs {t2}"
+            c.checkStatus "v3 bearer token accepted in Authorization Bearer (hits requires 400)" (← postRpc "order" (orderReq 0 99) (some t1)) 400
+            c.checkStatus "v3 bearer token in qed_session cookie rejected 401" (← httpRpc srv.port "Catalog" "order" (orderReq 0 99) none #[("Cookie", s!"qed_session={t1}"), ("Origin", s!"http://127.0.0.1:{srv.port}")]) 401
+        | e1, e2 => c.check "mintBearerToken succeeded" false s!"{repr e1} / {repr e2}"
         for (lbl, req, tok?, want) in [("unauth order rejected 401", orderReq 0 1, none, 401), ("forged HMAC rejected 401", orderReq 0 1, some ("alice." ++ String.ofList (List.replicate 64 '0')), 401),
             ("expired v1 token rejected 401", orderReq 0 1, some expiredV1, 401), ("requires qty <= 50 rejected 400", orderReq 0 99, some validV1, 400),
             ("rotated QED_AUTH_SECRET_PREV accepted (hits requires 400)", orderReq 0 99, some rotatedV1, 400)] do
@@ -147,6 +251,7 @@ def run : IO Bool := do
         c.check "burst excess rejected with 429 Too Many Requests" (rlResps.any (·.status == 429))
         c.check "429 response includes Retry-After header" (rlResps.any fun r => r.status == 429 && (r.header? "retry-after").isSome)
     runWebEssentialsSuite c
+    runServiceAndExternalSuite c
   c.finish
 
-end Tests.Native.FullstackRpc
+end QedTests.Native.FullstackRpc

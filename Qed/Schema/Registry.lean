@@ -45,6 +45,22 @@ def resolveSchemaCtxArgs (ref : Lean.Syntax) (tag : String) (ctxBinders : Array 
 theorem structMaxLeMax {a b c d : Nat} (h1 : a ≤ c) (h2 : b ≤ d) : Nat.max a b ≤ Nat.max c d :=
   Nat.max_le.2 ⟨Nat.le_trans h1 (Nat.le_max_left c d), Nat.le_trans h2 (Nat.le_max_right c d)⟩
 
+/-- Linear `Except.bind` reduction helper avoiding `O(2^N)` kernel `isDefEq` blowup in `simp`-generated roundtrip proofs. -/
+theorem exceptBind_eq {ε α β : Type} {a : Except ε α} {v : α}
+    {k : α → Except ε β} {r : Except ε β}
+    (ha : a = .ok v) (hk : k v = r) : (a >>= k) = r := by
+  subst ha; exact hk
+
+theorem optionBind_pure_isSome_iff {α β : Type} (o : Option α) (f : α → β) :
+    (o >>= fun a => pure (f a)).isSome = true ↔ o.isSome = true := by
+  cases o <;> rfl
+
+theorem optionBind_isSome_iff {α β : Type} (o : Option α) (f : α → Option β) {Q : Prop}
+    (hf : ∀ a, (f a).isSome = true ↔ Q) : (o >>= f).isSome = true ↔ (o.isSome = true ∧ Q) := by
+  cases o with
+  | none => simp [bind, Option.bind]
+  | some a => simpa [bind, Option.bind] using hf a
+
 section CodecDerive
 open Lean Elab Command Term
 
@@ -96,9 +112,10 @@ def mkStructJsonCmds (t : Ident) (fields : Array StructFieldSpec) (opts : Struct
   let fieldEqs ← fields.mapM fun f => let (kLit, fId) := (Syntax.mkStrLit f.wireKey, f.ident); match f.codecTerm? with
     | some inp => `(term| $(mkIdent `Qed.Codec.fromJsonField_of_field) $inp ($toId $xId) $kLit ($xId.$fId:ident) rfl)
     | none     => `(term| Qed.LawfulJson.fromField_of_field ($toId $xId) $kLit ($xId.$fId:ident) rfl)
+  let roundtripPf ← fieldEqs.foldrM (init := ← `(term| rfl)) fun eqPf acc => `(term| Qed.exceptBind_eq $eqPf $acc)
   let thmId := mkIdent (tId ++ `_fromJson_toJson)
   return cmds ++ #[
-    ← `(command| private theorem $thmId ($xId:ident : $t) : $fromId ($toId $xId) = .ok $xId := by unfold $fromId; simp only [$[$fieldEqs:term],*, bind, Except.bind, pure, Except.pure]),
+    ← `(command| private theorem $thmId ($xId:ident : $t) : $fromId ($toId $xId) = .ok $xId := by unfold $fromId; exact $roundtripPf),
     ← `(command| instance $(mkIdent (tId ++ `instLawfulJson)):ident : Qed.LawfulJson $t where
           depthBound := $depthBoundExpr; depth_toJson := fun $xId:ident => Nat.add_le_add_left $depthProofExpr 1; fromJson_toJson := $thmId) ]
 
@@ -111,20 +128,24 @@ def mkProtoFieldTailsAndTags (reads : Array Term) (needTagsPf : Bool) : CommandE
     if needTagsPf then tagsPosPf ← `(term| Qed.Proto.msg_tags_pos_encodeAppend (Nat.zero_lt_succ $(numLit i)) $(reads[i]!) $tagsPosPf)
   return (tails, tagsPosPf)
 
-def mkProtoFieldRoundtripTacs (fields : Array StructFieldSpec) (reads tails : Array Term) (xId? : Option Ident := none) :
+def mkProtoFieldRoundtripTacs (fields : Array StructFieldSpec) (reads _tails : Array Term) (xId? : Option Ident := none) :
     CommandElabM (Array Ident × Array (TSyntax `tactic)) := do
-  let n := fields.size; let protoBody := tails[0]!
-  let mut pIdents : Array Ident := #[]; let mut pHaveTacs : Array (TSyntax `tactic) := #[]
+  let n := fields.size
+  let tailIds : Array Ident := (Array.range (n + 1)).map fun i => mkIdent (Name.mkSimple s!"_pt{i}")
+  let mut pHaveTacs : Array (TSyntax `tactic) := #[← `(tactic| let $(tailIds[n]!):ident : List (Nat × Qed.Proto.WireVal) := [])]
+  for i in (Array.range n).reverse do
+    pHaveTacs := pHaveTacs.push (← `(tactic| let $(tailIds[i]!):ident := Qed.ToProtoField.encodeProtoField $(numLit (i + 1)) $(reads[i]!) ++ $(tailIds[i + 1]!)))
+  let mut pIdents : Array Ident := #[]
   for i in [0:n] do
     let kLit := numLit (i + 1); let f := fields[i]!
     let mut gtPf ← `(term| Qed.Proto.allTagsGt_nil $kLit)
     for j in (Array.range n).extract (i + 1) n |>.reverse do
       gtPf ← `(term| Qed.Proto.allTagsGt_encodeAppend (Nat.lt_of_sub_eq_succ (rfl : $(numLit (j + 1)) - $kLit = Nat.succ $(numLit (j - i - 1)))) $(reads[j]!) $gtPf)
-    let mut rawEq ← `(term| Qed.Proto.decodeProtoField_hit $kLit $(reads[i]!) $(tails[i + 1]!) $gtPf)
+    let mut rawEq ← `(term| Qed.Proto.decodeProtoField_hit $kLit $(reads[i]!) $(tailIds[i + 1]!) $gtPf)
     for j in (Array.range i).reverse do
-      rawEq ← `(term| Eq.trans (Qed.Proto.decodeProtoField_skip (α := $(f.valTy)) (Nat.ne_of_lt (Nat.lt_of_sub_eq_succ (rfl : $kLit - $(numLit (j + 1)) = Nat.succ $(numLit (i - j - 1))))) $(reads[j]!) $(tails[j + 1]!)) $rawEq)
+      rawEq ← `(term| Eq.trans (Qed.Proto.decodeProtoField_skip (α := $(f.valTy)) (Nat.ne_of_lt (Nat.lt_of_sub_eq_succ (rfl : $kLit - $(numLit (j + 1)) = Nat.succ $(numLit (i - j - 1))))) $(reads[j]!) $(tailIds[j + 1]!)) $rawEq)
     let wrappedEq ← match f.codecTerm?, xId? with
-      | some inp, some xId => let fId := f.ident; `(term| $(mkIdent `Qed.Codec.fromProtoField_of_field) $inp $kLit $protoBody ($xId.$fId:ident) $rawEq)
+      | some inp, some xId => let fId := f.ident; `(term| $(mkIdent `Qed.Codec.fromProtoField_of_field) $inp $kLit $(tailIds[0]!) ($xId.$fId:ident) $rawEq)
       | _, _ => pure rawEq
     let hId := mkIdent (Name.mkSimple s!"_hp{i}"); pIdents := pIdents.push hId; pHaveTacs := pHaveTacs.push (← `(tactic| have $hId:ident := $wrappedEq))
   return (pIdents, pHaveTacs)
@@ -151,10 +172,11 @@ def mkStructProtoCmds (t : Ident) (fields : Array StructFieldSpec) (opts : Struc
                     ← `(command| instance $(mkIdent (tId ++ `instFromProto)):ident : Qed.FromProto $t := .ofFields $fromId)]
   if !opts.emitLawful then return cmds
   let (pIdents, pHaveTacs) ← mkProtoFieldRoundtripTacs fields reads tails (some xId)
+  let roundtripPf ← pIdents.foldrM (init := ← `(term| rfl)) fun hp acc => `(term| Qed.exceptBind_eq $hp $acc)
   let thmId := mkIdent (tId ++ `_fromProto_toProto)
   return cmds ++ #[
     ← `(command| private theorem $thmId ($xId:ident : $t) : $fromId ($toId $xId) = Except.ok $xId := by
-          $[$pHaveTacs:tactic]*; unfold $fromId $toId; simp only [$[$pIdents:term],*, bind, Except.bind, pure, Except.pure]),
+          $[$pHaveTacs:tactic]*; unfold $fromId $toId; exact $roundtripPf),
     ← `(command| instance $(mkIdent (tId ++ `instLawfulProto)):ident : Qed.LawfulProto $t := .ofFields $toId $fromId (fun $xId => $tagsPosPf) $thmId) ]
 
 end CodecDerive

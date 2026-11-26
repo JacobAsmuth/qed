@@ -1,5 +1,5 @@
 import Qed
-import Tests.CheckHelper
+import QedTests.CheckHelper
 open Qed
 
 namespace AuthChecks
@@ -54,6 +54,9 @@ server AuthApi:
   rpc whoamiUser() -> String!:
     requires auth(user)
     return f"{user.id}:{user.role}"
+  rpc approveInteractive() -> String!:
+    requires auth, ctx.isSession, user.emailVerified
+    return user.id
 
 router AuthRoute:
   home      = "/"
@@ -89,7 +92,13 @@ example : Qed.Auth.parseJwtAlg "none" = none ∧ Qed.Auth.parseJwtAlg "HS256" = 
   s!"https://qed.cloud{AuthRoute.project "demo"}" == "https://qed.cloud/projects/demo" &&
   Qed.Auth.sanitizeReturnTo (some "//evil.com") == "/" && Qed.Auth.sanitizeReturnTo (some "/dashboard") == "/dashboard" &&
   CloudAuth.fromCtx { userId := some "u1", claims := [("email", "a@b.c"), ("role", "admin"), ("orgId", "org_1"), ("email_verified", "true")] } ==
-    some { id := "u1", email := "a@b.c", role := "admin", orgId := some "org_1", verified := true }
+    some { id := "u1", emailVerified := true, email := "a@b.c", role := "admin", orgId := some "org_1", verified := true } &&
+  (match Qed.Auth.parseJwtClaims (.obj [("iss", .str "https://idp.test"), ("sub", .str "u1"), ("aud", .str "app"), ("exp", Qed.toJson (9999999999 : Nat)), ("email_verified", .str "true")]) with
+   | .ok jc => !jc.emailVerified && jc.claim "email_verified" == some "false"
+   | .error _ => false) &&
+  (match Qed.Auth.parseJwtClaims (.obj [("iss", .str "https://idp.test"), ("sub", .str "u1"), ("aud", .str "app"), ("exp", Qed.toJson (9999999999 : Nat)), ("email_verified", .bool true)]) with
+   | .ok jc => jc.emailVerified && jc.claim "email_verified" == some "true"
+   | .error _ => false)
 bad_srv1 "`onSignIn` in `server MissingAuthServer` requires `use auth : <Auth>`" MissingAuthServer : onSignIn(user): pass
 
 end AuthChecks

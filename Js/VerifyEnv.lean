@@ -411,6 +411,7 @@ def isServerOwner (env : Environment) (owner : Name) : Bool :=
   !owner.isAnonymous && (hasOwnerMarker env owner `_qed_server_marker ||
     (env.find? (owner ++ `dispatchM)).any (exprHasConst (· == `Qed.Server.RequestCtx) ·.type))
 def isExternalOwner (env : Environment) (owner : Name) : Bool := hasOwnerMarker env owner `_qed_external_marker
+def isServiceOwner (env : Environment) (owner : Name) : Bool := hasOwnerMarker env owner `_qed_service_marker
 def isDatabaseOwner (env : Environment) (owner : Name) : Bool := hasOwnerMarker env owner `_qed_database_marker
 def isAuthOwner (env : Environment) (owner : Name) : Bool := hasOwnerMarker env owner `_qed_auth_marker
 def isDeployOwner (env : Environment) (owner : Name) : Bool := hasOwnerMarker env owner `_qed_deploy_marker
@@ -437,7 +438,7 @@ private def serverOnlyLeaves : Array String := #[
   "dispatchM", "wsDispatchM", "wsProject", "httpDispatchM", "authHookM", "initState", "runServer",
   "jobs", "verifiedJobs", "jobNames", "readOnlyMethods", "methods", "channels"
 ]
-private def dbOnlyLeaves : Array String := #["config", "ensureSchema", "ddl", "rlsDdl", "instSafeIOEnsureSchema"]
+private def dbOnlyLeaves : Array String := #["config", "ensureSchema", "ddl", "rlsDdl", "instSafeIOEnsureSchema", "Snap"]
 
 def isServerOnlyDeclName (env : Environment) : Name → Bool
   | .anonymous => false | .num p _ => isServerOnlyDeclName env p
@@ -445,10 +446,10 @@ def isServerOnlyDeclName (env : Environment) : Name → Bool
       if s.startsWith "_closed_" then isServerOnlyDeclName env owner && !isBenignEmptyCseThunk env (.str owner s)
       else ((serverOnlyLeaves.contains s || s.endsWith "_step" || s.endsWith "_handler" || s.endsWith "_project") && isServerOwner env owner) ||
         (dbOnlyLeaves.contains s && isDatabaseOwner env owner) ||
-        ((s == "schema" || s == "decodeRow") && (isDatabaseOwner env owner || isDatabaseOwner env owner.getPrefix)) ||
+        ((s == "schema" || s == "decodeRow" || s == "decodeMetaRow" || s == "metaColumns") && (isDatabaseOwner env owner || isDatabaseOwner env owner.getPrefix)) ||
         (s == "config" && isAuthOwner env owner) || (s == "spec" && isDeployOwner env owner) ||
         (s == "baseUrl" && externalHasSecrets env owner) ||
-        (s == "secrets" && (isServerOwner env owner || isExternalOwner env owner || isDatabaseOwner env owner || isAuthOwner env owner)) ||
+        (s == "secrets" && (isServerOwner env owner || isExternalOwner env owner || isServiceOwner env owner || isDatabaseOwner env owner || isAuthOwner env owner)) ||
         isServerOnlyDeclName env owner
 
 private def serverOnlyModules : Std.HashSet Name := Std.HashSet.ofList [
@@ -461,9 +462,13 @@ private def serverOnlyDecls : Std.HashSet Name := Std.HashSet.ofList [
   `Qed.Server.MonadServer.dbExec, `Qed.Server.MonadServer.dbExecDdl, `Qed.Server.MonadServer.dbTxBegin,
   `Qed.Server.MonadServer.dbTxExec, `Qed.Server.MonadServer.dbTxCommit, `Qed.Server.MonadServer.dbTxRollback,
   `Qed.Server.MonadServer.setCookie, `Qed.Server.MonadServer.sendSse, `Qed.Server.MonadServer.readEnv,
-  `Qed.Server.MonadServer.nowMs, `Qed.Server.MonadServer.randomHex, `Qed.Server.MonadServer.hmacSha256,
+  `Qed.Server.MonadServer.nowMs, `Qed.Server.MonadServer.randomHex, `Qed.Server.MonadServer.randomBytes,
+  `Qed.Server.MonadServer.hmacSha256, `Qed.Server.MonadServer.sha256, `Qed.Server.MonadServer.constEq,
+  `Qed.Server.MonadServer.aeadEncrypt, `Qed.Server.MonadServer.aeadDecrypt,
   `Qed.Server.MonadServer.wsBroadcast, `Qed.Server.flushWsEmits, `Qed.Server.MonadAtomic.runAtomic,
-  `Qed.Server.MonadAtomic.runAtomicRead, `Qed.Server.Webhook.postJson, `Qed.Server.Webhook.postBytes
+  `Qed.Server.MonadAtomic.runAtomicRead, `Qed.Server.Webhook.postJson, `Qed.Server.Webhook.postBytes,
+  `Qed.Crypto.hmacSha256, `Qed.Crypto.hmacSha256Hex, `Qed.Crypto.constEq, `Qed.Crypto.sha256, `Qed.Crypto.sha256Hex,
+  `Qed.Time.nowMs, `Qed.Time.nowSec, `Qed.Random.hex, `Qed.Random.bytes, `Qed.Random.uuid
 ]
 
 def clientLeakReason? (env : Environment) (n : Name) : Option String :=

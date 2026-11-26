@@ -156,12 +156,12 @@ and `qed start` or `qed preview` for production builds; `qed build` emits conten
 client assets `app.<hash>.mjs`, `qed_host.<hash>.mjs`, `styles.<hash>.css`, and `qed_manifest.json`
 alongside `dist/server`.
 
-`qed test` builds and runs the native Lean test runner in [`Tests/Runner.lean`](../Tests/Runner.lean) with zero Node.js or Python dependencies:
+`qed test` builds and runs the native Lean test runner in [`QedTests/Runner.lean`](../QedTests/Runner.lean) with zero Node.js or Python dependencies:
 
-- [`Tests/Native/CliScaffold.lean`](../Tests/Native/CliScaffold.lean) — `qed new`, production builds with content-hashed assets, native SSR and `qed serve` traversal guards, and kernel/extern verification gates.
-- [`Tests/Native/FullstackRpc.lean`](../Tests/Native/FullstackRpc.lean) — native Rust/Lean server RFC 9112 framing, concurrent handler pool, auth/expiring tokens/rotation, RS256 OAuth2 and TLS/HTTP external calls, SSR, and `/_qed/rpc/…` binary Protobuf RPCs.
-- [`Tests/Native/Database.lean`](../Tests/Native/Database.lean) — multi-transport database integration tests running the same compiled server binary against embedded SQLite with restart durability, HTTP SQL, and PostgreSQL v3 wire protocol with SCRAM-SHA-256 auth, plus RLS isolation and client leak checks.
-- [`Tests/Native/WebSocket.lean`](../Tests/Native/WebSocket.lean) — RFC 6455 multiplexed server channels, CSWSH origin enforcement, cross-worker broadcasts, and transactional `emit` rollback.
+- [`QedTests/Native/CliScaffold.lean`](../QedTests/Native/CliScaffold.lean): `qed new`, production builds with content-hashed assets, native SSR and `qed serve` traversal guards, and kernel/extern verification gates.
+- [`QedTests/Native/FullstackRpc.lean`](../QedTests/Native/FullstackRpc.lean): native Rust/Lean server RFC 9112 framing, concurrent handler pool, auth/expiring tokens/rotation, RS256 OAuth2 and TLS/HTTP external calls, SSR, and `/_qed/rpc/...` binary Protobuf RPCs.
+- [`QedTests/Native/Database.lean`](../QedTests/Native/Database.lean): multi-transport database integration tests running the same compiled server binary against embedded SQLite with restart durability, HTTP SQL, and PostgreSQL v3 wire protocol with SCRAM-SHA-256 auth, plus RLS isolation and client leak checks.
+- [`QedTests/Native/WebSocket.lean`](../QedTests/Native/WebSocket.lean): RFC 6455 multiplexed server channels, CSWSH origin enforcement, cross-worker broadcasts, and transactional `emit` rollback.
 - Pipeline benchmarks live in [`Bench/`](../Bench) via `lake exe bench`.
 
 ## Source map
@@ -181,4 +181,4 @@ alongside `dist/server`.
 | [`Js/Backend.lean`](../Js/Backend.lean) · [`Js/VerifyEnv.lean`](../Js/VerifyEnv.lean) · [`Js/Proofs.lean`](../Js/Proofs.lean) · [`Js/Main.lean`](../Js/Main.lean) | Total Lean IR → typed JS AST compiler, `qedjs` CLI, kernel/client-leak gates, and lowering soundness proofs. |
 | [`Cli.lean`](../Cli.lean) | `qed` CLI under `Cli/`: `dev`, `build`, `start`, `preview`, `test`, `check`, `clean`, `new`, `doctor`. |
 | [`runtime/`](../runtime) | Browser runtime ES modules: `qed_rt.mjs`, `qed_dom.mjs`, `qed_host.mjs`. |
-| [`Examples/`](../Examples) · [`Tests/`](../Tests) · [`scripts/axioms.lean`](../scripts/axioms.lean) | Guided example apps, compile-time checks, native Lean integration test suites, and `#print axioms` manifest. |
+| [`Examples/`](../Examples) · [`QedTests/`](../QedTests) · [`scripts/axioms.lean`](../scripts/axioms.lean) | Guided example apps, compile-time checks, native Lean integration test suites, and `#print axioms` manifest. |

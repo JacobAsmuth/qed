@@ -1,6 +1,6 @@
 import Qed
 import Qed.Cloud.Proofs
-import Tests.CheckHelper
+import QedTests.CheckHelper
 open Qed Qed.Cloud
 
 namespace CloudChecks

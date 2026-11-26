@@ -56,8 +56,8 @@ lean_exe qedjs where
 lean_lib Examples where
   globs := #[.submodules `Examples]
 
-lean_lib Tests where
-  globs := #[.submodules `Tests]
+lean_lib QedTests where
+  globs := #[.submodules `QedTests]
 
 lean_lib Bench where
   globs := #[.submodules `Bench]
@@ -70,7 +70,7 @@ lean_exe qed where
   moreLinkArgs := #["-pthread"]
 
 lean_exe qedtest where
-  root := `Tests.Runner
+  root := `QedTests.Runner
   moreLinkArgs := #["-pthread"]
 
 lean_exe bench where

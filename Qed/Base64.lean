@@ -137,4 +137,11 @@ private theorem decodeBufAcc_eq : ∀ (cs : List Char) (acc : List UInt8), decod
 def decodeFast (s : String) : Except String ByteArray := (decodeBufAcc s.toList []).map fun xs => ByteArray.mk xs.toArray
 @[csimp] theorem decode_eq_fast : @decode = @decodeFast := by funext s; unfold decode decodeFast; rw [decodeBufAcc_eq]; cases decodeList s.toList <;> simp [Except.map]
 
+def encodeString (s : String) : String := encode s.toUTF8
+def decode? (s : String) : Option ByteArray := (decode s).toOption
+def decodeUrl? (s : String) : Option ByteArray := (decodeUrl s).toOption
+def decodeString (s : String) : Except String String :=
+  (decode s).bind fun bs => (String.fromUTF8? bs).elim (.error "base64: invalid UTF-8") .ok
+def decodeString? (s : String) : Option String := (decodeString s).toOption
+
 end Qed.Base64

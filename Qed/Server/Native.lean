@@ -225,6 +225,10 @@ def verifyUserTokenWithNow (secrets : List String) (token : String) (now : Nat) 
       let .ok sigBytes := Proto.decodeHex sigHex | return none
       let prefixParts := revPrefixParts.reverse; let payload := String.intercalate "." prefixParts
       let candidate? : Option String := match prefixParts with
+        | "v3" :: expStr :: jti :: uidParts =>
+            let uid := String.intercalate "." uidParts
+            if jti.isEmpty || uid.isEmpty then none else (parseStrictU64 expStr 18446744073709551615).bind fun expSec => if now < expSec then some uid else none
+        | "v3" :: _ => none
         | "v1" :: expStr :: uidParts =>
             let uid := String.intercalate "." uidParts
             if uid.isEmpty then none else (parseStrictU64 expStr 18446744073709551615).bind fun expSec => if now < expSec then some uid else none
@@ -262,11 +266,12 @@ private def extractBearer (authHdr : String) : Option String :=
 
 private def mapApi {α : Type} (x : IO (Except String α)) : IO (Except ApiError α) := (·.mapError ApiError.internal) <$> x
 private def liftApi {α : Type} (x : IO (Except String α)) : ExceptT ApiError IO α := liftE (mapApi x)
-private def resolveBaseOrigin (req : OutboundReq) : IO String := do
-  if req.serviceName == "Webhook" || req.ssrfGuard then return stripTrailingSlashes req.baseOrigin
-  for key in ["QED_EXT_" ++ req.serviceName.toUpper ++ "_BASE", "QED_EXT_" ++ req.serviceName ++ "_BASE"] do
-    if let some ov ← Prim.getEnv key then let t := stripTrailingSlashes (trimWs ov); if !t.isEmpty then return t
-  return stripTrailingSlashes req.baseOrigin
+private def resolveBaseOrigin (req : OutboundReq) (allowDevOverride : Bool) : IO (String × Bool) := do
+  if req.serviceName == "Webhook" then return (stripTrailingSlashes req.baseOrigin, true)
+  if allowDevOverride || !req.ssrfGuard then
+    for key in ["QED_EXT_" ++ req.serviceName.toUpper ++ "_BASE", "QED_EXT_" ++ req.serviceName ++ "_BASE"] do
+      if let some ov ← Prim.getEnv key then let t := stripTrailingSlashes (trimWs ov); if !t.isEmpty then return (t, false)
+  return (stripTrailingSlashes req.baseOrigin, req.ssrfGuard)
 private def requireSecretEnv (envVar : String) : IO (Except ApiError String) := do
   match ← Prim.getEnv envVar with
   | some tok => return if tok.isEmpty then .error (ApiError.internal s!"secret environment variable `{envVar}` is empty") else .ok tok
@@ -284,7 +289,7 @@ private def resolveAuthHeaders (gcpCache? : Option (Prim.StateBox (Array GcpToke
   | .gcpMetadata audience? =>
       (·.map fun tok => [("Authorization", "Bearer " ++ sanitizeHeader tok)]) <$>
         ((·.mapError fun e => ApiError.internal s!"GCP metadata token fetch failed: {e}") <$> fetchGcpMetadataToken gcpCache? audience?)
-private inductive ResolvedDbTransport where
+inductive ResolvedDbTransport where
   | sqlite (path : String) | postgres (url : String) (ssrfGuard : Bool := false) | httpSql (url : String) (bearer? : Option String)
   | d1 (accountId dbId token : String) | turso (url token : String)
 private def stripSqliteScheme (u : String) : String :=
@@ -308,10 +313,24 @@ private def resolveDbEndpoint (ep : Db.DbEndpoint) : IO (Except String ResolvedD
   | .turso uE tS => return .turso (← reqEnv uE "Turso URL env") (← reqEnv tS "Turso token secret")
   | .httpSql uE tS? => return .httpSql (← reqEnv uE "HTTP SQL URL env") (← liftIO (tS?.bindM loadNonEmptyEnv))
   | .managedPostgres dbName _ => return .postgres (← reqEnv (Qed.Cloud.managedPostgresSecretVar dbName) "managed PostgreSQL secret") false
-private def resolveDbConfigCore (rawDeployEnv? : Option String) (onCloudRun : Bool) (cfg : Db.DbConfig) : IO (Except ApiError ResolvedDbTransport) := do
+private def isExplicitEnvEndpointSet : Db.DbEndpoint → IO Bool
+  | .urlEnv v | .postgresEnv v | .sqliteEnv v _ | .turso v _ | .httpSql v _ => (·.isSome) <$> loadNonEmptyEnv v
+  | .cloudflareD1 aE _ dE _ tS => do
+      if (← loadNonEmptyEnv aE).isNone then return false
+      if (← loadNonEmptyEnv dE).isNone then return false
+      return (← loadNonEmptyEnv tS).isSome
+  | .managedPostgres dbName _ => (·.isSome) <$> loadNonEmptyEnv (Qed.Cloud.managedPostgresSecretVar dbName)
+  | .postgresUrl _ _ | .sqlitePath _ => pure false
+def resolveDbConfigCore (rawDeployEnv? : Option String) (onCloudRun : Bool) (cfg : Db.DbConfig) : IO (Except ApiError ResolvedDbTransport) := do
   match rawDeployEnv? with
-  | some rawEnv => match Qed.Cloud.DeployEnv.parse? (trimWs rawEnv) with
+  | some rawEnv => match Qed.Cloud.DeployEnv.parse? (trimWs rawEnv).toLower with
       | none => return .error (ApiError.internal s!"invalid QED_DEPLOY_ENV `{rawEnv}` (expected dev, preview, staging, or prod)")
+      | some .dev =>
+          let epDev := cfg.endpointForEnv .dev
+          if epDev != cfg.endpoint then
+            if ← isExplicitEnvEndpointSet cfg.endpoint then
+              return (← resolveDbEndpoint cfg.endpoint).mapError fun e => ApiError.internal s!"database `{cfg.name}` unavailable for env `dev`: {e}"
+          return (← resolveDbEndpoint epDev).mapError fun e => ApiError.internal s!"database `{cfg.name}` unavailable for env `dev`: {e}"
       | some env => return (← resolveDbEndpoint (cfg.endpointForEnv env)).mapError fun e => ApiError.internal s!"database `{cfg.name}` unavailable for env `{env}`: {e}"
   | none => match ← resolveDbEndpoint cfg.endpoint with
       | .ok tr => return .ok tr
@@ -450,9 +469,21 @@ private def withTxTransport {α : Type} (dbCache? : Option DbResolveCache) (cfg 
   | .sqlite p => liftE (onSqlite p) | .postgres u ssrfGuard => liftE (onPg u ssrfGuard)
   | _ => throw (ApiError.internal "multi-statement transactions require SQLite or PostgreSQL transport")
 private def finishPgTx (conn : Db.PgWire.PgConn) (cmd : String) : IO (Except ApiError Unit) := do
-  let (res, conn') ← Db.PgWire.execSimpleOnConn conn cmd
+  -- On PostgreSQL, sending COMMIT on an aborted transaction (`txStatus == 'E'`, SQLSTATE 25P02)
+  -- succeeds with a `ROLLBACK` CommandComplete tag instead of an ErrorResponse. Fail closed.
+  if cmd == "COMMIT" && conn.txStatus == 0x45 then
+    let (rbRes, conn') ← Db.PgWire.execSimpleOnConnTag conn "ROLLBACK"
+    match rbRes with
+    | .ok (_, cFinal) => Db.PgWire.releaseConn cFinal
+    | .error _ => Db.PgWire.releaseConn { conn' with healthy := false }
+    return .error (ApiError.internal "postgres COMMIT failed: transaction was already aborted (25P02)")
+  let (res, conn') ← Db.PgWire.execSimpleOnConnTag conn cmd
   match res with
-  | .ok cFinal => Db.PgWire.releaseConn cFinal; return .ok ()
+  | .ok (tag, cFinal) =>
+      Db.PgWire.releaseConn cFinal
+      if cmd == "COMMIT" && !tag.isEmpty && tag != "COMMIT" then
+        return .error (ApiError.internal s!"postgres COMMIT was rolled back by server (tag `{tag}`, aborted transaction 25P02)")
+      return .ok ()
   | .error e => Db.PgWire.releaseConn { conn' with healthy := false }; return .error (ApiError.internal s!"postgres {cmd} failed: {e}")
 
 private def runAead (op : ByteArray → ByteArray → ByteArray → IO (Except String ByteArray))
@@ -469,8 +500,14 @@ private def mkNativeServerInstWith (gcpCache? : Option (Prim.StateBox (Array Gcp
     | .httpCall req => ExceptT.run do
         let authHdrs ← liftE (resolveAuthHeaders gcpCache? req.auth ssrfGuard)
         let allHdrs := (req.headers.map (fun (k, v) => (sanitizeHeader k, sanitizeHeader v)) ++ authHdrs).toArray
-        let (st, respBody, respHdrs) ← liftE ((·.mapError fun e => ApiError.internal s!"external HTTP transport error ({req.serviceName}): {e}") <$>
-          execHttpCall req.method ((← resolveBaseOrigin req) ++ req.pathAndQuery) allHdrs req.body req.ssrfGuard)
+        let (baseOrigin, effSsrf) ← resolveBaseOrigin req (!ssrfGuard)
+        let fmtErr (e : String) : ApiError :=
+          let hint := if effSsrf && req.serviceName != "Webhook" && e.startsWith "SSRF blocked:" then
+              s!" (add `ssrf_guard false` to `external {req.serviceName}` if this service intentionally targets a private/localhost address)"
+            else ""
+          ApiError.internal s!"external HTTP transport error ({req.serviceName}): {e}{hint}"
+        let (st, respBody, respHdrs) ← liftE ((·.mapError fmtErr) <$>
+          execHttpCall req.method (baseOrigin ++ req.pathAndQuery) allHdrs req.body effSsrf)
         return { status := st.toUInt32, body := respBody, headers := respHdrs.toList }
     | .dbExec cfg q => ExceptT.run do match ← liftE (resolveDbConfig cfg dbCache?) with
         | tr@(.postgres _ _) => let (sqlPg, pPg) := q.compile .postgres; liftE (execRawOnTransport tr "" sqlPg pPg [])
@@ -498,7 +535,8 @@ private def mkNativeServerInstWith (gcpCache? : Option (Prim.StateBox (Array Gcp
     | .setCookie c => if let some ref := cookieSink? then ref.modify (·.push c) else pure ()
     | .sendSse ev => if let some ref := sseSink? then ref.modify (·.push ev) else pure ()
     | .readEnv v => Prim.getEnv v | .nowMs => Prim.nowMs | .randomHex n => Prim.randomHex n
-    | .hmacSha256 key msg => Prim.hmacSha256 key msg | .wsBroadcast t p => Prim.wsBroadcast t p
+    | .randomBytes n => Prim.randomBytes n | .hmacSha256 key msg => Prim.hmacSha256 key msg
+    | .sha256 data => Prim.sha256 data | .constEq a b => Prim.constEq a b | .wsBroadcast t p => Prim.wsBroadcast t p
     | .aeadEncrypt kEnv fb aad pt => runAead Prim.aeadEncrypt kEnv fb aad pt
     | .aeadDecrypt kEnv fb aad ct => runAead Prim.aeadDecrypt kEnv fb aad ct
 
@@ -607,25 +645,33 @@ termination_by rx.size - off
 private def stripQuery (target : String) : String := (findByte target 0 63).elim target fun q => String.Pos.Raw.extract target ⟨0⟩ ⟨q⟩
 private def dropPrefixBytes (s : String) (byteLen : Nat) : String := if byteLen >= s.utf8ByteSize then "" else String.Pos.Raw.extract s ⟨byteLen⟩ ⟨s.utf8ByteSize⟩
 private def resolveAuthPrincipal (cfg : ServerConfig) (oidcRt? : Option Qed.Auth.Oidc.OidcRuntime)
-    (bearer? : Option String) (cookies : List (String × String)) : IO (Option String × List (String × String)) := do
-  if let (some rt, some tok) := (oidcRt?, bearer?) then
-    if (tok.splitOn ".").length == 3 then
-      return match ← Qed.Auth.Oidc.verifyOidcJwt execHttpCall rt tok with | .ok jc => (some jc.sub, jc.flatClaims) | .error _ => (none, [])
+    (bearer? : Option String) (cookies : List (String × String)) : IO (Option String × List (String × String) × AuthMethod) := do
   let sessionSecrets := match oidcRt? with | some rt => if !rt.cfg.sessionSecrets.isEmpty then rt.cfg.sessionSecrets else cfg.authSecrets | none => cfg.authSecrets
-  if let some tok := bearer?.orElse (fun _ => cookies.lookup "qed_session") then
-    let now ← nowSec
-    if tok.startsWith "tx1." then return (none, [])
-    if tok.startsWith "v2." then return (← Qed.Auth.Oidc.verifySessionCookieV2 sessionSecrets tok now).elim (none, []) fun p => (some p.userId, p.claims)
-    if !sessionSecrets.isEmpty then return (← verifyUserTokenWithNow sessionSecrets tok now cfg.requireExpiring, [])
-  return (none, [])
+  if let some tok := bearer? then
+    if let some rt := oidcRt? then
+      if (tok.splitOn ".").length == 3 then
+        return match ← Qed.Auth.Oidc.verifyOidcJwt execHttpCall rt tok with | .ok jc => (some jc.sub, jc.flatClaims, .oidcJwt) | .error _ => (none, [], .none)
+    -- Bearer headers accept bearer tokens (`v3.`/`v1.`/legacy) only, never session/tx/onetap cookies (`v2.`/`tx1.`/`ot1.`).
+    if tok.startsWith "v2." || tok.startsWith "tx1." || tok.startsWith "ot1." then return (none, [], .none)
+    if !sessionSecrets.isEmpty then
+      let now ← nowSec
+      return match ← verifyUserTokenWithNow sessionSecrets tok now cfg.requireExpiring with
+        | some uid => (some uid, [], .bearer) | none => (none, [], .none)
+    return (none, [], .none)
+  if let some tok := cookies.lookup "qed_session" then
+    -- Session cookies strictly require `v2.` session envelopes; reject `v1.`/`v3.` bearer tokens and legacy HMAC tokens.
+    if tok.startsWith "v2." then
+      let now ← nowSec
+      return (← Qed.Auth.Oidc.verifySessionCookieV2 sessionSecrets tok now).elim (none, [], .none) fun p => (some p.userId, p.claims, .session)
+  return (none, [], .none)
 private def buildRequestCtxReq (cfg : ServerConfig) (req : ParsedReqHead) (clientIp : String)
     (body : ByteArray := ByteArray.empty) (oidcRt? : Option Qed.Auth.Oidc.OidcRuntime := none) : IO RequestCtx := do
   let hdrList := req.headers.toList
   let cookies := if !req.hasCookie then [] else hdrList.foldl (fun acc (k, v) => if eqCI k "cookie" then acc ++ parseCookiePairs v else acc) []
   let bearer? := req.auth?.bind extractBearer
-  let (userId?, claims) ← resolveAuthPrincipal cfg oidcRt? bearer? cookies
+  let (userId?, claims, authMethod) ← resolveAuthPrincipal cfg oidcRt? bearer? cookies
   let query := (findByte req.target 0 63).elim "" fun q => if q + 1 >= req.target.utf8ByteSize then "" else String.Pos.Raw.extract req.target ⟨q + 1⟩ ⟨req.target.utf8ByteSize⟩
-  return { headers := hdrList, cookies, bearerToken := bearer?, userId := userId?, claims, clientIp, query,
+  return { headers := hdrList, cookies, bearerToken := bearer?, userId := userId?, claims, authMethod, clientIp, query,
            body := if body.isEmpty then "" else (String.fromUTF8? body).getD "" }
 
 private structure WireVariants where

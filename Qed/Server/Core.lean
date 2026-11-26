@@ -33,12 +33,20 @@ instance : NonNullJson ApiError := ⟨nofun⟩
 instance : LawfulProto ApiError := .ofEquiv (fun e => (e.code, e.message)) (fun p => ⟨p.1, p.2⟩) (fun ⟨_, _⟩ => rfl)
 end ApiError
 
+inductive AuthMethod where
+  | none
+  | session
+  | bearer
+  | oidcJwt
+deriving Inhabited, DecidableEq, Repr
+
 structure RequestCtx where
   headers     : List (String × String) := []
   cookies     : List (String × String) := []
   bearerToken : Option String := none
   userId      : Option String := none
   claims      : List (String × String) := []
+  authMethod  : AuthMethod := .none
   clientIp    : String := "127.0.0.1"
   connId      : String := ""
   query       : String := ""
@@ -53,6 +61,8 @@ def claim (ctx : RequestCtx) (name : String) : Option String :=
   (ctx.claims.lookup name).orElse fun _ => if name == "verified" then ctx.claims.lookup "email_verified" else none
 def hasClaim (ctx : RequestCtx) (name expected : String) : Bool := ctx.claim name == some expected
 def isAuthenticated (ctx : RequestCtx) : Bool := ctx.userId.isSome
+def isSession (ctx : RequestCtx) : Bool := ctx.userId.isSome && ctx.authMethod == .session
+def emailVerified (ctx : RequestCtx) : Bool := ctx.claim "email_verified" == some "true"
 def queryParams (ctx : RequestCtx) : List (String × String) := Qed.parseQueryParams ctx.query
 def queryParam (ctx : RequestCtx) (key : String) : Option String := ctx.queryParams.lookup key
 def parseJson (ctx : RequestCtx) (α : Type) [FromJson α] (maxDepth : Nat := 64) : Except ApiError α :=
@@ -194,6 +204,7 @@ end HttpResponse
 /-! ## SSRF Origin-Pinning & Path-Traversal Closure (`external_url_preserves_origin`) -/
 
 abbrev isSafeSegChar : Char → Bool := Qed.isPctEncodedChar
+@[inline] def isSafeLitSegChar (c : Char) : Bool := isSafeSegChar c || c == ':'
 @[inline] def isSafeExtSuffixChar (c : Char) : Bool :=
   isSafeSegChar c || c == '/' || c == '?' || c == '&' || c == '=' || c == ':' || c == '+' || c == ','
 abbrev pctEncode : String → String := Qed.encodeSeg
@@ -206,6 +217,14 @@ theorem isSafeExtSuffixChar_no_smuggle {c : Char} (h : isSafeExtSuffixChar c = t
 private theorem safeSeg_implies_extSuffix {s : String} (h : s.toList.all isSafeSegChar = true) :
     s.toList.all isSafeExtSuffixChar = true :=
   List.all_eq_true.2 fun c hc => by simp [isSafeExtSuffixChar, List.all_eq_true.1 h c hc]
+private theorem safeLitSeg_implies_extSuffix {s : String} (h : s.toList.all isSafeLitSegChar = true) :
+    s.toList.all isSafeExtSuffixChar = true :=
+  List.all_eq_true.2 fun c hc => by
+    have h' := List.all_eq_true.1 h c hc
+    simp only [isSafeLitSegChar, isSafeExtSuffixChar, Bool.or_eq_true] at h' ⊢
+    rcases h' with h1 | h2
+    · simp [h1]
+    · simp [h2]
 
 private def rawSingleSeg (s : String) : String := if s == "." then "%2E" else if s == ".." then "%2E%2E" else pctEncode s
 def encodeSingleSeg (s : String) : Except ApiError String :=
@@ -247,8 +266,52 @@ theorem encodeMultiSeg_safe {s out : String} (h : encodeMultiSeg s = .ok out) : 
     refine joinDelim_safe (sep := '/') rfl segs (list_mapM_except_all (fun _ _ hab => ?_) hm)
     unfold encodeMultiSegElem at hab; split at hab <;> first | cases hab | exact safeSeg_implies_extSuffix (encodeSingleSeg_safe hab).2.2.2
 
-inductive PathPart where | lit (seg : String) | seg (val : String) | multiSeg (val : String) deriving Inhabited, DecidableEq, Repr
-inductive QueryVal where | lit (val : String) | param (val : String) deriving Inhabited, DecidableEq, Repr
+inductive SegPiece where | lit (s : String) | param (val : String) deriving Inhabited, DecidableEq, Repr
+inductive PathPart where | lit (seg : String) | seg (val : String) | multiSeg (val : String) | compound (pieces : List SegPiece) deriving Inhabited, DecidableEq, Repr
+inductive QueryVal where | lit (val : String) | param (val : String) | omit deriving Inhabited, DecidableEq, Repr
+
+class ToQueryVal (α : Type) where
+  toQueryVal : α → QueryVal
+instance (priority := low) {α : Type} [RouteParam α] : ToQueryVal α := ⟨fun a => .param (RouteParam.toSeg a)⟩
+instance : ToQueryVal Bool := ⟨fun b => .param (if b then "true" else "false")⟩
+instance {α : Type} [ToQueryVal α] : ToQueryVal (Option α) := ⟨fun | some a => ToQueryVal.toQueryVal a | none => .omit⟩
+
+class ToHeaderVal (α : Type) where
+  toHeaderVal? : α → Option String
+instance (priority := low) {α : Type} [RouteParam α] : ToHeaderVal α := ⟨fun a => some (RouteParam.toSeg a)⟩
+instance : ToHeaderVal Bool := ⟨fun b => some (if b then "true" else "false")⟩
+instance {α : Type} [ToHeaderVal α] : ToHeaderVal (Option α) := ⟨fun | some a => ToHeaderVal.toHeaderVal? a | none => none⟩
+
+mutual
+  def jsonToFormFields (pfx : String) : Json → List (String × String)
+    | .null => []
+    | .bool b => if pfx.isEmpty then [] else [(pfx, if b then "true" else "false")]
+    | .num n => if pfx.isEmpty then [] else [(pfx, String.ofList (Json.renderNumL n))]
+    | .str s => if pfx.isEmpty then [] else [(pfx, s)]
+    | .arr es => jsonArrToFormFields pfx 0 es
+    | .obj ms => jsonObjToFormFields pfx ms
+  def jsonArrToFormFields (pfx : String) (idx : Nat) : List Json → List (String × String)
+    | [] => []
+    | e :: es =>
+        let key := if pfx.isEmpty then toString idx else pfx ++ "[" ++ toString idx ++ "]"
+        jsonToFormFields key e ++ jsonArrToFormFields pfx (idx + 1) es
+  def jsonObjToFormFields (pfx : String) : List (String × Json) → List (String × String)
+    | [] => []
+    | (k, v) :: ms =>
+        let key := if pfx.isEmpty then k else pfx ++ "[" ++ k ++ "]"
+        jsonToFormFields key v ++ jsonObjToFormFields pfx ms
+end
+
+class ToFormFields (α : Type) where
+  toFormFields : α → List (String × String)
+instance : ToFormFields (List (String × String)) := ⟨id⟩
+instance : ToFormFields (Array (String × String)) := ⟨Array.toList⟩
+instance : ToFormFields (Qed.Dict String String) := ⟨fun d => d.entriesList⟩
+instance (priority := low) {α : Type} [ToJson α] : ToFormFields α := ⟨fun a => jsonToFormFields "" (toJson a)⟩
+
+def encodeFormBodyOf {α : Type} [ToFormFields α] (val : α) : ByteArray :=
+  (Qed.encodeFormBody (ToFormFields.toFormFields val)).toUTF8
+
 private def hasValidOriginBody (base : String) : Bool :=
   !base.endsWith "/" && base.toList.all fun c => isSafeUrlChar c && c != '?' && c != '#' && c != '\\' && c != '@' && decide (32 < c.toNat ∧ c.toNat ≠ 127)
 def isValidBaseOrigin (base : String) : Bool := (base.startsWith "https://" || base.startsWith "http://") && hasValidOriginBody base
@@ -258,32 +321,63 @@ def toWsOrigin (base : String) : String :=
   if base.startsWith "https://" then "wss://" ++ String.ofList (base.toList.drop 8)
   else if base.startsWith "http://" then "ws://" ++ String.ofList (base.toList.drop 7) else base
 
+private def concatStrings : List String → String
+  | [] => "" | s :: ss => s ++ concatStrings ss
+private theorem concatStrings_safe {ss : List String} (hs : ∀ s ∈ ss, s.toList.all isSafeExtSuffixChar = true) :
+    (concatStrings ss).toList.all isSafeExtSuffixChar = true := by
+  induction ss with
+  | nil => rfl
+  | cons s rest ih => simp [concatStrings, String.toList_append, hs s (by simp), ih (fun x hx => hs x (by simp [hx]))]
+private def renderSegPiece : SegPiece → Except ApiError String
+  | .lit s => if s.toList.all isSafeLitSegChar then .ok s else .error (ApiError.internal "invalid static path literal in external endpoint")
+  | .param v => encodeSingleSeg v
 private def renderPathPart : PathPart → Except ApiError String
-  | .lit s => if !s.isEmpty && s != "." && s != ".." && s.toList.all isSafeSegChar then .ok s else .error (ApiError.internal "invalid static path literal in external endpoint")
+  | .lit s => if !s.isEmpty && s != "." && s != ".." && s.toList.all isSafeLitSegChar then .ok s else .error (ApiError.internal "invalid static path literal in external endpoint")
   | .seg v => encodeSingleSeg v | .multiSeg v => encodeMultiSeg v
+  | .compound ps => do
+      let joined := concatStrings (← ps.mapM renderSegPiece)
+      if joined.isEmpty || joined == "." || joined == ".." then .error (ApiError.badRequest "URL path segment cannot be empty or dot-traversal") else .ok joined
 private def renderQueryPairs : List (String × QueryVal) → List String
-  | [] => [] | (k, v) :: rest => (pctEncode k ++ "=" ++ pctEncode (match v with | .lit r | .param r => r)) :: renderQueryPairs rest
+  | [] => []
+  | (_, .omit) :: rest => renderQueryPairs rest
+  | (k, .lit r) :: rest | (k, .param r) :: rest => (pctEncode k ++ "=" ++ pctEncode r) :: renderQueryPairs rest
 private theorem renderQueryPairs_safe : ∀ (qs : List (String × QueryVal)) (p : String), p ∈ renderQueryPairs qs → p.toList.all isSafeExtSuffixChar = true
   | [], _, hm => nomatch hm
-  | (k, v) :: rest, p, hm => (List.mem_cons.1 hm).elim
+  | (_, .omit) :: rest, p, hm => renderQueryPairs_safe rest p hm
+  | (k, .lit r) :: rest, p, hm => (List.mem_cons.1 hm).elim
       (fun heq => by subst heq; have hk := safeSeg_implies_extSuffix (pctEncode_safe k); have heq' : isSafeExtSuffixChar '=' = true := rfl
-                     cases v <;> simp [String.toList_append, hk, heq', safeSeg_implies_extSuffix (pctEncode_safe _)])
+                     simp [String.toList_append, hk, heq', safeSeg_implies_extSuffix (pctEncode_safe r)])
+      (renderQueryPairs_safe rest p)
+  | (k, .param r) :: rest, p, hm => (List.mem_cons.1 hm).elim
+      (fun heq => by subst heq; have hk := safeSeg_implies_extSuffix (pctEncode_safe k); have heq' : isSafeExtSuffixChar '=' = true := rfl
+                     simp [String.toList_append, hk, heq', safeSeg_implies_extSuffix (pctEncode_safe r)])
       (renderQueryPairs_safe rest p)
 
 def buildExternalSuffix (parts : List PathPart) (query : List (String × QueryVal)) : Except ApiError String := do
   let pathStr := joinDelim '/' (← parts.mapM renderPathPart)
-  return if query.isEmpty then pathStr else pathStr ++ "?" ++ joinDelim '&' (renderQueryPairs query)
+  let qPairs := renderQueryPairs query
+  return if qPairs.isEmpty then pathStr else pathStr ++ "?" ++ joinDelim '&' qPairs
 theorem buildExternalSuffix_safe {parts : List PathPart} {query : List (String × QueryVal)} {sfx : String}
     (h : buildExternalSuffix parts query = .ok sfx) : sfx.toList.all isSafeExtSuffixChar = true := by
   unfold buildExternalSuffix at h; rcases except_bind_ok h with ⟨segs, hr, hret⟩
   have hsegs : ∀ seg ∈ segs, seg.toList.all isSafeExtSuffixChar = true := list_mapM_except_all (fun p seg hp => by
     cases p with
     | lit s => dsimp only [renderPathPart] at hp; split at hp <;> first
-        | (rename_i hok; injection hp with hp; subst hp; simp only [Bool.and_eq_true] at hok; exact safeSeg_implies_extSuffix hok.2) | contradiction
+        | (rename_i hok; injection hp with hp; subst hp; simp only [Bool.and_eq_true] at hok; exact safeLitSeg_implies_extSuffix hok.2) | contradiction
     | seg _ => exact safeSeg_implies_extSuffix (encodeSingleSeg_safe hp).2.2.2
-    | multiSeg _ => exact encodeMultiSeg_safe hp) hr
+    | multiSeg _ => exact encodeMultiSeg_safe hp
+    | compound ps =>
+        dsimp only [renderPathPart] at hp; rcases except_bind_ok hp with ⟨pcs, hpcs, hjoin⟩
+        split at hjoin
+        · cases hjoin
+        · injection hjoin with hjoin; subst hjoin
+          refine concatStrings_safe (list_mapM_except_all (fun pc rendered hpc => by
+            cases pc with
+            | lit s => dsimp only [renderSegPiece] at hpc; split at hpc <;> first
+                | (rename_i hok; injection hpc with hpc; subst hpc; exact safeLitSeg_implies_extSuffix hok) | contradiction
+            | param _ => exact safeSeg_implies_extSuffix (encodeSingleSeg_safe hpc).2.2.2) hpcs)) hr
   have hpath := joinDelim_safe (sep := '/') rfl segs hsegs
-  by_cases hq : query.isEmpty <;> (simp [hq, pure, Except.pure] at hret; subst hret)
+  by_cases hq : (renderQueryPairs query).isEmpty <;> (simp [hq, pure, Except.pure] at hret; subst hret)
   · exact hpath
   · have hqchar : isSafeExtSuffixChar '?' = true := rfl
     simp [String.toList_append, hpath, hqchar, joinDelim_safe (sep := '&') rfl _ (renderQueryPairs_safe query)]
@@ -321,7 +415,7 @@ structure OutboundReq where
   headers      : List (String × String)
   body         : ByteArray
   auth         : AuthSpec := .none
-  ssrfGuard    : Bool := false
+  ssrfGuard    : Bool := true
 deriving Inhabited
 
 structure OutboundResp where
@@ -335,7 +429,8 @@ inductive ServerEffect : Type where
   | dbTxBegin (cfg : Db.DbConfig) | dbTxExec (cfg : Db.DbConfig) (txId : UInt64) (q : Db.SqlQuery)
   | dbTxCommit (cfg : Db.DbConfig) (txId : UInt64) | dbTxRollback (cfg : Db.DbConfig) (txId : UInt64)
   | setCookie (cookie : SetCookie) | sendSse (ev : SseEvent) | readEnv (v : String) | nowMs
-  | randomHex (n : UInt32) | hmacSha256 (key msg : ByteArray) | wsBroadcast (t : String) (p : ByteArray)
+  | randomHex (n : UInt32) | randomBytes (n : UInt32) | hmacSha256 (key msg : ByteArray)
+  | sha256 (data : ByteArray) | constEq (a b : ByteArray) | wsBroadcast (t : String) (p : ByteArray)
   | aeadEncrypt (keyEnv : String) (fallback? : Option String) (aad pt : ByteArray)
   | aeadDecrypt (keyEnv : String) (fallback? : Option String) (aad ct : ByteArray)
 
@@ -343,7 +438,8 @@ inductive ServerEffect : Type where
   | .httpCall _ => Except ApiError OutboundResp | .dbExec _ _ | .dbTxExec _ _ _ => Except ApiError Db.DbResult
   | .dbExecDdl _ | .dbTxCommit _ _ => Except ApiError Unit | .dbTxBegin _ => Except ApiError UInt64
   | .dbTxRollback _ _ | .setCookie _ | .sendSse _ | .wsBroadcast _ _ => Unit
-  | .readEnv _ => Option String | .nowMs => UInt64 | .randomHex _ => String | .hmacSha256 _ _ => ByteArray
+  | .readEnv _ => Option String | .nowMs => UInt64 | .randomHex _ => String | .randomBytes _ => ByteArray
+  | .hmacSha256 _ _ | .sha256 _ => ByteArray | .constEq _ _ => Bool
   | .aeadEncrypt _ _ _ _ | .aeadDecrypt _ _ _ _ => Except ApiError ByteArray
 
 class MonadServer (m : Type → Type) where exec : (eff : ServerEffect) → m eff.Resp
@@ -359,8 +455,10 @@ srvEff2 dbTxExec (cfg : Db.DbConfig) (txId : UInt64) (q : Db.SqlQuery) : Except 
 srvEff2 dbTxRollback (cfg : Db.DbConfig) (txId : UInt64) : Unit => .dbTxRollback cfg txId ; setCookie (c : SetCookie) : Unit => .setCookie c
 srvEff2 sendSse (ev : SseEvent) : Unit => .sendSse ev ; readEnv (v : String) : Option String => .readEnv v
 srvEff2 nowMs : UInt64 => .nowMs ; randomHex (n : UInt32) : String => .randomHex n
-srvEff2 hmacSha256 (key msg : ByteArray) : ByteArray => .hmacSha256 key msg ; wsBroadcast (t : String) (p : ByteArray) : Unit => .wsBroadcast t p
-srvEff2 aeadEncrypt (keyEnv : String) (fallback? : Option String) (aad pt : ByteArray) : Except ApiError ByteArray => .aeadEncrypt keyEnv fallback? aad pt ; aeadDecrypt (keyEnv : String) (fallback? : Option String) (aad ct : ByteArray) : Except ApiError ByteArray => .aeadDecrypt keyEnv fallback? aad ct
+srvEff2 randomBytes (n : UInt32) : ByteArray => .randomBytes n ; hmacSha256 (key msg : ByteArray) : ByteArray => .hmacSha256 key msg
+srvEff2 sha256 (data : ByteArray) : ByteArray => .sha256 data ; constEq (a b : ByteArray) : Bool => .constEq a b
+srvEff2 wsBroadcast (t : String) (p : ByteArray) : Unit => .wsBroadcast t p ; aeadEncrypt (keyEnv : String) (fallback? : Option String) (aad pt : ByteArray) : Except ApiError ByteArray => .aeadEncrypt keyEnv fallback? aad pt
+@[reducible, inline] def aeadDecrypt {m : Type → Type} [MonadServer m] (keyEnv : String) (fallback? : Option String) (aad ct : ByteArray) : m (Except ApiError ByteArray) := exec (.aeadDecrypt keyEnv fallback? aad ct)
 end MonadServer
 
 structure WsEmit where
@@ -482,9 +580,10 @@ def mintBearerToken {m : Type → Type} [Monad m] [MonadServer m] (userId : Stri
     | some sec =>
         if sec.isEmpty then Pure.pure (.error (ApiError.internal s!"secret `{secretEnv}` is empty"))
         else MonadServer.nowMs >>= fun now =>
-          let payload := "v1." ++ toString (now.toNat / 1000 + ttlSec) ++ "." ++ userId
-          MonadServer.hmacSha256 sec.toUTF8 payload.toUTF8 >>= fun sig =>
-            Pure.pure (.ok (payload ++ "." ++ Proto.encodeHex sig))
+          MonadServer.randomHex 16 >>= fun jti =>
+            let payload := "v3." ++ toString (now.toNat / 1000 + ttlSec) ++ "." ++ jti ++ "." ++ userId
+            MonadServer.hmacSha256 sec.toUTF8 payload.toUTF8 >>= fun sig =>
+              Pure.pure (.ok (payload ++ "." ++ Proto.encodeHex sig))
 
 theorem noAtomic_mintBearerToken (userId : String) (ttlSec : Nat) (secretEnv : String) :
     NoAtomic (mintBearerToken (m := ThreadProg σ) userId ttlSec secretEnv) := by
@@ -498,7 +597,8 @@ theorem noAtomic_mintBearerToken (userId : String) (ttlSec : Nat) (secretEnv : S
         · simp only [h, ↓reduceIte]; exact .pure _
         · simp only [h, Bool.false_eq_true, ↓reduceIte]
           exact noAtomic_bind (.io .nowMs _ .pure) fun _ =>
-            noAtomic_bind (.io (.hmacSha256 _ _) _ .pure) fun _ => .pure _
+            noAtomic_bind (.io (.randomHex 16) _ .pure) fun _ =>
+              noAtomic_bind (.io (.hmacSha256 _ _) _ .pure) fun _ => .pure _
 instance (userId : String) (ttlSec : Nat) (secretEnv : String) : SafeIO (mintBearerToken (m := ThreadProg σ) userId ttlSec secretEnv) :=
   ⟨noAtomic_mintBearerToken userId ttlSec secretEnv⟩
 
@@ -679,6 +779,10 @@ class SrvUnwrapOpt (W Inner : Type) (Val : outParam Type) where unwrapOpt : W �
 @[reducible] instance {Inner α : Type} : SrvUnwrapOpt (Option α) Inner α := ⟨fun | some a => .ok a | none => .error (.ok none)⟩
 @[reducible] instance {Inner α : Type} : SrvUnwrapOpt (Except ApiError α) Inner α := ⟨fun | .ok a => .ok a | .error e => .error (.error e)⟩
 
+class SrvRetAwait (E W : Type) (Val : outParam Type) where liftRet : W → Except E Val
+@[reducible] instance {E W Val : Type} [SrvUnwrap E W Val] : SrvRetAwait E W Val := ⟨SrvUnwrap.unwrap⟩
+@[reducible] instance (priority := low) {E α : Type} : SrvRetAwait E α α := ⟨Except.ok⟩
+
 @[simp] theorem srvUnwrap_srvFailure_ok_iff {ε α : Type} (x : Except ApiError α) (a : α) : (SrvUnwrap.unwrap (E := SrvFailure ε) x = Except.ok a) = (x = Except.ok a) := propext (by cases x <;> simp [SrvUnwrap.unwrap])
 @[simp] theorem srvUnwrap_str_ok_iff {E α : Type} [SrvErr E] (x : Except String α) (a : α) : (SrvUnwrap.unwrap (E := E) x = Except.ok a) = (x = Except.ok a) := propext (by cases x <;> simp [SrvUnwrap.unwrap])
 @[simp] theorem srvUnwrap_opt_ok_iff {E α : Type} [SrvErr E] (x : Option α) (a : α) : (SrvUnwrap.unwrap (E := E) x = Except.ok a) = (x = some a) := propext (by cases x <;> simp [SrvUnwrap.unwrap])
@@ -764,3 +868,105 @@ theorem srvGetAt_congr_arr {xs ys : Array α} {j : Nat} (heq : ys = xs) (hj : j 
 end SrvStepSimps
 
 end Qed.Server
+
+/-! ## Server-Safe Standard Intrinsics (`Qed.Secret`, `Qed.Crypto`, `Qed.Time`, `Qed.Random`) -/
+
+namespace Qed
+
+/-- Redacted secret string wrapper. Intentionally omits `ToJson`, `ToProto`, `ToSql`, and `ToQueryVal`
+    instances so secrets cannot accidentally leak into wire responses, SQL queries, or logs. -/
+structure Secret where
+  private mk ::
+  private raw : String
+deriving DecidableEq
+
+namespace Secret
+@[inline] def ofString (s : String) : Secret := ⟨s⟩
+@[inline] def expose (s : Secret) : String := s.raw
+@[inline] def toUTF8 (s : Secret) : ByteArray := s.raw.toUTF8
+@[inline] def isEmpty (s : Secret) : Bool := s.raw.isEmpty
+instance : ToString Secret := ⟨fun _ => "<redacted>"⟩
+instance : Repr Secret := ⟨fun _ _ => "<redacted>"⟩
+end Secret
+
+class ToBytes (α : Type) where
+  toBytes : α → ByteArray
+@[inline] instance : ToBytes ByteArray := ⟨id⟩
+@[inline] instance : ToBytes String := ⟨String.toUTF8⟩
+@[inline] instance : ToBytes Secret := ⟨Secret.toUTF8⟩
+
+namespace Crypto
+open Qed.Server
+
+def hmacSha256 {α β : Type} [ToBytes α] [ToBytes β] {m : Type → Type} [MonadServer m] (key : α) (msg : β) : m ByteArray :=
+  MonadServer.hmacSha256 (ToBytes.toBytes key) (ToBytes.toBytes msg)
+
+def hmacSha256Hex {α β : Type} [ToBytes α] [ToBytes β] {m : Type → Type} [Monad m] [MonadServer m] (key : α) (msg : β) : m String :=
+  MonadServer.hmacSha256 (ToBytes.toBytes key) (ToBytes.toBytes msg) >>= fun mac => Pure.pure (Proto.encodeHex mac)
+
+def constEq {α β : Type} [ToBytes α] [ToBytes β] {m : Type → Type} [MonadServer m] (a : α) (b : β) : m Bool :=
+  MonadServer.constEq (ToBytes.toBytes a) (ToBytes.toBytes b)
+
+def sha256 {α : Type} [ToBytes α] {m : Type → Type} [MonadServer m] (data : α) : m ByteArray :=
+  MonadServer.sha256 (ToBytes.toBytes data)
+
+def sha256Hex {α : Type} [ToBytes α] {m : Type → Type} [Monad m] [MonadServer m] (data : α) : m String :=
+  MonadServer.sha256 (ToBytes.toBytes data) >>= fun h => Pure.pure (Proto.encodeHex h)
+
+instance {σ α β : Type} [ToBytes α] [ToBytes β] (key : α) (msg : β) : SafeIO (hmacSha256 (m := ThreadProg σ) key msg) :=
+  ⟨.io (.hmacSha256 _ _) _ .pure⟩
+instance {σ α β : Type} [ToBytes α] [ToBytes β] (key : α) (msg : β) : SafeIO (hmacSha256Hex (m := ThreadProg σ) key msg) :=
+  ⟨noAtomic_bind (.io (.hmacSha256 _ _) _ .pure) fun _ => .pure _⟩
+instance {σ α β : Type} [ToBytes α] [ToBytes β] (a : α) (b : β) : SafeIO (constEq (m := ThreadProg σ) a b) :=
+  ⟨.io (.constEq _ _) _ .pure⟩
+instance {σ α : Type} [ToBytes α] (data : α) : SafeIO (sha256 (m := ThreadProg σ) data) :=
+  ⟨.io (.sha256 _) _ .pure⟩
+instance {σ α : Type} [ToBytes α] (data : α) : SafeIO (sha256Hex (m := ThreadProg σ) data) :=
+  ⟨noAtomic_bind (.io (.sha256 _) _ .pure) fun _ => .pure _⟩
+end Crypto
+
+namespace Time
+open Qed.Server
+
+def nowMs {m : Type → Type} [Monad m] [MonadServer m] : m Nat :=
+  MonadServer.nowMs >>= fun ms => Pure.pure ms.toNat
+
+def nowSec {m : Type → Type} [Monad m] [MonadServer m] : m Nat :=
+  MonadServer.nowMs >>= fun ms => Pure.pure (ms.toNat / 1000)
+
+instance {σ : Type} : SafeIO (nowMs (m := ThreadProg σ)) :=
+  ⟨noAtomic_bind (.io .nowMs _ .pure) fun _ => .pure _⟩
+instance {σ : Type} : SafeIO (nowSec (m := ThreadProg σ)) :=
+  ⟨noAtomic_bind (.io .nowMs _ .pure) fun _ => .pure _⟩
+end Time
+
+namespace Random
+open Qed.Server
+
+def hex {m : Type → Type} [MonadServer m] (numBytes : Nat) : m String :=
+  MonadServer.randomHex numBytes.toUInt32
+
+def bytes {m : Type → Type} [MonadServer m] (numBytes : Nat) : m ByteArray :=
+  MonadServer.randomBytes numBytes.toUInt32
+
+def formatUuidV4 (bs : ByteArray) : String :=
+  let getB (i : Nat) : UInt8 := if h : i < bs.size then bs[i] else 0
+  let b6 := (getB 6 &&& 0x0f) ||| 0x40
+  let b8 := (getB 8 &&& 0x3f) ||| 0x80
+  let hex2 (b : UInt8) : String := String.ofList [hexDigitLower (b.toNat / 16), hexDigitLower (b.toNat % 16)]
+  hex2 (getB 0) ++ hex2 (getB 1) ++ hex2 (getB 2) ++ hex2 (getB 3) ++ "-" ++
+  hex2 (getB 4) ++ hex2 (getB 5) ++ "-" ++
+  hex2 b6 ++ hex2 (getB 7) ++ "-" ++
+  hex2 b8 ++ hex2 (getB 9) ++ "-" ++
+  hex2 (getB 10) ++ hex2 (getB 11) ++ hex2 (getB 12) ++ hex2 (getB 13) ++ hex2 (getB 14) ++ hex2 (getB 15)
+
+def uuid {m : Type → Type} [Monad m] [MonadServer m] : m String :=
+  MonadServer.randomBytes 16 >>= fun bs => Pure.pure (formatUuidV4 bs)
+
+instance {σ : Type} (n : Nat) : SafeIO (hex (m := ThreadProg σ) n) := ⟨.io (.randomHex _) _ .pure⟩
+instance {σ : Type} (n : Nat) : SafeIO (bytes (m := ThreadProg σ) n) := ⟨.io (.randomBytes _) _ .pure⟩
+instance {σ : Type} : SafeIO (uuid (m := ThreadProg σ)) :=
+  ⟨noAtomic_bind (.io (.randomBytes 16) _ .pure) fun _ => .pure _⟩
+end Random
+
+end Qed

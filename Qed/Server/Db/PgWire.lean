@@ -55,15 +55,18 @@ private def findZeroByte (ba : ByteArray) (i : Nat) : Nat :=
   if h : i < ba.size then if ba[i]'h == 0 then i else findZeroByte ba (i + 1) else ba.size
 termination_by ba.size - i
 def parseErrorResponse (payload : ByteArray) : String :=
-  let rec go (off : Nat) : Nat → String
-    | 0 => "postgres error"
+  let rec go (off : Nat) (msg? sqlstate? : Option String) : Nat → String
+    | 0 => match sqlstate?, msg? with | some c, some m => s!"[{c}] {m}" | none, some m => m | some c, none => s!"postgres error [{c}]" | none, none => "postgres error"
     | fuel + 1 => if h : off < payload.size then
         let code := payload[off]'h
-        if code == 0 then "postgres error"
+        if code == 0 then go off msg? sqlstate? 0
         else let zPos := findZeroByte payload (off + 1)
-             if code == 0x4D then (String.fromUTF8? (payload.extract (off + 1) zPos)).getD "postgres error" else go (zPos + 1) fuel
-      else "postgres error"
-  go 0 (payload.size + 1)
+             let txt? := String.fromUTF8? (payload.extract (off + 1) zPos)
+             if code == 0x4D then go (zPos + 1) (txt?.orElse fun _ => msg?) sqlstate? fuel
+             else if code == 0x43 then go (zPos + 1) msg? (txt?.orElse fun _ => sqlstate?) fuel
+             else go (zPos + 1) msg? sqlstate? fuel
+      else go off msg? sqlstate? 0
+  go 0 none none (payload.size + 1)
 def parseRowDescription (payload : ByteArray) : Array Nat :=
   let rec go (off : Nat) (acc : Array Nat) : Nat → Array Nat
     | 0 => acc | n + 1 => let afterName := min (findZeroByte payload off + 1) payload.size
@@ -87,9 +90,11 @@ def parseDataRow (oids : Array Nat) (payload : ByteArray) : Except String DbRow 
              if off + 4 + n > payload.size then .error "truncated postgres DataRow column payload"
              else go (off + 4 + n) (colIdx + 1) (acc.push (← decodePgCell (oids.getD colIdx 25) (payload.extract (off + 4) (off + 4 + n)))) rem
   (readU16BE payload 0).elim (.error "truncated postgres DataRow header") (go 2 0 #[])
-def parseCommandTagAffected (payload : ByteArray) : Nat :=
+def parseCommandTag (payload : ByteArray) : String :=
   let trimmed := if payload.size > 0 && payload[payload.size - 1]! == 0 then payload.extract 0 (payload.size - 1) else payload
-  (((String.fromUTF8? trimmed).getD "").splitOn " ").reverse.head?.bind String.toNat? |>.getD 0
+  (String.fromUTF8? trimmed).getD ""
+def parseCommandTagAffected (payload : ByteArray) : Nat :=
+  ((parseCommandTag payload).splitOn " ").reverse.head?.bind String.toNat? |>.getD 0
 
 /-! ### `postgres://` URL Parser & SCRAM-SHA-256 Auth -/
 
@@ -182,17 +187,18 @@ private def authLoop (handle : UInt64) (cfg : PgConnParams) (buf : ByteArray) (o
       | _ => authLoop handle cfg b1 o1 clientNonce clientFirstBare fuel
 
 private def collectQueryResultLoop (handle : UInt64) (buf : ByteArray) (off : Nat)
-    (oids : Array Nat) (rows : Array DbRow) (affected : Nat) (err? : Option String) :
-    Nat → PgM (Except String DbResult × ByteArray × Nat × UInt8)
+    (oids : Array Nat) (rows : Array DbRow) (affected : Nat) (cmdTag : String) (err? : Option String) :
+    Nat → PgM (Except String (DbResult × String) × ByteArray × Nat × UInt8)
   | 0 => throw "postgres query response exceeded frame limit"
   | fuel + 1 => do
       let (f, b1, o1) ← readNextFrame handle buf off 4096
-      let next (o := oids) (rs := rows) (aff := affected) (e := err?) := collectQueryResultLoop handle b1 o1 o rs aff e fuel
+      let next (o := oids) (rs := rows) (aff := affected) (tag := cmdTag) (e := err?) := collectQueryResultLoop handle b1 o1 o rs aff tag e fuel
       match f.tag with
-      | 0x5A => return (err?.elim (.ok { rows, affected }) .error, b1, o1, f.payload.data.getD 0 0)
+      | 0x5A => return (err?.elim (.ok ({ rows, affected }, cmdTag)) .error, b1, o1, f.payload.data.getD 0 0)
       | 0x45 => next (e := some (parseErrorResponse f.payload)) | 0x54 => next (o := parseRowDescription f.payload)
       | 0x44 => match parseDataRow oids f.payload with | .ok row => next (rs := rows.push row) | .error e => next (e := some e)
-      | 0x43 => next (aff := parseCommandTagAffected f.payload) | _ => next
+      | 0x43 => let tag := parseCommandTag f.payload; next (aff := (tag.splitOn " ").reverse.head?.bind String.toNat? |>.getD 0) (tag := tag)
+      | _ => next
 
 def PgConnParams.poolKey (cfg : PgConnParams) : String :=
   s!"{cfg.user}:{cfg.password}@{cfg.host.toLower}:{cfg.port}/{cfg.database}?ssl={match cfg.sslMode with | .disable => "disable" | .prefer => "prefer" | .require => "require"}&ssrf={if cfg.ssrfGuard then "1" else "0"}"
@@ -258,17 +264,21 @@ def releaseConn (conn : PgConn) : IO Unit := do
          (ev, m.insert conn.poolKey (kept.push (conn.handle, nowMs)))
   evicted.forM (closePgHandle · true)
 
-private def runWireOnConn (conn : PgConn) (wire : ByteArray) (errPrefix : String) (fuel : Nat) : IO (Except String (DbResult × PgConn) × PgConn) := do
+private def runWireOnConn (conn : PgConn) (wire : ByteArray) (errPrefix : String) (fuel : Nat) : IO (Except String (DbResult × String × PgConn) × PgConn) := do
   match ← Prim.outboundWriteAll conn.handle wire with
   | .error e => return (.error s!"{errPrefix}: {e}", { conn with healthy := false })
-  | .ok () => match ← (collectQueryResultLoop conn.handle conn.buf conn.off #[] #[] 0 none fuel).run with
+  | .ok () => match ← (collectQueryResultLoop conn.handle conn.buf conn.off #[] #[] 0 "" none fuel).run with
       | .error transportErr => return (.error transportErr, { conn with healthy := false })
-      | .ok (qRes, b', o', status) => let conn' := { conn with buf := b', off := o', txStatus := status, healthy := true }; return (qRes.map (·, conn'), conn')
-def execOnConn (conn : PgConn) (sql : String) (params : Array SqlVal) : IO (Except String (DbResult × PgConn) × PgConn) :=
-  runWireOnConn conn (encodeParse sql ++ encodeBind params ++ encodeMsg 0x44 (pushCString (ByteArray.empty.push 0x50) "") ++
+      | .ok (qRes, b', o', status) => let conn' := { conn with buf := b', off := o', txStatus := status, healthy := true }; return (qRes.map fun (r, tag) => (r, tag, conn'), conn')
+def execOnConn (conn : PgConn) (sql : String) (params : Array SqlVal) : IO (Except String (DbResult × PgConn) × PgConn) := do
+  let (res, conn') ← runWireOnConn conn (encodeParse sql ++ encodeBind params ++ encodeMsg 0x44 (pushCString (ByteArray.empty.push 0x50) "") ++
     encodeMsg 0x45 (pushU32BE (pushCString ByteArray.empty "") 0) ++ encodeMsg 0x53 ByteArray.empty) "postgres query write failed" 65536
-def execSimpleOnConn (conn : PgConn) (sql : String) : IO (Except String PgConn × PgConn) := do
+  return (res.map fun (r, _, c) => (r, c), conn')
+def execSimpleOnConnTag (conn : PgConn) (sql : String) : IO (Except String (String × PgConn) × PgConn) := do
   let (res, conn') ← runWireOnConn conn (encodeMsg 0x51 (pushCString ByteArray.empty sql)) "postgres simple query write failed" 4096
+  return (res.map fun (_, tag, c) => (tag, c), conn')
+def execSimpleOnConn (conn : PgConn) (sql : String) : IO (Except String PgConn × PgConn) := do
+  let (res, conn') ← execSimpleOnConnTag conn sql
   return (res.map Prod.snd, conn')
 
 private def execParameterizedAttempt (cfg : PgConnParams) (sql : String) (params : Array SqlVal) : Nat → PgM DbResult

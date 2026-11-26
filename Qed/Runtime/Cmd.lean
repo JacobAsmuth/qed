@@ -90,6 +90,7 @@ def Cmd.storageGet (key : String) (onValue : Option String → msg) : Cmd msg :=
 def Cmd.pushUrl {α} [ToHref α] (target : α) : Cmd msg := .pushPath (ToHref.toUrl target)
 def Cmd.navigate {α} [ToHref α] (target : α) : Cmd msg := .pushPath (ToHref.toUrl target)
 def Cmd.replaceUrl {α} [ToHref α] (target : α) : Cmd msg := .fx "history.replace" (ToHref.toHref target) "" ""
+def Cmd.openExternal (url : Url) : Cmd msg := .fx "location.assign" url.raw "" ""
 def Cmd.back : Cmd msg := .fx "history.back" "" "" ""
 def Cmd.forward : Cmd msg := .fx "history.forward" "" "" ""
 def Cmd.copy (text : String) : Cmd msg := .fx "clipboard.write" text "" ""

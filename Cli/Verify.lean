@@ -650,7 +650,7 @@ def kernelEnvClean (q? : Option QedjsEnv := none) (alreadyBuilt : Bool := false)
       "Qed", "Qed.Driver", "Qed.Server.Native", "Qed.Cloud.Proofs", "Qed.Cloud.GcpApi", "Qed.Cloud.Executor",
       "Qed.Proofs.DomArena", "Qed.Proofs.ViewPatch", "Qed.Proofs.KeyedReconcile", "Qed.Proofs.Hydration", "Js.Backend", "Js.Proofs",
       "Examples.Counter", "Examples.Todo", "Examples.Signup", "Examples.Chat", "Examples.Bookshelf", "Examples.CloudBooks", "Examples.LiveRoom",
-      "Tests.ServerChecks", "Tests.DbChecks", "Tests.SpeculativeChecks", "Tests.JsGate", "Tests.VerificationChecks", "Tests.CloudChecks"] root)
+      "QedTests.ServerChecks", "QedTests.DbChecks", "QedTests.SpeculativeChecks", "QedTests.JsGate", "QedTests.VerificationChecks", "QedTests.CloudChecks"] root)
     q.run (#["--verify-env"] ++ mods) (quiet := true)
   else
     let jsMod ← jsRoot; let mut mods := #[root]
@@ -675,7 +675,7 @@ def externsCovered (q? : Option QedjsEnv := none) (alreadyBuilt : Bool := false)
       | .raw          => (#[mod], driverEntries)
     mods := m; entries := e
   if hasExamples then
-    mods := mods.push "Tests.JsGate"
+    mods := mods.push "QedTests.JsGate"
     entries := entries ++ #["JsGate.run", "JsGate.counts", "JsGate.probeCount", "JsGate.names"]
   if entries.isEmpty then return true
   let some q ← ensureQedjsEnv q? | return false
@@ -690,7 +690,7 @@ def verify (checkExterns : Bool := true) (extraLakeTargets : Array String := #[]
   let hasExamples ← isInRepo
   let tGrep ← IO.asTask grepForbidden; let tEff ← spawnIf hasExamples effectsCovered
   let tGraph ← spawnIf hasExamples buildGraphClean; let tLp ← IO.asTask lakeEnvLeanPath
-  let base ← if hasExamples then pure #["Qed", "Qed.Driver", "QedServer", "QedProofs", "JsProofs", "qedjs", "Examples", "Tests"]
+  let base ← if hasExamples then pure #["Qed", "Qed.Driver", "QedServer", "QedProofs", "JsProofs", "qedjs", "Examples", "QedTests"]
     else do let (root, jsMod) := (← webRoot, ← jsRoot); pure (if checkExterns && jsMod != root then #[root, jsMod] else #[root])
   let extra := targetMod?.elim extraLakeTargets (addUniq extraLakeTargets ·)
   if (← shLakeBuild (#["build"] ++ base ++ extra.filter (!base.contains ·))) != 0 then

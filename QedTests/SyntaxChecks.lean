@@ -1,5 +1,5 @@
 import Qed
-import Tests.CheckHelper
+import QedTests.CheckHelper
 open Qed
 
 namespace SyntaxChecks
@@ -840,6 +840,7 @@ component SessionParentShell:
   state flt : NestedFilter = { page = 0, search = "", tags = ["a"] }
   state lastSaved : String = ""
   query items = PolishRpcSrv.listItems(flt.search)
+  query homeItems = PolishRpcSrv.listItems(flt.search) if current == .home
   head:
     title "Polish App"
     canonical f"https://qed.cloud{current}"
@@ -863,6 +864,16 @@ component SessionParentShell:
     flt.tags[0] = "z"
   action refreshItems:
     items.invalidate()
+  action invBoth:
+    invalidate(items, homeItems)
+  action searchAndRefetch(q: String):
+    flt.search = q
+    items.refetch()
+  action refetchThenSearch(q: String):
+    items.refetch()
+    flt.search = q
+  action goExternal:
+    Cmd.openExternal(url("https://checkout.stripe.com/c/pay_1"))
   action optimisticAdd(x: String):
     items.update(xs => xs.push(x))
   action replaceItems(xs: String[]):
@@ -934,7 +945,27 @@ example := @MultiStyleSpliceDemo.app_view_eq
   let (s5, _) := SessionParentShell.update s4 .bumpNested
   let (s6, _) := SessionParentShell.update s5 (.replaceItems #["one"])
   let (s7, _) := SessionParentShell.update s6 (.optimisticAdd "two")
-  let (_, cRef) := SessionParentShell.update s7 .refreshItems
+  let (_, cRef) := SessionParentShell.app.update s7 .refreshItems
+  let countReqs (c : Cmd SessionParentShell.Msg) : Nat := (Cmd.flatten c).foldl (fun n x => match x with | .requestBytes .. => n + 1 | _ => n) 0
+  -- Coalesced query refresh: mutating query key + refetch in either order fires 1 RPC per active query (never duplicate).
+  let sAcct := (SessionParentShell.app.update s7 (._onRoute .account)).1
+  let (_, cCoal1) := SessionParentShell.app.update sAcct (.searchAndRefetch "abc")
+  let (_, cCoal2) := SessionParentShell.app.update sAcct (.refetchThenSearch "def")
+  -- Cross-route invalidate(items, homeItems): off-route `homeItems` clears `seen` with 0 RPCs for it, then reloads fresh on return to `.home`.
+  let sHomeLoaded := { s7 with homeItems := s7.homeItems.setKey (SessionParentShell._qKey_homeItems s7) #["stale"] }
+  let (sOff, _) := SessionParentShell.app.update sHomeLoaded (._onRoute .account)
+  let (sOffInv, cOffInv) := SessionParentShell.app.update sOff .invBoth
+  let (sBack, cBack) := SessionParentShell.app.update sOffInv (._onRoute .home)
+  -- Stale pre-refetch response ignored by `putRev`
+  let sBumped := (SessionParentShell.app.update s7 .refreshItems).1
+  let cAfterStale := sBumped.items.putRev (SessionParentShell._qKey_items s7) (.ok #["old"]) (SessionParentShell._qKey_items sBumped)
+  -- Cmd.openExternal + Url codecs
+  let (_, cExt) := SessionParentShell.update s7 .goExternal
+  let uOk := url("https://checkout.stripe.com/c/pay_1")
+  let uJsonRt := (Qed.FromJson.fromJson (α := Qed.Url) (Qed.ToJson.toJson uOk)).toOption == some uOk
+  let uProtoRt := (Qed.Proto.decode (α := Qed.Url) (Qed.Proto.encode uOk)).toOption == some uOk
+  let uJsBlocked := !(Qed.FromJson.fromJson (α := Qed.Url) (.str "javascript:alert(1)")).isOk &&
+                    !(Qed.Proto.decode (α := Qed.Url) (Qed.Proto.encode "javascript:alert(1)")).isOk
   let rOff := Html.render (MultiStyleSpliceDemo.view MultiStyleSpliceDemo.init)
   let rOn  := Html.render (MultiStyleSpliceDemo.view { active := true })
   let c0 : Cached Nat := ({} : Cached Nat).setKey "k" 10
@@ -949,6 +980,12 @@ example := @MultiStyleSpliceDemo.app_view_eq
   s6.items.getD #[] == #["one"] && s6.items.isOk &&
   s7.items.getD #[] == #["one", "two"] &&
   (match cRef with | .none => false | _ => true) &&
+  countReqs cCoal1 == 1 && countReqs cCoal2 == 1 &&
+  sOffInv.homeItems.seen.isEmpty && countReqs cOffInv == 1 &&
+  sBack.homeItems.isLoading && countReqs cBack == 1 &&
+  cAfterStale.getD #[] != #["old"] && cAfterStale.seen.isEmpty &&
+  (match cExt with | .fx "location.assign" "https://checkout.stripe.com/c/pay_1" "" "" => true | _ => false) &&
+  uJsonRt && uProtoRt && uJsBlocked &&
   (SessionParentShell.headInfo s2).1.title == some "Settings" &&
   (SessionParentShell.headInfo s2).1.canonical == some "https://qed.cloud/account" &&
   (SessionParentShell.headInfo s2).1.redirect == some "/" &&
@@ -996,5 +1033,36 @@ example := @MultiStyleSpliceDemo.app_view_eq
   Qed.Time.formatUtc 1700000000 == "2023-11-14 22:13 UTC" &&
   Qed.Time.formatDuration 125 == "2m 5s" &&
   Qed.Time.formatRelative 1000 700 == "5m ago"
+
+/-! ## Wide Schema Proof Synthesis (24 fields under default heartbeats) -/
+
+schema Wide24Schema:
+  f01 : String
+  f02 : String
+  f03 : String
+  f04 : String
+  f05 : String
+  f06 : String
+  f07 : String
+  f08 : String
+  f09 : String
+  f10 : String
+  f11 : String
+  f12 : String
+  f13 : String
+  f14 : String
+  f15 : String
+  f16 : String
+  f17 : Nat
+  f18 : Nat
+  f19 : Bool
+  f20 : Bool
+  f21 : String where 1 <= f21.length <= 64
+  f22 : Nat where 1 <= f22 <= 100
+  f23 : String
+  f24 : String
+
+example : Qed.LawfulJson Wide24Schema × Qed.LawfulProto Wide24Schema × Qed.LawfulJson Wide24Schema.Draft :=
+  (inferInstance, inferInstance, inferInstance)
 
 end SyntaxChecks

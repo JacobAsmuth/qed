@@ -54,6 +54,7 @@ structure ServerInfo where
 deriving Inhabited
 
 initialize serverRegistry : Lean.SimplePersistentEnvExtension ServerInfo (Lean.NameMap ServerInfo) ← Qed.Diag.mkNameMapExt (·.serverName)
+initialize failedServerRegistry : Lean.SimplePersistentEnvExtension Lean.Name (Lean.NameMap Lean.Name) ← Qed.Diag.mkNameMapExt id
 
 def lookupServerMethod? (env : Lean.Environment) (currNs : Lean.Name) (openDecls : List Lean.OpenDecl) (callName : Lean.Name) :
     Option (ServerInfo × ServerMethodInfo) :=
@@ -208,6 +209,13 @@ def isValidEnvVarName (s : String) : Bool :=
 def exprCallsOld (stx : Lean.Syntax) : Bool :=
   Qed.Lang.stxAny (fun s => s.getKind == ``Qed.Lang.qedCall && (s.getArg 0).getKind == ``Qed.Lang.qedIdent && ((s.getArg 0).getArg 0).getId.eraseMacroScopes == `old) stx
 
+structure DbEncKeyInfo where
+  keyEnv    : String
+  fallback? : Option String := none
+  isBytes   : Bool := false
+  prevKeys  : List (String × Option String) := []
+deriving Inhabited, Repr
+
 structure DbColumnInfo where
   name         : String
   isPrimaryKey : Bool := false
@@ -215,23 +223,29 @@ structure DbColumnInfo where
   isUnique     : Bool := false
   isNullable   : Bool := false
   isNat        : Bool := false
+  isInt        : Bool := false
   refs?        : Option (String × String) := none
-  encKey?      : Option (String × Option String × Bool) := none
+  encKey?      : Option DbEncKeyInfo := none
 deriving Inhabited, Repr
 
 structure DbTableInfo where
-  tableName         : String
-  rowTypeConst      : Lean.Name
-  columns           : Array DbColumnInfo
-  hasReadPolicy     : Bool := false
-  hasInsertPolicy   : Bool := false
-  hasUpdatePolicy   : Bool := false
-  hasDeletePolicy   : Bool := false
-  hasTransInv       : Bool := false
-  readPolicyLabel   : String := ""
-  insertPolicyLabel : String := ""
-  updatePolicyLabel : String := ""
-  deletePolicyLabel : String := ""
+  tableName            : String
+  rowTypeConst         : Lean.Name
+  columns              : Array DbColumnInfo
+  hasMeta              : Bool := false
+  hasReadPolicy        : Bool := false
+  hasInsertPolicy      : Bool := false
+  hasUpdatePolicy      : Bool := false
+  hasDeletePolicy      : Bool := false
+  hasCrossReadPolicy   : Bool := false
+  hasCrossInsertPolicy : Bool := false
+  hasCrossUpdatePolicy : Bool := false
+  hasCrossDeletePolicy : Bool := false
+  hasTransInv          : Bool := false
+  readPolicyLabel      : String := ""
+  insertPolicyLabel    : String := ""
+  updatePolicyLabel    : String := ""
+  deletePolicyLabel    : String := ""
 deriving Inhabited, Repr
 
 structure DatabaseInfo where
@@ -239,6 +253,7 @@ structure DatabaseInfo where
   shortName         : String
   configConst       : Lean.Name
   ensureSchemaConst : Lean.Name
+  snapTypeConst?    : Option Lean.Name := none
   secrets           : Array String
   hasDevFallback    : Bool := false
   isManaged         : Bool := false
@@ -261,6 +276,35 @@ deriving Inhabited, Repr
 initialize authRegistry : Lean.SimplePersistentEnvExtension AuthInfo (Lean.NameMap AuthInfo) ← Qed.Diag.mkNameMapExt (·.authName)
 abbrev lookupAuth? (env : Lean.Environment) (currNs : Lean.Name) (openDecls : List Lean.OpenDecl) (authRef : Lean.Name) : Option AuthInfo :=
   Qed.Diag.lookupNameMapExt? authRegistry env currNs openDecls authRef (some `config)
+
+structure ServiceMethodInfo where
+  name          : String
+  defConst      : Lean.Name
+  minParamCount : Nat
+  paramCount    : Nat
+  isMonadic     : Bool
+  isFallible    : Bool
+  takesCtx      : Bool := false
+  dbWrite       : Bool := false
+  hasCookieOp   : Bool := false
+  hasEnsures    : Bool := false
+deriving Inhabited, Repr
+
+structure ServiceInfo where
+  serviceName      : Lean.Name
+  shortName        : String
+  secrets          : Array String := #[]
+  ownSecrets       : Array String := #[]
+  envVars          : Array (String × String × Option String) := #[]
+  externalServices : Array (String × String) := #[]
+  databases        : Array Lean.Name := #[]
+  methods          : Array ServiceMethodInfo := #[]
+deriving Inhabited
+
+initialize serviceRegistry : Lean.SimplePersistentEnvExtension ServiceInfo (Lean.NameMap ServiceInfo) ← Qed.Diag.mkNameMapExt (·.serviceName)
+initialize failedServiceRegistry : Lean.SimplePersistentEnvExtension Lean.Name (Lean.NameMap Lean.Name) ← Qed.Diag.mkNameMapExt id
+abbrev lookupService? (env : Lean.Environment) (currNs : Lean.Name) (openDecls : List Lean.OpenDecl) (svcRef : Lean.Name) : Option ServiceInfo :=
+  Qed.Diag.lookupNameMapExt? serviceRegistry env currNs openDecls svcRef (some `_qed_service_marker)
 
 def findNamedArg? (named : Array (String × Lean.Syntax)) (key : String) : Option Lean.Syntax := (named.find? (·.1 == key)).map Prod.snd
 

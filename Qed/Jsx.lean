@@ -151,33 +151,35 @@ partial def attrsToTerms (rawAttrs : Array Syntax) (tag : String := "") : MacroM
   let (isCheck, textEvt) := (isCheckboxAttrs rawAttrs, if tag == "select" then ``Qed.onChange else ``Qed.onInput)
   let mut out : Array Term := #[]
   for stx in rawAttrs do
-    if stx.getKind == ``attrSplice then out := out.push (← expandJsxExpr "" none (`(Qed.Attr.empty)) (stx.getArg 1)).1
-    else
-      let (name, valNode) := (tokenVal (stx.getArg 0), stx.getArg 1)
-      if name == "bind" then
-        if valNode.getNumArgs == 0 then Macro.throwErrorAt stx "`bind` requires `{field}` (in a component) or `{(value, onEdit)}`"
-        let vT ← expandAttrVal valNode (`(""))
-        if vT.raw.isIdent then Macro.throwErrorAt vT s!"`bind=\{{vT.raw.getId}}` shorthands state binding inside a `component`; outside a `component` view, pass `bind=\{({vT.raw.getId}, onEdit)}`"
-        let (valE, setE) ← match vT with | `(($a:term, $b:term)) => pure (a, b) | _ => pure (← `(($vT).1), ← `(($vT).2))
-        out := out.push (← `($(mkCIdent (if isCheck then ``Qed.checked else ``Qed.value)) $valE))
-                  |>.push (← `($(mkCIdent (if isCheck then ``Qed.onCheck else textEvt)) $setE))
-      else if valNode.getNumArgs == 0 then
-        if flagAttrs.contains name then out := out.push (← `($(mkCIdent (Name.mkStr2 "Qed" name)) true))
-        else
-          checkSafeAttrName (stx.getArg 0) name
-          if isUrlAttrName name then Macro.throwErrorAt (stx.getArg 0) s!"URL attribute `{name}` requires a value (a `Router` route or `Url`, e.g. `{name}=\{Route.home}` or `{name}=\{url(\"/path\")}`)"
-          out := out.push (← `(Qed.attr $(Syntax.mkStrLit name) ""))
+    let added ← withRef stx do
+      if stx.getKind == ``attrSplice then pure #[(← expandJsxExpr "" none (`(Qed.Attr.empty)) (stx.getArg 1)).1]
       else
-        if isUrlAttrName name && (valNode.getArg 1).getKind == ``attrValStr then
-          let raw := (⟨(valNode.getArg 1).getArg 0⟩ : TSyntax `str).getString
-          Macro.throwErrorAt ((valNode.getArg 1).getArg 0)
-            s!"URL attribute `{name}` cannot take raw string literal `\"{raw}\"` (raw strings are disallowed to prevent XSS and broken links).\nPass a typed `Router` route or a compile-time checked literal: `{name}=\{url(\"{raw}\")}`."
-        let vT ← expandAttrVal valNode (`(""))
-        let vChecked ← if isUrlAttrName name then `(qedCheckUrlVal% $(Syntax.mkStrLit name) ($vT)) else pure vT
-        out := out.push <| ← match attrHelper? name with
-          | some h => `($(mkCIdent h) $vChecked)
-          | none => do checkSafeAttrName (stx.getArg 0) name
-                       if isUrlAttrName name then `(Qed.attr $(Syntax.mkStrLit name) (Qed.ToHref.toHref $vChecked)) else `(Qed.attr $(Syntax.mkStrLit name) $vT)
+        let (name, valNode) := (tokenVal (stx.getArg 0), stx.getArg 1)
+        if name == "bind" then
+          if valNode.getNumArgs == 0 then Macro.throwErrorAt stx "`bind` requires `{field}` (in a component) or `{(value, onEdit)}`"
+          let vT ← expandAttrVal valNode (`(""))
+          if vT.raw.isIdent then Macro.throwErrorAt vT s!"`bind=\{{vT.raw.getId}}` shorthands state binding inside a `component`; outside a `component` view, pass `bind=\{({vT.raw.getId}, onEdit)}`"
+          let (valE, setE) ← match vT with | `(($a:term, $b:term)) => pure (a, b) | _ => pure (← `(($vT).1), ← `(($vT).2))
+          pure #[← `($(mkCIdent (if isCheck then ``Qed.checked else ``Qed.value)) $valE), ← `($(mkCIdent (if isCheck then ``Qed.onCheck else textEvt)) $setE)]
+        else if valNode.getNumArgs == 0 then
+          if flagAttrs.contains name then pure #[← `($(mkCIdent (Name.mkStr2 "Qed" name)) true)]
+          else
+            checkSafeAttrName (stx.getArg 0) name
+            if isUrlAttrName name then Macro.throwErrorAt (stx.getArg 0) s!"URL attribute `{name}` requires a value (a `Router` route or `Url`, e.g. `{name}=\{Route.home}` or `{name}=\{url(\"/path\")}`)"
+            pure #[← `(Qed.attr $(Syntax.mkStrLit name) "")]
+        else
+          if isUrlAttrName name && (valNode.getArg 1).getKind == ``attrValStr then
+            let raw := (⟨(valNode.getArg 1).getArg 0⟩ : TSyntax `str).getString
+            Macro.throwErrorAt ((valNode.getArg 1).getArg 0)
+              s!"URL attribute `{name}` cannot take raw string literal `\"{raw}\"` (raw strings are disallowed to prevent XSS and broken links).\nPass a typed `Router` route or a compile-time checked literal: `{name}=\{url(\"{raw}\")}`."
+          let vT ← expandAttrVal valNode (`(""))
+          let vChecked ← if isUrlAttrName name then withRef (valNode.getArg 1) `(qedCheckUrlVal% $(Syntax.mkStrLit name) ($vT)) else pure vT
+          let attrT ← match attrHelper? name with
+            | some h => `($(mkCIdent h) $vChecked)
+            | none => do checkSafeAttrName (stx.getArg 0) name
+                         if isUrlAttrName name then `(Qed.attr $(Syntax.mkStrLit name) (Qed.ToHref.toHref $vChecked)) else `(Qed.attr $(Syntax.mkStrLit name) $vT)
+          pure #[attrT]
+    out := out ++ added
   return out
 
 partial def isMapCall (stx : Syntax) : Bool :=
@@ -224,7 +226,7 @@ partial def childrenToTerm (pPath : String) (parentCtx? : Option (String × Html
   if !cur.isEmpty then lists := lists.push (← `([$cur,*]))
   match lists.toList with | [] => `([]) | l :: ls => ls.foldlM (init := l) fun acc x => `($acc ++ $x)
 
-partial def expandAwaitTag (pPath : String) (parentCtx? : Option (String × HtmlCtx)) (stx opener : Syntax) (attrStxs kids : Array Syntax) : MacroM Term := do
+partial def expandAwaitTag (pPath : String) (parentCtx? : Option (String × HtmlCtx)) (stx opener : Syntax) (attrStxs kids : Array Syntax) : MacroM Term := withRef stx do
   let valid := ["of", "as", "err", "loading", "failed", "idle"]
   let parseVar (attrNm : String) (v : Term) : MacroM Ident :=
     if v.raw.isIdent then pure ⟨v.raw⟩ else if let some s := v.raw.isStrLit? then pure (mkIdentFrom v (Name.mkSimple s))
@@ -249,7 +251,7 @@ partial def expandAwaitTag (pPath : String) (parentCtx? : Option (String × Html
         if isEl then `((fun (_ : String) => $f)) else pure f
   `($(mkIdent `Qed.Resource.awaitView) $ofT $readyT $(← attrs["loading"]?.getDM `(Qed.Html.text "Loading…")) $failT $(← attrs["idle"]?.getDM `(Qed.Html.empty)))
 
-partial def componentToTerm (pPath : String) (parentCtx? : Option (String × HtmlCtx)) (stx opener : Syntax) (tag : String) (attrStxs kids : Array Syntax) : MacroM Term := do
+partial def componentToTerm (pPath : String) (parentCtx? : Option (String × HtmlCtx)) (stx opener : Syntax) (tag : String) (attrStxs kids : Array Syntax) : MacroM Term := withRef stx do
   if tag == "Await" then return ← expandAwaitTag pPath parentCtx? stx opener attrStxs kids
   let compProps ← attrStxs.mapM fun a => do
     if a.getKind == ``attrSplice then
@@ -260,7 +262,7 @@ partial def componentToTerm (pPath : String) (parentCtx? : Option (String × Htm
   let kidsT ← if kids.isEmpty then `([]) else childrenToTerm "" none opener kids
   `(qedComp% $(Syntax.mkStrLit tag) $(Syntax.mkStrLit pPath) $(Syntax.mkNumLit (toString ((stx.getPos?.map (·.byteIdx)).getD 0))) [$[$compProps],*] $kidsT)
 
-partial def elementToTerm (pPath : String) (parentCtx? : Option (String × HtmlCtx)) (stx : Syntax) : MacroM Term := do
+partial def elementToTerm (pPath : String) (parentCtx? : Option (String × HtmlCtx)) (stx : Syntax) : MacroM Term := withRef stx do
   if stx.getKind == ``jsxFragment then childrenToTerm pPath parentCtx? (stx.getArg 1) (stx.getArg 2).getArgs
   else if stx.getKind == ``selfClosing || stx.getKind == ``withChildren then
     let hasKids := stx.getKind == ``withChildren; let tag := tokenVal (stx.getArg 1)

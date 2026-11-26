@@ -6,7 +6,7 @@ import Qed.Json
 open System (FilePath)
 open Qed.Server Qed.Server.Http
 
-namespace Tests.Native
+namespace QedTests.Native
 instance {ε α : Type} [BEq ε] [BEq α] : BEq (Except ε α) where beq | .ok a, .ok b => a == b | .error e, .error f => e == f | _, _ => false
 instance : BEq ByteArray where beq a b := a.data == b.data
 instance : Repr ByteArray where reprPrec b _ := s!"ByteArray({b.size} bytes)"
@@ -193,4 +193,4 @@ def runParallelAll (n : Nat) (f : IO Bool) : IO Bool := do
   let tasks ← (Array.range n).mapM fun _ => IO.asTask (prio := .dedicated) f
   tasks.allM fun t => return (← IO.wait t).toOption == some true
 
-end Tests.Native
+end QedTests.Native

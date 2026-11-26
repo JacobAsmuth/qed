@@ -13,27 +13,29 @@ private def mergeHeaders (defaults custom : List (String × String)) : List (Str
   let cl := sc.map (·.1.toLower)
   defaults.filter (fun (k, _) => !cl.contains k.toLower) ++ sc
 
-private def checkHttpOk (resp : OutboundResp) : Except ApiError OutboundResp :=
-  if 200 ≤ resp.status && resp.status < 300 then .ok resp
+private def checkHttpOk (okStatuses : List UInt32 := []) (resp : OutboundResp) : Except ApiError OutboundResp :=
+  let ok := if okStatuses.isEmpty then 200 ≤ resp.status && resp.status < 300 else okStatuses.contains resp.status
+  if ok then .ok resp
   else let msg := (String.fromUTF8? resp.body).getD "external HTTP error"
        .error { code := resp.status.toNat, message := if msg.isEmpty then s!"HTTP {resp.status}" else msg }
 
 @[specialize]
 def execExternalRaw {m : Type → Type} [Monad m] [MonadServer m] (serviceName baseOrigin method : String)
     (parts : List PathPart) (query : List (String × QueryVal)) (defaultHeaders customHeaders : List (String × String))
-    (body : ByteArray) (auth : AuthSpec) : m (Except ApiError OutboundResp) := do
+    (body : ByteArray) (auth : AuthSpec) (ssrfGuard : Bool := true) (okStatuses : List UInt32 := []) : m (Except ApiError OutboundResp) := do
   match buildExternalSuffix parts query with
   | .error e => return .error e
-  | .ok sfx => return (← MonadServer.httpCall { serviceName, baseOrigin, method, pathAndQuery := "/" ++ sfx, headers := mergeHeaders defaultHeaders customHeaders, body, auth, ssrfGuard := false }).bind checkHttpOk
+  | .ok sfx => return (← MonadServer.httpCall { serviceName, baseOrigin, method, pathAndQuery := "/" ++ sfx, headers := mergeHeaders defaultHeaders customHeaders, body, auth, ssrfGuard }).bind (checkHttpOk okStatuses)
 
 instance {σ : Type} (svc base method : String) (parts : List PathPart) (query : List (String × QueryVal))
-    (defHdrs custHdrs : List (String × String)) (body : ByteArray) (auth : AuthSpec) :
-    SafeIO (execExternalRaw (m := ThreadProg σ) svc base method parts query defHdrs custHdrs body auth) where
+    (defHdrs custHdrs : List (String × String)) (body : ByteArray) (auth : AuthSpec)
+    (ssrfGuard : Bool) (okStatuses : List UInt32) :
+    SafeIO (execExternalRaw (m := ThreadProg σ) svc base method parts query defHdrs custHdrs body auth ssrfGuard okStatuses) where
   noAtomic := by
     unfold execExternalRaw
     cases buildExternalSuffix parts query with
     | error e => exact .pure (Except.error e)
-    | ok sfx => exact .io (.httpCall _) _ fun res => .pure (res.bind checkHttpOk)
+    | ok sfx => exact .io (.httpCall _) _ fun res => .pure (res.bind (checkHttpOk okStatuses))
 
 @[specialize] def decodeRespBytes (res : Except ApiError OutboundResp) : Except ApiError Bytes := res.map (·.body)
 @[specialize] def decodeRespUnit (res : Except ApiError OutboundResp) : Except ApiError Unit := res.map fun _ => ()
@@ -42,7 +44,9 @@ instance {σ : Type} (svc base method : String) (parts : List PathPart) (query :
 @[specialize] def decodeRespProto {α : Type} [FromProto α] (res : Except ApiError OutboundResp) : Except ApiError α :=
   res.bind fun r => (Proto.decode (α := α) r.body).mapError fun e => ApiError.internal s!"external protobuf decode failed: {e}"
 @[specialize] def decodeRespJson {α : Type} [FromJson α] (res : Except ApiError OutboundResp) : Except ApiError α :=
-  (decodeRespString res).bind fun raw => ((Json.parse raw 128).bind (FromJson.fromJson (α := α))).mapError fun e => ApiError.internal s!"external JSON decode failed: {e}"
+  (decodeRespString res).bind fun raw =>
+    let payload := if raw.trimAscii.isEmpty then "{}" else raw
+    ((Json.parse payload 128).bind (FromJson.fromJson (α := α))).mapError fun e => ApiError.internal s!"external JSON decode failed: {e}"
 
 namespace Webhook
 
@@ -75,14 +79,17 @@ end Webhook
 
 /-! ## `external` Command Elaborator -/
 
-private inductive UrlSegSpec where | lit (s : String) | singleParam (name : String) | multiParam (name : String)
+private inductive UrlSegPiece where | lit (s : String) | param (name : String) deriving Inhabited
+private inductive UrlSegSpec where | lit (s : String) | singleParam (name : String) | multiParam (name : String) | compound (pieces : Array UrlSegPiece)
 private inductive QueryValSpec where | lit (s : String) | param (name : String)
 
+private inductive ExtParamKind where | plain | header (wireName : String) | query (wireName : String) deriving BEq
+
 private structure ParsedExtParam where
-  ref        : Lean.Syntax
-  headerKey? : Option String
-  ident      : Lean.Ident
-  ty         : Qed.Lang.LoweredQedType
+  ref   : Lean.Syntax
+  kind  : ExtParamKind
+  ident : Lean.Ident
+  ty    : Qed.Lang.LoweredQedType
 
 section ExternalElab
 open Lean Elab Command
@@ -95,22 +102,69 @@ private def parseUrlTemplate (ref : Syntax) (tmpl : String) : CommandElabM (Arra
   if qParts.length > 2 then throwErrorAt ref s!"external endpoint path `{tmpl}` has multiple `?` query delimiters"
   let mut segSpecs : Array UrlSegSpec := #[]; let mut querySpecs : Array (String × QueryValSpec) := #[]
   let phRef ← IO.mkRef (#[] : Array String)
-  let addPh (raw kindDesc : String) : CommandElabM (String × Bool) := do
-    let rest := String.ofList (raw.toList.drop 1); let isMulti := rest.endsWith "*"
-    let pname := if isMulti then String.ofList (rest.toList.take (rest.length - 1)) else rest
+  let registerPh (raw kindDesc : String) (allowWildcard : Bool) : CommandElabM (String × Bool) := do
+    let isMulti := raw.endsWith "*"
+    if isMulti && !allowWildcard then throwErrorAt ref s!"wildcard placeholder `*{raw}` is not allowed in {kindDesc} in `{tmpl}`"
+    let pname := if isMulti then String.ofList (raw.toList.take (raw.length - 1)) else raw
     if pname.isEmpty then throwErrorAt ref s!"empty {kindDesc} placeholder in `{tmpl}`"
-    if (← phRef.get).contains pname then throwErrorAt ref s!"duplicate placeholder `:{pname}` in `{tmpl}`"
+    if (← phRef.get).contains pname then throwErrorAt ref s!"duplicate placeholder `{pname}` in `{tmpl}`"
     phRef.modify (·.push pname); return (pname, isMulti)
+  let parseBraceSeg (seg : String) : CommandElabM UrlSegSpec := do
+    let mut pieces : Array UrlSegPiece := #[]
+    let mut curLit : Array Char := #[]
+    let mut curPh : Array Char := #[]
+    let mut inBrace := false
+    let mut wildName? : Option String := none
+    for c in seg.toList do
+      if inBrace then
+        if c == '{' then throwErrorAt ref s!"nested `\{` in URL path segment `{seg}` of `{tmpl}`"
+        else if c == '}' then
+          let raw := String.ofList curPh.toList
+          let (pn, isMulti) ← registerPh raw "`{...}`" true
+          if isMulti then wildName? := some pn
+          pieces := pieces.push (.param pn); curPh := #[]; inBrace := false
+        else curPh := curPh.push c
+      else
+        if c == '}' then throwErrorAt ref s!"unmatched `}` in URL path segment `{seg}` of `{tmpl}`"
+        else if c == '{' then
+          if !curLit.isEmpty then
+            let lit := String.ofList curLit.toList
+            unless lit.toList.all isSafeLitSegChar do throwErrorAt ref s!"invalid static URL path text `{lit}` in `{tmpl}`"
+            pieces := pieces.push (.lit lit); curLit := #[]
+          inBrace := true
+        else curLit := curLit.push c
+    if inBrace then throwErrorAt ref s!"unclosed `\{` in URL path segment `{seg}` of `{tmpl}`"
+    if !curLit.isEmpty then
+      let lit := String.ofList curLit.toList
+      unless lit.toList.all isSafeLitSegChar do throwErrorAt ref s!"invalid static URL path text `{lit}` in `{tmpl}`"
+      pieces := pieces.push (.lit lit)
+    if let some wn := wildName? then
+      if pieces.size != 1 then throwErrorAt ref s!"multi-segment wildcard `\{{wn}*}` must occupy an entire path segment in `{tmpl}`"
+      return .multiParam wn
+    if pieces.size == 1 then match pieces[0]! with
+      | .lit s =>
+          if s == "." || s == ".." then throwErrorAt ref s!"invalid static URL path segment `{seg}` in `{tmpl}`"
+          return .lit s
+      | .param pn => return .singleParam pn
+    else return .compound pieces
   for seg in ((qParts.headD "").splitOn "/").filter (· != "") do
-    if seg.startsWith ":" then let (pn, m) ← addPh seg "`:`"; segSpecs := segSpecs.push (if m then .multiParam pn else .singleParam pn)
+    if seg.contains '{' || seg.contains '}' then
+      segSpecs := segSpecs.push (← parseBraceSeg seg)
+    else if seg.startsWith ":" then
+      let (pn, m) ← registerPh (String.ofList (seg.toList.drop 1)) "`:`" true
+      segSpecs := segSpecs.push (if m then .multiParam pn else .singleParam pn)
     else
-      if seg == "." || seg == ".." || !seg.toList.all isSafeSegChar then throwErrorAt ref s!"invalid static URL path segment `{seg}` in `{tmpl}`"
+      if seg == "." || seg == ".." || !seg.toList.all isSafeLitSegChar then throwErrorAt ref s!"invalid static URL path segment `{seg}` in `{tmpl}`"
       segSpecs := segSpecs.push (.lit seg)
   for pair in ((qParts.getD 1 "").splitOn "&").filter (· != "") do
     match pair.splitOn "=" with
     | [k, v] =>
         if k.isEmpty then throwErrorAt ref s!"empty query parameter key in `{tmpl}`"
-        let qv ← if v.startsWith ":" then do pure (.param (← addPh v "query").1) else pure (.lit v)
+        let qv ←
+          if v.startsWith ":" then do pure (.param (← registerPh (String.ofList (v.toList.drop 1)) "query" false).1)
+          else if v.startsWith "{" && v.endsWith "}" && v.length >= 2 then do
+            pure (.param (← registerPh (String.ofList ((v.toList.drop 1).take (v.length - 2))) "query" false).1)
+          else pure (.lit v)
         querySpecs := querySpecs.push (k, qv)
     | [k] => querySpecs := querySpecs.push (k, .lit "")
     | _ => throwErrorAt ref s!"malformed query parameter `{pair}` in `{tmpl}`"
@@ -118,9 +172,10 @@ private def parseUrlTemplate (ref : Syntax) (tmpl : String) : CommandElabM (Arra
 
 @[noinline]
 private def parseExternalClauses (svcIdent : Ident) (svcName : Name) (clauses : Array Syntax) :
-    CommandElabM (String × AuthSpec × Array Syntax × Array Syntax) := do
+    CommandElabM (String × AuthSpec × Bool × Array Syntax × Array Syntax) := do
   let mut baseOrigin? : Option (Syntax × String) := none; let mut authSpec : AuthSpec := .none
-  let mut hasAuth := false; let mut epClauses : Array Syntax := #[]; let mut wsClauses : Array Syntax := #[]
+  let mut hasAuth := false; let mut ssrfGuard? : Option Bool := none
+  let mut epClauses : Array Syntax := #[]; let mut wsClauses : Array Syntax := #[]
   for c in clauses do
     let k := c.getKind
     if k == ``extBaseClause then
@@ -129,6 +184,11 @@ private def parseExternalClauses (svcIdent : Ident) (svcName : Name) (clauses : 
       let trimmed := if rawBase.endsWith "/" then String.ofList (rawBase.toList.take (rawBase.length - 1)) else rawBase
       unless isValidWsBaseOrigin trimmed do throwErrorAt c s!"invalid `base` URL `{rawBase}`: expected pinned `https://`, `http://`, `wss://`, or `ws://` origin without `?`, `#`, `@`, or `\\`"
       baseOrigin? := some (c, trimmed)
+    else if k == ``extSsrfGuardClause then
+      if ssrfGuard?.isSome then throwErrorAt c s!"duplicate `ssrf_guard` clause in `external {svcName}`"
+      let optVal := c.getArg 1
+      let enabled := if optVal.getNumArgs == 1 then (optVal.getArg 0).getId.eraseMacroScopes != `false else true
+      ssrfGuard? := some enabled
     else if k == ``extAuthBearer || k == ``extAuthHeader || k == ``extAuthGcp || k == ``extAuthGcpMeta then
       if hasAuth then throwErrorAt c s!"duplicate `auth` clause in `external {svcName}`"
       hasAuth := true
@@ -151,65 +211,95 @@ private def parseExternalClauses (svcIdent : Ident) (svcName : Name) (clauses : 
     else throwErrorAt c "unexpected clause in `external` block"
   let some (baseRef, baseOrigin) := baseOrigin? | throwErrorAt svcIdent s!"`external {svcName}` must declare `base \"https://...\"` or `base \"wss://...\"`"
   if epClauses.isEmpty && wsClauses.isEmpty then throwErrorAt svcIdent s!"`external {svcName}` must declare at least one HTTP endpoint or `ws` channel"
+  if ssrfGuard?.isSome && epClauses.isEmpty then throwErrorAt svcIdent s!"`ssrf_guard` in `external {svcName}` applies to server-side HTTP endpoints"
   if !epClauses.isEmpty && !isValidBaseOrigin baseOrigin then throwErrorAt baseRef s!"`external {svcName}` declares HTTP endpoints, so `base` must use `https://` or `http://` (got `{baseOrigin}`)"
   if !wsClauses.isEmpty && hasAuth then throwErrorAt svcIdent s!"`external {svcName}` declares client-usable `ws` channels and cannot attach server `auth` secrets; split server-authenticated HTTP endpoints into a separate `external` block"
-  return (baseOrigin, authSpec, epClauses, wsClauses)
+  return (baseOrigin, authSpec, ssrfGuard?.getD true, epClauses, wsClauses)
 
 private def lowerUrlParts (ref : Syntax) (segSpecs : Array UrlSegSpec) (querySpecs : Array (String × QueryValSpec)) (paramIdents : Array Ident) :
     CommandElabM (Array Term × Array Term) := do
-  let paramSeg (pn : String) : CommandElabM Term := do
+  let findParam (pn : String) : CommandElabM Ident := do
     let some pid := paramIdents.find? (·.getId.toString == pn) | throwErrorAt ref "internal missing URL param"
-    `(Qed.RouteParam.toSeg $pid)
+    return pid
+  let paramSeg (pn : String) : CommandElabM Term := do `(Qed.RouteParam.toSeg $(← findParam pn))
   let pathTerms ← segSpecs.mapM fun
     | .lit s => `(Qed.Server.PathPart.lit $(Syntax.mkStrLit s))
     | .singleParam pn => do `(Qed.Server.PathPart.seg $(← paramSeg pn))
     | .multiParam pn => do `(Qed.Server.PathPart.multiSeg $(← paramSeg pn))
+    | .compound pieces => do
+        let pTerms ← pieces.mapM fun
+          | .lit s => `(Qed.Server.SegPiece.lit $(Syntax.mkStrLit s))
+          | .param pn => do `(Qed.Server.SegPiece.param $(← paramSeg pn))
+        `(Qed.Server.PathPart.compound [$[$pTerms],*])
   let queryTerms ← querySpecs.mapM fun (qk, qv) => do
     match qv with
     | .lit s => `(($(Syntax.mkStrLit qk), Qed.Server.QueryVal.lit $(Syntax.mkStrLit s)))
-    | .param pn => do `(($(Syntax.mkStrLit qk), Qed.Server.QueryVal.param $(← paramSeg pn)))
+    | .param pn => do `(($(Syntax.mkStrLit qk), Qed.Server.ToQueryVal.toQueryVal $(← findParam pn)))
   return (pathTerms, queryTerms)
 
-private def parseTypedParams (ctxLabel : String) (rawParams : Array Syntax) (allowHeader := false) (paramKind := "parameter") : CommandElabM (Array ParsedExtParam) := do
+private def parseTypedParams (ctxLabel : String) (rawParams : Array Syntax) (allowExtKinds := false) (paramKind := "parameter") : CommandElabM (Array ParsedExtParam) := do
   let mut out : Array ParsedExtParam := #[]; let mut seen : Array String := #[]
   for rp in rawParams do
     let pk := rp.getKind
-    let (hk?, pid, tyNode) ←
-      if allowHeader && pk == ``extParamHeader then pure (some (⟨rp.getArg 2⟩ : TSyntax `str).getString, (⟨rp.getArg 4⟩ : Ident), rp.getArg 6)
-      else if !allowHeader || pk == ``extParamPlain then pure (none, (⟨rp.getArg 0⟩ : Ident), rp.getArg 2)
+    let (kind, pid, tyNode) ←
+      if allowExtKinds && pk == ``extParamHeader then pure (.header (⟨rp.getArg 2⟩ : TSyntax `str).getString, (⟨rp.getArg 4⟩ : Ident), rp.getArg 6)
+      else if allowExtKinds && pk == ``extParamQuery then
+        let pid : Ident := ⟨rp.getArg 2⟩
+        let wireName := if (rp.getArg 1).getNumArgs == 3 then (⟨(rp.getArg 1).getArg 1⟩ : TSyntax `str).getString else pid.getId.toString
+        if wireName.isEmpty then throwErrorAt rp s!"query parameter wire name cannot be empty in {ctxLabel}"
+        pure (.query wireName, pid, rp.getArg 4)
+      else if !allowExtKinds || pk == ``extParamPlain then pure (.plain, (⟨rp.getArg 0⟩ : Ident), rp.getArg 2)
       else throwErrorAt rp "invalid endpoint parameter"
     let pstr := pid.getId.toString
     if seen.contains pstr then throwErrorAt pid s!"duplicate {paramKind} `{pstr}` in {ctxLabel}"
     seen := seen.push pstr
-    out := out.push { ref := rp, headerKey? := hk?, ident := pid, ty := ← liftMacroM <| lowerSrvType tyNode false s!"{paramKind} `{pstr}`" }
+    out := out.push { ref := rp, kind, ident := pid, ty := ← liftMacroM <| lowerSrvType tyNode false s!"{paramKind} `{pstr}`" }
   return out
 
 private def classifyExtWsCodec (ty : Qed.Lang.LoweredQedType) : Qed.ExtWsCodec :=
   if ty.isProto then .proto else if ty.mods.isEmpty && (ty.baseName == `Bytes || ty.baseName == `ByteArray) then .bytes
   else if ty.mods.isEmpty && ty.baseName == `String then .text else .json
 
-private def isUnitExtType (ty : Qed.Lang.LoweredQedType) : Bool := !ty.isProto && ty.mods.isEmpty && ty.baseName == `Unit
+private def isUnitExtType (ty : Qed.Lang.LoweredQedType) : Bool := !ty.isProto && !ty.isForm && ty.mods.isEmpty && ty.baseName == `Unit
 
 @[noinline]
-private def elabExternalEndpoint (svcName : Name) (svcStrLit : StrLit) (baseId : Ident) (authTerm : Term) (methodNames : Array Name) (ep : Syntax) : CommandElabM Name := do
+private def elabExternalEndpoint (svcName : Name) (svcStrLit : StrLit) (baseId : Ident) (authTerm : Term) (ssrfGuard : Bool) (methodNames : Array Name) (ep : Syntax) : CommandElabM Name := do
   let httpVerbRaw := (ep.getArg 0).getId.toString.toUpper; let urlTmpl := (⟨ep.getArg 1⟩ : TSyntax `str).getString
   let fnIdent : Ident := ⟨ep.getArg 2⟩; let fnName := fnIdent.getId
   if methodNames.contains fnName then throwErrorAt fnIdent s!"duplicate endpoint `{fnName}` in `external {svcName}`"
   let parsedParams ← parseTypedParams s!"endpoint `{fnName}`" (ep.getArg 4).getSepArgs true
   let retTy ← liftMacroM <| lowerSrvType (ep.getArg 7) false "external endpoint return types (external calls are automatically fallible at `await`; write `-> T` instead of `-> T!`)"
+  if retTy.isForm then throwErrorAt (ep.getArg 7) "`Form(T)` is only supported for HTTP request body parameters, not response types"
+  let okStatusList ← if (ep.getArg 8).getNumArgs == 4 then
+      ((ep.getArg 8).getArg 2).getSepArgs.mapM fun nStx => do
+        let n := (⟨nStx⟩ : TSyntax `num).getNat
+        unless 100 ≤ n && n < 600 do throwErrorAt nStx s!"HTTP status code `{n}` in `ok [...]` must be between 100 and 599"
+        pure (n.toUInt32)
+    else pure #[]
   let (segSpecs, querySpecs, placeholders) ← parseUrlTemplate (ep.getArg 1) urlTmpl
   for ph in placeholders do
-    unless parsedParams.any fun p => p.headerKey?.isNone && p.ident.getId.toString == ph do
-      throwErrorAt (ep.getArg 1) s!"URL placeholder `:{ph}` has no matching parameter `{ph}` in `{fnName}`"
+    unless parsedParams.any fun p => p.kind == .plain && p.ident.getId.toString == ph do
+      throwErrorAt (ep.getArg 1) s!"URL placeholder `{ph}` has no matching plain parameter `{ph}` in `{fnName}`"
   let mut bodyParam? : Option ParsedExtParam := none
   for p in parsedParams do
-    if p.headerKey?.isNone && !placeholders.contains p.ident.getId.toString then
-      if httpVerbRaw == "GET" || httpVerbRaw == "DELETE" then throwErrorAt p.ref s!"parameter `{p.ident.getId}` on `{httpVerbRaw}` endpoint `{fnName}` is not referenced as `:{p.ident.getId}` in `{urlTmpl}`"
-      if let some prev := bodyParam? then throwErrorAt p.ref s!"endpoint `{fnName}` has multiple request body parameters (`{prev.ident.getId}` and `{p.ident.getId}`); bundle them into a `schema` type"
-      bodyParam? := some p
+    match p.kind with
+    | .header _ | .query _ =>
+        if p.ty.isForm then throwErrorAt p.ref "`Form(T)` is only supported for HTTP request body parameters"
+    | .plain =>
+        if !placeholders.contains p.ident.getId.toString then
+          if httpVerbRaw == "GET" || httpVerbRaw == "DELETE" then throwErrorAt p.ref s!"parameter `{p.ident.getId}` on `{httpVerbRaw}` endpoint `{fnName}` is not referenced as `:{p.ident.getId}` or `\{{p.ident.getId}}` in `{urlTmpl}` (or mark it `query`)"
+          if let some prev := bodyParam? then throwErrorAt p.ref s!"endpoint `{fnName}` has multiple request body parameters (`{prev.ident.getId}` and `{p.ident.getId}`); bundle them into a `schema` type"
+          bodyParam? := some p
+        else if p.ty.isForm then
+          throwErrorAt p.ref "`Form(T)` cannot be used as a URL path or query placeholder"
   let (pIdents, pTyTerms) := (parsedParams.map (·.ident), parsedParams.map (·.ty.term))
-  let (pathTerms, queryTerms) ← lowerUrlParts (ep.getArg 1) segSpecs querySpecs ((parsedParams.filter (·.headerKey?.isNone)).map (·.ident))
-  let customHdrTerms ← (parsedParams.filterMap fun p => p.headerKey?.map (·, p.ident)).mapM fun (hk, pid) => `(($(Syntax.mkStrLit hk), Qed.RouteParam.toSeg $pid))
+  let (pathTerms, tmplQueryTerms) ← lowerUrlParts (ep.getArg 1) segSpecs querySpecs ((parsedParams.filter (·.kind == .plain)).map (·.ident))
+  let paramQueryTerms ← (parsedParams.filterMap fun p => match p.kind with | .query qk => some (qk, p.ident) | _ => none).mapM fun (qk, pid) =>
+    `(($(Syntax.mkStrLit qk), Qed.Server.ToQueryVal.toQueryVal $pid))
+  let queryTerms := tmplQueryTerms ++ paramQueryTerms
+  let customHdrOptTerms ← (parsedParams.filterMap fun p => match p.kind with | .header hk => some (hk, p.ident) | _ => none).mapM fun (hk, pid) =>
+    `((Qed.Server.ToHeaderVal.toHeaderVal? $pid).map fun _hv => ($(Syntax.mkStrLit hk), _hv))
+  let customHdrsTerm ← if customHdrOptTerms.isEmpty then `(([] : List (String × String))) else `(List.filterMap id [$[$customHdrOptTerms],*])
   let retPayloadTerm := retTy.term
   let (acceptHdr, decodeCall) ← if isUnitExtType retTy then pure (none, ← `(Qed.Server.decodeRespUnit rawRes)) else match classifyExtWsCodec retTy with
     | .proto => pure (some ("Accept", "application/x-protobuf"), ← `(Qed.Server.decodeRespProto (α := $retPayloadTerm) rawRes))
@@ -218,16 +308,19 @@ private def elabExternalEndpoint (svcName : Name) (svcStrLit : StrLit) (baseId :
     | .json  => pure (some ("Accept", "application/json"), ← `(Qed.Server.decodeRespJson (α := $retPayloadTerm) rawRes))
   let (bodyTerm, ctHdr) ← match bodyParam? with
     | none => pure (← `(ByteArray.empty), (none : Option (String × String)))
-    | some bp => if isUnitExtType bp.ty then pure (← `(ByteArray.empty), none) else match classifyExtWsCodec bp.ty with
-        | .proto => pure (← `(Qed.Proto.encode $(bp.ident)), some ("Content-Type", "application/x-protobuf"))
-        | .bytes => pure (← `(($(bp.ident) : ByteArray)), some ("Content-Type", "application/octet-stream"))
-        | .text | .json => pure (← `((Qed.Json.render (Qed.toJson $(bp.ident))).toUTF8), some ("Content-Type", "application/json"))
+    | some bp =>
+        if bp.ty.isForm then pure (← `(Qed.Server.encodeFormBodyOf $(bp.ident)), some ("Content-Type", "application/x-www-form-urlencoded"))
+        else if isUnitExtType bp.ty then pure (← `(ByteArray.empty), none) else match classifyExtWsCodec bp.ty with
+          | .proto => pure (← `(Qed.Proto.encode $(bp.ident)), some ("Content-Type", "application/x-protobuf"))
+          | .bytes => pure (← `(($(bp.ident) : ByteArray)), some ("Content-Type", "application/octet-stream"))
+          | .text | .json => pure (← `((Qed.Json.render (Qed.toJson $(bp.ident))).toUTF8), some ("Content-Type", "application/json"))
   let defHdrTerms ← (#[ctHdr, acceptHdr].filterMap id).mapM fun (k, v) => `(($(Syntax.mkStrLit k), $(Syntax.mkStrLit v)))
+  let okTerms ← okStatusList.mapM fun code => `(($(quote code.toNat) : UInt32))
   let fullFnId := mkIdentFrom fnIdent (svcName ++ fnName)
   elabCommand (← `(command|
     @[specialize] def $fullFnId {m : Type → Type} [Monad m] [Qed.Server.MonadServer m] $[($pIdents:ident : $pTyTerms:term)]* :
         m (Except Qed.Server.ApiError $retPayloadTerm) := do
-      let rawRes ← Qed.Server.execExternalRaw $svcStrLit $baseId $(Syntax.mkStrLit httpVerbRaw) [$[$pathTerms],*] [$[$queryTerms],*] [$[$defHdrTerms],*] [$[$customHdrTerms],*] $bodyTerm $authTerm
+      let rawRes ← Qed.Server.execExternalRaw $svcStrLit $baseId $(Syntax.mkStrLit httpVerbRaw) [$[$pathTerms],*] [$[$queryTerms],*] [$[$defHdrTerms],*] $customHdrsTerm $bodyTerm $authTerm $(quote ssrfGuard) [$[$okTerms],*]
       return $decodeCall))
   let fullFnCall ← Qed.Lang.mkAppTerms (← `($fullFnId)) (pIdents.map (⟨·.raw⟩))
   elabCommand (← `(command|
@@ -251,6 +344,7 @@ private def elabExternalWsChannel (svcName fullSvcName : Name) (svcNameStr : Str
   let parsedParams ← parseTypedParams s!"`ws {chName}`" (wsStx.getArg 4).getSepArgs
   let (pIdents, pTyTerms) := (parsedParams.map (·.ident), parsedParams.map (·.ty.term)); let seenP := pIdents.map (·.getId.toString)
   let evTy ← liftMacroM <| lowerSrvType (wsStx.getArg 7) false s!"event type of `ws {chName}`"
+  if evTy.isForm then throwErrorAt (wsStx.getArg 7) "`Form(T)` is only supported for HTTP request body parameters"
   let evTyTerm := evTy.term; let evCodec := classifyExtWsCodec evTy; let isBinary := evCodec == .proto || evCodec == .bytes
   let (segSpecs, querySpecs, placeholders) ← parseUrlTemplate (wsStx.getArg 1) urlTmpl
   for ph in placeholders do unless seenP.contains ph do throwErrorAt (wsStx.getArg 1) s!"WebSocket URL placeholder `:{ph}` has no matching parameter `{ph}` in `{chName}`"
@@ -294,6 +388,7 @@ private def elabExternalWsChannel (svcName fullSvcName : Name) (svcNameStr : Str
   let mut sendCodec : Qed.ExtWsCodec := .json; let mut sendParamTypeConsts : Array Name := #[]
   let mut sendReqConst? : Option Name := none; let mut sendReqLabel := ""; let mut sendHelperConst : Name := .anonymous
   if let some sp := sendParams[0]? then
+    if sp.ty.isForm then throwErrorAt sp.ref "`Form(T)` is only supported for HTTP request body parameters"
     let (spId, spTyTerm) := (sp.ident, sp.ty.term); sendCodec := classifyExtWsCodec sp.ty
     sendParamTypeConsts ← elabParamTypeAbbrevs chIdent svcName fullSvcName chName "_SendParam_" #[spTyTerm]
     let (sr?, sl) ← elabExtReqPred chIdent svcName fullSvcName chName "_send_req" #[spId] #[spTyTerm] sendReqExprs
@@ -312,7 +407,7 @@ private def elabExternalWsChannel (svcName fullSvcName : Name) (svcNameStr : Str
 @[noinline, command_elab externalCmd]
 def elabExternalCmd : CommandElab := fun stx => do
   let svcIdent : Ident := ⟨stx.getArg 1⟩; let svcName := svcIdent.getId; let svcNameStr := svcName.toString
-  let (baseOrigin, authSpec, epClauses, wsClauses) ← parseExternalClauses svcIdent svcName (stx.getArg 3).getArgs
+  let (baseOrigin, authSpec, ssrfGuard, epClauses, wsClauses) ← parseExternalClauses svcIdent svcName (stx.getArg 3).getArgs
   let fullSvcName := (← getCurrNamespace) ++ svcName; let secretsList := authSpec.requiredSecrets.toArray
   let (baseId, secId, mrkId) := (mkIdentFrom svcIdent (svcName ++ `baseUrl), mkIdentFrom svcIdent (svcName ++ `secrets), mkIdentFrom svcIdent (svcName ++ `_qed_external_marker))
   let authTerm : Term ← match authSpec with
@@ -326,7 +421,7 @@ def elabExternalCmd : CommandElab := fun stx => do
     ← `(command| theorem $mrkId : True := True.intro)]
   for cmd in hdrCmds do elabCommand cmd
   let mut methodNames : Array Name := #[]
-  for ep in epClauses do methodNames := methodNames.push (← elabExternalEndpoint svcName (Syntax.mkStrLit svcNameStr) baseId authTerm methodNames ep)
+  for ep in epClauses do methodNames := methodNames.push (← elabExternalEndpoint svcName (Syntax.mkStrLit svcNameStr) baseId authTerm ssrfGuard methodNames ep)
   for ws in wsClauses do methodNames := methodNames.push (← elabExternalWsChannel svcName fullSvcName svcNameStr baseId methodNames ws)
   modifyEnv fun env => externalRegistry.addEntry env { serviceName := fullSvcName, baseOrigin, secrets := secretsList, methods := methodNames.map (fullSvcName ++ ·) }
 

@@ -205,8 +205,9 @@ private def mkHardenedCookie (name value : String) (maxAge : Nat) (devMode : Boo
 
 private def filterSessionClaims (claimNames : List String) (c : JwtClaims) : List (String × String) :=
   let addMissing (xs : List (String × String)) (k v : String) := if xs.any (·.1 == k) then xs else xs ++ [(k, v)]
-  let base := c.flatClaims.filter fun (k, _) => k == "email" || k == "email_verified" || k == "name" || claimNames.contains k
-  addMissing (c.email?.elim base (addMissing base "email")) "email_verified" (if c.emailVerified then "true" else "false")
+  let base := c.flatClaims.filter fun (k, _) => k == "email" || k == "name" || (k != "email_verified" && claimNames.contains k)
+  let withEmail := c.email?.elim base (addMissing base "email")
+  withEmail ++ [("email_verified", if c.emailVerified then "true" else "false")]
 
 /-! ### Built-In OIDC Auth Endpoints (`/_qed/auth/login`, `/callback`, `/logout`, `/me`, `/onetap`) -/
 

@@ -1,11 +1,11 @@
 import Qed
 import Qed.Server.Native
 import Cli.Common
-import Tests.Native.Harness
+import QedTests.Native.Harness
 open System (FilePath)
 open Qed Qed.Server
 
-namespace Tests.Native.VerificationAndJobs
+namespace QedTests.Native.VerificationAndJobs
 
 private def localDomHarnessJs : String := r#"
 import assert from 'node:assert/strict';
@@ -164,7 +164,7 @@ private def runLocalDomJsTest (c : TestChecker) : IO Unit := do
       IO.FS.writeFile (outDir / f) (← IO.FS.readFile (root / "runtime" / f))
     let entries := Qed.Cli.driverEntries.map (fun e => if e == "main:__main" then "JsGate.localBugsMain:__main" else e) ++
       #["JsGate.localBugsSsrPage1:ssr_page1", "JsGate.localBugsStatePage1:state_page1"]
-    let args := #["--rt", (root / "runtime" / "qed_rt.mjs").toString, (outDir / "app.mjs").toString, "Tests.JsGate", "--"] ++ entries
+    let args := #["--rt", (root / "runtime" / "qed_rt.mjs").toString, (outDir / "app.mjs").toString, "QedTests.JsGate", "--"] ++ entries
     let (jc, jo, je) ← runCmd qedjs args (cwd := some root) (env := #[("LEAN_PATH", some lp)])
     c.check "qedjs compiles LocalBugsApp fixture" (jc == 0) (jo ++ je)
     if jc != 0 then return
@@ -205,4 +205,4 @@ def run : IO Bool := do
   runLocalDomJsTest c
   c.finish
 
-end Tests.Native.VerificationAndJobs
+end QedTests.Native.VerificationAndJobs

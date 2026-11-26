@@ -91,6 +91,50 @@ def parseInt? (s : String) : Option Int :=
   | '-' :: cs => (parseNatAux 0 cs).map fun n => -(Int.ofNat n)
   | cs => (parseNatAux 0 cs).map Int.ofNat
 
+private theorem dropWhileWs_length_le : ∀ cs : List Char, (dropWhileWs cs).length ≤ cs.length
+  | [] => Nat.le_refl 0
+  | c :: cs => by
+      unfold dropWhileWs; split
+      · exact Nat.le_trans (dropWhileWs_length_le cs) (Nat.le_succ _)
+      · exact Nat.le_refl _
+
+theorem take_length_le (s : String) (n : Nat) : (take s n).length ≤ n := by
+  simp only [take, String.length_ofList, List.length_take]; exact Nat.min_le_left _ _
+
+theorem trimLeft_length_le (s : String) : (trimLeft s).length ≤ s.length := by
+  simpa only [trimLeft, String.length_ofList, String.length_toList] using dropWhileWs_length_le s.toList
+
+theorem trimRight_length_le (s : String) : (trimRight s).length ≤ s.length := by
+  have h := dropWhileWs_length_le s.toList.reverse
+  simpa only [trimRight, String.length_ofList, List.length_reverse, String.length_toList] using h
+
+theorem trim_length_le (s : String) : (trim s).length ≤ s.length := by
+  have h1 := dropWhileWs_length_le (dropWhileWs s.toList).reverse
+  have h2 := dropWhileWs_length_le s.toList
+  have : (dropWhileWs (dropWhileWs s.toList).reverse).reverse.length ≤ s.toList.length := by
+    rw [List.length_reverse]; exact Nat.le_trans h1 (by rw [List.length_reverse]; exact h2)
+  simpa only [trim, String.length_ofList, String.length_toList] using this
+
+theorem toLower_length (s : String) : (toLower s).length = s.length := by
+  simp only [toLower, String.length_ofList, List.length_map, String.length_toList]
+
+theorem toUpper_length (s : String) : (toUpper s).length = s.length := by
+  simp only [toUpper, String.length_ofList, List.length_map, String.length_toList]
+
+theorem truncate_length_le (s : String) (maxLen : Nat) (ellipsis : String := "...") :
+    (truncate s maxLen ellipsis).length ≤ maxLen := by
+  unfold truncate
+  split
+  · assumption
+  · split
+    · exact take_length_le s maxLen
+    · have h1 := take_length_le s (maxLen - ellipsis.length)
+      rw [String.length_append]; omega
+
+-- Prevent `Meta.whnf`/`isDefEq` from unfolding string helper internals during DB `where` / invariant proofs
+-- while keeping kernel `decide` and `#guard` working.
+attribute [irreducible] trimLeft trimRight trim toLower toUpper contains containsCI take drop truncate splitChar split replace
+
 end Str
 
 private def padZero (w : Nat) (s : String) : String :=
@@ -341,5 +385,14 @@ def formatRelative (nowSec thenSec : Nat) : String :=
     else formatDateUtc thenSec
 
 end Time
+
+class AbsDiff (α : Type) where
+  absDiff : α → α → Nat
+
+@[inline] def absDiff {α : Type} [AbsDiff α] (a b : α) : Nat := AbsDiff.absDiff a b
+@[inline] instance : AbsDiff Nat := ⟨fun a b => if a ≥ b then a - b else b - a⟩
+@[inline] instance : AbsDiff Int := ⟨fun a b => (a - b).natAbs⟩
+@[simp] theorem absDiff_nat (a b : Nat) : absDiff a b = if a ≥ b then a - b else b - a := rfl
+@[simp] theorem absDiff_int (a b : Int) : absDiff a b = (a - b).natAbs := rfl
 
 end Qed

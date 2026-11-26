@@ -1,5 +1,5 @@
 import Qed
-import Tests.ServerChecks
+import QedTests.ServerChecks
 
 namespace WebEssentialsFixture
 inductive TestRoute where | home | old | missing deriving Inhabited, DecidableEq

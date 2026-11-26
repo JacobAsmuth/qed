@@ -379,10 +379,16 @@ private def mkSchemaCoreCmds (sc : SchemaCtx) (draftId : Ident) : CommandElabM (
   let (parseId, canId, viewId) := (mkIdent (tId ++ `parse), mkIdent (tId ++ `canSubmit), mkIdent (tId ++ `formView))
   let (parseApp, canApp, viewApp) := (← sc.appTo ⟨parseId.raw⟩, ← sc.appTo ⟨canId.raw⟩, ← sc.appTo ⟨viewId.raw⟩)
   let rhs ← mkConjBody (← runCalls.mapM fun rc => `(($rc).isSome)) (ascribeProp := false)
-  let casesTac ← runCalls.foldrM
-    (init := ← `(tactic| simp only [Option.isSome_some, Option.isSome_none, Bool.false_eq_true, and_true, true_and, and_false, false_and, iff_self, bind, Option.bind, pure, Pure.pure]))
-    fun rc acc => `(tactic| cases $rc:term with
-      | none => simp only [Option.isSome_none, Bool.false_eq_true, false_and, and_false, iff_self, bind, Option.bind] | some _ => ($acc:tactic))
+  let canSubmitPf : Term ← do
+    let n := runCalls.size
+    let mut pf ← `(term| Qed.optionBind_pure_isSome_iff $(runCalls[n - 1]!) _)
+    for i in (Array.range (n - 1)).reverse do
+      pf ← `(term| Qed.optionBind_isSome_iff $(runCalls[i]!) _ (fun _ => $pf))
+    if n ≤ 2 then pure pf
+    else
+      let mut reassoc ← `(term| Iff.rfl)
+      for _ in [0 : n - 2] do reassoc ← `(term| and_assoc.symm.trans $reassoc)
+      `(term| Iff.trans $pf $reassoc)
   let rowGroups ← (pairs.zip runCalls).mapM fun ((f, inp), rc) =>
     `(term| Codec.formFieldRow ($inp).inForm ($inp).wrapLabel (d.$f:ident != "" && ($rc).isNone)
               $(Syntax.mkStrLit (toString f.getId)) $(Syntax.mkStrLit ("Please enter a valid " ++ toString f.getId))
@@ -396,7 +402,7 @@ private def mkSchemaCoreCmds (sc : SchemaCtx) (draftId : Ident) : CommandElabM (
           $[let $fs:ident ← $runCalls:term]*
           return { $[$fs:ident],* }),
     ← `(command| def $canId $[($cbns:ident : $cbts:term)]* (d : $draftId) : Bool := ($parseApp d).isSome),
-    ← `(command| theorem $(mkIdent (tId ++ `canSubmit_iff)) $[($cbns:ident : $cbts:term)]* (d : $draftId) : $canApp d = true ↔ $rhs := by unfold $canId $parseId; $casesTac),
+    ← `(command| theorem $(mkIdent (tId ++ `canSubmit_iff)) $[($cbns:ident : $cbts:term)]* (d : $draftId) : $canApp d = true ↔ $rhs := by unfold $canId $parseId; exact $canSubmitPf),
     ← `(command| def $viewId {msg : Type} $[($cbns:ident : $cbts:term)]* (d : $draftId) (onEdit : $draftId → msg) (submit : $tApp → msg) : Html msg := el "div" [cls "qed-form"] $viewBody),
     ← `(command| @[simp] theorem $(mkIdent (tId ++ `formView_validIn)) {msg : Type} $[($cbns:ident : $cbts:term)]* (inForm : Bool) (d : $draftId) (onEdit : $draftId → msg) (submit : $tApp → msg) :
           Html.validIn ⟨.normal, false, false, inForm⟩ ($viewApp d onEdit submit) = true := Codec.formDiv_validIn inForm _ $validBodyPf) ]
@@ -479,7 +485,10 @@ private def checkSchemaSatAndExamples (sc : SchemaCtx) (resolved : Array Resolve
     if let some synthTerms ← resolved.zipIdx.foldlM (init := some #[]) fun acc? (rf, i) => do
         let some arr := acc? | return none
         return (← synthesizeFieldWitness? pfTac rf whereRawExprs[i]!).map arr.push then
-      let fs := sc.fs; emitSatisfiableCmds sc sc.t (← `({ $[$fs:ident := $synthTerms:term],* }))
+      let fs := sc.fs
+      let witId := mkIdentFrom sc.t (sc.t.getId ++ `_witness)
+      elabCommand (← `(command| private def $witId : $(sc.t) := { $[$fs:ident := $synthTerms:term],* }))
+      emitSatisfiableCmds sc sc.t witId
 
 private def splitDataItems (kindLow : String) (t : Ident) (items : Array Syntax) :
     CommandElabM (Array Syntax × Array Syntax) := do
@@ -727,9 +736,10 @@ private def mkPayloadEnumProtoCmds (t : Ident) (variants : Array ParsedEnumVaria
     fromAlts := fromAlts.push (← `(Lean.Parser.Term.matchAltExpr| | $viLit => $armDo))
     if emitLawful then
       let (pIdents, pHaveTacs) ← mkProtoFieldRoundtripTacs allSpecs allReads tails none
+      let roundtripPf ← pIdents.foldrM (init := ← `(term| rfl)) fun hp acc => `(term| Qed.exceptBind_eq $hp $acc)
       tagPosCases := tagPosCases.push (← `(Lean.Parser.Tactic.inductionAlt| | $(mkIdent vName):ident $[$pIds:ident]* => exact $tagsPosPf))
       rtCases := rtCases.push (← `(Lean.Parser.Tactic.inductionAlt| | $(mkIdent vName):ident $[$pIds:ident]* =>
-        $[$pHaveTacs:tactic]*; unfold $fromId $toId; simp only [$[$pIdents:term],*, bind, Except.bind, pure, Except.pure]))
+        $[$pHaveTacs:tactic]*; unfold $fromId $toId; exact $roundtripPf))
   fromAlts := fromAlts.push (← `(Lean.Parser.Term.matchAltExpr| | n => Except.error ($(Syntax.mkStrLit s!"protobuf: invalid {tId} tag ") ++ toString n)))
   let mut cmds : Array (TSyntax `command) := #[
     ← `(command| def $toId : $t → List (Nat × Qed.Proto.WireVal) $[$toAlts:matchAlt]*),

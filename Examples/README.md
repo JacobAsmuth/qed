@@ -46,4 +46,4 @@ Run all proof checks and the 6 native test suites from the repo root:
 
 ## Compiler Gates & Benchmarks
 
-Compiler and runtime test modules live in [../Tests/](../Tests/), covering `SyntaxChecks`, `ServerChecks`, `DbChecks`, `CssChecks`, `JsGate`, `SpeculativeChecks`, and the native `Tests/Runner.lean` test runner. Pipeline benchmarks live in [../Bench/](../Bench/) via `lake exe bench`.
+Compiler and runtime test modules live in [../QedTests/](../QedTests/), covering `SyntaxChecks`, `ServerChecks`, `DbChecks`, `CssChecks`, `JsGate`, `SpeculativeChecks`, and the native `QedTests/Runner.lean` test runner. Pipeline benchmarks live in [../Bench/](../Bench/) via `lake exe bench`.

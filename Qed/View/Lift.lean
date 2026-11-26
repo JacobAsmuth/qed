@@ -120,7 +120,7 @@ private def liftAttrList (m : Ident) (fields : Array Ident) (lst : Syntax) : Mac
   return some (← `([$lifted,*]))
 
 mutual
-  partial def viewLift (m : Ident) (fields : Array Ident) (stx : Syntax) : MacroM Syntax := do
+  partial def viewLift (m : Ident) (fields : Array Ident) (stx : Syntax) : MacroM Syntax := withRef stx do
     let liftIf (c t e : Term) (h? : Option Ident) : MacroM Syntax := do
       let t' : Term := ⟨← viewLift m fields t⟩; let e' : Term := ⟨← viewLift m fields e⟩
       let mkIte (a b : Term) := match h? with | some h => `(if $h:ident : $c then $a else $b) | none => `(if $c then $a else $b)

@@ -247,6 +247,15 @@ ffi_export! {
         write_hex(raw, hex);
         qed_lean_io_mk_ok(mk_str(std::str::from_utf8_unchecked(hex)))
     };
+    qed_server_random_bytes(num_bytes: u32) => {
+        let n = (num_bytes as usize).min(65536);
+        if n == 0 { return qed_lean_io_mk_ok(mk_ba(&[])); }
+        let (mut sr, mut hr) = ([0u8; 64], Vec::new());
+        let raw: &mut [u8] = if n <= 64 { &mut sr[..n] } else { hr.resize(n, 0); &mut hr };
+        if SystemRandom::new().fill(raw).is_err() { return qed_lean_io_mk_err(c"CSPRNG failure".as_ptr()); }
+        qed_lean_io_mk_ok(mk_ba(raw))
+    };
+    qed_server_const_eq(a_obj: *mut LeanObj, b_obj: *mut LeanObj) => mk_io_bool(ct_eq(ba_slice(a_obj), ba_slice(b_obj)));
     qed_server_hmac_sha256(key_obj: *mut LeanObj, msg_obj: *mut LeanObj) =>
         qed_lean_io_mk_ok(mk_ba(with_hmac_key(ba_slice(key_obj), |k| hmac::sign(k, ba_slice(msg_obj))).as_ref()));
     qed_server_hmac_sha256_verify(key_obj: *mut LeanObj, msg_obj: *mut LeanObj, sig_obj: *mut LeanObj) =>
@@ -355,5 +364,14 @@ mod tests {
         }
         assert!(aead_aes256_gcm_seal(b"", aad, b"x").is_err());
         assert!(aead_aes256_gcm_open(key, aad, &[0u8; 27]).is_err());
+    }
+
+    #[test]
+    fn ct_eq_checks_all_bytes_and_lengths() {
+        assert!(ct_eq(b"", b""));
+        assert!(ct_eq(b"hello-world", b"hello-world"));
+        assert!(!ct_eq(b"hello-world", b"hello-worlD"));
+        assert!(!ct_eq(b"hello", b"hello!"));
+        assert!(!ct_eq(b"a", b""));
     }
 }

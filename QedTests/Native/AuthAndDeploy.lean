@@ -4,12 +4,12 @@ import Qed.Cloud.Executor
 import Qed.Deploy
 import Cli.DevAuth
 import Cli.Scaffold
-import Tests.Native.Harness
-import Tests.AuthChecks
-import Tests.ServerChecks
-open Qed.Auth Qed.Auth.Oidc Qed.Server Tests.Native
+import QedTests.Native.Harness
+import QedTests.AuthChecks
+import QedTests.ServerChecks
+open Qed.Auth Qed.Auth.Oidc Qed.Server QedTests.Native
 
-namespace Tests.Native.AuthAndDeploy
+namespace QedTests.Native.AuthAndDeploy
 
 private def stripHostPrefix (url : String) : String :=
   match url.splitOn "://" with
@@ -48,8 +48,8 @@ private def testCryptoAndJwtCore (c : TestChecker) : IO Unit := do
   c.checkEq "RequestCtx.isAuthenticated accepts verified userId" ({ userId := some "usr_alice" } : Qed.Server.RequestCtx).isAuthenticated true
 
 private def testOidcFlowAndDeployManifest (c : TestChecker) : IO Unit :=
-  withDevApp c "Tests.AuthChecks" fun outDir => do
-    c.check "buildDevApp Tests.AuthChecks succeeded" true
+  withDevApp c "QedTests.AuthChecks" fun outDir => do
+    c.check "buildDevApp QedTests.AuthChecks succeeded" true
     let manifestPath := outDir ++ "/qed_deploy.json"; let existsM ← (System.FilePath.mk manifestPath).pathExists
     c.check "qed_deploy.json emitted on build" existsM
     if existsM then
@@ -62,7 +62,7 @@ private def testOidcFlowAndDeployManifest (c : TestChecker) : IO Unit :=
             ("databases contains AuthNotesDb", "databases", (·.any (·.pathStr? "name" == some "AuthNotesDb"))),
             ("secrets contains AUTH_NOTES_DB_URL", "secrets", (·.any (·.str? == some "AUTH_NOTES_DB_URL")))] do
           c.checkJsonArr s!"manifest {lbl}" j p pred
-    checkLeakGate c "Tests.AuthChecks" #["AuthChecks.CloudAuth.config", "AuthChecks.CloudAuth.secrets"]
+    checkLeakGate c "QedTests.AuthChecks" #["AuthChecks.CloudAuth.config", "AuthChecks.CloudAuth.secrets"]
     let devAuthPort ← Prim.freePort
     withNativeBin c "qed dev-auth started cleanly" (← qedBinPath) #["dev-auth", toString devAuthPort] devAuthPort #[] fun _ => do
       c.checkHttp "dev-auth discovery" (← httpReq devAuthPort "GET" "/.well-known/openid-configuration") (contains := ["ES256", "S256"])
@@ -222,10 +222,10 @@ private def testRoadmapRuntimeFeatures (c : TestChecker) : IO Unit := do
     c.check "[stage-sdk] uses inputBinFile for libqed_server" (staged.contains "inputBinFile (pkg.staticLibDir / nameToStaticLib \"qed_server\")")
     c.check "[stage-sdk] preserves QedServer roots" (staged.contains "lean_lib QedServer" && staged.contains "`Qed.Cloud.Executor")
   -- 5. `qedjs --verify-env` verifies `Qed.Str`, `Qed.Time`, session propagation, query controls, nested mutation, or-patterns, JSX `let`
-  let (code, _, err) ← runCmd (← qedjsBinPath) #["--verify-env", "Tests.SyntaxChecks"]
-  c.check "[js-verify-env] Tests.SyntaxChecks (Qed.Str + Qed.Time + Track 2/5) passes qedjs --verify-env" (code == 0) err
+  let (code, _, err) ← runCmd (← qedjsBinPath) #["--verify-env", "QedTests.SyntaxChecks"]
+  c.check "[js-verify-env] QedTests.SyntaxChecks (Qed.Str + Qed.Time + Track 2/5) passes qedjs --verify-env" (code == 0) err
 
 def run : IO Bool := do
   let c ← mkChecker "auth-and-deploy"; testCryptoAndJwtCore c; testOidcFlowAndDeployManifest c; testRoadmapRuntimeFeatures c; c.finish
 
-end Tests.Native.AuthAndDeploy
+end QedTests.Native.AuthAndDeploy

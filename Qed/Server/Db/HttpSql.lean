@@ -49,6 +49,6 @@ def decodeD1Response (raw : String) (expectedCols : List String) : Except String
   return { rows := ← decodeJsonRows first "results" rowDec "D1 results is not an array", affected := (first.get? "meta" |>.bind (·.natAt? "changes")).getD 0 }
 
 def queryExpectedCols : SqlQuery → List String
-  | .select _ cols _ _ _ _ | .insert _ _ cols | .upsert _ _ _ _ _ cols | .update _ _ _ cols | .delete _ _ cols => cols.map (·.raw)
-  | .joinSelect _ _ lc rc _ _ _ _ _ _ _ => lc.map (·.raw) ++ rc.map (·.raw) | .count _ _ | .aggregate _ _ _ _ => []
+  | .select _ cols _ _ _ _ | .insert _ _ cols | .insertOrIgnore _ _ _ cols | .upsert _ _ _ _ _ cols | .update _ _ _ cols | .delete _ _ cols => cols.map (·.raw)
+  | .joinSelect _ _ lc rc _ _ _ _ _ _ _ => lc.map (·.raw) ++ rc.map (·.raw) | .selectAll _ _ _ _ _ | .count _ _ | .aggregate _ _ _ _ => []
 end Qed.Server.Db.HttpSql

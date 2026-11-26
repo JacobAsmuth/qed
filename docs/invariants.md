@@ -78,7 +78,7 @@ syntax—Qed automatically projects the next model out of `(model, cmd)`.
 When a client `component` invokes a `server` `def` via `await` or `query`, Qed connects server contracts and component invariants in both directions:
 
 - **Client `invariant` -> Server `requires`:** Component `invariant`s, literals, `if`/`if let` branches, and `Field`/`Ensured` values are automatically available as hypotheses to discharge every server parameter `requires` clause at compile time.
-- **Server `ensures` -> Client `invariant`:** Server `ensures` postconditions are encoded via zero-trust `Ensured α p`, where `FromProto` re-verifies `p` on untrusted bytes, and unpacked into continuation hypotheses across `let x = await Server.fn(...) catch: ...` and `Cached.all` invariants on reactive `query` fields. See [`Examples/CloudBooks.lean`](../Examples/CloudBooks.lean) and [`Tests/ServerChecks.lean`](../Tests/ServerChecks.lean).
+- **Server `ensures` -> Client `invariant`:** Server `ensures` postconditions are encoded via zero-trust `Ensured α p`, where `FromProto` re-verifies `p` on untrusted bytes, and unpacked into continuation hypotheses across `let x = await Server.fn(...) catch: ...` and `Cached.all` invariants on reactive `query` fields. See [`Examples/CloudBooks.lean`](../Examples/CloudBooks.lean) and [`QedTests/ServerChecks.lean`](../QedTests/ServerChecks.lean).
 
 **Custom proofs with `using [lemma]` or `:= by`.** When a property depends on a custom recursive domain function or an unverified helper that automation cannot guess, pass a lemma with `using [myLemma]` or attach a Lean tactic proof with `:= by`. Inside a `component`, `init` is discharged automatically and `update` is in scope, so the proof handles preservation starting with `intro m msg h`:
 
@@ -240,5 +240,5 @@ Skip invariants when the guarantee already lives somewhere better:
   effect-safety invariant on a streaming SSE action.
 - [`Examples/CloudBooks.lean`](../Examples/CloudBooks.lean) — server state, monotonicity, and auth
   invariants paired with RPC `requires`/`ensures` contracts and client `orderedMatchesSlot`.
-- [`Tests/DbChecks.lean`](../Tests/DbChecks.lean) — database `policy`, column `where`, `immutable`,
+- [`QedTests/DbChecks.lean`](../QedTests/DbChecks.lean): database `policy`, column `where`, `immutable`,
   `old(...)`, and `transition` invariants paired with client RPC `requires`/`ensures`.

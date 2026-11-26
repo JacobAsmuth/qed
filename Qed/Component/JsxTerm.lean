@@ -117,6 +117,7 @@ private def elabStatefulCompTag (stx : Syntax) (expectedType? : Option Expr) (in
     if let some res ← elabSchemaFormTag stx expectedType? tag pPath cName propNodes hasKids then return res
     throwErrorAt stx s!"unknown schema form `<{tag}>`; check that `schema {String.ofList (tag.toList.take (tag.length - 5))}:` is defined and imported"
   if info?.isNone then
+    if ← isFailedComponent cName then return ← elabTerm (← `(Qed.Html.empty)) expectedType?
     let env ← getEnv
     unless env.contains (baseName ++ `_qed_mount) || env.contains (baseName ++ `_qed_renderTag) do
       throwErrorAt stx s!"unknown component `<{tag}>`; check the spelling or import the module defining `component {tag}:`{if !tag.contains '.' then s!" (HTML elements must be lowercase, e.g. `<{tag.toLower}>`)" else ""}"

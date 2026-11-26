@@ -549,12 +549,12 @@ private def proveStepSingleGoal (g0 : MVarId) (allStepCtx : Simp.Context) : Tact
             return (← closeLeafGoal g true) ++ (← stepTargetLoop fuel rest)
   stepTargetLoop 256 [g2]
 
-private def runProveStepOnGoals (gs : List MVarId) (userNames : Array Name) (fnStr lbl : String) : TacticM Unit := do
+private def runProveStepOnGoals (gs : List MVarId) (userNames : Array Name) (fnStr lbl : String) (throwOnRem : Bool := true) : TacticM Unit := do
   let allStepCtx ← mkDynamicSimpCtx userNames (some ("stepFixed", unwrapOkSimpNames ++ stepCombSimpNames ++ stepLetEqSimpNames ++ ensPostSimpNames ++ valUnwrapSimpNames ++ liftOptSimpNames))
   let mut rem : List MVarId := []
   for g in gs do rem := rem ++ (← proveStepSingleGoal g allStepCtx)
   setGoals rem
-  unless rem.isEmpty do
+  if throwOnRem && !rem.isEmpty then
     let (hdr, hint) : MessageData × String :=
       if lbl.startsWith "ensures:" then let p := (lbl.drop 8).toString.trimAscii.toString; (m!"Server postcondition `ensures {p}` failed in `{fnStr}`:", s!"Ensure every successful return path establishes `{p}`.")
       else if lbl.startsWith "init:" then let i := (lbl.drop 5).toString.trimAscii.toString; (m!"Server invariant `{i}` failed on initial state:", s!"Update the initial `state` values so they satisfy `{i}`.")
@@ -565,6 +565,8 @@ private def runProveStepOnGoals (gs : List MVarId) (userNames : Array Name) (fnS
 elab_rules : tactic
   | `(tactic| qedSrvProveStep [$[$unfoldIds:ident],*] $fnLabel:str $invLabel:str) => do
       runProveStepOnGoals (← getGoals) (← unfoldIds.mapM resolveGlobalConstNoOverload) fnLabel.getString invLabel.getString
+  | `(tactic| qedSrvPrepStep [$[$unfoldIds:ident],*]) => do
+      runProveStepOnGoals (← getGoals) (← unfoldIds.mapM resolveGlobalConstNoOverload) "" "" (throwOnRem := false)
 
 /-! ## Unified AST-Directed Async Prover Directly over `ProgSpec` -/
 
@@ -643,7 +645,7 @@ private def initAsyncSimpAndNorm (g : MVarId) (unfoldConsts : Array Name) :
     (normAsyncContGoal · dCtx sCtx)]
   return (dCtx, sCtx, gInit?)
 
-private def elabAsyncProve (isPreserves : Bool) (handlerId : Ident) (invUnfoldIds : Array Ident) (fnLabel invLabel : String) : TacticM Unit := do
+private def elabAsyncProve (isPreserves : Bool) (handlerId : Ident) (invUnfoldIds : Array Ident) (fnLabel invLabel : String) (throwOnRem : Bool := true) : TacticM Unit := do
   let g0 ← getMainGoal
   let g1 ← if isPreserves then
       let some g' ← tryCloseConstMutInv g0 | replaceMainGoal []; return
@@ -652,7 +654,7 @@ private def elabAsyncProve (isPreserves : Bool) (handlerId : Ident) (invUnfoldId
   let handlerConst ← resolveGlobalConstNoOverload handlerId; let userNames ← invUnfoldIds.mapM resolveGlobalConstNoOverload
   let (helperConsts, invConsts) := userNames.partition fun n => n.getString!.startsWith "_fn_"
   let (dCtx, sCtx, some gInit) ← initAsyncSimpAndNorm g1 (#[handlerConst] ++ helperConsts) | replaceMainGoal []; return
-  runProveStepOnGoals (← stepAsyncLoop isPreserves dCtx sCtx gInit) invConsts fnLabel invLabel
+  runProveStepOnGoals (← stepAsyncLoop isPreserves dCtx sCtx gInit) invConsts fnLabel invLabel throwOnRem
 
 private def stepSafeIOLoop (dCtx sCtx : Simp.Context) (gInit : MVarId) : TacticM (List MVarId) :=
   let norm1 (g' : MVarId) : TacticM (List MVarId) := return (← normAsyncContGoal g' dCtx sCtx).toList
@@ -689,6 +691,7 @@ private def elabSafeIOProve (fnId : Ident) : TacticM Unit := do
 elab_rules : tactic
   | `(tactic| qedSrvProveAsync $handlerId:ident [$[$invUnfoldIds:ident],*] $fnLabel:str $invLabel:str) => elabAsyncProve true handlerId invUnfoldIds fnLabel.getString invLabel.getString
   | `(tactic| qedSrvProveAsyncEnsures $handlerId:ident [$[$invUnfoldIds:ident],*] $fnLabel:str $invLabel:str) => elabAsyncProve false handlerId invUnfoldIds fnLabel.getString invLabel.getString
+  | `(tactic| qedSrvPrepAsyncEnsures $handlerId:ident [$[$invUnfoldIds:ident],*]) => elabAsyncProve false handlerId invUnfoldIds "" "" (throwOnRem := false)
   | `(tactic| qedSrvProveSafeIO $fnId:ident) => elabSafeIOProve fnId
 
 /-! ## Client RPC Precondition Prover (`qedProveRpcReq`) -/

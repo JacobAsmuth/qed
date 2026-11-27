@@ -243,11 +243,8 @@ def recordUsedRpc (accum : IO.Ref RewriteAccum) (srv m : String) : IO Unit :=
 
 def lowerLetStmt (st : Syntax) (lowerVal : Syntax → CommandElabM Term) (cont : Term) : CommandElabM Term := do
   let rhsT ← lowerVal (st.getArg 4)
-  if (st.getArg 1).isIdent then
-    let lId : Ident := ⟨st.getArg 1⟩
-    match ← lowerOptType (st.getArg 2) with
-    | some lTy => `(let $lId:ident : $lTy := $rhsT; $cont) | none => `(let $lId:ident := $rhsT; $cont)
-  else `(let _ := $rhsT; $cont)
+  let ty? ← lowerOptType (st.getArg 2)
+  mkLetBindTerm (st.getArg 1) ty? rhsT cont
 
 syntax (name := qedCompSetAtStx) "qedCompSetAt(" ident ", " term ", " term ")" : term
 
@@ -821,7 +818,7 @@ def lowerMutStmt? (spec : ComponentSpec) (s : Syntax) (strict : Bool) : CommandE
       let leafValT ← if strict && op == "=" && isPlaceholder rhsRaw then `(v) else desugarAssignPath fname path op (← lowerCompExpr .val rhsRaw)
       let fullValT ← if path.isEmpty then pure leafValT else buildRecordUpdateFrom ⟨(mkIdent fname).raw⟩ path (fun _ => pure leafValT)
       return mkBind fname fullValT
-    else if let (true, some (ref, fname, path)) := (lhs.getKind == ``qedIndex && op == "=", parseCompLVal? (lhs.getArg 0)) then
+    else if let (true, some (ref, fname, path)) := (lhs.getKind == ``qedIndex && (lhs.getArg 4).getNumArgs == 0 && op == "=", parseCompLVal? (lhs.getArg 0)) then
       let fname ← checkField ref fname; let idxT ← lowerCompExpr .val (lhs.getArg 2); let rhsT ← lowerCompExpr .val rhsRaw
       if path.isEmpty then return mkBind fname (← `(qedCompSetAt($(mkIdent fname), $idxT, $rhsT)))
       let upd ← buildRecordUpdateFrom ⟨(mkIdent fname).raw⟩ path fun curArr => do

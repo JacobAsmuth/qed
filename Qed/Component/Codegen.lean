@@ -39,7 +39,8 @@ private partial def anonymizePat (stx : Syntax) : Syntax :=
         Syntax.node stx.getHeadInfo ``qedPatWild #[Syntax.atom stx.getHeadInfo "_"]
       else stx
   else if k == ``qedPatDot && (stx.getArg 2).getNumArgs == 3 then mapInner 2
-  else if k == ``qedPatParen then setStxArg stx 1 (mapSep (stx.getArg 1))
+  else if k == ``qedPatParen || k == ``qedPatList then setStxArg stx 1 (mapSep (stx.getArg 1))
+  else if k == ``qedPatCons then setStxArg (setStxArg stx 0 (anonymizePat (stx.getArg 0))) 2 (anonymizePat (stx.getArg 2))
   else stx
 
 @[noinline]

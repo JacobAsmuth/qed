@@ -198,7 +198,7 @@ class DefaultCodec (α : Type) where codec : Codec α
 
 section SchemaParsers
 open Lean Parser
-private abbrev pType : Parser := categoryParser `qedType 0
+private abbrev pType : Parser := withPosition (categoryParser `qedType 0)
 private abbrev pExpr : Parser := categoryParser `qedExpr 0
 def schemaCtxParamP     : Parser := node `Qed.schemaCtxParam (ident >> ":" >> pType)
 def schemaFieldJsonOnly : Parser := node `Qed.schemaFieldJsonOnly (atomic (identEq `jsonOnly >> checkNoWsBefore "" >> "(") >> pType >> ")")
@@ -434,7 +434,7 @@ private def tryCheckPropWithTactic (goalTerm : Term) (tacStx : TSyntax `tactic) 
 private def mkSchemaRefinementTacs : CommandElabM (TSyntax `tactic × TSyntax `tactic) := do
   let simpTac ← `(tactic| simp only [Qed.Codec.valid, Qed.Codec.refine, Qed.Codec.jsonOnly, Qed.Codec.text, Qed.Codec.textarea,
       Qed.Codec.nat, Qed.Codec.int, Qed.Codec.checkbox, Qed.Codec.date, Qed.Codec.select, Qed.Codec.radios, Qed.Codec.json, Qed.Lang.QedVal.val_id])
-  let pfTac ← `(tactic| ((try $simpTac:tactic) <;> first | rfl | decide | decide +kernel | omega | trivial | (simp_all; try rfl; try decide; try decide +kernel; try omega)))
+  let pfTac ← `(tactic| ((try $simpTac:tactic) <;> first | qedCloseGround | rfl | decide | omega | trivial | (simp_all; try qedCloseGround; try rfl; try decide; try omega)))
   return (simpTac, pfTac)
 
 private def synthesizeFieldWitness? (pfTac : TSyntax `tactic) (rf : ResolvedField) (rawWheres : Array Syntax) : CommandElabM (Option Term) := do
@@ -515,7 +515,7 @@ private def elabSchemaRejectsClause (sc : SchemaCtx) (simpTac : TSyntax `tactic)
     throwErrorAt rejStx s!"{sc.kindName} `{tId}` `rejects {rejId}` requires at least one `where` or `invariant` constraint"
   let validConj ← Qed.mkConjBody checks (ascribeProp := false)
   let negGoal ← `(¬ ($validConj))
-  let negTac ← `(tactic| ((try $simpTac:tactic) <;> first | decide | decide +kernel | omega | (intro _h; simp_all; try omega; try decide; try decide +kernel)))
+  let negTac ← `(tactic| ((try $simpTac:tactic) <;> first | qedCloseGround | decide | omega | (intro _h; simp_all; try omega; try qedCloseGround; try decide)))
   if cbns.isEmpty then
     unless ← tryCheckPropWithTactic negGoal negTac do
       throwErrorAt rejStx m!"{sc.kindName} `{tId}` `rejects {rejId}` failed: the provided values unexpectedly satisfy all `where` and `invariant` constraints.\n\nHint: Strengthen the `where`/`invariant` rules or fix the negative test case `{rejId}`."
@@ -994,7 +994,7 @@ section MappingParsers
 open Lean Parser Qed.Lang
 
 declare_syntax_cat mapClause
-private abbrev mpType : Parser := categoryParser `qedType 0
+private abbrev mpType : Parser := withPosition (categoryParser `qedType 0)
 private abbrev mpExpr : Parser := categoryParser `qedExpr 0
 
 def mapUsingListP : Parser := node `Qed.mapUsingList (atomic (symbol "using") >> "[" >> sepBy1 termParser "," >> "]")
@@ -1143,12 +1143,10 @@ private partial def lowerMapStmts (isDecode : Bool) (locals : Array String) (stm
     if k == ``qedStmtLet then
       let bStx := st.getArg 1; let tyOpt := st.getArg 2; let rhsStx := st.getArg 4
       let (rhsT, hs) ← lowerMapExprWithHoists isDecode locals .val rhsStx
-      let bid : Ident := if bStx.isIdent then ⟨bStx⟩ else mkIdent `_
-      let nextLocals := if bStx.isIdent then locals.push bid.getId.eraseMacroScopes.toString else locals
+      let nextLocals := locals ++ (collectLetBinderIds bStx).map (·.toString)
       let rest ← lowerMapStmts isDecode nextLocals stmts (idx + 1)
-      let bound ← if tyOpt.getNumArgs == 2 then
-          let tyT ← liftMacroM (return (← lowerQedType (tyOpt.getArg 1) false).1); `(let $bid:ident : $tyT := $rhsT; $rest)
-        else `(let $bid:ident := $rhsT; $rest)
+      let ty? ← if tyOpt.getNumArgs == 2 then some <$> liftMacroM (return (← lowerQedType (tyOpt.getArg 1) false).1) else pure none
+      let bound ← mkLetBindTerm bStx ty? rhsT rest
       liftM <| wrapMapHoists hs bound
     else if k == ``qedStmtReturn then
       let opt := st.getArg 1

@@ -1238,4 +1238,180 @@ fn badRangeFour() -> Nat:
     s += i
   return s
 
+/-! ## Ground Kernel `example`, Cons Patterns, Tuple `let`, Multiline Signatures & Type Inference -/
+
+fn parseBigJsonAndEncode(raw: String) -> Except String String:
+  example largeJsonGround:
+    parseBigJsonAndEncode("{\"service\":\"qed-cloud-api\",\"region\":\"us-east1\",\"replicas\":3,\"env\":\"production\",\"tags\":[\"verified\",\"kernel\",\"kernel-checked\",\"fast-decide\"],\"description\":\"ground example over 150 characters touching Json.parse, String.toUTF8, and Base64\"}") == .ok("cWVkLWNsb3VkLWFwaQ==")
+  match Qed.Json.parse(raw):
+    case .error(e): return .error(e)
+    case .ok(j):
+      let name = j.strAtD("service", "")
+      return .ok(Qed.Base64.encode(name.toUTF8))
+
+fn multilineAndErgo(
+  xs: List Nat,
+  pair: (Nat, String),
+  arr: String[]
+) -> Except String Json:
+  example ergoPureWorks:
+    multilineAndErgo([10, 20], (3, "ok"), ["first"]) == .ok(Json.object([("sum", Qed.toJson(33)), ("first", .str("first")), ("items", Json.array([.str("ok")]))]))
+  let (n, label) = pair
+  let mut items : List Json = []
+  items = List.cons(.str(label), items)
+  let mut total = n
+  match xs:
+    case []: total += 0
+    case a :: b :: _: total += a + b
+    case a :: _: total += a
+  let first = arr[0]? ?? "none"
+  return .ok(Json.object([("sum", Qed.toJson(total)), ("first", .str(first)), ("items", Json.array(items.toArray))]))
+
+component ErgoComp:
+  state items : List Nat = [1, 2, 3]
+  state out   : Nat = 0
+
+  action step(p: (Nat, Nat)):
+    let (a, b) = p
+    match items:
+      case []: out = a + b
+      case h :: rest:
+        items = rest
+        out = h + a + b
+
+  view:
+    <div>
+      {match items: case []: <span>"empty"</span> case h :: _: <span>{h}</span>}
+    </div>
+
+/-! ## Relational `ensures` (`all`, self-calls, one-armed `if`/`if let`, O(k + S) string injectivity) -/
+
+fn isValidGcpSecretId(s: String) -> Bool:
+  return s.length > 0 and s.length <= 255 and s.all(c => ('a' <= c and c <= 'z') or ('A' <= c and c <= 'Z') or ('0' <= c and c <= '9') or c == '-' or c == '_')
+
+fn mkGcpSecretId?(tenantId: Nat, appId: Nat, env: String, name: String) -> String?:
+  ensures if let some(id) = result: isValidGcpSecretId(id)
+  ensures all t2: Nat, a2: Nat, e2: String, n2: String:
+    if result.isSome and result == mkGcpSecretId?(t2, a2, e2, n2):
+      tenantId == t2 and appId == a2 and env == e2 and name == n2
+  if env not in ["dev", "staging", "prod"]:
+    return none
+  if name.length == 0 or name.length > 64:
+    return none
+  if not name.all(c => ('a' <= c and c <= 'z') or ('0' <= c and c <= '9') or c == '_'):
+    return none
+  if toString(tenantId).length > 20 or toString(appId).length > 20:
+    return none
+  return some(f"qed-t{tenantId}-a{appId}-{env}-{name}")
+
+fn mkBucketKey?(tenantId: Nat, env: String, name: String) -> String?:
+  ensures all t2, e2, n2:
+    result.isSome and result == mkBucketKey?(t2, e2, n2) ->
+      tenantId == t2 and env == e2 and name == n2
+  if env.length == 0 or not env.all(c => ('a' <= c and c <= 'z') or ('0' <= c and c <= '9')):
+    return none
+  if name.length == 0:
+    return none
+  return some(f"bkt/{tenantId}/{env}/{name}")
+
+fn mkIntKey?(x: Int, y: Int, tag: String) -> String?:
+  ensures all x2, y2, t2:
+    if result.isSome and result == mkIntKey?(x2, y2, t2):
+      x == x2 and y == y2 and tag == t2
+  if tag.length == 0 or tag.contains('/'):
+    return none
+  return some(f"k/{x}/{y}/{tag}")
+
+fn isCleanSlug(s: String) -> Bool:
+  return s.length > 0 and s.all(c => ('a' <= c and c <= 'z') or ('0' <= c and c <= '9'))
+
+fn mkHelperKey?(org: String, repo: String) -> String?:
+  ensures all o2, r2:
+    if result.isSome and result == mkHelperKey?(o2, r2):
+      org == o2 and repo == r2
+  if not isCleanSlug(org) or not isCleanSlug(repo):
+    return none
+  return some(f"gh:{org}/{repo}")
+
+fn clamp0_100(x: Int) -> Int:
+  ensures all x2: Int: x <= x2 -> result <= clamp0_100(x2)
+  if x < 0:
+    return 0
+  if x > 100:
+    return 100
+  return x
+
+fn normalizePort(p: Nat) -> Nat:
+  ensures normalizePort(result) == result
+  if p == 0:
+    return 80
+  if p > 65535:
+    return 65535
+  return p
+
+fn mkScopedKey(isAdmin: Bool, tenantId: Nat) -> String:
+  ensures all b2: Bool, t2: Nat: result == mkScopedKey(b2, t2) -> isAdmin == b2 and tenantId == t2
+  if isAdmin:
+    return f"adm-{tenantId}"
+  return f"usr-{tenantId}"
+
+fn mkDeepKey10?(a: Nat, b: Nat, c: Nat, g: Nat, d: String, e: String, f: String) -> String?:
+  ensures all a2, b2, c2, g2, d2, e2, f2:
+    if result.isSome and result == mkDeepKey10?(a2, b2, c2, g2, d2, e2, f2):
+      a == a2 and b == b2 and c == c2 and g == g2 and d == d2 and e == e2 and f == f2
+  if a == 0:
+    return none
+  if b == 0:
+    return none
+  if c == 0:
+    return none
+  if g == 0:
+    return none
+  if a > 1000000:
+    return none
+  if b > 1000000:
+    return none
+  if d not in ["us", "eu", "ap"]:
+    return none
+  if e.length == 0 or not e.all(ch => ('a' <= ch and ch <= 'z') or ('0' <= ch and ch <= '9')):
+    return none
+  if f.length == 0 or f.length > 64:
+    return none
+  if toString(c).length > 10 or toString(g).length > 10:
+    return none
+  return some(f"pfx-{a}-{b}-{c}-{g}-{d}-{e}-{f}")
+
+example := @mkGcpSecretId?_ensures_1
+example := @mkGcpSecretId?_ensures_2
+example := @mkBucketKey?_ensures
+example := @mkIntKey?_ensures
+example := @mkHelperKey?_ensures
+example := @clamp0_100_ensures
+example := @normalizePort_ensures
+example := @mkScopedKey_ensures
+example := @mkDeepKey10?_ensures
+
+expect_err "`ensures` contract failed for `mkBadSecretId?`:\n  • action `right` must satisfy:  env = e2\n  • action `right` must satisfy:  name = n2" in
+fn mkBadSecretId?(tenantId: Nat, env: String, name: String) -> String?:
+  ensures all t2: Nat, e2: String, n2: String:
+    if result.isSome and result == mkBadSecretId?(t2, e2, n2):
+      tenantId == t2 and env == e2 and name == n2
+  if env not in ["dev", "dev-eu", "prod"]:
+    return none
+  if name.length == 0:
+    return none
+  return some(f"qed-t{tenantId}-{env}-{name}")
+
+expect_err "`ensures` contract failed for `mkBadConcat`:\n  • action `left` must satisfy:  a = a2\n  • action `right` must satisfy:  b = b2" in
+fn mkBadConcat(a: Nat, b: Nat) -> String:
+  ensures all a2: Nat, b2: Nat: result == mkBadConcat(a2, b2) -> a == a2 and b == b2
+  return f"k-{a}{b}"
+
+expect_err "`ensures` contract failed for `mkBadValidity?`" in
+fn mkBadValidity?(tenantId: Nat, name: String) -> String?:
+  ensures if let some(id) = result: isValidGcpSecretId(id)
+  if name.length == 0:
+    return none
+  return some(f"k-{tenantId}-{name}")
+
 end SyntaxChecks

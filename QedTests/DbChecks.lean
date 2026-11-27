@@ -830,22 +830,19 @@ database BadDbPolDeny:
       user = "alice"
       row = d1
 
-/-! ## Transactional, System-Scoped, and Conditional-Where DB Upgrades -/
+/-! ## Transactional and Conditional-Where DB Upgrades -/
 
-database SysTxDb:
-  sqlite ".qed/sys_tx_checks.db"
+database TxLeaseDb:
+  sqlite ".qed/tx_lease_checks.db"
   table leases:
     id      : String primary_key where 1 <= id.length <= 32
     ownerId : String immutable   where 1 <= ownerId.length <= 32
     status  : String             where status in ["open", "claimed", "done"]
     retries : Nat                where retries <= 10
-    policy read, write requires ctx.isSystem or some(row.ownerId) == ctx.userId
+    policy read, write requires some(row.ownerId) == ctx.userId
     invariant leaseFlow: transition row.status: "open" -> "claimed" -> "done"
     invariant retriesMono: row.retries >= old(row.retries)
     example openLease: id = "l1", ownerId = "alice", status = "open", retries = 0
-    policy_allows read sysCanReadAny:
-      system = true
-      row = openLease
     policy_allows read ownerCanRead:
       user = "alice"
       row = openLease
@@ -855,36 +852,35 @@ database SysTxDb:
     policy_denies write anonCannotWrite:
       row = openLease
 
-server stateless SysTxSrv:
-  use db : SysTxDb
+example : strHasAll TxLeaseDb.rlsDdl [
+  "ENABLE ROW LEVEL SECURITY",
+  "current_setting('qed.user_id', true)"] = true := by decide +kernel
 
-  fn claimInsideTx(tx: db.Tx, leaseId: String, uid: String) -> SysTxDb.leases?!:
+server stateless TxLeaseSrv:
+  use db : TxLeaseDb
+
+  fn claimInsideTx(tx: db.Tx, leaseId: String, uid: String) -> TxLeaseDb.leases?!:
     requires some(uid) == ctx.userId
     return await tx.leases.updateOne(
       where = r => r.id == leaseId and r.ownerId == uid and r.status == "open" and r.retries < 10,
       set = r => { status = "claimed", retries = r.retries + 1 })?
 
-  rpc claimMyLease(leaseId: String) -> SysTxDb.leases?!:
+  rpc claimMyLease(leaseId: String) -> TxLeaseDb.leases?!:
     requires auth
     db.transaction as tx:
       return await claimInsideTx(tx, leaseId, uid)?
 
-  system fn claimAnyOpen(leaseId: String) -> SysTxDb.leases?!:
-    db.transaction as tx:
-      return await tx.leases.updateOne(
-        where = r => r.id == leaseId and r.status == "open" and r.retries < 10,
-        set = r => { status = "claimed", retries = r.retries + 1 })?
-
-  system fn bulkClaimOpen(onlyId: String?) -> SysTxDb.leases[]!:
+  rpc bulkClaimMyOpen(onlyId: String?) -> TxLeaseDb.leases[]!:
+    requires auth
     return await db.leases.update(
       where = r =>
         if let some(lid) = onlyId:
-          r.id == lid and r.status == "open" and r.retries < 10
+          r.id == lid and r.ownerId == uid and r.status == "open" and r.retries < 10
         else:
-          r.status == "open" and r.retries < 10,
+          r.ownerId == uid and r.status == "open" and r.retries < 10,
       set = r => { status = "claimed", retries = r.retries + 1 })?
 
-  read_only rpc listMyLeases(onlyOpen: Bool, filterId: String?) -> SysTxDb.leases[]!:
+  read_only rpc listMyLeases(onlyOpen: Bool, filterId: String?) -> TxLeaseDb.leases[]!:
     requires auth
     return await db.leases.select(
       where = r =>
@@ -893,13 +889,15 @@ server stateless SysTxSrv:
         else:
           r.ownerId == uid)?
 
-  read_only system fn countAllLeases(onlyOpen: Bool) -> Nat!:
+  read_only fn countMyLeases(onlyOpen: Bool) -> Nat!:
+    requires auth
     return await db.leases.count(
-      where = r => (r.status == "open" if onlyOpen else true))?
+      where = r => r.ownerId == uid and (r.status == "open" if onlyOpen else true))?
 
-  example systemCanCount:
-    with db db.leases = [{ id = "l1", ownerId = "alice", status = "open", retries = 0 }, { id = "l2", ownerId = "bob", status = "done", retries = 1 }]
-    call countAllLeases(true)
+  example ownerCanCount:
+    with user "alice"
+    with db db.leases = [{ id = "l1", ownerId = "alice", status = "open", retries = 0 }, { id = "l2", ownerId = "alice", status = "done", retries = 1 }, { id = "l3", ownerId = "bob", status = "open", retries = 0 }]
+    call countMyLeases(true)
     expect ok(1)
 
   example ownerConditionalSelect:
@@ -908,28 +906,28 @@ server stateless SysTxSrv:
     call listMyLeases(true, none)
     expect ok([{ id = "l1", ownerId = "alice", status = "open", retries = 0 }])
 
-expect_err "Database `policy_allows read badSysAllow`" in
-database BadSysPolAllow:
-  sqlite ".qed/bad_sys_pallow.db"
+expect_err "Database `policy_allows read badOwnerAllow`" in
+database BadOwnerPolAllow:
+  sqlite ".qed/bad_owner_pallow.db"
   table leases:
     id      : String primary_key where 1 <= id.length <= 32
     ownerId : String             where 1 <= ownerId.length <= 32
-    policy read requires ctx.isSystem or some(ownerId) == ctx.userId
+    policy read requires some(ownerId) == ctx.userId
     example l1: id = "l1", ownerId = "alice"
-    policy_allows read badSysAllow:
+    policy_allows read badOwnerAllow:
       user = "bob"
       row = l1
 
-expect_err "Database read policy `SysTxDb.leases.read` failed in `sneakyReadAll → SysTxDb.leases.select`" in
-server stateless BadNonSysRead:
-  use db : SysTxDb
-  rpc sneakyReadAll() -> SysTxDb.leases[]!:
+expect_err "Database read policy `TxLeaseDb.leases.read` failed in `sneakyReadAll → TxLeaseDb.leases.select`" in
+server stateless BadNonOwnerRead:
+  use db : TxLeaseDb
+  rpc sneakyReadAll() -> TxLeaseDb.leases[]!:
     return await db.leases.select()?
 
-expect_err "Database read policy `SysTxDb.leases.read` failed in `leakySelect → SysTxDb.leases.select`" in
+expect_err "Database read policy `TxLeaseDb.leases.read` failed in `leakySelect → TxLeaseDb.leases.select`" in
 server stateless BadCondWhereRls:
-  use db : SysTxDb
-  read_only rpc leakySelect(onlyOpen: Bool) -> SysTxDb.leases[]!:
+  use db : TxLeaseDb
+  read_only rpc leakySelect(onlyOpen: Bool) -> TxLeaseDb.leases[]!:
     requires auth
     return await db.leases.select(
       where = r =>
@@ -938,20 +936,55 @@ server stateless BadCondWhereRls:
         else:
           r.status == "done")?
 
-expect_err "Database update policy `SysTxDb.leases.update` failed in `badTxUpdate → SysTxDb.leases.updateOne`" in
+expect_err "Database update policy `TxLeaseDb.leases.update` failed in `badTxUpdate → TxLeaseDb.leases.updateOne`" in
 service BadTxPolicyHelper:
-  use db : SysTxDb
-  fn badTxUpdate(tx: db.Tx, leaseId: String) -> SysTxDb.leases?!:
+  use db : TxLeaseDb
+  fn badTxUpdate(tx: db.Tx, leaseId: String) -> TxLeaseDb.leases?!:
     return await tx.leases.updateOne(
       where = r => r.id == leaseId and r.status == "open" and r.retries < 10,
       set = r => { status = "claimed" })?
 
-expect_err "Database transition/monotonicity invariant `SysTxDb.leases.TransInv` failed in `invalidReopen → SysTxDb.leases.updateOne`" in
+expect_err "Database transition/monotonicity invariant `TxLeaseDb.leases.TransInv` failed in `invalidReopen → TxLeaseDb.leases.updateOne`" in
 service BadTxTransInv:
-  use db : SysTxDb
-  system fn invalidReopen(leaseId: String) -> SysTxDb.leases?!:
+  use db : TxLeaseDb
+  fn invalidReopen(leaseId: String) -> TxLeaseDb.leases?!:
+    requires auth
     return await db.leases.updateOne(
-      where = r => r.id == leaseId and r.status == "done",
+      where = r => r.id == leaseId and r.ownerId == uid and r.status == "done",
       set = r => { status = "open" })?
+
+/-! ## `Str.truncate` / `Str.*` Length Bounds in `RowInv` & `FromSql Int` Kernel Reduction -/
+
+/-- Documented database testing automatic `Str.truncate`/`take`/`trim`/`toLower` bounds in `RowInv`. -/
+database StrBoundDb:
+  sqlite ".qed/str_bound_checks.db"
+  table slots:
+    id      : String primary_key where 1 <= id.length <= 64
+    ownerId : String immutable   where 1 <= ownerId.length <= 64
+    label   : String             where 1 <= label.length <= 64
+    tag     : String             where tag.length <= 16
+    code    : String             where code.length <= 32
+    policy read, write requires some(ownerId) == ctx.userId
+
+service StrBoundSvc:
+  use db : StrBoundDb
+
+  fn allocSlot(rawId: String, rawLabel: String, rawTag: String, rawCode: String) -> StrBoundDb.slots!:
+    requires auth, 1 <= uid.length <= 64, 1 <= rawId.length, 1 <= rawLabel.length, rawCode.length <= 32
+    let safeId = Qed.Str.truncate(rawId, 64)
+    let safeLabel = Qed.Str.truncate(rawLabel, 64)
+    let safeTag = Qed.Str.take(rawTag, 16)
+    let safeCode = Qed.Str.toLower(Qed.Str.trim(rawCode))
+    return await db.slots.insert(id = safeId, ownerId = uid, label = safeLabel, tag = safeTag, code = safeCode)?
+
+  fn relabelSlot(slotId: String, rawLabel: String, rawTag: String) -> StrBoundDb.slots?!:
+    requires auth, 1 <= rawLabel.length
+    return await db.slots.updateOne(
+      where = r => r.id == slotId and r.ownerId == uid,
+      set = { label = Qed.Str.truncate(rawLabel, 64), tag = Qed.Str.take(rawTag, 16) })?
+
+example : (
+  (match Qed.Server.Db.FromSql.fromSql (α := Int) (.text "-42") with | .ok n => n == -42 | _ => false) &&
+  (match Qed.Server.Db.FromSql.fromSql (α := Int) (.text "not_int") with | .error _ => true | _ => false)) = true := by decide +kernel
 
 end DbChecks

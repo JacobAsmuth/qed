@@ -26,7 +26,7 @@ instance : FromSql String := ⟨fun
 instance : ToSql Int := ⟨.int⟩
 instance : FromSql Int := ⟨fun
   | .int i => .ok i | .bool b => .ok (if b then 1 else 0)
-  | .text s => (s.toInt?).elim (.error s!"invalid INT: {s}") .ok | v => fromSqlErr "INT" v⟩
+  | .text s => (Qed.Str.parseInt? s).elim (.error s!"invalid INT: {s}") .ok | v => fromSqlErr "INT" v⟩
 instance : ToSql Nat := ⟨fun n => .int (Int.ofNat n)⟩
 instance : FromSql Nat := ⟨fun v => do
   let i ← FromSql.fromSql (α := Int) v
@@ -149,22 +149,7 @@ def SqlExpr.eraseVals : SqlExpr → SqlExpr
 abbrev SqlExpr.sameShape (e₁ e₂ : SqlExpr) : Prop := e₁.eraseVals = e₂.eraseVals
 def placeholder (d : SqlDialect) (idx : Nat) : String := d.pick "$" "?" ++ toString idx
 
-theorem nat_toString_digits (n : Nat) : ∀ c ∈ (toString n).toList, '0' ≤ c ∧ c ≤ '9' := by
-  have hdig : ∀ k : Fin 10, '0' ≤ Nat.digitChar k.val ∧ Nat.digitChar k.val ≤ '9' := by decide
-  have hmem : ∀ m (b : Nat) (acc : List Char), (∀ y ∈ acc, '0' ≤ y ∧ y ≤ '9') →
-      ∀ y ∈ Nat.toDigitsCore 10 m b acc, '0' ≤ y ∧ y ≤ '9' := by
-    intro m; induction m with
-    | zero => exact fun _ _ hacc => hacc
-    | succ m ih =>
-        intro b acc hacc y hy; unfold Nat.toDigitsCore at hy; dsimp only at hy
-        have hd := hdig ⟨b % 10, Nat.mod_lt b (by decide)⟩
-        split at hy
-        · exact (List.mem_cons.1 hy).elim (· ▸ hd) (hacc y)
-        · exact ih (b / 10) _ (fun z hz => (List.mem_cons.1 hz).elim (· ▸ hd) (hacc z)) y hy
-  intro c hc
-  have hrepr : (toString n).toList = Nat.toDigits 10 n := by
-    change (Nat.repr n).toList = Nat.toDigits 10 n; unfold Nat.repr; exact String.toList_ofList
-  rw [hrepr] at hc; exact hmem (n + 1) n [] (fun _ h => nomatch h) c hc
+abbrev nat_toString_digits := Qed.Str.nat_toString_digits
 
 private theorem nat_toString_no_semicolon (n : Nat) : NoSemi (toString n) :=
   fun c hc heq => absurd (heq ▸ nat_toString_digits n c hc) (by decide)

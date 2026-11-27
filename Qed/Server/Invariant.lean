@@ -22,7 +22,7 @@ open Lean Meta Elab Term Tactic Qed.Verify.Core
 private def strLenSP : Array Name := #[``qedReduceStrLen]
 private def valUnwrapSimpNames : Array Name := #[``Qed.Server.srvGetAt_eq, ``Qed.Server.SrvIdx.toNat_nat, ``Qed.Server.SrvIdx.toNat_fin] ++ valUnwrapBaseNames
 private def liftOptSimpNames : Array Name := #[``Qed.Server.SrvLiftOpt.liftOpt_opt, ``Qed.Server.SrvLiftOpt.liftOpt_val]
-private def arrayCoreSimpNames : Array Name := #[``Array.size_set, ``Array.size_push, ``Array.getElem_set_self] ++ dictSimpNames
+private def arrayCoreSimpNames : Array Name := #[``Array.size_set, ``Array.size_push, ``Array.getElem_set_self, ``Qed.Lang.QedSeqLit.ofList_array, ``Qed.Lang.QedSeqLit.ofList_list] ++ dictSimpNames
 private def unwrapOkSimpNames : Array Name := #[``Qed.Server.srvUnwrap_srvFailure_ok_iff, ``Qed.Server.srvUnwrap_str_ok_iff, ``Qed.Server.srvUnwrap_opt_ok_iff]
 private def diteFalseSimpNames : Array Name := #[``Qed.Server.srvDiteFalse_eq_true, ``Qed.Server.srvDiteFalse_eq_false]
 private def arrayAndBoolSimpNames : Array Name := #[``id_eq, ``ne_eq, ``Array.size_modify] ++ diteFalseSimpNames ++ valUnwrapSimpNames ++ arrayCoreSimpNames ++ boolSimpNames
@@ -660,7 +660,7 @@ private def stepAsyncLoop (isPreserves : Bool) (dCtx sCtx : Simp.Context) (gInit
 private def initAsyncSimpAndNorm (g : MVarId) (unfoldConsts : Array Name) :
     TacticM (Simp.Context × Simp.Context × Option MVarId) := do
   let (dCtx, _) ← mkCachedSimpCtx "asyncDsimp" #[``Qed.Server.srvSeqM, ``Qed.Server.dbRunTx, ``Qed.Server.SrvUnwrap.unwrap, ``Qed.Server.SrvErr.ofApi, ``Qed.Server.SrvUnwrapOpt.unwrapOpt] { zetaDelta := false } #[] true
-  let (sCtx, _) ← mkCachedSimpCtx "asyncNorm" (stepCombSimpNames ++ stepLetEqSimpNames ++ ensPostSimpNames ++ #[``Qed.Server.threadProg_pure_bind, ``Qed.Server.threadProg_pure_bind', ``Qed.Server.threadProg_bind_assoc])
+  let (sCtx, _) ← mkCachedSimpCtx "asyncNorm" (stepCombSimpNames ++ stepLetEqSimpNames ++ ensPostSimpNames ++ #[``Qed.Server.threadProg_pure_bind, ``Qed.Server.threadProg_pure_bind', ``Qed.Server.threadProg_bind_pure_left, ``Qed.Server.threadProg_bind_pure_left', ``Qed.Server.threadProg_bind_assoc, ``Qed.Server.threadProg_bind_assoc_inner, ``Qed.Server.threadProg_bind_assoc'])
   let gInit? ← runGoalPipe (← g.intros).2 [
     fun g => do tryGoalOptM g (simpGoalOnly · (← mkDynamicSimpCtx unfoldConsts (some ("asyncInit", #[``Qed.Server.srvFinishM, ``Qed.Server.srvSeqM, ``Qed.Server.dbRunTx])))),
     (normAsyncContGoal · dCtx sCtx)]

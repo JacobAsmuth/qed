@@ -14,7 +14,7 @@ open Lean Parser
 def routeEnumAltP : Parser := node `Qed.routeEnumAlt (ident >> optional ("=" >> strLit))
 @[command_parser] def routeEnumCmd : Parser := leading_parser withPosition
   ("route_enum " >> ident >> ":" >> checkColGt "expected indented `route_enum` variants" >> many1Indent routeEnumAltP)
-def routeParamP : Parser := node `Qed.routeParam (ident >> optional (":" >> categoryParser `qedType 0))
+def routeParamP : Parser := node `Qed.routeParam (ident >> optional (":" >> withPosition (categoryParser `qedType 0)))
 def routeAltP : Parser := node `Qed.routeAlt (withPosition
   (optional (symbol "*") >> ident >> optional (checkLineEq >> "(" >> sepBy1 routeParamP "," >> ")") >> optional ("=" >> strLit)))
 @[command_parser] def routerCmd : Parser := leading_parser withPosition

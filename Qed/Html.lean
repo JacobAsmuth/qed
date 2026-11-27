@@ -919,6 +919,204 @@ theorem parseInt?_repr (i : Int) : parseInt? (Int.repr i) = some i := by
             rw [← h, h1]; rfl
           exact h2
 
+theorem nat_toString_digits (n : Nat) : ∀ c ∈ (toString n).toList, '0' ≤ c ∧ c ≤ '9' := by
+  have hmem : ∀ m (b : Nat) (acc : List Char), (∀ y ∈ acc, '0' ≤ y ∧ y ≤ '9') →
+      ∀ y ∈ Nat.toDigitsCore 10 m b acc, '0' ≤ y ∧ y ≤ '9' := by
+    intro m; induction m with
+    | zero => exact fun _ _ hacc => hacc
+    | succ m ih =>
+        intro b acc hacc y hy; unfold Nat.toDigitsCore at hy; dsimp only at hy
+        have hd := (digitChar_ok ⟨b % 10, Nat.mod_lt b (by decide)⟩).1
+        split at hy
+        · exact (List.mem_cons.1 hy).elim (· ▸ hd) (hacc y)
+        · exact ih (b / 10) _ (fun z hz => (List.mem_cons.1 hz).elim (· ▸ hd) (hacc z)) y hy
+  intro c hc
+  have hrepr : (toString n).toList = Nat.toDigits 10 n := by
+    change (Nat.repr n).toList = Nat.toDigits 10 n; unfold Nat.repr; exact String.toList_ofList
+  rw [hrepr] at hc; exact hmem (n + 1) n [] (fun _ h => nomatch h) c hc
+
+theorem nat_toString_not_mem {d : Char} (hd : d < '0' ∨ '9' < d) (n : Nat) : d ∉ (toString n).toList := fun hm => by
+  have ⟨h1, h2⟩ := nat_toString_digits n d hm
+  have h1' : 48 ≤ d.toNat := h1; have h2' : d.toNat ≤ 57 := h2
+  rcases hd with hlt | hgt
+  · have : d.toNat < 48 := hlt; omega
+  · have : 57 < d.toNat := hgt; omega
+
+private theorem digit_mem_digits {c : Char} (h1 : '0' ≤ c) (h2 : c ≤ '9') : c ∈ "0123456789".toList := by
+  have h1' : 48 ≤ c.toNat := h1; have h2' : c.toNat ≤ 57 := h2
+  have hcases : c.toNat = 48 ∨ c.toNat = 49 ∨ c.toNat = 50 ∨ c.toNat = 51 ∨ c.toNat = 52 ∨
+      c.toNat = 53 ∨ c.toNat = 54 ∨ c.toNat = 55 ∨ c.toNat = 56 ∨ c.toNat = 57 := by omega
+  rcases hcases with h | h | h | h | h | h | h | h | h | h <;>
+    (have hc : c = Char.ofNat c.toNat := (Char.ofNat_toNat c).symm; rw [hc, h]; decide)
+
+theorem nat_toString_all {p : Char → Bool} (hp : "0123456789".toList.all p = true) (n : Nat) :
+    (toString n).toList.all p = true :=
+  List.all_eq_true.2 fun c hc =>
+    let ⟨h1, h2⟩ := nat_toString_digits n c hc
+    List.all_eq_true.1 hp c (digit_mem_digits h1 h2)
+
+theorem nat_toString_injective {a b : Nat} (h : toString a = toString b) : a = b :=
+  Option.some.inj (by
+    have h' : Nat.repr a = Nat.repr b := h
+    rw [← parseNat?_repr a, ← parseNat?_repr b, h'])
+
+theorem int_toString_chars (i : Int) : ∀ c ∈ (toString i).toList, c = '-' ∨ ('0' ≤ c ∧ c ≤ '9') := by
+  cases i with
+  | ofNat n =>
+      intro c hc
+      exact .inr (nat_toString_digits n c hc)
+  | negSucc n =>
+      intro c hc
+      have hrepr : (toString (Int.negSucc n)).toList = '-' :: (toString (n + 1)).toList := by
+        change ("-" ++ Nat.repr (n + 1)).toList = '-' :: (Nat.repr (n + 1)).toList
+        rw [String.toList_append]; rfl
+      rw [hrepr] at hc
+      exact (List.mem_cons.1 hc).elim .inl fun hm => .inr (nat_toString_digits (n + 1) c hm)
+
+theorem int_toString_not_mem {d : Char} (hd : d ≠ '-' ∧ (d < '0' ∨ '9' < d)) (i : Int) :
+    d ∉ (toString i).toList := fun hm => by
+  rcases int_toString_chars i d hm with heq | ⟨h1, h2⟩
+  · exact hd.1 heq
+  · have h1' : 48 ≤ d.toNat := h1; have h2' : d.toNat ≤ 57 := h2
+    rcases hd.2 with hlt | hgt
+    · have : d.toNat < 48 := hlt; omega
+    · have : 57 < d.toNat := hgt; omega
+
+theorem int_toString_all {p : Char → Bool} (hp : "-0123456789".toList.all p = true) (i : Int) :
+    (toString i).toList.all p = true :=
+  List.all_eq_true.2 fun c hc =>
+    (int_toString_chars i c hc).elim
+      (fun heq => List.all_eq_true.1 hp c (heq ▸ List.mem_cons_self))
+      (fun ⟨h1, h2⟩ => List.all_eq_true.1 hp c (List.mem_cons_of_mem '-' (digit_mem_digits h1 h2)))
+
+theorem int_toString_injective {a b : Int} (h : toString a = toString b) : a = b :=
+  Option.some.inj (by
+    have h' : Int.repr a = Int.repr b := h
+    rw [← parseInt?_repr a, ← parseInt?_repr b, h'])
+
+theorem list_append_sep_inj {α : Type} {d : α} {xs₁ xs₂ ys₁ ys₂ : List α}
+    (h₁ : d ∉ xs₁) (h₂ : d ∉ xs₂) (heq : xs₁ ++ d :: ys₁ = xs₂ ++ d :: ys₂) :
+    xs₁ = xs₂ ∧ ys₁ = ys₂ := by
+  induction xs₁ generalizing xs₂ with
+  | nil =>
+      cases xs₂ with
+      | nil => exact ⟨rfl, (List.cons.inj heq).2⟩
+      | cons b bs => exact absurd (List.cons.inj heq).1 (fun h => h₂ (h ▸ List.mem_cons_self))
+  | cons a as ih =>
+      cases xs₂ with
+      | nil => exact absurd (List.cons.inj heq).1.symm (fun h => h₁ (h ▸ List.mem_cons_self))
+      | cons b bs =>
+          have ⟨hab, htl⟩ := List.cons.inj heq
+          have ⟨has, hys⟩ := ih (fun hm => h₁ (List.mem_cons_of_mem _ hm)) (fun hm => h₂ (List.mem_cons_of_mem _ hm)) htl
+          exact ⟨hab ▸ has ▸ rfl, hys⟩
+
+theorem str_toString (s : String) : toString s = s := rfl
+
+theorem str_append_left_cancel {p x y : String} (h : p ++ x = p ++ y) : x = y :=
+  String.ext (List.append_cancel_left (as := p.toList) (by rw [← String.toList_append, ← String.toList_append, h]))
+
+theorem str_append_right_cancel {s x y : String} (h : x ++ s = y ++ s) : x = y :=
+  String.ext (List.append_cancel_right (bs := s.toList) (by rw [← String.toList_append, ← String.toList_append, h]))
+
+theorem str_split_sep_inj {sep a₁ a₂ r₁ r₂ : String} {d : Char}
+    (hsep : sep.toList.head? = some d) (h₁ : d ∉ a₁.toList) (h₂ : d ∉ a₂.toList)
+    (heq : a₁ ++ (sep ++ r₁) = a₂ ++ (sep ++ r₂)) : a₁ = a₂ ∧ r₁ = r₂ := by
+  have htl := congrArg String.toList heq
+  simp only [String.toList_append] at htl
+  cases hsp : sep.toList with
+  | nil => rw [hsp] at hsep; cases hsep
+  | cons c cs =>
+      rw [hsp] at hsep htl; cases hsep
+      have ⟨ha, hrest⟩ := list_append_sep_inj h₁ h₂ htl
+      have hr : r₁.toList = r₂.toList := List.append_cancel_left hrest
+      exact ⟨String.ext ha, String.ext hr⟩
+
+private theorem list_append_ne_of_diff_prefix {α : Type} [BEq α] [LawfulBEq α] :
+    ∀ {p₁ p₂ x y : List α}, (p₁.zip p₂).any (fun ab => ab.1 != ab.2) = true → p₁ ++ x = p₂ ++ y → False
+  | [], _, _, _, h, _ => by simp at h
+  | _ :: _, [], _, _, h, _ => by simp at h
+  | a :: as, b :: bs, x, y, h, heq => by
+      have ⟨hab, htl⟩ := List.cons.inj heq
+      simp only [List.zip_cons_cons, List.any_cons, Bool.or_eq_true, bne_iff_ne] at h
+      exact h.elim (fun hne => hne hab) fun hr => list_append_ne_of_diff_prefix hr htl
+
+theorem str_append_ne_of_diff_prefix {p₁ p₂ x y : String}
+    (hdiff : (p₁.toList.zip p₂.toList).any (fun ab => ab.1 != ab.2) = true)
+    (heq : p₁ ++ x = p₂ ++ y) : False :=
+  list_append_ne_of_diff_prefix hdiff (by simpa [String.toList_append] using congrArg String.toList heq)
+
+theorem str_not_mem_append {a b : String} {d : Char} (ha : d ∉ a.toList) (hb : d ∉ b.toList) :
+    d ∉ (a ++ b).toList := fun hm =>
+  (List.mem_append.1 (String.toList_append ▸ hm)).elim ha hb
+
+theorem str_not_mem_of_toList_all {s : String} {p : Char → Bool} {d : Char}
+    (hall : s.toList.all p = true) (hd : p d = false) : d ∉ s.toList := fun hm =>
+  Bool.false_ne_true (hd ▸ List.all_eq_true.1 hall d hm)
+
+theorem str_not_mem_of_all {s : String} {p : Char → Bool} {d : Char}
+    (hall : s.all p = true) (hd : p d = false) : d ∉ s.toList :=
+  str_not_mem_of_toList_all (String.all_bool_eq ▸ hall) hd
+
+theorem str_not_mem_of_forall {s : String} {P : Char → Prop} {d : Char}
+    (h : ∀ c ∈ s.toList, P c) (hd : ¬ P d) : d ∉ s.toList := fun hm => hd (h d hm)
+
+theorem str_not_mem_of_contains_false {s : String} {d : Char} (h : s.contains d = false) : d ∉ s.toList := by
+  rw [String.contains_char_eq, decide_eq_false_iff_not] at h; exact h
+
+theorem str_not_mem_of_not_contains {s : String} {d : Char} (h : ¬ s.contains d = true) : d ∉ s.toList := by
+  rw [String.contains_char_eq, decide_eq_true_eq] at h; exact h
+
+theorem str_not_mem_of_mem_list {s : String} {xs : List String} {d : Char}
+    (hmem : s ∈ xs) (hall : xs.all (fun x => !x.toList.contains d) = true) : d ∉ s.toList := by
+  have h := (Bool.not_eq_true' _).mp (List.all_eq_true.1 hall s hmem)
+  intro hm; exact Bool.false_ne_true (h ▸ List.contains_iff_mem.2 hm)
+
+theorem str_not_mem_of_mem_array {s : String} {xs : Array String} {d : Char}
+    (hmem : s ∈ xs) (hall : xs.toList.all (fun x => !x.toList.contains d) = true) : d ∉ s.toList :=
+  str_not_mem_of_mem_list (Array.mem_def.1 hmem) hall
+
+theorem str_all_of_mem_list {s : String} {xs : List String} {p : Char → Bool}
+    (hmem : s ∈ xs) (hall : xs.all (fun x => x.toList.all p) = true) : s.toList.all p = true :=
+  List.all_eq_true.1 hall s hmem
+
+theorem str_all_of_mem_array {s : String} {xs : Array String} {p : Char → Bool}
+    (hmem : s ∈ xs) (hall : xs.toList.all (fun x => x.toList.all p) = true) : s.toList.all p = true :=
+  str_all_of_mem_list (Array.mem_def.1 hmem) hall
+
+theorem list_all_mono {α : Type} {p₁ p₂ : α → Bool} {xs : List α}
+    (h : xs.all p₁ = true) (himp : ∀ x, p₁ x = true → p₂ x = true) : xs.all p₂ = true :=
+  List.all_eq_true.2 fun x hx => himp x (List.all_eq_true.1 h x hx)
+
+theorem str_length_bounds_of_mem_list {s : String} {xs : List String} {lo hi : Nat}
+    (hmem : s ∈ xs) (hall : xs.all (fun x => decide (lo ≤ x.length ∧ x.length ≤ hi)) = true) :
+    lo ≤ s.length ∧ s.length ≤ hi :=
+  of_decide_eq_true (List.all_eq_true.1 hall s hmem)
+
+theorem str_length_bounds_of_mem_array {s : String} {xs : Array String} {lo hi : Nat}
+    (hmem : s ∈ xs) (hall : xs.toList.all (fun x => decide (lo ≤ x.length ∧ x.length ≤ hi)) = true) :
+    lo ≤ s.length ∧ s.length ≤ hi :=
+  str_length_bounds_of_mem_list (Array.mem_def.1 hmem) hall
+
+theorem dite_eq_cases.{u} {α : Sort u} {c : Prop} [Decidable c] {t : c → α} {e : ¬c → α} {v : α} {P : Prop}
+    (heq : (if h : c then t h else e h) = v)
+    (ht : ∀ h : c, t h = v → P) (hf : ∀ h : ¬c, e h = v → P) : P :=
+  if h : c then ht h (by rwa [dite_eq_left h] at heq) else hf h (by rwa [dite_eq_right h] at heq)
+
+theorem eq_dite_cases.{u} {α : Sort u} {c : Prop} [Decidable c] {t : c → α} {e : ¬c → α} {v : α} {P : Prop}
+    (heq : v = (if h : c then t h else e h))
+    (ht : ∀ h : c, v = t h → P) (hf : ∀ h : ¬c, v = e h → P) : P :=
+  dite_eq_cases heq.symm (fun h htv => ht h htv.symm) (fun h hev => hf h hev.symm)
+
+theorem ite_eq_cases.{u} {α : Sort u} {c : Prop} [Decidable c] {t e v : α} {P : Prop}
+    (heq : (if c then t else e) = v)
+    (ht : c → t = v → P) (hf : ¬c → e = v → P) : P :=
+  if h : c then ht h (by rwa [ite_eq_left h] at heq) else hf h (by rwa [ite_eq_right h] at heq)
+
+theorem eq_ite_cases.{u} {α : Sort u} {c : Prop} [Decidable c] {t e v : α} {P : Prop}
+    (heq : v = (if c then t else e))
+    (ht : c → v = t → P) (hf : ¬c → v = e → P) : P :=
+  ite_eq_cases heq.symm (fun h htv => ht h htv.symm) (fun h hev => hf h hev.symm)
+
 attribute [irreducible] splitChar
 
 private def bytesStartsWith : List UInt8 → List UInt8 → Bool

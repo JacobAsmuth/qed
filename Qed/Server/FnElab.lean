@@ -206,6 +206,12 @@ def elabServerStateCmds (stateDecls : Array ParsedStateDecl) : SrvElabM Bool := 
         qedSrvProveStep [$(c.stateInvId), $initId] "initState" $(Syntax.mkStrLit ("init: " ++ singleInvLabelStr c.invs)))]
   return !(← hasSrvErrors)
 
+partial def unwrapDocClause (c : Syntax) : Option (TSyntax ``Lean.Parser.Command.docComment) × Syntax :=
+  if c.getKind == ``srvDocClause then
+    let (inner?, body) := unwrapDocClause (c.getArg 1)
+    (inner?.orElse fun _ => some ⟨c.getArg 0⟩, body)
+  else (none, c)
+
 @[noinline]
 def parseServerClauses (srvIdent : Ident) (srvName : Name) (clauses : Array Syntax) (isService : Bool := false) : CommandElabM ParsedServerBlock := do
   let blockKind := if isService then "service" else "server"
@@ -220,7 +226,8 @@ def parseServerClauses (srvIdent : Ident) (srvName : Name) (clauses : Array Synt
   let mut rpcsAuthInvs : Array (Ident × Array String) := #[]
   let mut noSecretsInvs : Array Ident := #[]
   let mut exampleClauses : Array Syntax := #[]
-  for c in clauses do
+  for rawC in clauses do
+    let (_, c) := unwrapDocClause rawC
     let k := c.getKind
     let hasDecl (nm : Name) := dbDecls.any (·.1.getId == nm) || serviceDecls.any (·.1.getId == nm) || authDecl?.any (·.1.getId == nm) || envDecls.any (·.ident.getId == nm) || stateDecls.any (·.1.getId == nm)
     if k == ``srvDbClause then
@@ -250,13 +257,13 @@ def parseServerClauses (srvIdent : Ident) (srvName : Name) (clauses : Array Synt
       unless isValidEnvVarName osKey do throwErrorAt (c.getArg 3) s!"invalid secret environment variable name `{osKey}`: must be non-empty and contain only ASCII letters, digits, or `_`"
       if hasDecl id.getId then throwErrorAt id s!"duplicate declaration `{id.getId}` in `{blockKind} {srvName}`"
       envDecls := envDecls.push { ident := id, osKey, default? := none, isSecret := true }
-    else if k == ``srvHelperFnClause then helperClauses := helperClauses.push c
+    else if k == ``srvHelperFnClause then helperClauses := helperClauses.push rawC
     else if k == ``srvInvNoSecretsClause then
       let nameId : Ident := ⟨c.getArg 1⟩
       if seenInvNames.contains nameId.getId then throwErrorAt nameId s!"duplicate invariant `{nameId.getId}` in `{blockKind} {srvName}`"
       seenInvNames := seenInvNames.push nameId.getId
       noSecretsInvs := noSecretsInvs.push nameId
-    else if k == ``srvExampleClause then exampleClauses := exampleClauses.push c
+    else if k == ``srvExampleClause then exampleClauses := exampleClauses.push rawC
     else if isService then
       throwErrorAt c s!"only `use`, `env`, `secret`, `fn`, `example`, and `invariant ... : no_required_secrets` declarations are allowed in stateless `service {srvName}`"
     else if k == ``srvInvRoutesAuthClause then
@@ -289,7 +296,7 @@ def parseServerClauses (srvIdent : Ident) (srvName : Name) (clauses : Array Synt
     else if k == ``srvBeforeClause then
       if beforeClause?.isSome then throwErrorAt c s!"duplicate `before` middleware in `server {srvName}`"
       beforeClause? := some c
-    else if k == ``srvFnClause then fnClauses := fnClauses.push c
+    else if k == ``srvFnClause then fnClauses := fnClauses.push rawC
     else if k == ``srvChannelClause then chanClauses := chanClauses.push c
     else if k == ``srvHttpRouteClause || k == ``srvStreamClause then httpClauses := httpClauses.push c
     else if k == ``srvJobClause then jobClauses := jobClauses.push c
@@ -324,7 +331,7 @@ partial def scanCtxEnv (envVars locals : Array String) (stx : Syntax) : Bool × 
   else if k == ``qedLamN then scanCtxEnv envVars (locals ++ (stx.getArg 1).getSepArgs.filterMap fun b => if b.isIdent then some b.getId.toString else none) (stx.getArg 4)
   else if k == ``qedAllIn || k == ``qedAnyIn then
     let (c1, e1) := scanCtxEnv envVars locals (stx.getArg 3); let (c2, e2) := scanCtxEnv envVars (locals.push (stx.getArg 1).getId.toString) (stx.getArg 5); (c1 || c2, e1 || e2)
-  else if k == ``qedAllVars then scanCtxEnv envVars (locals ++ (stx.getArg 1).getSepArgs.map (·.getId.toString)) (stx.getArg 3)
+  else if k == ``qedAllVars then scanCtxEnv envVars (locals ++ (stx.getArg 1).getSepArgs.map fun b => (qedAllVarIdent b).getId.toString) (stx.getArg 3)
   else stx.getArgs.foldl (fun (ac, ae) ch => let (c, e) := scanCtxEnv envVars locals ch; (ac || c, ae || e)) (false, false)
 
 def isAuthReqLabel (s : String) : Bool := s.contains "ctx.userId" || s.contains "ctx.isAuthenticated" || s.contains "ctx.bearerToken"

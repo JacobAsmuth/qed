@@ -830,12 +830,6 @@ server WorkerLoopSrv:
   state processed : Nat = 0
   state pending   : Nat = 3
 
-  system fn isElevated() -> Bool!:
-    return ctx.isSystem
-
-  rpc checkSystemFlag() -> Bool!:
-    return ctx.isSystem
-
   every 5s drainOne -> Bool:
     no_http, no_decrypt
     let mut didWork = false
@@ -850,24 +844,6 @@ server WorkerLoopSrv:
     no_http, no_decrypt
     atomic:
       processed += 0
-
-  example systemFnAlwaysElevates:
-    call isElevated()
-    expect ok(true)
-
-  example systemExampleDefault:
-    with system
-    call checkSystemFlag()
-    expect ok(true)
-
-  example systemExampleExplicit:
-    with system = true
-    call checkSystemFlag()
-    expect ok(true)
-
-  example nonSystemDefault:
-    call checkSystemFlag()
-    expect ok(false)
 
 example : (WorkerLoopSrv.jobs.size == 2 && (WorkerLoopSrv.jobs[0]?.map (·.name) == some "drainOne") && (WorkerLoopSrv.jobs[0]?.map (·.runWorkM?.isSome) == some true)) = true := by decide +kernel
 
@@ -915,5 +891,144 @@ service BadAsyncBreakSvc:
   fn bad() -> Nat!:
     break
     return 1
+
+/-! ## Kernel Reduction, Webhook Effects & Ergonomics Regressions -/
+
+/-- External JSON API used to verify `decodeRespJson` reduces in Lean's kernel. -/
+external JsonEchoApi:
+  base "https://api.json-echo.example.com"
+  get "/item/{id}" getItem(id: String) -> Json
+
+structure ErgoQueryPlan where
+  orderBy? : Option String
+  limit?   : Option Nat
+deriving BEq, Repr
+
+private def testAlertWebhookUrl : Qed.Server.WebhookUrl :=
+  Qed.Server.WebhookUrl.make "https://hooks.example.com/alerts" (by decide +kernel)
+
+private def testRawWebhookUrl : Qed.Server.WebhookUrl :=
+  Qed.Server.WebhookUrl.make "https://hooks.example.com/raw" (by decide +kernel)
+
+/-- Service exercising external `-> Json`, `Webhook`, trailing `?`, cons patterns, tuple `let`, multiline signatures, doc comments, and type inference. -/
+service ErgoAndKernelSvc:
+  /-- Fetch a JSON item from an external endpoint returning `-> Json`. -/
+  fn fetchJsonName(id: String) -> String!:
+    let j = await JsonEchoApi.getItem(id)?
+    return j.strAtD("name", "empty")
+
+  /-- Dispatch a JSON webhook alert and prove no DB write / decrypt / crypto effects. -/
+  fn dispatchJsonAlert(url: WebhookUrl, msg: String) -> String!:
+    no_db_write, no_decrypt, no_crypto
+    let payload = Json.object([("msg", .str(msg)), ("tags", Json.array([.str("alert")]))])
+    let resp : Json = await Qed.Server.Webhook.postJson(url, payload)?
+    return resp.strAtD("status", "sent")
+
+  /-- Dispatch a raw bytes webhook alert and prove no DB write / decrypt / crypto effects. -/
+  fn dispatchBytesAlert(url: WebhookUrl, raw: Bytes) -> Nat!:
+    no_db_write, no_decrypt, no_crypto
+    let resp = await Qed.Server.Webhook.postBytes(url, "application/octet-stream", raw)?
+    return resp.size
+
+  /-- Trailing `?` ergonomics: `arr[0]?`, user `plan.orderBy?`, Json `.obj?`/`.str?`, local `x?`. -/
+  fn inspectPlan(arr: String[], plan: ErgoQueryPlan, v: Json) -> String:
+    let first? = arr[0]?
+    let ord? = plan.orderBy?
+    let hasObj = v.obj?.isSome
+    let label = v.str? ?? (first? ?? "none")
+    let suffix = if hasObj: "obj" else: ord? ?? "default"
+    return label ++ ":" ++ suffix
+
+  /-- Explicit `(arr[0])?` still unwraps an element of `Array (Option String)`. -/
+  fn unwrapFirstOpt(arr: String?[]) -> String!:
+    if arr.size == 0:
+      return fail(400, "empty")
+    let s = (arr[0])?
+    return s
+
+  /-- Cons pattern matching (`case x :: xs:`) and tuple destructuring (`let (a, b) = ...`). -/
+  fn sumHeadPair(xs: List Nat, pair: (Nat, (Nat, Nat))) -> Nat:
+    let (a, (b, _)) = pair
+    match xs:
+      case []: return a + b
+      case h :: []: return h + a + b
+      case h1 :: h2 :: _: return h1 + h2 + a + b
+
+  /-- Multiline signature with multi-word return type and `let mut : List Json = []`. -/
+  fn buildJsonList(
+    xs: String[],
+    tag: String
+  ) -> Except Qed.Server.ApiError Json:
+    let mut acc : List Json = []
+    for x in xs:
+      acc = List.cons(Json.obj([("tag", .str(tag)), ("v", .str(x))]), acc)
+    return .ok(Json.arr(acc.reverse))
+
+  /-- Doc-commented example testing `-> Json` external endpoint, `Webhook`, and dotted `.ok(...)`. -/
+  example jsonEndpointAndDottedOk:
+    with http GET "https://api.json-echo.example.com/item/42" => 200 "{\"name\":\"widget\"}"
+    call fetchJsonName("42")
+    expect result.map(s => s ++ "!") == .ok("widget!")
+
+  example jsonEndpointEmptyBody:
+    with http GET "https://api.json-echo.example.com/item/empty" => 200 "   "
+    call fetchJsonName("empty")
+    expect ok("empty")
+
+  example webhookJsonAndBytes:
+    with http POST "https://hooks.example.com/alerts" => 200 "{\"status\":\"accepted\"}"
+    call dispatchJsonAlert(testAlertWebhookUrl, "hi")
+    expect ok("accepted")
+
+  example webhookBytesOk:
+    with http POST "https://hooks.example.com/raw" => 200 "pong"
+    call dispatchBytesAlert(testRawWebhookUrl, "ping".toUTF8)
+    expect ok(4)
+
+  example ergoHelpersWork:
+    call inspectPlan(["alpha"], { orderBy? = some("id"), limit? = none }, Json.str("beta"))
+    expect result == "beta:id"
+
+  example explicitUnwrapArrElem:
+    call unwrapFirstOpt([some("ok")])
+    expect ok("ok")
+
+  example consAndTupleWork:
+    call sumHeadPair([10, 20, 30], (1, (2, 99)))
+    expect result == 33
+
+  example listMutAndJsonObjWork:
+    call buildJsonList(["a", "b"], "k")
+    expect result == .ok(Json.arr([Json.obj([("tag", .str("k")), ("v", .str("a"))]), Json.obj([("tag", .str("k")), ("v", .str("b"))])]))
+
+expect_err "Server invariant `no_http` failed in `badWebhookNoHttp`" in
+service BadWebhookNoHttpSvc:
+  fn badWebhookNoHttp(url: WebhookUrl) -> String!:
+    no_http
+    let resp : Json = await Qed.Server.Webhook.postJson(url, Json.null)?
+    return resp.render
+
+/-- Stateful server verifying doc comments, multiline `rpc` signature, and tuple `let` across `atomic:`. -/
+server ErgoStatefulSrv:
+  /-- Running total state. -/
+  state total : Nat = 0
+
+  /-- Multiline `rpc` with tuple `let` inside `atomic:` exporting a destructured binding. -/
+  rpc addAndSplit(
+    pair: (Nat, Nat)
+  ) -> Except String Nat:
+    let _ = await PingApi.ping()
+      catch _e:
+        ""
+    atomic:
+      let (delta, bonus) = pair
+      total += delta
+    return .ok(bonus)
+
+example : (
+  let ev : Qed.Server.SseEvent := { data := "line1\nline2", event := some "msg" }
+  ev.render == "event: msg\ndata: line1\ndata: line2\n\n" &&
+  (match Qed.Server.encodeMultiSeg "/a/b c" with | .ok s => s == "a/b%20c" | .error _ => false) &&
+  (match Qed.Server.encodeMultiSeg "/a/b c/" with | .error _ => true | .ok _ => false)) = true := by decide +kernel
 
 end ServerChecks

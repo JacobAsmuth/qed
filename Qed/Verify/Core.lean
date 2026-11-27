@@ -28,11 +28,12 @@ def dbBaseSimpNames : Array Name := boolSimpNames ++ valUnwrapBaseNames ++ optCo
   `Qed.Server.Db.some_getD_eq_self_iff, ``List.any_eq_true, ``Array.contains_iff_mem,
   ``Qed.Lang.QedMem.mem_array, ``Qed.Lang.QedMem.mem_list, ``Qed.Lang.QedMemProp.memProp_array, ``Qed.Lang.QedMemProp.memProp_list,
   ``Qed.Lang.QedSeqLit.ofList_array, ``Qed.Lang.QedSeqLit.ofList_list, ``Array.mem_toArray, ``List.mem_cons, ``List.not_mem_nil,
+  `Qed.Str.toLower_length, `Qed.Str.toUpper_length, `Qed.Str.truncate_length, `Qed.Str.take_length, `Qed.Str.drop_length,
   ``true_and, ``and_true, ``false_or, ``or_false, ``true_or, ``or_true, ``id_eq, ``ne_eq]
 
 private def addSimpNamesWithEqns (st : SimpTheorems) (names : Array Name) (dsimpOnly : Bool := false) (withEqns : Bool := false) :
-    MetaM (SimpTheorems × Array Name) := do
-  let env ← getEnv; let mut st := st; let mut eqnsAdded := #[]
+    MetaM SimpTheorems := do
+  let env ← getEnv; let mut st := st
   for n in names do
     if let some ci := env.find? n then
       match ci with
@@ -40,10 +41,26 @@ private def addSimpNamesWithEqns (st : SimpTheorems) (names : Array Name) (dsimp
       | _ =>
           st ← st.addDeclToUnfold n
           if withEqns && !dsimpOnly then
-            if let some eqns ← getEqnsFor? n then for eq in eqns do st ← st.addConst eq; eqnsAdded := eqnsAdded.push eq
-  return (st, eqnsAdded)
+            if let some eqns ← getEqnsFor? n then for eq in eqns do st ← st.addConst eq
+  return st
 
-initialize simpThmsCache : IO.Ref (Std.HashMap (String × Name × Bool × Bool × Bool) (SimpTheorems × Array Name)) ← IO.mkRef {}
+/-- Collect every local-module constant (including `_simp_*` aux lemmas and generated equations)
+    referenced by `st`, paired with its type, so cached `SimpTheorems` are never reused across
+    async elaboration branches that lack or differently number those local declarations. -/
+private def collectLocalSimpDeps (env : Environment) (st : SimpTheorems) : Array (Name × Expr) :=
+  let map₂ := env.constants.map₂
+  let addName (acc : Std.HashMap Name Expr) (c : Name) : Std.HashMap Name Expr :=
+    if acc.contains c then acc
+    else match map₂.find? c with
+      | some ci => acc.insert c ci.type
+      | none => acc
+  let collectTree (acc : Std.HashMap Name Expr) (tree : SimpTheoremTree) : Std.HashMap Name Expr :=
+    tree.foldValues (init := acc) fun acc thm => thm.proof.getUsedConstants.foldl addName acc
+  let seen := collectTree (collectTree {} st.pre) st.post
+  let seen := st.toUnfold.fold (init := seen) addName
+  seen.fold (init := #[]) fun acc k ty => acc.push (k, ty)
+
+initialize simpThmsCache : IO.Ref (Std.HashMap (String × Name × Bool × Bool × Bool) (SimpTheorems × Array (Name × Expr))) ← IO.mkRef {}
 initialize simprocsCache : IO.Ref (Std.HashMap (Array Name × Bool) Simp.SimprocsArray) ← IO.mkRef {}
 
 def getCachedSimprocs (names : Array Name) (post : Bool := true) : MetaM Simp.SimprocsArray := do
@@ -59,9 +76,12 @@ def getCachedSimprocs (names : Array Name) (post : Bool := true) : MetaM Simp.Si
 def getCachedSimpThms (key : String) (names : Array Name) (dsimpOnly : Bool := false) (withEqns : Bool := true) : MetaM SimpTheorems := do
   let env ← getEnv
   let cacheKey := (key, env.header.mainModule, dsimpOnly, withEqns, env.contains `Qed.Codec.valid)
-  if let some (st, needed) := (← simpThmsCache.get).get? cacheKey then if needed.all env.contains then return st
-  let (st, eqns) ← addSimpNamesWithEqns {} names dsimpOnly withEqns
-  simpThmsCache.modify (·.insert cacheKey (st, eqns)); return st
+  if let some (st, needed) := (← simpThmsCache.get).get? cacheKey then
+    if needed.all fun (k, ty) => match env.find? k with | some ci => ci.type == ty | none => false then
+      return st
+  let st ← addSimpNamesWithEqns {} names dsimpOnly withEqns
+  let deps := collectLocalSimpDeps (← getEnv) st
+  simpThmsCache.modify (·.insert cacheKey (st, deps)); return st
 
 /-- Resolve a component `update`/`app` ident and include its generated hoisted helpers (`stepOwn`, `_reconcileHoisted`) when present. -/
 def resolveCompUpdateUnfolds (idStx : Syntax) : CoreM (Array Name) := do
@@ -86,7 +106,7 @@ def mkCachedSimpCtx (key : String) (names : Array Name) (cfg : Simp.Config := { 
 def mkDynamicSimpCtx (extraNames : Array Name) (baseKey? : Option (String × Array Name) := none)
     (cfg : Simp.Config := { zetaDelta := false }) (dsimpOnly : Bool := false) (withEqns : Bool := true) : MetaM Simp.Context := do
   let baseSt ← match baseKey? with | some (k, ns) => getCachedSimpThms k ns dsimpOnly withEqns | none => pure {}
-  mkSimpCtx cfg #[(← addSimpNamesWithEqns baseSt extraNames dsimpOnly withEqns).1]
+  mkSimpCtx cfg #[← addSimpNamesWithEqns baseSt extraNames dsimpOnly withEqns]
 
 def mkEmptyDsimpCtx (cfg : Simp.Config := {}) : MetaM Simp.Context := mkSimpCtx cfg #[]
 
@@ -96,7 +116,7 @@ def mkSimpCtxWithBase (extraNames : Array Name := #[]) (cfg : Simp.Config := {})
   let thms ← if extraNames.isEmpty then pure #[base]
     else match cacheKey? with
       | some k => pure #[base, ← getCachedSimpThms k extraNames false withEqns]
-      | none   => pure #[(← addSimpNamesWithEqns base extraNames false withEqns).1]
+      | none   => pure #[← addSimpNamesWithEqns base extraNames false withEqns]
   mkSimpCtx cfg thms
 
 def tryRestoreM {m : Type → Type} {s α : Type} [Monad m] [MonadBacktrack s m] [MonadExcept Exception m]
@@ -191,6 +211,11 @@ private def tryEmitFieldOrFin (env : Environment) (includeFin : Bool) (sub ty : 
   if includeFin && ty.isAppOfArity ``Fin 1 then tryEmitApp env ``Fin.isLt #[sub] addFact; return true
   return false
 
+private def strLenFactRules : Array (Name × Nat × Name) := #[
+  (`Qed.Str.truncate, 3, `Qed.Str.truncate_length), (`Qed.Str.take, 2, `Qed.Str.take_length), (`Qed.Str.drop, 2, `Qed.Str.drop_length),
+  (`Qed.Str.trim, 1, `Qed.Str.trim_length_le), (`Qed.Str.trimLeft, 1, `Qed.Str.trimLeft_length_le), (`Qed.Str.trimRight, 1, `Qed.Str.trimRight_length_le),
+  (`Qed.Str.toLower, 1, `Qed.Str.toLower_length), (`Qed.Str.toUpper, 1, `Qed.Str.toUpper_length)]
+
 private def inspectSubtermForFacts (env : Environment) (cfg : FactScanConfig) (forallHyps : Array Expr) (sub : Expr) (addFact : Expr → MetaM Unit) : MetaM Unit := do
   if sub.hasLooseBVars then return
   match sub with | .sort _ | .lit _ | .mvar _ | .bvar _ | .forallE .. | .lam .. => return | _ => pure ()
@@ -201,6 +226,10 @@ private def inspectSubtermForFacts (env : Environment) (cfg : FactScanConfig) (f
     let a := sub.getAppArgs; tryEmitApp env `Qed.Dict.size_remove_le #[a[3]!, a[4]!] addFact
   if cfg.includeCollectionRules && sub.isAppOfArity ``GetElem.getElem 8 then
     for fh in forallHyps do tryEmitApp env ``Array.forall_elem #[sub.getAppArgs[7]!, fh] addFact
+  if let .const c _ := sub.getAppFn then
+    let a := sub.getAppArgs
+    if let some (_, _, lem) := strLenFactRules.find? fun (fn, ar, _) => fn == c && ar == a.size then
+      tryEmitApp env lem a addFact
   let some t ← try some <$> inferType sub catch _ => pure none | return
   let tC := t.consumeMData
   if ← tryEmitFieldOrFin env cfg.includeFin sub tC addFact then return
@@ -270,6 +299,47 @@ def tryDirectDecide (g : MVarId) : MetaM Bool := do
 def tryDirectOmega (g : MVarId) : MetaM Bool := tryRestoreM false id do
   let some g' ← g.falseOrByContra | return true
   g'.withContext do Omega.omega ((← getPropHyps).toList.map mkFVar) g' {}; return true
+
+@[noinline]
+private partial def proveGroundKernelProp (env : Environment) (e : Expr) : TacticM (Option Expr) := do
+  let e := e.consumeMData
+  match e with
+  | .letE _ _ v b _ => proveGroundKernelProp env (b.instantiate1 v)
+  | _ =>
+      if e.isConstOf ``True then return some (mkConst ``True.intro)
+      if e.isAppOfArity ``And 2 then
+        let a := e.getAppArgs[0]!; let b := e.getAppArgs[1]!
+        if let some pa ← proveGroundKernelProp env a then
+          if let some pb ← proveGroundKernelProp env b then
+            return some (mkApp4 (mkConst ``And.intro) a b pa pb)
+        return none
+      if let some (ty, lhs, rhs) := e.eq? then
+        if (match Kernel.isDefEq env {} lhs rhs with | .ok true => true | _ => false) then
+          return some (mkApp2 (mkConst ``Eq.refl [← getLevel ty]) ty lhs)
+      let mv ← mkFreshExprMVar e
+      let saved ← getGoals; setGoals [mv.mvarId!]
+      let ok ← tryTac (requireClosed := true) `(tactic| decide +kernel)
+      setGoals saved
+      if ok then return some (← instantiateMVars mv)
+      return none
+
+/-- Close a ground goal quickly without blowing elaborator `maxRecDepth`: reducible-only trivial check
+first, then kernel `Kernel.isDefEq` (handles `let`, `And`, `True`, and `Eq` on types without `DecidableEq`,
+e.g. `Except`/`Json`) and `decide +kernel` for closed decidable propositions. -/
+def tryCloseGroundKernel (g : MVarId) : TacticM Bool := do
+  if ← tryCloseTrivial g (reducibleOnly := true) then return true
+  let tgt ← g.withContext do instantiateMVars (← g.getType)
+  if !tgt.hasFVar && !tgt.hasMVar && !tgt.hasLevelMVar then
+    let env ← getEnv
+    if let some pf ← g.withContext (proveGroundKernelProp env tgt) then
+      g.assign pf
+      return true
+  return false
+
+elab "qedCloseGround" : tactic => do
+  let g ← getMainGoal
+  if ← tryCloseGroundKernel g then replaceMainGoal []
+  else throwError "qedCloseGround failed"
 
 def tryCloseBasic (g : MVarId) (skipTarget : Expr → Bool := fun _ => false) (reducibleOnly : Bool := false) : MetaM Bool := do
   if ← tryCloseTrivial g skipTarget reducibleOnly then return true

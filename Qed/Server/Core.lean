@@ -51,7 +51,6 @@ structure RequestCtx where
   connId      : String := ""
   query       : String := ""
   body        : String := ""
-  isSystem    : Bool := false
 deriving Inhabited, DecidableEq, Repr
 
 namespace RequestCtx
@@ -170,10 +169,10 @@ def msg (data : String) (event : Option String := none) (id : Option String := n
   { data, event, id, retry }
 def render (ev : SseEvent) : String :=
   let line (k : String) (v? : Option String) := (v?.map (s!"{k}: {·}\n")).getD ""
-  let cleanData := ev.data.replace "\r\n" "\n" |>.replace "\r" "\n"
+  let cleanData := Qed.Str.replace (Qed.Str.replace ev.data "\r\n" "\n") "\r" "\n"
   line "event" (ev.event.map sanitizeHeader) ++ line "id" (ev.id.map sanitizeHeader) ++
-    line "retry" (ev.retry.map toString) ++ String.join ((cleanData.splitOn "\n").map ("data: " ++ · ++ "\n")) ++ "\n"
-def formatStream (events : List SseEvent) : ByteArray := (String.join (events.map SseEvent.render)).toUTF8
+    line "retry" (ev.retry.map toString) ++ String.intercalate "" ((Qed.Str.splitChar cleanData '\n').map ("data: " ++ · ++ "\n")) ++ "\n"
+def formatStream (events : List SseEvent) : ByteArray := (String.intercalate "" (events.map SseEvent.render)).toUTF8
 end SseEvent
 
 structure HttpResponse where
@@ -258,7 +257,7 @@ private def encodeMultiSegElem (seg : String) : Except ApiError String :=
   if seg.isEmpty || seg == "." || seg == ".." then .error (ApiError.badRequest "invalid multi-segment URL path component") else encodeSingleSeg seg
 def encodeMultiSeg (s : String) : Except ApiError String := do
   let trimmed := match s.toList with | '/' :: cs => String.ofList cs | _ => s
-  let segs ← match trimmed.splitOn "/" with | [] => .error (ApiError.badRequest "multi-segment URL path cannot be empty") | xs => xs.mapM encodeMultiSegElem
+  let segs ← match Qed.Str.splitChar trimmed '/' with | [] => .error (ApiError.badRequest "multi-segment URL path cannot be empty") | xs => xs.mapM encodeMultiSegElem
   return joinDelim '/' segs
 theorem encodeMultiSeg_safe {s out : String} (h : encodeMultiSeg s = .ok out) : out.toList.all isSafeExtSuffixChar = true := by
   unfold encodeMultiSeg at h; dsimp only at h; split at h
@@ -510,10 +509,16 @@ variable {σ α β γ : Type} {Inv Inv₁ Inv₂ : σ → Prop} {A A₁ A₂ : P
 
 @[simp] theorem threadProg_pure_bind  (a : α) (k : α → ThreadProg σ β) : ((Pure.pure a : ThreadProg σ α) >>= k) = k a := rfl
 @[simp] theorem threadProg_pure_bind' (a : α) (k : α → ThreadProg σ β) : (ThreadProg.pure a >>= k) = k a := rfl
+@[simp] theorem threadProg_bind_pure_left  (a : α) (k : α → ThreadProg σ β) : ThreadProg.bind (Pure.pure a) k = k a := rfl
+@[simp] theorem threadProg_bind_pure_left' (a : α) (k : α → ThreadProg σ β) : ThreadProg.bind (ThreadProg.pure a) k = k a := rfl
 @[simp] theorem threadProg_bind_assoc (p : ThreadProg σ α) (f : α → ThreadProg σ β) (g : β → ThreadProg σ γ) :
     ((p >>= f) >>= g) = (p >>= fun x => f x >>= g) := by
   change ThreadProg.bind (ThreadProg.bind p f) g = ThreadProg.bind p (fun x => ThreadProg.bind (f x) g)
   induction p with | pure _ => rfl | io _ _ ih | atomic _ _ ih => exact congrArg _ (funext ih)
+@[simp] theorem threadProg_bind_assoc_inner (p : ThreadProg σ α) (f : α → ThreadProg σ β) (g : β → ThreadProg σ γ) :
+    (ThreadProg.bind p f >>= g) = (p >>= fun x => f x >>= g) := threadProg_bind_assoc p f g
+@[simp] theorem threadProg_bind_assoc' (p : ThreadProg σ α) (f : α → ThreadProg σ β) (g : β → ThreadProg σ γ) :
+    ThreadProg.bind (ThreadProg.bind p f) g = ThreadProg.bind p (fun x => ThreadProg.bind (f x) g) := threadProg_bind_assoc p f g
 
 inductive ProgSpec {σ α : Type} (Inv : σ → Prop) (AllowAtomic : Prop) (Step : σ → σ → Prop) (Post : α → Prop) : ThreadProg σ α → Prop where
   | pure (a : α) : Post a → ProgSpec Inv AllowAtomic Step Post (.pure a)

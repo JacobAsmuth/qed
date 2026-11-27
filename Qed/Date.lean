@@ -74,8 +74,14 @@ private theorem dropWhileWs_length_le : ∀ cs : List Char, (dropWhileWs cs).len
       · exact Nat.le_trans (dropWhileWs_length_le cs) (Nat.le_succ _)
       · exact Nat.le_refl _
 
+theorem take_length (s : String) (n : Nat) : (take s n).length = min s.length n := by
+  simp only [take, String.length_ofList, List.length_take, String.length_toList]; exact Nat.min_comm _ _
+
 theorem take_length_le (s : String) (n : Nat) : (take s n).length ≤ n := by
-  simp only [take, String.length_ofList, List.length_take]; exact Nat.min_le_left _ _
+  rw [take_length]; exact Nat.min_le_right _ _
+
+theorem drop_length (s : String) (n : Nat) : (drop s n).length = s.length - n := by
+  simp only [drop, String.length_ofList, List.length_drop, String.length_toList]
 
 theorem trimLeft_length_le (s : String) : (trimLeft s).length ≤ s.length := by
   simpa only [trimLeft, String.length_ofList, String.length_toList] using dropWhileWs_length_le s.toList
@@ -97,15 +103,18 @@ theorem toLower_length (s : String) : (toLower s).length = s.length := by
 theorem toUpper_length (s : String) : (toUpper s).length = s.length := by
   simp only [toUpper, String.length_ofList, List.length_map, String.length_toList]
 
-theorem truncate_length_le (s : String) (maxLen : Nat) (ellipsis : String := "...") :
-    (truncate s maxLen ellipsis).length ≤ maxLen := by
+theorem truncate_length (s : String) (maxLen : Nat) (ellipsis : String := "...") :
+    (truncate s maxLen ellipsis).length = min s.length maxLen := by
   unfold truncate
   split
-  · assumption
+  · omega
   · split
-    · exact take_length_le s maxLen
-    · have h1 := take_length_le s (maxLen - ellipsis.length)
-      rw [String.length_append]; omega
+    · exact take_length s maxLen
+    · rw [String.length_append, take_length]; omega
+
+theorem truncate_length_le (s : String) (maxLen : Nat) (ellipsis : String := "...") :
+    (truncate s maxLen ellipsis).length ≤ maxLen := by
+  rw [truncate_length s maxLen ellipsis]; exact Nat.min_le_right _ _
 
 -- Prevent `Meta.whnf`/`isDefEq` from unfolding string helper internals during DB `where` / invariant proofs
 -- while keeping kernel `decide +kernel` working.

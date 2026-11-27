@@ -321,7 +321,9 @@ private partial def liftAwaitStmts (ctx : RewriteCtx) (actionParams outerParams 
       if k == ``qedStmtAssign && st.getNumArgs > 3 && (st.getArg 3).getNumArgs > 0 then
         throwErrorAt ((st.getArg 3).getArg 0) "`predict` can only be used on an `await` server RPC call"
       if k == ``qedStmtLet && (unwrapParens1 (st.getArg 4)).getKind == ``qedAwait then
-        let xId : Ident := if (st.getArg 1).isIdent then ⟨st.getArg 1⟩ else mkIdentFrom st `_qedAwaitRes
+        let bStx := st.getArg 1
+        let isTuple := bStx.getKind == ``qedLetPatTuple
+        let xId : Ident := if bStx.isIdent then ⟨bStx⟩ else mkIdentFrom st `_qedAwaitRes
         let optTy? ← lowerOptType (st.getArg 2)
         let (rpcId, rawArgs) ← unpackAwaitCall st (unwrapParens1 (st.getArg 4))
         let (srvInfo, mInfo) ← resolveRpcForAwait ctx rpcId rawArgs.size
@@ -331,17 +333,25 @@ private partial def liftAwaitStmts (ctx : RewriteCtx) (actionParams outerParams 
           | none => pure #[]
         let parsedCatch ← catchCases.foldlM (init := #[]) fun acc c => do pure (acc ++ (← classifyCatchCase mInfo.domainErrTags mInfo.isOption c))
         let ac : AwaitCallCtx := .mk st xId optTy? rpcId rawArgs srvInfo mInfo parsedCatch outerParams localNames
+        let rest' := if isTuple then
+          let unpackSt := Syntax.node info ``qedStmtLet #[Syntax.atom info "let", bStx, Syntax.node info nullKind #[], Syntax.atom info "=", Syntax.node info ``qedIdent #[xId.raw], Syntax.node info nullKind #[]]
+          unpackSt :: rest
+        else rest
         if let some (_, predBody) := clauses.predict? then
-          return ← liftPredictedAwait ctx actionParams liftRec ac predBody clauses.onConfirm? clauses.rollback? catchCases preStmts #[] rest
-        let restArr := rest.toArray; let prep ← prepareAwaitCall ctx ac (restArr ++ catchCases)
+          return ← liftPredictedAwait ctx actionParams liftRec ac predBody clauses.onConfirm? clauses.rollback? catchCases preStmts #[] rest'
+        let restArr := rest'.toArray; let prep ← prepareAwaitCall ctx ac (restArr ++ catchCases)
         let (nextOuter, nextLocals) := (shadowOuter outerParams xId prep.xBinderTy?, if prep.xBinderTy?.isSome then localNames else localNames.push xId.getId.eraseMacroScopes)
         return (prep.preLetStmts.push (← registerAwaitContSite ctx liftRec ac prep (liftAwaitStmts ctx · nextOuter nextLocals restArr)), none)
       if k == ``qedStmtLet then
         if (st.getArg 5).getNumArgs > 0 then throwErrorAt ((st.getArg 5).getArg 0) "`predict`, `on_confirm`, `rollback`, and `catch` can only be used on an `await` server RPC call"
-        let (outer', locals') ← if (st.getArg 1).isIdent then
-          let lId : Ident := ⟨st.getArg 1⟩; let optTy? ← lowerOptType (st.getArg 2)
+        let bStx := st.getArg 1
+        let (outer', locals') ← if bStx.isIdent then
+          let lId : Ident := ⟨bStx⟩; let optTy? ← lowerOptType (st.getArg 2)
           pure (shadowOuter outerParams lId optTy?, if optTy?.isSome then localNames else localNames.push lId.getId.eraseMacroScopes)
-        else pure (outerParams, localNames)
+        else
+          let bIds := collectLetBinderIds bStx
+          let o' := bIds.foldl (init := outerParams) fun acc nm => acc.filter (·.1.getId.eraseMacroScopes != nm)
+          pure (o', localNames ++ bIds)
         let (tail, tailCls?) ← go outer' locals' (preStmts.push st) rest
         return (#[st] ++ tail, tailCls?.map (#[st] ++ ·))
       if k == ``qedStmtReturn then return (#[st], none)

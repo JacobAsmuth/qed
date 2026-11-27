@@ -44,30 +44,42 @@ instance {σ : Type} (svc base method : String) (parts : List PathPart) (query :
   res.bind fun r => (String.fromUTF8? r.body).elim (.error (ApiError.internal "external API returned invalid UTF-8")) .ok
 @[specialize] def decodeRespProto {α : Type} [FromProto α] (res : Except ApiError OutboundResp) : Except ApiError α :=
   res.bind fun r => (Proto.decode (α := α) r.body).mapError fun e => ApiError.internal s!"external protobuf decode failed: {e}"
+private def isAllWsBytesAux (s : String) (i : Nat) : Nat → Bool
+  | 0 => true
+  | fuel + 1 =>
+      if h : i < s.utf8ByteSize then
+        let b := s.getUTF8Byte ⟨i⟩ h
+        if b == 32 || b == 9 || b == 10 || b == 13 then isAllWsBytesAux s (i + 1) fuel else false
+      else true
+
+private def isAllWsBytes (s : String) : Bool := isAllWsBytesAux s 0 s.utf8ByteSize
+
 @[specialize] def decodeRespJson {α : Type} [FromJson α] (res : Except ApiError OutboundResp) : Except ApiError α :=
   (decodeRespString res).bind fun raw =>
-    let payload := if raw.trimAscii.isEmpty then "{}" else raw
+    let payload := if isAllWsBytes raw then "{}" else raw
     ((Json.parse payload 128).bind (FromJson.fromJson (α := α))).mapError fun e => ApiError.internal s!"external JSON decode failed: {e}"
 
 namespace Webhook
 
 private def splitHttpsOriginAndPath (raw : String) : String × String :=
-  match (String.ofList (raw.toList.drop 8)).splitOn "/" with
+  match Qed.Str.splitChar (String.ofList (raw.toList.drop 8)) '/' with
   | [] => (raw, "/")
   | host :: rest => ("https://" ++ host, if rest.isEmpty then "/" else "/" ++ String.intercalate "/" rest)
 
 @[specialize]
-private def postRaw {m : Type → Type} [Monad m] [MonadServer m] (url : WebhookUrl) (headers : List (String × String)) (body : Bytes) : m (Except ApiError OutboundResp) := do
+def postRaw {m : Type → Type} [Monad m] [MonadServer m] (url : WebhookUrl) (headers : List (String × String)) (body : Bytes) : m (Except ApiError OutboundResp) := do
   let (origin, path) := splitHttpsOriginAndPath url.raw
   return (← MonadServer.httpCall { serviceName := "Webhook", baseOrigin := origin, method := "POST", pathAndQuery := path, headers, body, auth := .none, ssrfGuard := true }).bind checkHttpOk
 
 @[specialize]
-def postJson {Payload Resp : Type} {m : Type → Type} [Monad m] [MonadServer m] [ToJson Payload] [FromJson Resp] (url : WebhookUrl) (payload : Payload) : m (Except ApiError Resp) :=
-  decodeRespJson <$> postRaw url [("Content-Type", "application/json"), ("Accept", "application/json")] (Json.render (toJson payload)).toUTF8
+def postJson {Payload Resp : Type} {m : Type → Type} [Monad m] [MonadServer m] [ToJson Payload] [FromJson Resp] (url : WebhookUrl) (payload : Payload) : m (Except ApiError Resp) := do
+  let res ← postRaw url [("Content-Type", "application/json"), ("Accept", "application/json")] (Json.render (toJson payload)).toUTF8
+  return decodeRespJson res
 
 @[specialize]
-def postBytes {m : Type → Type} [Monad m] [MonadServer m] (url : WebhookUrl) (mime : String) (body : Bytes) : m (Except ApiError Bytes) :=
-  decodeRespBytes <$> postRaw url [("Content-Type", sanitizeHeader mime)] body
+def postBytes {m : Type → Type} [Monad m] [MonadServer m] (url : WebhookUrl) (mime : String) (body : Bytes) : m (Except ApiError Bytes) := do
+  let res ← postRaw url [("Content-Type", sanitizeHeader mime)] body
+  return decodeRespBytes res
 
 instance {σ Payload Resp : Type} [ToJson Payload] [FromJson Resp] (url : WebhookUrl) (payload : Payload) :
     SafeIO (postJson (Payload := Payload) (Resp := Resp) (m := ThreadProg σ) url payload) where
@@ -75,6 +87,28 @@ instance {σ Payload Resp : Type} [ToJson Payload] [FromJson Resp] (url : Webhoo
 
 instance {σ : Type} (url : WebhookUrl) (mime : String) (body : Bytes) : SafeIO (postBytes (m := ThreadProg σ) url mime body) where
   noAtomic := by unfold postBytes postRaw; exact .io (.httpCall _) _ fun res => .pure (decodeRespBytes (res.bind checkHttpOk))
+
+theorem progEffSpec_postRaw {σ : Type} {Inv : σ → Prop} {A : Prop} {Step : σ → σ → Prop}
+    {EffOk : ServerEffect → Prop} {Post : Except ApiError OutboundResp → Prop}
+    (url : WebhookUrl) (headers : List (String × String)) (body : Bytes)
+    (hHttp : ∀ req, EffOk (.httpCall req)) (hPost : ∀ r, Post r) :
+    ProgEffSpec Inv A Step EffOk Post (postRaw (m := ThreadProg σ) url headers body) :=
+  .io (.httpCall _) _ (hHttp _) fun res => .pure _ (hPost (res.bind checkHttpOk))
+
+theorem progEffSpec_postJson {σ Payload Resp : Type} [ToJson Payload] [FromJson Resp]
+    {Inv : σ → Prop} {A : Prop} {Step : σ → σ → Prop}
+    {EffOk : ServerEffect → Prop} {Post : Except ApiError Resp → Prop}
+    (url : WebhookUrl) (payload : Payload)
+    (hHttp : ∀ req, EffOk (.httpCall req)) (hPost : ∀ r, Post r) :
+    ProgEffSpec Inv A Step EffOk Post (postJson (Payload := Payload) (Resp := Resp) (m := ThreadProg σ) url payload) :=
+  (progEffSpec_postRaw url _ _ hHttp fun _ => trivial).bind fun res _ => .pure _ (hPost (decodeRespJson res))
+
+theorem progEffSpec_postBytes {σ : Type} {Inv : σ → Prop} {A : Prop} {Step : σ → σ → Prop}
+    {EffOk : ServerEffect → Prop} {Post : Except ApiError Bytes → Prop}
+    (url : WebhookUrl) (mime : String) (body : Bytes)
+    (hHttp : ∀ req, EffOk (.httpCall req)) (hPost : ∀ r, Post r) :
+    ProgEffSpec Inv A Step EffOk Post (postBytes (m := ThreadProg σ) url mime body) :=
+  (progEffSpec_postRaw url _ _ hHttp fun _ => trivial).bind fun res _ => .pure _ (hPost (decodeRespBytes res))
 
 end Webhook
 
@@ -622,8 +656,8 @@ private def elabExternalWsChannel (svcName fullSvcName : Name) (svcNameStr : Str
 
 @[noinline, command_elab externalCmd]
 def elabExternalCmd : CommandElab := fun stx => do
-  let svcIdent : Ident := ⟨stx.getArg 1⟩; let svcName := svcIdent.getId; let svcNameStr := svcName.toString
-  let (baseSpec, authSpec, ssrfGuard, epClauses, wsClauses) ← parseExternalClauses svcIdent svcName (stx.getArg 3).getArgs
+  let svcIdent : Ident := ⟨stx.getArg 2⟩; let svcName := svcIdent.getId; let svcNameStr := svcName.toString
+  let (baseSpec, authSpec, ssrfGuard, epClauses, wsClauses) ← parseExternalClauses svcIdent svcName (stx.getArg 4).getArgs
   let baseOrigin := baseSpec.rawTemplate
   let fullSvcName := (← getCurrNamespace) ++ svcName; let secretsList := authSpec.requiredSecrets.toArray
   let (baseId, secId, mrkId) := (mkIdentFrom svcIdent (svcName ++ `baseUrl), mkIdentFrom svcIdent (svcName ++ `secrets), mkIdentFrom svcIdent (svcName ++ `_qed_external_marker))

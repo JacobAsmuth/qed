@@ -240,6 +240,7 @@ def Json.num?  : Json → Option JsonNumber             | .num n  => some n | _ 
 def Json.arr?  : Json → Option (List Json)            | .arr es => some es | _ => none
 def Json.obj?  : Json → Option (List (String × Json)) | .obj ms => some ms | _ => none
 def Json.object (entries : Array (String × Json)) : Json := .obj entries.toList
+def Json.array  (entries : Array Json) : Json := .arr entries.toList
 def Json.field (j : Json) (key : String) : Except String Json :=
   match j with | .obj ms => (ms.foldl (fun acc kv => if kv.1 == key then some kv.2 else acc) none).elim (.error s!"missing key '{key}'") .ok | _ => .error "expected an object"
 def Json.get? (j : Json) (key : String) : Option Json := (j.field key).toOption

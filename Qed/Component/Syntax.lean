@@ -36,7 +36,7 @@ section CompParsers
 open Lean Parser Qed.Lang
 
 private abbrev pExpr (p : Nat := 0) : Parser := categoryParser `qedExpr p
-private abbrev pType : Parser := categoryParser `qedType 0
+private abbrev pType : Parser := withPosition (categoryParser `qedType 0)
 private abbrev pPat  : Parser := categoryParser `qedPat 0
 private abbrev kwPos (k : Name) (p : Parser) : Parser := withPosition (atomic (identEq k) >> p)
 private def compParam     : Parser := node `Qed.componentParam (ident >> ":" >> pType)

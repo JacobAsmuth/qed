@@ -184,22 +184,32 @@ def ensureUnitReturn (ref : Lean.Syntax) (stmts : Array Lean.Syntax) : Array Lea
   else let i := Lean.SourceInfo.fromRef ref; stmts.push (Lean.Syntax.node i ``qedStmtReturn #[Lean.Syntax.atom i "return", Lean.Syntax.node i Lean.nullKind #[]])
 
 private def knownQMethodNames : Array String := #[
-  "toNat?", "toInt?", "head?", "back?", "getLast?", "get?", "find?", "findIdx?", "indexOf?",
-  "str?", "nat?", "int?", "bool?", "strAt?", "natAt?", "intAt?", "boolAt?",
-  "parse?", "decode?", "decodeUrl?", "decodeString?", "fromUTF8?", "fromIso?", "parseNat?", "parseInt?"
+  "toNat?", "toInt?", "head?", "back?", "getLast?", "get?", "find?", "findIdx?", "findSome?", "indexOf?",
+  "str?", "nat?", "int?", "bool?", "num?", "arr?", "obj?", "strAt?", "natAt?", "intAt?", "boolAt?", "pathStr?",
+  "parse?", "decode?", "decodeUrl?", "decodeString?", "fromUTF8?", "fromIso?", "parseNat?", "parseInt?",
+  "lookup?", "getElem?", "maxAge?"
 ]
 
-private def isKnownQNameStr (s : String) : Bool :=
-  let leaf := match s.splitOn "." |>.reverse with | h :: _ => h | [] => s
-  knownQMethodNames.contains leaf
+private def knownQMethodSet : Std.HashSet String := knownQMethodNames.foldl (·.insert ·) {}
+
+private def leafOfDottedStr (s : String) : String :=
+  match s.splitOn "." |>.reverse with | h :: _ => h | [] => s
+
+partial def exprHasUnwrapWith (knownQ boundLocals : Std.HashSet String) (stx : Lean.Syntax) : Bool :=
+  let k := stx.getKind
+  if k == ``qedUnwrap then true
+  else if k == ``qedDotIdent || k == ``qedLam1 || k == ``qedLamN || k == ``qedAllIn || k == ``qedAnyIn || k == ``qedAllVars then false
+  else if k == ``qedIdent then
+    let s := (stx.getArg 0).getId.toString
+    s.endsWith "?" && !knownQ.contains (leafOfDottedStr s) && !boundLocals.contains s
+  else if k == ``qedProj then
+    let f := (stx.getArg 2).getId.toString
+    (f.endsWith "?" && !knownQ.contains f) || exprHasUnwrapWith knownQ boundLocals (stx.getArg 0)
+  else stx.getArgs.any (exprHasUnwrapWith knownQ boundLocals)
+
+def exprHasUnwrap (stx : Lean.Syntax) : Bool := exprHasUnwrapWith knownQMethodSet {} stx
 
 mutual
-  partial def exprHasUnwrap (stx : Lean.Syntax) : Bool :=
-    let k := stx.getKind
-    if k == ``qedUnwrap then true
-    else if k == ``qedDotIdent || k == ``qedLam1 || k == ``qedLamN || k == ``qedAllIn || k == ``qedAnyIn || k == ``qedAllVars then false
-    else if k == ``qedIdent then let s := (stx.getArg 0).getId.toString; s.endsWith "?" && !isKnownQNameStr s
-    else stx.getArgs.any exprHasUnwrap
   partial def stmtMayReturnEarly (stx : Lean.Syntax) : Bool :=
     let k := stx.getKind
     if k == ``qedStmtReturn || k == ``qedStmtAtomic || (matchTxStmt? stx).isSome then true
@@ -217,11 +227,71 @@ end
 section ExprLowering
 open Lean Elab Command
 
-private def peelIdentTrailingQ (id : Ident) : Ident × Nat :=
+private initialize importedQNamesCache : IO.Ref (Name × Std.HashSet String) ← IO.mkRef (.anonymous, {})
+
+private def userQLeaf? (env : Environment) (n : Name) : Option String :=
+  match n with
+  | .str _ leaf =>
+      if leaf.endsWith "?" && !Qed.Diag.isToolchainRoot (Qed.Diag.modRootOf env n env.header.mainModule) (includeQed := true) then
+        some leaf
+      else none
+  | _ => none
+
+def getKnownQLeafNames : CommandElabM (Std.HashSet String) := do
+  let env ← getEnv; let mod := env.header.mainModule
+  let (cMod, impSet) ← importedQNamesCache.get
+  let base ← if cMod == mod then pure impSet else do
+    let s := env.constants.map₁.fold (init := knownQMethodSet) fun acc n _ =>
+      match userQLeaf? env n with | some leaf => acc.insert leaf | none => acc
+    importedQNamesCache.set (mod, s); pure s
+  return env.constants.map₂.foldl (init := base) fun acc n _ =>
+    match userQLeaf? env n with | some leaf => acc.insert leaf | none => acc
+
+private partial def stmtsHaveUnwrapAux (knownQ : Std.HashSet String) (bound : Std.HashSet String) (stmts : Array Syntax) (i : Nat) : Bool :=
+  if h : i < stmts.size then
+    let st := stmts[i]; let k := st.getKind
+    let hasE := exprHasUnwrapWith knownQ bound
+    let addIds (ns : Array Name) (b : Std.HashSet String) := ns.foldl (fun acc n => acc.insert n.toString) b
+    if k == ``qedStmtLet then
+      hasE (st.getArg 4) || hasE (st.getArg 5) || stmtsHaveUnwrapAux knownQ (addIds (collectLetBinderIds (st.getArg 1)) bound) stmts (i + 1)
+    else if k == ``qedStmtLetMut then
+      hasE (st.getArg 5) || stmtsHaveUnwrapAux knownQ (bound.insert (st.getArg 2).getId.eraseMacroScopes.toString) stmts (i + 1)
+    else if k == ``qedStmtLetElse then
+      hasE (st.getArg 3) || stmtsHaveUnwrapAux knownQ bound (extractLetElseStmts st) 0 ||
+        stmtsHaveUnwrapAux knownQ (addIds (collectQedPatIds (st.getArg 1)) bound) stmts (i + 1)
+    else if k == ``qedStmtIf then
+      hasE (st.getArg 1) || stmtsHaveUnwrapAux knownQ bound (suiteStmts (st.getArg 3)) 0 ||
+        ((desugarElifs (st.getArg 4).getArgs (st.getArg 5)).any fun es => stmtsHaveUnwrapAux knownQ bound es 0) ||
+        stmtsHaveUnwrapAux knownQ bound stmts (i + 1)
+    else if k == ``qedStmtIfLet then
+      hasE (st.getArg 4) || stmtsHaveUnwrapAux knownQ (addIds (collectQedPatIds (st.getArg 2)) bound) (suiteStmts (st.getArg 6)) 0 ||
+        ((extractElseSuite (st.getArg 7)).any fun es => stmtsHaveUnwrapAux knownQ bound es 0) ||
+        stmtsHaveUnwrapAux knownQ bound stmts (i + 1)
+    else if k == ``qedStmtMatch then
+      (st.getArg 1).getSepArgs.any hasE ||
+        ((st.getArg 3).getArgs.any fun c => stmtsHaveUnwrapAux knownQ (addIds (collectCasePatIds (extractCasePatAlts (c.getArg 1))) bound) (suiteStmts (c.getArg 3)) 0) ||
+        stmtsHaveUnwrapAux knownQ bound stmts (i + 1)
+    else if k == ``qedStmtFor then
+      let bStx := st.getArg 1
+      let bBody := if bStx.isIdent then bound.insert bStx.getId.eraseMacroScopes.toString else bound
+      hasE (st.getArg 3) || stmtsHaveUnwrapAux knownQ bBody (suiteStmts (st.getArg 5)) 0 || stmtsHaveUnwrapAux knownQ bound stmts (i + 1)
+    else if k == ``qedStmtAtomic then
+      stmtsHaveUnwrapAux knownQ bound (suiteStmts (st.getArg 2)) 0 || stmtsHaveUnwrapAux knownQ bound stmts (i + 1)
+    else if let some (_, _, _, txStmts) := matchTxStmt? st then
+      stmtsHaveUnwrapAux knownQ bound txStmts 0 || stmtsHaveUnwrapAux knownQ bound stmts (i + 1)
+    else hasE st || stmtsHaveUnwrapAux knownQ bound stmts (i + 1)
+  else false
+
+def stmtsHaveUnwrapM (initLocals : Array String) (stmts : Array Syntax) : CommandElabM Bool := do
+  let knownQ ← getKnownQLeafNames
+  let bound := initLocals.foldl (·.insert ·) {}
+  return stmtsHaveUnwrapAux knownQ bound stmts 0
+
+private def peelTrailingQ (knownQ : Std.HashSet String) (isBound : String → Bool) (id : Ident) : Ident × Nat :=
   let rec go : List Char → Nat → List Char × Nat
     | '?' :: rest, q =>
         let cand := String.ofList ('?' :: rest).reverse
-        if isKnownQNameStr cand then ('?' :: rest, q) else go rest (q + 1)
+        if knownQ.contains (leafOfDottedStr cand) || isBound cand then ('?' :: rest, q) else go rest (q + 1)
     | rev, q => (rev, q)
   let (revBase, q) := go id.getId.toString.toList.reverse 0
   if q == 0 then (id, 0) else (mkIdentFrom id ((String.ofList revBase.reverse |>.splitOn ".").foldl Name.str .anonymous), q)
@@ -383,10 +453,19 @@ private def hoistAwaitUnwrap (recGo : ExprMode → Syntax → SrvExprM Term) (st
   modify fun s => { s with hoisted := s.hoisted.push (.awaitUnwrap stx tmp callTerm) }
   liftMacroM (finishTermMode mode ⟨tmp⟩)
 
+private def ctxHasIdent (ctx : LowerCtx) (s : String) : Bool :=
+  ctx.locals.contains s || ctx.stateFields.contains s || ctx.envVars.contains s
+
 private def mkSrvLowerHooks (recGo : ExprMode → Syntax → SrvExprM Term) : LowerHooks SrvExprM :=
   { LowerHooks.mkDefault (fun ref msg => throwErrorAt ref msg) with
-    lowerIdent := fun stx id mode => do let ctx ← read; let (cid, q) := peelIdentTrailingQ id; liftMacroM (finishTermMode mode (← liftM <| hoistPureUnwraps stx ctx q (← resolveDottedIdent stx ctx cid)))
-    lowerProj := fun stx objT fld mode => do let ctx ← read; let (cf, q) := peelIdentTrailingQ fld; liftMacroM (finishTermMode mode (← liftM <| hoistPureUnwraps stx ctx q (← `(($objT).$cf:ident))))
+    lowerIdent := fun stx id mode => do
+      let ctx ← read; let knownQ ← liftM (m := CommandElabM) getKnownQLeafNames
+      let (cid, q) := peelTrailingQ knownQ (ctxHasIdent ctx) id
+      liftMacroM (finishTermMode mode (← liftM <| hoistPureUnwraps stx ctx q (← resolveDottedIdent stx ctx cid)))
+    lowerProj := fun stx objT fld mode => do
+      let ctx ← read; let knownQ ← liftM (m := CommandElabM) getKnownQLeafNames
+      let (cf, q) := peelTrailingQ knownQ (fun _ => false) fld
+      liftMacroM (finishTermMode mode (← liftM <| hoistPureUnwraps stx ctx q (← `(($objT).$cf:ident))))
     lowerIndex := fun _ arrT idxT mode => do liftMacroM (finishTermMode mode (← `(srvGetElem($arrT, $idxT))))
     lowerCall := lowerSrvCallHook
     lowerUnwrap := fun stx innerRaw mode => do
@@ -408,7 +487,7 @@ private def mkSrvLowerHooks (recGo : ExprMode → Syntax → SrvExprM Term) : Lo
     lowerType := fun t => liftMacroM (return (← lowerQedType t false).1)
     lowerPat := fun p => liftMacroM (lowerQedPat p)
     withLocals := fun names k => withReader (fun c => { c with locals := c.locals ++ names, allowAwait := false, allowUnwrap := false }) k
-    useDirectArray := true
+    useDirectArray := false
     freshIdent := fun pfx => liftM <| freshIdent pfx }
 
 private partial def lowerExprM (mode : ExprMode) (stx : Syntax) : SrvExprM Term := lowerQedExpr (mkSrvLowerHooks lowerExprM) mode stx
@@ -440,7 +519,7 @@ private partial def parseLValPath (ctx : LowerCtx) (stx : Syntax) : LowerM (Iden
         let _ ← checkStateRead stx ctx rStr; recordMutated rStr
         return (mkIdentFrom stx root, rest.toArray.map (LValStep.field <| mkIdentFrom stx ·))
   else if k == ``qedProj then let (r, ps) ← parseLValPath ctx (stx.getArg 0); return (r, ps.push (.field ⟨stx.getArg 2⟩))
-  else if k == ``qedIndex then let (r, ps) ← parseLValPath ctx (stx.getArg 0); return (r, ps.push (.index (← lowerExpr ctx .val (stx.getArg 2))))
+  else if k == ``qedIndex && (stx.getArg 4).getNumArgs == 0 then let (r, ps) ← parseLValPath ctx (stx.getArg 0); return (r, ps.push (.index (← lowerExpr ctx .val (stx.getArg 2))))
   else throwErrorAt stx "invalid mutation target; expected `stateField`, `stateField.sub`, or `stateField[i].sub`"
 
 private partial def withUpdatedPathCPS (steps : Array LValStep) (idx : Nat) (curVal : Term)
@@ -563,38 +642,53 @@ private def wrapHoists (mode : BlockMode) (ctx : LowerCtx) (steps : Array Hoiste
         `((srvAwaitPlain($callTerm)) >>= fun $tmp:ident => $acc)
     | .pureUnwrap tmp valTerm, _ => liftM <| wrapUnwrapStep mode ctx tmp valTerm acc
 
-private def bindOptIdent (xStx : Syntax) (val cont : Term) : CommandElabM Term :=
-  if xStx.isIdent then let xId : Ident := ⟨xStx⟩; `(let $xId:ident := $val; $cont) else `(let _ := $val; $cont)
+private def bindOptIdent (xStx : Syntax) (ty? : Option Term) (val cont : Term) : CommandElabM Term :=
+  mkLetBindTerm xStx ty? val cont
+
+private def lowerOptLetType (stmt : Syntax) : LowerM (Option Term) :=
+  if (stmt.getArg 2).getNumArgs == 2 then some <$> liftMacroM (return (← lowerQedType ((stmt.getArg 2).getArg 1) false).1) else pure none
 
 @[noinline]
-private def bindLet (mode : BlockMode) (xStx : Syntax) (val cont : Term) : LowerM Term := do
+private def bindLet (mode : BlockMode) (xStx : Syntax) (ty? : Option Term) (val cont : Term) : LowerM Term := do
   match mode with
   | .pure .. =>
-      let xId ← if xStx.isIdent then pure ⟨xStx⟩ else freshIdent "_srvDiscard"
-      `(Qed.Server.srvLetEq $val (fun $xId:ident $(← freshIdent "_srvEq"):ident => $cont))
-  | .async _ => liftM <| bindOptIdent xStx val cont
+      let typedVal ← match ty? with | some ty => `(($val : $ty)) | none => pure val
+      if xStx.isIdent then
+        `(Qed.Server.srvLetEq $typedVal (fun $(⟨xStx⟩):ident $(← freshIdent "_srvEq"):ident => $cont))
+      else if xStx.getKind == ``qedLetPatTuple then
+        let tupId ← freshIdent "_srvTup"; let pat ← lowerLetBinderPat xStx
+        `(Qed.Server.srvLetEq $typedVal (fun $tupId:ident $(← freshIdent "_srvEq"):ident => let $pat:term := $tupId:ident; $cont))
+      else
+        `(Qed.Server.srvLetEq $typedVal (fun $(← freshIdent "_srvDiscard"):ident $(← freshIdent "_srvEq"):ident => $cont))
+  | .async _ => liftM <| bindOptIdent xStx ty? val cont
 
 private def dropMutLocals (names : Array Name) (muts : Array Ident) : Array Ident :=
   muts.filter fun m => !names.contains m.getId.eraseMacroScopes
 
-private def pushOptLocal (ctx : LowerCtx) (xStx : Syntax) : LowerCtx :=
-  if xStx.isIdent then
-    { ctx with locals := ctx.locals.push xStx.getId.toString, mutLocals := dropMutLocals #[xStx.getId.eraseMacroScopes] ctx.mutLocals }
-  else ctx
-
 private def pushPatLocals (ctx : LowerCtx) (patIds : Array Name) : LowerCtx :=
   { ctx with locals := ctx.locals ++ patIds.map (·.toString), mutLocals := dropMutLocals patIds ctx.mutLocals }
 
-private def isBareUnwrapExpr (allowAwait : Bool) (eStx : Syntax) : Bool :=
+private def pushOptLocal (ctx : LowerCtx) (xStx : Syntax) : LowerCtx :=
+  let ids := collectLetBinderIds xStx
+  if ids.isEmpty then ctx else pushPatLocals ctx ids
+
+private def isBareUnwrapExpr (allowAwait : Bool) (knownQ : Std.HashSet String) (ctx : LowerCtx) (eStx : Syntax) : Bool :=
   let u := unwrapParens1 eStx
   u.getKind == ``qedUnwrap || (allowAwait && u.getKind == ``qedAwait && (unwrapParens1 (u.getArg 1)).getKind == ``qedUnwrap) ||
-  (eStx.getKind == ``qedIdent && (eStx.getArg 0).getId.toString.endsWith "?") || (eStx.getKind == ``qedProj && (eStx.getArg 2).getId.toString.endsWith "?")
+  (eStx.getKind == ``qedIdent &&
+    let s := (eStx.getArg 0).getId.toString
+    s.endsWith "?" && !knownQ.contains (leafOfDottedStr s) && !ctxHasIdent ctx s) ||
+  (eStx.getKind == ``qedProj &&
+    let f := (eStx.getArg 2).getId.toString
+    f.endsWith "?" && !knownQ.contains f)
 
 /-! ## Unified Pure & Async Statement Block Lowering (`lowerBlock`) -/
 
 private partial def lowerCatchFallback? (ctx : LowerCtx) (stmts : Array Syntax) : LowerM (Option Term) := do
+  let knownQ ← liftM getKnownQLeafNames
+  let bound := (ctx.locals ++ ctx.stateFields ++ ctx.envVars).foldl (·.insert ·) {}
   let lowerPureNoHoist (eStx : Syntax) : LowerM (Option Term) := do
-    if exprHasAwait eStx || exprHasUnwrap eStx then return none
+    if exprHasAwait eStx || exprHasUnwrapWith knownQ bound eStx then return none
     let (t, steps) ← lowerExprCollectingHoists { ctx with allowAwait := false } .val eStx
     return if steps.isEmpty then some t else none
   if stmts.isEmpty then return none
@@ -606,8 +700,9 @@ private partial def lowerCatchFallback? (ctx : LowerCtx) (stmts : Array Syntax) 
   else if stmts[0]!.getKind == ``qedStmtLet && stmts[0]![5].getNumArgs == 0 then
     let st := stmts[0]!
     let some rhsTerm ← lowerPureNoHoist (st.getArg 4) | return none
+    let ty? ← lowerOptLetType st
     let some tailTerm ← lowerCatchFallback? (pushOptLocal ctx (st.getArg 1)) (stmts.extract 1 stmts.size) | return none
-    some <$> liftM (bindOptIdent (st.getArg 1) (← `(srvRejectUnhandledErr($rhsTerm))) tailTerm)
+    some <$> liftM (bindOptIdent (st.getArg 1) ty? (← `(srvRejectUnhandledErr($rhsTerm))) tailTerm)
   else return none
 
 @[noinline]
@@ -691,34 +786,40 @@ private def lowerReturn (mode : BlockMode) (ctx : LowerCtx) (stmt : Syntax) : Lo
     wrapHoists mode ctx steps (← liftM <| (if isFail then mkErrLeaf else mkOkLeaf) mode ctx term)
 
 @[noinline]
-private def lowerLet (mode : BlockMode) (ctx : LowerCtx) (stmt : Syntax) (rest : Array Syntax)
+private def lowerLetCore (allowAwait : Bool) (ctx : LowerCtx) (stmt : Syntax) (rest : Array Syntax)
+    (bindVal : Syntax → Option Term → Term → Term → LowerM Term)
+    (wrapH : Array HoistedStep → Term → LowerM Term)
     (recBlock : LowerCtx → Array Syntax → LowerM Term) : LowerM Term := do
-  let xStx := stmt.getArg 1; let rhsRaw := stmt.getArg 4
+  let xStx := stmt.getArg 1; let ty? ← lowerOptLetType stmt; let rhsRaw := stmt.getArg 4
   if let some catchNode ← extractSrvLetCatch? (stmt.getArg 5) then
-    if catchNode.getKind == `Qed.Lang.catchArms then throwErrorAt catchNode "multi-arm `catch: case ...` is for client components; in server functions use `catch err:`"
+    if catchNode.getKind == `Qed.Lang.catchArms then throwErrorAt catchNode "multi-arm `catch: case ...` is for client components; in server/service functions use `catch err:`"
     let rhsStx := unwrapParens1 rhsRaw; let binderStx := catchNode.getArg 0; let catchStmts := suiteStmts (catchNode.getArg 2)
     let errId : Ident := if binderStx.isIdent then ⟨binderStx⟩ else mkIdent `_srvCatchErr
     let catchCtx := pushOptLocal ctx binderStx; let okTerm ← recBlock (pushOptLocal ctx xStx) rest
     let (scrutTerm, steps, awaitCall?) : Term × Array HoistedStep × Option (Term × Ident) ←
       if rhsStx.getKind == ``qedAwait then
-        match mode with
-        | .pure .. => throwErrorAt rhsRaw "`await` cannot be used inside a synchronous or `atomic` block"
-        | .async _ => let (c, s) ← lowerExprCollectingHoists ctx .val (rhsStx.getArg 1); let r ← freshIdent "_catchAw"; pure (⟨r⟩, s, some (c, r))
+        unless allowAwait do throwErrorAt rhsRaw "`await` cannot be used inside a synchronous or `atomic` block"
+        let (c, s) ← lowerExprCollectingHoists ctx .val (rhsStx.getArg 1); let r ← freshIdent "_catchAw"; pure (⟨r⟩, s, some (c, r))
       else let (r, s) ← lowerExprCollectingHoists ctx .val rhsStx; pure (r, s, none)
-    let mkUnwrapMatch (errBody : Term) (okId : Ident) (okBody : Term) : CommandElabM Term :=
-      `(match Qed.Server.SrvUnwrap.unwrap (E := Qed.Server.ApiError) $scrutTerm with | Except.error $errId:ident => $errBody | Except.ok $okId:ident => $okBody)
+    let mkUnwrapMatch (errBody okPat okBody : Term) : CommandElabM Term :=
+      `(match Qed.Server.SrvUnwrap.unwrap (E := Qed.Server.ApiError) $scrutTerm with | Except.error $errId:ident => $errBody | Except.ok $okPat:term => $okBody)
     let innerTerm ← if let some fbTerm ← lowerCatchFallback? catchCtx catchStmts then
-        let okValId ← freshIdent "_catchOk"; bindLet mode xStx (← liftM <| mkUnwrapMatch fbTerm okValId ⟨okValId.raw⟩) okTerm
+        let okValId ← freshIdent "_catchOk"; bindVal xStx ty? (← liftM <| mkUnwrapMatch fbTerm ⟨okValId.raw⟩ ⟨okValId.raw⟩) okTerm
       else
         unless blockAlwaysTerminates ctx.loopMuts?.isSome catchStmts do
           throwErrorAt stmt (if ctx.loopMuts?.isSome then "the `catch` block must end with `return`, `break`, `continue`, or a fallback value expression" else "the `catch` block must either `return` on all paths or end with a fallback value expression")
-        liftM <| mkUnwrapMatch (← recBlock catchCtx catchStmts) (if xStx.isIdent then ⟨xStx⟩ else mkIdent `_srvDiscard) okTerm
+        let errBody ← recBlock catchCtx catchStmts
+        match ty? with
+        | some ty => let okValId ← freshIdent "_catchOk"; liftM <| mkUnwrapMatch errBody ⟨okValId.raw⟩ (← mkLetBindTerm xStx (some ty) ⟨okValId.raw⟩ okTerm)
+        | none =>
+            let okPat ← if xStx.isIdent then pure ⟨xStx⟩ else if xStx.getKind == ``qedLetPatTuple then lowerLetBinderPat xStx else pure ⟨(mkIdent `_srvDiscard).raw⟩
+            liftM <| mkUnwrapMatch errBody okPat okTerm
     let awaitedTerm ← match awaitCall? with | some (c, r) => `($c >>= fun $r:ident => $innerTerm) | none => pure innerTerm
-    wrapHoists mode ctx steps awaitedTerm
+    wrapH steps awaitedTerm
   else
     let (rhsTerm, steps) ← lowerExprCollectingHoists ctx .val rhsRaw
     let checkedRhs ← if steps.isEmpty then `(srvRejectUnhandledErr($rhsTerm)) else pure rhsTerm
-    wrapHoists mode ctx steps (← bindLet mode xStx checkedRhs (← recBlock (pushOptLocal ctx xStx) rest))
+    wrapH steps (← bindVal xStx ty? checkedRhs (← recBlock (pushOptLocal ctx xStx) rest))
 
 @[noinline]
 private def lowerPureMutationStmt (mode : BlockMode) (pCtx : LowerCtx) (sCur : Ident) (stmt : Syntax) (rest : Array Syntax)
@@ -752,9 +853,10 @@ private def lowerAtomicStmt (aCtx : LowerCtx) (stateTyTerm? : Option Term) (stmt
     (lowerPure : LowerCtx → Ident → Ident → Array Syntax → LowerM Term) (lowerRest : LowerCtx → Array Syntax → LowerM Term) : LowerM Term := do
   let atomStmts := suiteStmts (stmt.getArg 2); let alwaysRet := blockAlwaysReturns atomStmts
   let exportedIds := if alwaysRet then #[] else atomStmts.foldl (init := #[]) fun ids s =>
-    if s.getKind == ``qedStmtLet && (s.getArg 1).isIdent then
-      let id : Ident := ⟨s.getArg 1⟩; let nm := id.getId.eraseMacroScopes.toString
-      if rest.any (stxMentionsVar nm) then ids.filter (·.getId.eraseMacroScopes.toString != nm) |>.push id else ids
+    if s.getKind == ``qedStmtLet then
+      (collectLetBinderIds (s.getArg 1)).foldl (init := ids) fun acc nm =>
+        let sNm := nm.toString
+        if rest.any (stxMentionsVar sNm) then acc.filter (·.getId.eraseMacroScopes.toString != sNm) |>.push (mkIdentFrom s nm) else acc
     else ids
   let mkLoopAwareRet (retTerm : Term) : CommandElabM Term := match aCtx.loopMuts? with
     | none => `(Pure.pure (some $retTerm))
@@ -964,7 +1066,7 @@ private partial def lowerBlock (isPure inAtomic : Bool) (s₀ sCur : Ident) (sta
       else throwErrorAt stmt s!"redundant `atomic` block: `{ctx.fnName}` has no `await` calls, so it already executes atomically"
     else lowerAtomicStmt bCtx stateTyTerm? stmt rest (fun c s0 s st => lowerBlock true true s0 s none c st) recSame
   else if k == ``qedStmtReturn then lowerReturn mode bCtx stmt
-  else if k == ``qedStmtLet then lowerLet mode bCtx stmt rest recSame
+  else if k == ``qedStmtLet then lowerLetCore (!isPure) bCtx stmt rest (bindLet mode) (wrapHoists mode bCtx) recSame
   else if k == ``qedStmtLetElse then
     let patStx := stmt.getArg 1; let patTerm ← liftMacroM (lowerQedPat patStx)
     let (scrutTerm, steps) ← lowerExprCollectingHoists bCtx .val (stmt.getArg 3)
@@ -985,8 +1087,9 @@ private partial def lowerBlock (isPure inAtomic : Bool) (s₀ sCur : Ident) (sta
       throwErrorAt stmt s!"cannot mutate server state outside an `atomic:` block in `{ctx.fnName}` because `{ctx.fnName}` uses `await`"
   else if k == ``qedStmtExpr then
     let eStx := stmt.getArg 0; let (eTerm, steps) ← lowerExprCollectingHoists bCtx .val eStx
-    let valTerm ← if isBareUnwrapExpr (!isPure) eStx then pure eTerm else `(srvEnsureUnit($eTerm))
-    wrapHoists mode bCtx steps (← bindLet mode Syntax.missing valTerm (← recSame bCtx rest))
+    let knownQ ← liftM getKnownQLeafNames
+    let valTerm ← if isBareUnwrapExpr (!isPure) knownQ bCtx eStx then pure eTerm else `(srvEnsureUnit($eTerm))
+    wrapHoists mode bCtx steps (← bindLet mode Syntax.missing none valTerm (← recSame bCtx rest))
   else if k == ``qedStmtIf then
     let (condTerm, steps) ← lowerExprCollectingHoists bCtx .propGuard (stmt.getArg 1); let hGuard ← freshIdent "_srvG"
     wrapHoists mode bCtx steps (← lowerBranch mode bCtx rest (suiteStmts (stmt.getArg 3)) bCtx (desugarElifs (stmt.getArg 4).getArgs (stmt.getArg 5)) isPure
@@ -1060,29 +1163,7 @@ partial def lowerInfallibleAsyncBlock (ctx : LowerCtx) (stmts : Array Syntax) : 
       let (t, steps) ← lowerExprCollectingHoists ctx .val retExpr
       wrapInfallibleHoists steps (← liftM <| wrapInfRet (← `(srvAutoField($t))))
   else if k == ``qedStmtLet then
-    let xStx := stmt.getArg 1; let rhsRaw := stmt.getArg 4
-    if let some catchNode ← extractSrvLetCatch? (stmt.getArg 5) then
-      if catchNode.getKind == `Qed.Lang.catchArms then throwErrorAt catchNode "multi-arm `catch: case ...` is for client components; in server/service functions use `catch err:`"
-      let rhsStx := unwrapParens1 rhsRaw; let binderStx := catchNode.getArg 0; let catchStmts := suiteStmts (catchNode.getArg 2)
-      let errId : Ident := if binderStx.isIdent then ⟨binderStx⟩ else mkIdent `_srvCatchErr
-      let catchCtx := pushOptLocal ctx binderStx; let okTerm ← lowerInfallibleAsyncBlock (pushOptLocal ctx xStx) rest
-      let (scrutTerm, steps, awaitCall?) ← if rhsStx.getKind == ``qedAwait then
-          let (c, s) ← lowerExprCollectingHoists ctx .val (rhsStx.getArg 1); let r ← freshIdent "_catchAw"; pure (⟨r⟩, s, some (c, r))
-        else let (r, s) ← lowerExprCollectingHoists ctx .val rhsStx; pure (r, s, none)
-      let mkUnwrapMatch (errBody : Term) (okId : Ident) (okBody : Term) : CommandElabM Term :=
-        `(match Qed.Server.SrvUnwrap.unwrap (E := Qed.Server.ApiError) $scrutTerm with | Except.error $errId:ident => $errBody | Except.ok $okId:ident => $okBody)
-      let innerTerm ← if let some fbTerm ← lowerCatchFallback? catchCtx catchStmts then
-          let okValId ← freshIdent "_catchOk"; liftM <| bindOptIdent xStx (← liftM <| mkUnwrapMatch fbTerm okValId ⟨okValId.raw⟩) okTerm
-        else
-          unless termCheck catchStmts do
-            throwErrorAt stmt (if ctx.loopMuts?.isSome then "the `catch` block must end with `return`, `break`, `continue`, or a fallback value expression" else "the `catch` block must either `return` on all paths or end with a fallback value expression")
-          liftM <| mkUnwrapMatch (← lowerInfallibleAsyncBlock catchCtx catchStmts) (if xStx.isIdent then ⟨xStx⟩ else mkIdent `_srvDiscard) okTerm
-      let awaitedTerm ← match awaitCall? with | some (c, r) => `($c >>= fun $r:ident => $innerTerm) | none => pure innerTerm
-      wrapInfallibleHoists steps awaitedTerm
-    else
-      let (rhsTerm, steps) ← lowerExprCollectingHoists ctx .val rhsRaw
-      let checkedRhs ← if steps.isEmpty then `(srvRejectUnhandledErr($rhsTerm)) else pure rhsTerm
-      wrapInfallibleHoists steps (← liftM <| bindOptIdent xStx checkedRhs (← lowerInfallibleAsyncBlock (pushOptLocal ctx xStx) rest))
+    lowerLetCore true ctx stmt rest (fun x ty? v c => liftM <| bindOptIdent x ty? v c) wrapInfallibleHoists lowerInfallibleAsyncBlock
   else if k == ``qedStmtLetElse then
     let patStx := stmt.getArg 1; let patTerm ← liftMacroM (lowerQedPat patStx)
     let (scrutTerm, steps) ← lowerExprCollectingHoists ctx .val (stmt.getArg 3)
@@ -1112,7 +1193,7 @@ partial def lowerInfallibleAsyncBlock (ctx : LowerCtx) (stmts : Array Syntax) : 
     wrapInfallibleHoists allSteps matchT
   else if k == ``qedStmtExpr then
     let (eTerm, steps) ← lowerExprCollectingHoists ctx .val (stmt.getArg 0)
-    wrapInfallibleHoists steps (← liftM <| bindOptIdent Syntax.missing (← `(srvEnsureUnit($eTerm))) (← lowerInfallibleAsyncBlock ctx rest))
+    wrapInfallibleHoists steps (← liftM <| bindOptIdent Syntax.missing none (← `(srvEnsureUnit($eTerm))) (← lowerInfallibleAsyncBlock ctx rest))
   else
     let sn := stxSnippet stmt
     throwErrorAt stmt s!"unsupported statement{if sn.isEmpty then s!"({k})" else s!" `{sn}`"} in infallible async function `{ctx.fnName}`"

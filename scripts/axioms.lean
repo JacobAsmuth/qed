@@ -151,6 +151,8 @@ Qed.Auth: parseJwtAlg_rejects_none parseJwtAlg_rejects_hs256 validateJwtClaims_r
   isSafeReturnTo_rejects_javascript sanitizeReturnTo_safe
 Qed.Deploy: validate_rejects_bad_version validate_rejects_unsafe_auth_callback validate_default_ok
 Qed.Base64: decode_encode encode_length encodeUrl_length
+Qed.Str: nat_toString_injective int_toString_injective str_split_sep_inj str_append_ne_of_diff_prefix
+  nat_toString_all int_toString_all str_length_bounds_of_mem_list dite_eq_cases
 Qed.Mapping: decode_encode
 Qed.Codec: run_refine_text run_refine_textarea
 Qed: toString_field fromUTF8?_toUTF8
@@ -189,6 +191,6 @@ open Lean in
       let bad := axs.filter (!allowed.contains ·)
       unless bad.isEmpty do
         throwError "unexpected axiom(s) in {n}: {bad.toList}"
-  unless seen.size == 421 do
-    throwError "expected 421 theorems in axioms manifest, checked {seen.size}"
+  unless seen.size == 429 do
+    throwError "expected 429 theorems in axioms manifest, checked {seen.size}"
   IO.println s!"✓ {seen.size} theorems checked: 0 unexpected axioms"

@@ -53,11 +53,10 @@ def dbAssignItem : Parser := node `Qed.Server.Db.assignItem (ident >> "=" >> dbE
 def dbPolExUser    : Parser := node `Qed.Server.Db.polExUser (withPosition (atomic (identEq `user >> "=") >> dbExpr))
 def dbPolExRole    : Parser := node `Qed.Server.Db.polExRole (withPosition (atomic (identEq `role >> "=") >> dbExpr))
 def dbPolExSession : Parser := node `Qed.Server.Db.polExSession (withPosition (atomic (identEq `session >> "=") >> dbExpr))
-def dbPolExSystem  : Parser := node `Qed.Server.Db.polExSystem (withPosition (atomic (identEq `system >> "=") >> dbExpr))
 def dbPolExCtx     : Parser := node `Qed.Server.Db.polExCtx (withPosition (atomic (identEq `ctx >> "=") >> dbExpr))
 def dbPolExRow     : Parser := node `Qed.Server.Db.polExRow (withPosition (atomic (identEq `row >> "=") >> dbExpr))
 def dbPolExSnap    : Parser := node `Qed.Server.Db.polExSnap (withPosition (atomic (identEq `snap >> ident >> "=") >> dbExpr))
-def dbPolicyExItem : Parser := dbPolExUser <|> dbPolExRole <|> dbPolExSession <|> dbPolExSystem <|> dbPolExCtx <|> dbPolExRow <|> dbPolExSnap
+def dbPolicyExItem : Parser := dbPolExUser <|> dbPolExRole <|> dbPolExSession <|> dbPolExCtx <|> dbPolExRow <|> dbPolExSnap
 
 @[dbTableClause_parser] def dbTablePolicyClause : Parser := leading_parser withPosition (atomic (identEq `policy) >> sepBy1 dbPolicyOp "," >> kw "requires" >> sepBy1 dbExpr ",")
 @[dbTableClause_parser] def dbTableTransInvClause : Parser := leading_parser withPosition (atomic ("invariant " >> ident >> ":" >> identEq `transition) >> categoryParser `qedExpr 90 >> ":" >> sepBy1 dbTransEdge ",")
@@ -91,7 +90,7 @@ def dbBackfillSetItem : Parser := node `Qed.Server.Db.backfillSetItem (ident >> 
   withPosition (atomic (identEq `backfill) >> ident >> identEq `set >> "{" >> sepBy1 dbBackfillSetItem "," >> "}" >>
     optional (checkLineEq >> symbol "where" >> dbExpr))
 @[dbClause_parser] def dbTableClauseTop : Parser := leading_parser withPosition (atomic (identEq `table) >> ident >> dbIndented "expected indented `table` columns/policies" `dbTableClause)
-@[command_parser] def databaseCmd : Parser := leading_parser withPosition ("database " >> ident >> dbIndented "expected indented `database` clauses" `dbClause)
+@[command_parser] def databaseCmd : Parser := leading_parser optional Command.docComment >> withPosition ("database " >> ident >> dbIndented "expected indented `database` clauses" `dbClause)
 
 end DbParsers
 
@@ -752,7 +751,7 @@ private def elabAllTableExamples (dbName : Name) (tables : Array ParsedTable) (t
       elabCommand (← `(command| def $defId : $rowTyId := $rowTerm))
       let exErrLit := Syntax.mkStrLit s!"Database `example {exId.getId.eraseMacroScopes}` on table `{t.tableName}` does not satisfy row invariants"
       withRef exId <| elabCommand (← `(command| theorem $validId : $rowInvId $defId := by
-        (try simp only [$rowInvId:ident, $defId:ident, Qed.Lang.QedVal.val_id]); all_goals (first | trivial | rfl | decide | decide +kernel | omega | fail $exErrLit)))
+        (try simp only [$rowInvId:ident, $defId:ident, Qed.Lang.QedVal.val_id]); all_goals (first | trivial | qedCloseGround | rfl | decide | omega | fail $exErrLit)))
   -- Pass 2: emit `rejects`, `transition_example`/`transition_rejects`, and `policy_allows`/`policy_denies`
   for ((t, tInfo), hasInhab) in (tables.zip tableInfos).zip hasInhabs do
     let rowTypeName := dbName ++ t.ident.getId; let rowTyId := mkIdentFrom t.ident rowTypeName
@@ -764,7 +763,7 @@ private def elabAllTableExamples (dbName : Name) (tables : Array ParsedTable) (t
       let thmId := mkIdentFrom rejId (rowTypeName ++ (Name.mkSimple s!"rejects_{rejId.getId.eraseMacroScopes}"))
       let rejErrLit := Syntax.mkStrLit s!"Database `rejects {rejId.getId.eraseMacroScopes}` on table `{t.tableName}` could not be proved invalid (row may satisfy all invariants)"
       withRef rejId <| elabCommand (← `(command| theorem $thmId : ¬ $rowInvId ($rowTerm) := by
-        (try simp only [$rowInvId:ident, Qed.Lang.QedVal.val_id]); all_goals (first | decide | decide +kernel | omega | fail $rejErrLit)))
+        (try simp only [$rowInvId:ident, Qed.Lang.QedVal.val_id]); all_goals (first | qedCloseGround | decide | omega | fail $rejErrLit)))
     for trStx in t.transExamples do
       let isAllows := (trStx.getArg 0).getId.eraseMacroScopes == `transition_example
       let trId : Ident := ⟨trStx.getArg 1⟩
@@ -787,13 +786,13 @@ private def elabAllTableExamples (dbName : Name) (tables : Array ParsedTable) (t
       let thmId := mkIdentFrom trId (rowTypeName ++ (Name.mkSimple s!"{pfx}{trId.getId.eraseMacroScopes}"))
       let goal ← if isAllows then `($transInvId ($oldTerm) ($newTerm)) else `(¬ $transInvId ($oldTerm) ($newTerm))
       let trErrLit := Syntax.mkStrLit s!"Database `{kwName} {trId.getId.eraseMacroScopes}` on table `{t.tableName}` failed transition invariant check"
-      withRef trId <| elabCommand (← `(command| theorem $thmId : $goal := by (try simp only [$transInvId:ident, Qed.Lang.QedVal.val_id]); all_goals (first | trivial | rfl | decide | decide +kernel | omega | fail $trErrLit)))
+      withRef trId <| elabCommand (← `(command| theorem $thmId : $goal := by (try simp only [$transInvId:ident, Qed.Lang.QedVal.val_id]); all_goals (first | trivial | qedCloseGround | rfl | decide | omega | fail $trErrLit)))
     for pStx in t.polExamples do
       let isAllows := (pStx.getArg 0).getId.eraseMacroScopes == `policy_allows
       let opName := ((pStx.getArg 1).getArg 0).getId.eraseMacroScopes
       let pId : Ident := ⟨pStx.getArg 2⟩
       let mut ctx? : Option Term := none; let mut user? : Option Syntax := none
-      let mut role? : Option Term := none; let mut session? : Option Term := none; let mut system? : Option Term := none
+      let mut role? : Option Term := none; let mut session? : Option Term := none
       let mut row? : Option Term := none; let mut snaps : Std.HashMap String Term := {}
       for item in (pStx.getArg 4).getArgs do
         let ik := item.getKind
@@ -801,7 +800,6 @@ private def elabAllTableExamples (dbName : Name) (tables : Array ParsedTable) (t
         else if ik == `Qed.Server.Db.polExUser then user? := some (item.getArg 2)
         else if ik == `Qed.Server.Db.polExRole then role? := some (← lowerDbExExpr dbName t allEx (item.getArg 2))
         else if ik == `Qed.Server.Db.polExSession then session? := some (← lowerDbExExpr dbName t allEx (item.getArg 2))
-        else if ik == `Qed.Server.Db.polExSystem then system? := some (← lowerDbExExpr dbName t allEx (item.getArg 2))
         else if ik == `Qed.Server.Db.polExRow then row? := some (← lowerDbExExpr dbName t allEx (item.getArg 2))
         else if ik == `Qed.Server.Db.polExSnap then
           let stblId : Ident := ⟨item.getArg 1⟩; let stbl := stblId.getId.eraseMacroScopes.toString
@@ -824,8 +822,7 @@ private def elabAllTableExamples (dbName : Name) (tables : Array ParsedTable) (t
             let authTerm ← match session? with
               | some sT => `(if $sT then Qed.Server.AuthMethod.session else Qed.Server.AuthMethod.bearer)
               | none => if hasU then `(Qed.Server.AuthMethod.bearer) else `(Qed.Server.AuthMethod.none)
-            let sysTerm ← match system? with | some st => pure st | none => `(false)
-            `({ userId := $uTerm, claims := $claimsTerm, authMethod := $authTerm, isSystem := $sysTerm : Qed.Server.RequestCtx })
+            `({ userId := $uTerm, claims := $claimsTerm, authMethod := $authTerm : Qed.Server.RequestCtx })
       let polSpecs : Array (Ident × Bool) := match opName with
         | `read   => #[(mkIdentFrom pId (rowTypeName ++ `ReadPolicy), tInfo.hasCrossReadPolicy)]
         | `insert => #[(mkIdentFrom pId (rowTypeName ++ `InsertPolicy), tInfo.hasCrossInsertPolicy)]
@@ -854,11 +851,11 @@ private def elabAllTableExamples (dbName : Name) (tables : Array ParsedTable) (t
       let verb := if isAllows then "allows" else "denies"
       let thmId := mkIdentFrom pId (rowTypeName ++ (Name.mkSimple s!"policy_{opName}_{verb}_{pId.getId.eraseMacroScopes}"))
       let polErrLit := Syntax.mkStrLit s!"Database `policy_{verb} {opName} {pId.getId.eraseMacroScopes}` on table `{t.tableName}` failed policy check"
-      withRef pId <| elabCommand (← `(command| theorem $thmId : $fullGoal := by (try simp only [$[$polIds:ident],*, Qed.Lang.QedVal.val_id]); all_goals (first | trivial | rfl | decide | decide +kernel | omega | fail $polErrLit)))
+      withRef pId <| elabCommand (← `(command| theorem $thmId : $fullGoal := by (try simp only [$[$polIds:ident],*, Qed.Lang.QedVal.val_id]); all_goals (first | trivial | qedCloseGround | rfl | decide | omega | fail $polErrLit)))
 
 @[noinline, command_elab databaseCmd]
 def elabDatabaseCmd : CommandElab := fun stx => do
-  let dbIdent : Ident := ⟨stx.getArg 1⟩; let dbName := dbIdent.getId; let dbShort := dbName.toString; let fullDbName := (← getCurrNamespace) ++ dbName
+  let dbIdent : Ident := ⟨stx.getArg 2⟩; let dbName := dbIdent.getId; let dbShort := dbName.toString; let fullDbName := (← getCurrNamespace) ++ dbName
   let mut primaryEp? : Option (Term × Qed.Cloud.DbEnvSpec) := none
   let mut envSlots : Qed.Cloud.EnvMap (Option (Term × Qed.Cloud.DbEnvSpec)) := Qed.Cloud.EnvMap.ofDefault none
   let mut isManaged := false; let mut hasExplicitEnv := false; let mut secrets : Array String := #[]
@@ -876,7 +873,7 @@ def elabDatabaseCmd : CommandElab := fun stx => do
     let (epT, secs, spec) ← parseEndpointSpec epStx (some env)
     return (curSlots.set env (some (epT, spec)), if env == .dev then curSecs else pushSecs secs curSecs)
 
-  for c in (stx.getArg 3).getArgs do
+  for c in (stx.getArg 4).getArgs do
     let k := c.getKind
     if k == ``dbManagedClause then
       if isManaged || primaryEp?.isSome || Qed.Cloud.DeployEnv.all.any (envSlots.get · |>.isSome) then

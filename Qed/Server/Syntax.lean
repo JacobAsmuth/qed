@@ -18,7 +18,7 @@ section SrvParsers
 open Lean Parser Qed.Lang
 
 private def qExpr : Parser := categoryParser `qedExpr 0
-private def qType : Parser := categoryParser `qedType 0
+private def qType : Parser := withPosition (categoryParser `qedType 0)
 private def secretArg : Parser := identEq `secret >> "(" >> strLit >> ")"
 private def indentedCat (msg : String) (cat : Name) : Parser := ":" >> checkColGt msg >> many1Indent (categoryParser cat 0)
 private def blockCmd (kw msg : String) (cat : Name) : Parser := withPosition (kw >> ident >> indentedCat msg cat)
@@ -77,7 +77,7 @@ def extBaseWhereItem : Parser := extBaseWhereIn <|> extBaseWhereEnum
 @[extClause_parser] def extWsClause : Parser := leading_parser
   withPosition (atomic (identEq `ws) >> strLit >> checkColGt "expected WebSocket channel signature" >>
     callSig srvParam >> optional (indentedCat "expected indented `ws` channel clauses" `extWsSubClause))
-@[command_parser] def externalCmd : Parser := leading_parser blockCmd "external " "expected indented `external` clauses" `extClause
+@[command_parser] def externalCmd : Parser := leading_parser optional Command.docComment >> blockCmd "external " "expected indented `external` clauses" `extClause
 
 @[srvClause_parser] def srvDbClause : Parser := leading_parser withPosition (atomic (identEq `use) >> ident >> ":" >> ident)
 @[srvClause_parser] def srvEnvClause : Parser := leading_parser withPosition (atomic (identEq `env) >> ident >> "=" >> strLit >> optional (" ?? " >> strLit))
@@ -124,9 +124,8 @@ private def identDotTransaction : Parser :=
 @[srvClause_parser] def srvStreamClause : Parser := leading_parser withPosition (atomic (identEq `stream) >> strLit >> ":" >> srvContractSuite "expected indented `stream` body" srvContractLine)
 @[srvClause_parser] def srvFnClause : Parser := leading_parser
   withPosition (optional (atomic (identEq `read_only)) >> atomic (identEq `rpc) >> callSig srvParam >> ":" >> srvContractSuite "expected indented RPC body" srvContractLine)
-def srvFnMod : Parser := node `Qed.Server.srvFnMod (atomic (identEq `read_only) <|> atomic (identEq `system))
 @[srvClause_parser] def srvHelperFnClause : Parser := leading_parser
-  withPosition (atomic (many srvFnMod >> identEq `fn) >> ident >> checkNoWsBefore "" >> "(" >> sepBy srvParam "," >> ")" >> optional (" -> " >> qType) >> ":" >>
+  withPosition (optional (atomic (identEq `read_only)) >> atomic (identEq `fn) >> ident >> checkNoWsBefore "" >> "(" >> sepBy srvParam "," >> ")" >> optional (" -> " >> qType) >> ":" >>
     srvContractSuite "expected indented helper function body" srvContractLine)
 @[srvClause_parser] def srvBeforeClause : Parser := leading_parser withPosition (atomic (identEq `before >> ":") >> qedSuite)
 @[srvClause_parser] def srvJobClause : Parser := leading_parser
@@ -138,7 +137,6 @@ def srvExMethod : Parser := extHttpMethod <|> identEq `GET <|> identEq `POST <|>
 @[srvExItem_parser] def srvExUser : Parser := leading_parser withPosition (atomic (symbol "with" >> identEq `user) >> qExpr)
 @[srvExItem_parser] def srvExRole : Parser := leading_parser withPosition (atomic (symbol "with" >> identEq `role) >> qExpr)
 @[srvExItem_parser] def srvExSession : Parser := leading_parser withPosition (atomic (symbol "with" >> identEq `session >> "=") >> qExpr)
-@[srvExItem_parser] def srvExSystem : Parser := leading_parser withPosition (atomic (symbol "with" >> identEq `system) >> optional ("=" >> qExpr))
 @[srvExItem_parser] def srvExHeader : Parser := leading_parser withPosition (atomic (symbol "with" >> identEq `header) >> strLit >> "=" >> qExpr)
 @[srvExItem_parser] def srvExQuery : Parser := leading_parser withPosition (atomic (symbol "with" >> identEq `query >> "=") >> qExpr)
 @[srvExItem_parser] def srvExBody : Parser := leading_parser withPosition (atomic (symbol "with" >> identEq `body >> "=") >> qExpr)
@@ -159,9 +157,12 @@ def srvExMethod : Parser := extHttpMethod <|> identEq `GET <|> identEq `POST <|>
     checkColGt "expected indented `example` steps" >> many1Indent (categoryParser `srvExItem 0))
 @[srvClause_parser] def srvOnCreateAccountClause : Parser := leading_parser authHook `onCreateAccount
 @[srvClause_parser] def srvOnSignInClause : Parser := leading_parser authHook `onSignIn
+@[srvClause_parser] def srvDocClause : Parser := leading_parser withPosition (Command.docComment >> checkColEq >> categoryParser `srvClause 0)
 @[command_parser] def serverCmd : Parser := leading_parser
+  optional Command.docComment >>
   withPosition ("server " >> optional (atomic (identEq `stateless)) >> ident >> indentedCat "expected indented `server` body" `srvClause)
 @[command_parser] def serviceCmd : Parser := leading_parser
+  optional Command.docComment >>
   withPosition (atomic (identEq `service >> ident >> ":") >> checkColGt "expected indented `service` body" >> many1Indent (categoryParser `srvClause 0))
 
 @[fullstackClause_parser] def fsServerClause : Parser := leading_parser withPosition ("server " >> ident)

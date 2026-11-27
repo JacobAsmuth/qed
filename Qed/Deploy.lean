@@ -12,7 +12,7 @@ abbrev DeployAuthManifest := Qed.Auth.OidcAuthSpec
 
 structure DeployAssetManifest where
   (path mime : String) (bytes : Nat := 0)
-deriving Inhabited, DecidableEq, Repr
+deriving Inhabited, DecidableEq
 
 structure DeployColumnManifest where
   (name : String) (isPrimaryKey isImmutable isUnique isNullable : Bool := false) (refs? : Option (String × String) := none)
@@ -48,7 +48,7 @@ deriving Inhabited
 structure EnvFootprint where
   (secrets : List SecretRef := []) (egress : List String := []) (managedDbs : List (String × DbCluster) := [])
   (ephemeralDbs : List String := []) (authTarget? : Option AuthEnvTarget := none)
-deriving Inhabited, DecidableEq, Repr
+deriving Inhabited, DecidableEq
 
 private def dedupSecretsByEnvVar (xs : List SecretRef) : List SecretRef :=
   xs.foldl (init := []) fun acc s => if acc.any (·.envVar == s.envVar) then acc else acc ++ [s]
@@ -153,10 +153,12 @@ theorem validate_default_ok : ({} : DeployManifest).validate = .ok () := rfl
 
 private def optJson {α : Type} (o : Option α) (f : α → Json) : Json := (o.map f).getD .null
 private def jArr {α : Type} (xs : List α) (f : α → Json) : Json := .arr (xs.map f)
+private def strObj (fs : List (String × String)) : Json := .obj (fs.map fun (k, v) => (k, .str v))
+private def boolFs (fs : List (String × Bool)) : List (String × Json) := fs.map fun (k, v) => (k, .bool v)
 
 private def footprintToJson (fp : EnvFootprint) : Json := .obj [
   ("secrets", toJson (fp.secrets.map (·.envVar))), ("egress", toJson fp.egress),
-  ("managedDbs", jArr fp.managedDbs fun (nm, cl) => .obj [("name", .str nm), ("cluster", .str (match cl with | .prodCluster => "prod" | .nonProdCluster => "nonProd"))]),
+  ("managedDbs", jArr fp.managedDbs fun (nm, cl) => strObj [("name", nm), ("cluster", match cl with | .prodCluster => "prod" | .nonProdCluster => "nonProd")]),
   ("ephemeralDbs", toJson fp.ephemeralDbs),
   ("authTarget", optJson fp.authTarget? fun | .localDev => .str "localDev" | .previewIdp => .str "previewIdp" | .managedOidc _ => .str "managedOidc" | .customOidc => .str "customOidc")]
 
@@ -166,31 +168,26 @@ def DeployManifest.toJson (m : DeployManifest) : Json :=
     ("version", tj m.version), ("rootModule", .str m.rootModule), ("mode", .str m.mode), ("secrets", tj m.secrets),
     ("envVars", jArr m.envVars fun (nm, osKey, def?) => .obj [("name", .str nm), ("osKey", .str osKey), ("default", tj def?)]),
     ("egress", tj m.egress),
-    ("databases", jArr m.databases fun db => .obj [
-      ("name", .str db.shortName), ("isManaged", .bool db.isManaged), ("hasDevFallback", .bool db.hasDevFallback), ("secrets", tj db.secrets),
-      ("tables", jArr db.tables fun t => .obj [
-        ("name", .str t.tableName), ("hasReadPolicy", .bool t.hasReadPolicy), ("hasInsertPolicy", .bool t.hasInsertPolicy),
-        ("hasUpdatePolicy", .bool t.hasUpdatePolicy), ("hasDeletePolicy", .bool t.hasDeletePolicy), ("hasTransInv", .bool t.hasTransInv),
-        ("columns", jArr t.columns fun c => .obj [
-          ("name", .str c.name), ("primaryKey", .bool c.isPrimaryKey), ("immutable", .bool c.isImmutable),
-          ("unique", .bool c.isUnique), ("nullable", .bool c.isNullable),
-          ("references", tj (c.refs?.map fun (rt, rc) => s!"{rt}({rc})"))])])]),
+    ("databases", jArr m.databases fun db => .obj <| [("name", .str db.shortName)] ++ boolFs [("isManaged", db.isManaged), ("hasDevFallback", db.hasDevFallback)] ++
+      [("secrets", tj db.secrets), ("tables", jArr db.tables fun t => .obj <| [("name", .str t.tableName)] ++
+        boolFs [("hasReadPolicy", t.hasReadPolicy), ("hasInsertPolicy", t.hasInsertPolicy), ("hasUpdatePolicy", t.hasUpdatePolicy), ("hasDeletePolicy", t.hasDeletePolicy), ("hasTransInv", t.hasTransInv)] ++
+        [("columns", jArr t.columns fun c => .obj <| [("name", .str c.name)] ++ boolFs [("primaryKey", c.isPrimaryKey), ("immutable", c.isImmutable), ("unique", c.isUnique), ("nullable", c.isNullable)] ++
+          [("references", tj (c.refs?.map fun (rt, rc) => s!"{rt}({rc})"))])])]),
     ("auth", optJson m.auth? fun a => .obj [
       ("name", .str a.name), ("isManaged", .bool a.isManaged), ("issuerEnv", .str a.issuerEnv), ("issuerDefault", tj a.issuerDefault?),
       ("audienceEnv", .str a.audienceEnv), ("audienceDefault", tj a.audienceDefault?), ("clientIdEnv", tj a.clientIdEnv?),
       ("clientIdDefault", tj a.clientIdDefault?), ("clientSecretEnv", tj a.clientSecretEnv?), ("providers", tj a.providers),
       ("sessionTtlSec", tj a.sessionTtlSec), ("loginPath", .str a.loginPath), ("callbackPath", .str a.callbackPath),
       ("logoutPath", .str a.logoutPath), ("mePath", .str a.mePath),
-      ("claims", jArr a.claims fun c => .obj [("name", .str c.name), ("type", .str c.typeName), ("default", .str c.defaultValue)])]),
-    ("server", optJson m.server? fun s => .obj [
-      ("name", .str s.name), ("shortName", .str s.shortName), ("hasState", .bool s.hasState), ("hasHttpRoutes", .bool s.hasHttpRoutes),
-      ("methods", jArr s.methods fun mt => .obj [("name", .str mt.name), ("readOnly", .bool mt.isReadOnly), ("requiresAuth", .bool mt.requiresAuth)]),
-      ("channels", tj s.channels), ("jobs", tj s.jobs)]),
+      ("claims", jArr a.claims fun c => strObj [("name", c.name), ("type", c.typeName), ("default", c.defaultValue)])]),
+    ("server", optJson m.server? fun s => .obj <| [("name", .str s.name), ("shortName", .str s.shortName)] ++
+      boolFs [("hasState", s.hasState), ("hasHttpRoutes", s.hasHttpRoutes)] ++
+      [("methods", jArr s.methods fun mt => .obj <| [("name", .str mt.name)] ++ boolFs [("readOnly", mt.isReadOnly), ("requiresAuth", mt.requiresAuth)]),
+       ("channels", tj s.channels), ("jobs", tj s.jobs)]),
     ("deploy", optJson m.deploy? fun d => .obj [
       ("name", .str d.name), ("appName", .str d.appName), ("regions", tj (d.regions.map GcpRegion.toString)),
       ("domain", tj d.domain?), ("compute", .str d.compute.toString), ("timeoutSec", tj d.timeoutSec?),
-      ("preview", .obj [
-        ("enabled", .bool d.preview.enabled), ("subdomain", tj d.preview.subdomain?),
+      ("preview", .obj [("enabled", .bool d.preview.enabled), ("subdomain", tj d.preview.subdomain?),
         ("host", tj (d.preview.resolvedHost? d.domain? |>.map (·.render))),
         ("protection", .str (match d.preview.protection with | .team_only => "team_only" | .pub => "public")), ("ttlSec", tj d.preview.ttlSec)])]),
     ("assets", jArr m.assets fun a => .obj [("path", .str a.path), ("mime", .str a.mime), ("bytes", tj a.bytes)]),

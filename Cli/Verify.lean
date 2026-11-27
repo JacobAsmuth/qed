@@ -52,9 +52,9 @@ private structure CustomTokenMap where
 
 /-! ### Shared Lean 4 Lexical Primitives -/
 
-private def sliceStr (cs : Array Char) (s e : Nat) : String := Id.run do
-  let mut out := ""; for k in [s:e] do out := out.push cs[k]!
-  return out
+private partial def sliceStrGo (cs : Array Char) (e k : Nat) (out : String) : String :=
+  if k < e then sliceStrGo cs e (k + 1) (out.push cs[k]!) else out
+private def sliceStr (cs : Array Char) (s e : Nat) : String := sliceStrGo cs e s ""
 @[inline] private def at2 (cs : Array Char) (n i : Nat) (a b : Char) : Bool := i + 1 < n && cs[i]! == a && cs[i + 1]! == b
 private partial def skipLine (cs : Array Char) (n i : Nat) : Nat := if i < n && cs[i]! != '\n' then skipLine cs n (i + 1) else i
 private partial def scanIdentEnd (cs : Array Char) (n i : Nat) : Nat := if i < n && Lean.isIdRest cs[i]! then scanIdentEnd cs n (i + 1) else i
@@ -63,7 +63,7 @@ private partial def skipDigits (cs : Array Char) (n i : Nat) (alnum : Bool) : Na
 private partial def countHashes (cs : Array Char) (n pos k : Nat) : Nat := if pos + k < n && cs[pos + k]! == '#' then countHashes cs n pos (k + 1) else k
 private def rawStrHashesAt (cs : Array Char) (n pos : Nat) : Option Nat :=
   if pos >= n || cs[pos]! != 'r' then none else let k := countHashes cs n (pos + 1) 0; if pos + 1 + k < n && cs[pos + 1 + k]! == '"' then some k else none
-@[inline] private def isRawStrStart (cs : Array Char) (n i : Nat) (prevIdent : Bool) : Bool :=
+private def isRawStrStart (cs : Array Char) (n i : Nat) (prevIdent : Bool) : Bool :=
   cs[i]! == 'r' && !prevIdent && (i == 0 || (cs[i - 1]! != '.' && cs[i - 1]! != '`')) && (rawStrHashesAt cs n i).isSome
 
 private partial def skipBlockComment (cs : Array Char) (n j ln ls depth : Nat) : Nat × Nat × Nat :=
@@ -72,7 +72,7 @@ private partial def skipBlockComment (cs : Array Char) (n j ln ls depth : Nat) :
   else if at2 cs n j '/' '-' then skipBlockComment cs n (j + 2) ln ls (depth + 1)
   else if at2 cs n j '-' '/' then skipBlockComment cs n (j + 2) ln ls (depth - 1)
   else skipBlockComment cs n (j + 1) ln ls depth
-@[inline] private def enterBlockComment (cs : Array Char) (n i ln ls : Nat) : Nat × Nat × Nat :=
+private def enterBlockComment (cs : Array Char) (n i ln ls : Nat) : Nat × Nat × Nat :=
   if i + 2 < n then if cs[i + 2]! == '\n' then skipBlockComment cs n (i + 3) (ln + 1) (i + 3) 1 else skipBlockComment cs n (i + 3) ln ls 1 else (n, ln, ls)
 
 private partial def scanRawStrLoop (cs : Array Char) (n k bs j ln ls : Nat) : Nat × Nat × Nat × Nat × Nat :=
@@ -80,25 +80,23 @@ private partial def scanRawStrLoop (cs : Array Char) (n k bs j ln ls : Nat) : Na
   else if cs[j]! == '\n' then scanRawStrLoop cs n k bs (j + 1) (ln + 1) (j + 1)
   else if cs[j]! == '"' && j + k < n && countHashes cs n (j + 1) 0 >= k then (j + 1 + k, bs, j, ln, ls)
   else scanRawStrLoop cs n k bs (j + 1) ln ls
-@[inline] private def scanRawStr (cs : Array Char) (n i ln ls : Nat) : Nat × Nat × Nat × Nat × Nat :=
+private def scanRawStr (cs : Array Char) (n i ln ls : Nat) : Nat × Nat × Nat × Nat × Nat :=
   let k := (rawStrHashesAt cs n i).getD 0; scanRawStrLoop cs n k (i + 2 + k) (i + 2 + k) ln ls
 
-private def scanCharLit (cs : Array Char) (n i : Nat) : Nat := Id.run do
-  let mut j := i + 1
-  if j < n && cs[j]! == '\\' then
-    j := j + 2
-    while j < n && j < i + 10 && cs[j]! != '\n' do if cs[j]! == '\'' then return j + 1 else j := j + 1
-  else if j + 1 < n && cs[j]! != '\n' && cs[j]! != '\'' && cs[j + 1]! == '\'' then return j + 2
-  return i + 1
+private partial def scanCharEscEnd (cs : Array Char) (stop j fallback : Nat) : Nat :=
+  if j < stop && cs[j]! != '\n' then if cs[j]! == '\'' then j + 1 else scanCharEscEnd cs stop (j + 1) fallback else fallback
+private def scanCharLit (cs : Array Char) (n i : Nat) : Nat :=
+  let j := i + 1
+  if j < n && cs[j]! == '\\' then scanCharEscEnd cs (min n (i + 10)) (j + 2) (i + 1)
+  else if j + 1 < n && cs[j]! != '\n' && cs[j]! != '\'' && cs[j + 1]! == '\'' then j + 2
+  else i + 1
 private partial def scanGuillemetLoop (cs : Array Char) (n j ln ls : Nat) : Nat × Nat × Nat × Nat :=
   if j >= n || cs[j]! == '»' then (j, if j < n then j + 1 else j, ln, ls)
   else if cs[j]! == '\n' then scanGuillemetLoop cs n (j + 1) (ln + 1) (j + 1) else scanGuillemetLoop cs n (j + 1) ln ls
 
-private def matchWord (cs : Array Char) (s e : Nat) (w : String) : Bool :=
-  e - s == w.length && Id.run do
-    let mut k := s
-    for c in w.toList do if cs[k]! != c then return false else k := k + 1
-    return true
+private def matchWordList (cs : Array Char) (k : Nat) : List Char → Bool
+  | [] => true | c :: rest => cs[k]! == c && matchWordList cs (k + 1) rest
+private def matchWord (cs : Array Char) (s e : Nat) (w : String) : Bool := e - s == w.length && matchWordList cs s w.toList
 private def forbiddenAt? (cs : Array Char) (s e : Nat) : Option String := match e - s, cs[s]! with
   | 5, 's' => if cs[s+1]! == 'o' && cs[s+2]! == 'r' && cs[s+3]! == 'r' && cs[s+4]! == 'y' then some "sorry" else none
   | 5, 'a' => if cs[s+1]! == 'd' && cs[s+2]! == 'm' && cs[s+3]! == 'i' && cs[s+4]! == 't' then some "admit" else none
@@ -128,98 +126,108 @@ private partial def decodeLeanStrLoop (cs : Array Char) (stop : Nat) (stopAtQuot
     else if stopAtQuote && ch == '"' then (out, i + 1, ls)
     else decodeLeanStrLoop cs stop stopAtQuote (i + 1) (if ch == '\n' then i + 1 else ls) (out.push ch)
 
-private def isLexerCustomToken (tok : String) : Bool := Id.run do
-  let cs := tok.toList.toArray; let n := cs.size
-  if n == 0 || tok == "/-" || (rawStrHashesAt cs n 0).isSome then return false
-  let c0 := cs[0]!; if c0 == '"' || c0 == '\'' || c0 == '«' then return false
-  let mut hasSpecial := false
-  for k in [0:n] do
-    let c := cs[k]!
-    if c == '\n' || c == '\r' then return false
-    if c == '"' || c == '\'' || c == '«' || c == '»' then hasSpecial := true
-    else if n > 1 && (c == '{' || c == '}' || c == '(' || c == ')' || c == '[' || c == ']' || c == '⟨' || c == '⟩') then hasSpecial := true
-    else if k + 1 < n && ((c == '-' && (cs[k+1]! == '-' || cs[k+1]! == '/')) || (c == '/' && cs[k+1]! == '-')) then hasSpecial := true
-  if hasSpecial then return true
-  let mut m := n; while m > 0 && cs[m - 1]! == '#' do m := m - 1
-  return m >= 2 && cs[m - 1]! == 'r' && !Lean.isIdRest cs[m - 2]!
+private def isOpenDelim (c : Char) : Bool := c == '(' || c == '[' || c == '{'
+private def isCloseDelim (c : Char) : Bool := c == ')' || c == ']' || c == '}'
+private def isChoiceOp (c : Char) : Bool := c == '?' || c == '*' || c == '+' || c == '<'
+private def isAtPrefix (c : Char) : Bool := c == '$' || c == '@' || c == '↑' || c == '⇑' || c == '↥' || c == '`'
+private def isOpenGrp (c : Char) : Bool := c == '(' || c == '[' || c == '⟨'
+private def isCloseGrp (c : Char) : Bool := c == ')' || c == ']' || c == '⟩'
 
-private def prepareCustomTokens (toks : Array String) : CustomTokenMap := Id.run do
-  let mut byPair : Std.HashMap (Char × Char) (Array (Array Char × Bool)) := {}
-  let mut pairMask : Array UInt64 := Array.replicate 256 0
-  let mut hasNonAscii := false; let mut hasSingleCloseGuillemet := false
-  let mut hasExactDocOpener := false; let mut hasCloseBraceToken := false
-  for s in toks.qsort (·.length > ·.length) do
+private partial def hasCustomTokSpecial (cs : Array Char) (n k : Nat) (hasSp : Bool) : Bool × Bool :=
+  if k >= n then (true, hasSp)
+  else
+    let c := cs[k]!
+    if c == '\n' || c == '\r' then (false, false)
+    else
+      let sp := hasSp || c == '"' || c == '\'' || c == '«' || c == '»' ||
+        (n > 1 && (isOpenDelim c || isCloseDelim c || c == '⟨' || c == '⟩')) ||
+        (k + 1 < n && ((c == '-' && (cs[k+1]! == '-' || cs[k+1]! == '/')) || (c == '/' && cs[k+1]! == '-')))
+      hasCustomTokSpecial cs n (k + 1) sp
+private partial def trimEndHashes (cs : Array Char) (m : Nat) : Nat := if m > 0 && cs[m - 1]! == '#' then trimEndHashes cs (m - 1) else m
+
+private def isLexerCustomToken (tok : String) : Bool :=
+  let cs := tok.toList.toArray; let n := cs.size
+  if n == 0 || tok == "/-" || (rawStrHashesAt cs n 0).isSome then false
+  else let c0 := cs[0]!; if c0 == '"' || c0 == '\'' || c0 == '«' then false
+  else match hasCustomTokSpecial cs n 0 false with
+    | (false, _) => false | (true, true) => true
+    | (true, false) => let m := trimEndHashes cs n; m >= 2 && cs[m - 1]! == 'r' && !Lean.isIdRest cs[m - 2]!
+
+private def prepareCustomTokens (toks : Array String) : CustomTokenMap :=
+  (toks.qsort (·.length > ·.length)).foldl (init := { pairMask := Array.replicate 256 0 }) fun st s =>
     let arr := s.toList.toArray
-    if arr.size == 1 && arr[0]! == '»' then hasSingleCloseGuillemet := true
+    if arr.size == 1 && arr[0]! == '»' then { st with hasSingleCloseGuillemet := true }
     else if arr.size >= 2 then
       let (c0, c1) := (arr[0]!, arr[1]!)
-      if c0.toNat < 128 && c1.toNat < 128 then
-        let idx := (c0.toNat <<< 7) ||| c1.toNat
-        pairMask := pairMask.set! (idx >>> 6) (pairMask[idx >>> 6]! ||| (1 <<< (idx &&& 63).toUInt64))
-      else hasNonAscii := true
-      if arr.size == 3 && c0 == '/' && c1 == '-' && (arr[2]! == '-' || arr[2]! == '!') then hasExactDocOpener := true
-      if c0 == '}' then hasCloseBraceToken := true
-      byPair := byPair.insert (c0, c1) ((byPair.getD (c0, c1) #[]).push (arr, arr.all Lean.isIdRest))
-  return { byPair, pairMask, hasNonAscii, hasSingleCloseGuillemet, hasExactDocOpener, hasCloseBraceToken }
+      let (pm, nonAsc) := if c0.toNat < 128 && c1.toNat < 128 then
+          let idx := (c0.toNat <<< 7) ||| c1.toNat
+          (st.pairMask.set! (idx >>> 6) (st.pairMask[idx >>> 6]! ||| (1 <<< (idx &&& 63).toUInt64)), st.hasNonAscii)
+        else (st.pairMask, true)
+      { byPair := st.byPair.insert (c0, c1) ((st.byPair.getD (c0, c1) #[]).push (arr, arr.all Lean.isIdRest)),
+        pairMask := pm, hasNonAscii := nonAsc, hasSingleCloseGuillemet := st.hasSingleCloseGuillemet,
+        hasExactDocOpener := st.hasExactDocOpener || (arr.size == 3 && c0 == '/' && c1 == '-' && (arr[2]! == '-' || arr[2]! == '!')),
+        hasCloseBraceToken := st.hasCloseBraceToken || c0 == '}' }
+    else st
+
+private partial def matchTokTail (cs tok : Array Char) (pos m k : Nat) : Bool :=
+  if k >= m then true else cs[pos + k]! == tok[k]! && matchTokTail cs tok pos m (k + 1)
 
 private def matchCustomTokenAt (cs : Array Char) (n : Nat) (toks : CustomTokenMap)
-    (pos : Nat) (prevIdent prevIdentEnd : Bool) (blockCloseBrace : Bool := false) : Option Nat := Id.run do
-  if pos >= n then return none
-  let c0 := cs[pos]!
-  if toks.byPair.isEmpty then return if toks.hasSingleCloseGuillemet && c0 == '»' then some 1 else none
-  if blockCloseBrace && c0 == '}' then return none
-  if pos + 1 < n then
-    let c1 := cs[pos + 1]!
-    let mayMatch := if c0.toNat < 128 && c1.toNat < 128 then
-        let idx := (c0.toNat <<< 7) ||| c1.toNat; ((toks.pairMask[idx >>> 6]! >>> (idx &&& 63).toUInt64) &&& 1) != 0
-      else toks.hasNonAscii
-    if mayMatch then
-      if let some bucket := toks.byPair.get? (c0, c1) then
-        if c0 == '.' && prevIdentEnd && (Lean.isIdFirst c1 || c1 == '«') then return none
-        if c0 == '`' then
-          let after := if c1 == '`' then pos + 2 else pos + 1
-          if after < n && (Lean.isIdFirst cs[after]! || cs[after]! == '«') then return none
-        if Lean.isIdFirst c0 && (prevIdent || (pos > 0 && (cs[pos - 1]! == '.' || cs[pos - 1]! == '`'))) then return none
-        for (tok, allIdRest) in bucket do
-          let m := tok.size
-          if pos + m <= n then
-            if Lean.isIdFirst c0 && allIdRest && pos + m < n && Lean.isIdRest cs[pos + m]! then continue
-            let mut ok := true
-            for k in [2:m] do if cs[pos + k]! != tok[k]! then ok := false; break
-            if ok then return some m
-  return if toks.hasSingleCloseGuillemet && c0 == '»' then some 1 else none
+    (pos : Nat) (prevIdent prevIdentEnd : Bool) (blockCloseBrace : Bool := false) : Option Nat :=
+  if pos >= n then none
+  else
+    let c0 := cs[pos]!
+    let fallback := if toks.hasSingleCloseGuillemet && c0 == '»' then some 1 else none
+    if toks.byPair.isEmpty then fallback
+    else if blockCloseBrace && c0 == '}' then none
+    else if pos + 1 < n then
+      let c1 := cs[pos + 1]!
+      let mayMatch := if c0.toNat < 128 && c1.toNat < 128 then
+          let idx := (c0.toNat <<< 7) ||| c1.toNat; ((toks.pairMask[idx >>> 6]! >>> (idx &&& 63).toUInt64) &&& 1) != 0
+        else toks.hasNonAscii
+      if !mayMatch then fallback
+      else match toks.byPair.get? (c0, c1) with
+        | none => fallback
+        | some bucket =>
+            if (c0 == '.' && prevIdentEnd && (Lean.isIdFirst c1 || c1 == '«')) ||
+               (c0 == '`' && let after := if c1 == '`' then pos + 2 else pos + 1; after < n && (Lean.isIdFirst cs[after]! || cs[after]! == '«')) ||
+               (Lean.isIdFirst c0 && (prevIdent || (pos > 0 && (cs[pos - 1]! == '.' || cs[pos - 1]! == '`')))) then none
+            else (bucket.findSome? fun (tok, allIdRest) =>
+              let m := tok.size
+              if pos + m <= n && !(Lean.isIdFirst c0 && allIdRest && pos + m < n && Lean.isIdRest cs[pos + m]!) && matchTokTail cs tok pos m 2 then some m else none).orElse fun _ => fallback
+    else fallback
 
-private def prevQualifierAt (cs : Array Char) (tokStart : Nat) : Option String := Id.run do
-  if tokStart == 0 || cs[tokStart - 1]! != '.' then return none
-  let e := tokStart - 1
-  if e > 0 && cs[e - 1]! == '»' then
-    let mut s := e - 1; while s > 0 && cs[s - 1]! != '«' do s := s - 1
-    return if s > 0 && cs[s - 1]! == '«' then some (sliceStr cs s (e - 1)) else none
-  let mut s := e; while s > 0 && Lean.isIdRest cs[s - 1]! do s := s - 1
-  return if s < e then some (sliceStr cs s e) else none
+private partial def scanBackWhile (cs : Array Char) (p : Char → Bool) (s : Nat) : Nat :=
+  if s > 0 && p cs[s - 1]! then scanBackWhile cs p (s - 1) else s
+private def prevQualifierAt (cs : Array Char) (tokStart : Nat) : Option String :=
+  if tokStart == 0 || cs[tokStart - 1]! != '.' then none
+  else
+    let e := tokStart - 1
+    if e > 0 && cs[e - 1]! == '»' then
+      let s := scanBackWhile cs (· != '«') (e - 1)
+      if s > 0 && cs[s - 1]! == '«' then some (sliceStr cs s (e - 1)) else none
+    else let s := scanBackWhile cs Lean.isIdRest e; if s < e then some (sliceStr cs s e) else none
 
-@[inline] private def isDocCommentOverridden (cs : Array Char) (n i : Nat) (toks : CustomTokenMap)
+private def isDocCommentOverridden (cs : Array Char) (n i : Nat) (toks : CustomTokenMap)
     (prevIdent prevIdentEnd treatDoc : Bool) : Bool :=
   i + 2 < n && (cs[i + 2]! == '-' || cs[i + 2]! == '!') &&
   match matchCustomTokenAt cs n toks i prevIdent prevIdentEnd with | some m => m >= 4 || (treatDoc && m == 3) | none => false
 
-private def countNewlines (cs : Array Char) (i len ls : Nat) (asLineStart : Bool) : Nat := Id.run do
-  let mut cur := ls
-  for k in [0:len] do if cs[i + k]! == '\n' then cur := if asLineStart then i + k + 1 else cur + 1
-  return cur
+private partial def countNewlinesGo (cs : Array Char) (i stop cur : Nat) (asLineStart : Bool) : Nat :=
+  if i >= stop then cur else countNewlinesGo cs (i + 1) stop (if cs[i]! == '\n' then (if asLineStart then i + 1 else cur + 1) else cur) asLineStart
+private def countNewlines (cs : Array Char) (i len ls : Nat) (asLineStart : Bool) : Nat := countNewlinesGo cs i (i + len) ls asLineStart
 
 private inductive LexSkip where
   | newline (ni : Nat) | trivia (ni nln nls : Nat) | rawStr (ni bs be nln nls : Nat) | custom (cLen : Nat) | other
 
-@[inline] private def stepLexSkip (cs : Array Char) (n i ln ls : Nat) (toks : CustomTokenMap) (prevId prevEnd treatDoc blockCb : Bool) : LexSkip :=
-  match cs[i]! with
-  | '\n' => .newline (i + 1) | ' ' | '\t' | '\r' => .trivia (i + 1) ln ls
-  | c =>
-    if c.isWhitespace then .trivia (i + 1) ln ls
-    else if at2 cs n i '-' '-' then .trivia (skipLine cs n (i + 2)) ln ls
-    else if at2 cs n i '/' '-' && !isDocCommentOverridden cs n i toks prevId prevEnd treatDoc then let (ni, nl, nls) := enterBlockComment cs n i ln ls; .trivia ni nl nls
-    else if isRawStrStart cs n i prevId then let (ni, bs, be, nl, nls) := scanRawStr cs n i ln ls; .rawStr ni bs be nl nls
-    else if let some cLen := matchCustomTokenAt cs n toks i prevId prevEnd blockCb then .custom cLen else .other
+@[noinline] private def stepLexSkip (cs : Array Char) (n i ln ls : Nat) (toks : CustomTokenMap) (prevId prevEnd treatDoc blockCb : Bool) : LexSkip :=
+  let c := cs[i]!
+  if c == '\n' then .newline (i + 1)
+  else if c == ' ' || c == '\t' || c == '\r' || c.isWhitespace then .trivia (i + 1) ln ls
+  else if at2 cs n i '-' '-' then .trivia (skipLine cs n (i + 2)) ln ls
+  else if at2 cs n i '/' '-' && !isDocCommentOverridden cs n i toks prevId prevEnd treatDoc then let (ni, nl, nls) := enterBlockComment cs n i ln ls; .trivia ni nl nls
+  else if isRawStrStart cs n i prevId then let (ni, bs, be, nl, nls) := scanRawStr cs n i ln ls; .rawStr ni bs be nl nls
+  else if let some cLen := matchCustomTokenAt cs n toks i prevId prevEnd blockCb then .custom cLen else .other
 
 /-! ### Pass A: Tail-Recursive Register-Pure Syntax & Custom Token Extractor -/
 
@@ -233,7 +241,7 @@ private def pushDedup (raw : String) (acc : Array String) (seen : Std.HashSet St
 -- `fl : UInt32`: 1=prevId, 2=prevEnd, 4=inRuleHdr, 8=atStmtStart, 16=atDeclPrefix, 32=hasAtInterp,
 -- 64=hasSynGen, 128=hasLocalAst, 256=hasCmdStr, 512=hasSynKwStr, 1024=hasParserDef,
 -- 2048=hasUB, 4096=hasUD, 8192=fileHasBrace, 16384=hdrHasChoice
-@[inline] private def flushHdr (fl : UInt32) (acc : ExtractAcc) : UInt32 × ExtractAcc :=
+@[noinline] private def flushHdr (fl : UInt32) (acc : ExtractAcc) : UInt32 × ExtractAcc :=
   if (fl &&& 4) == 0 then (fl, acc)
   else
     let ch := (fl &&& 16384) != 0
@@ -255,6 +263,34 @@ private def recordStr (fl : UInt32) (acc : ExtractAcc) (s : String) : UInt32 × 
     hdrK := if inHdr then acc.hdrK.step '[' ']' trimmed else acc.hdrK,
     hdrP := if inHdr then acc.hdrP.step '(' ')' trimmed else acc.hdrP })
 
+@[noinline] private def stepExtractIdent (ctx : ExtractCtx) (i ls ic qm delimD quoteD : Nat) (fl0 : UInt32) (acc : ExtractAcc) :
+    Nat × Nat × Nat × Nat × UInt32 × ExtractAcc :=
+  let (cs, n) := (ctx.cs, ctx.n); let c := cs[i]!; let isGuil := c == '«'
+  let (tokS, tokE, ni, nls) := if isGuil then let (ge, ni, _, nls) := scanGuillemetLoop cs n (i + 1) 0 ls; (i + 1, ge, ni, nls)
+    else let ni := scanIdentEnd cs n (i + 1); (i, ni, ni, ls)
+  let len := tokE - tokS; let flBase := (fl0 &&& ~~~24) ||| (if isGuil then 2 else 3)
+  let maybeP := (fl0 &&& 1024) == 0 && len >= 7 && cs[tokE - 1]! == 'r' && cs[tokE - 7]! == '_'
+  let shortSkip := !isGuil && ((len == 2 && cs[tokS + 1]! != '!' && !(c == 'i' && cs[tokS + 1]! == 'n')) || (len == 3 && c != 'd' && c != 'e'))
+  if len < 2 || shortSkip || (!isGuil && !('a' ≤ c && c ≤ 'z') && !maybeP) then (ni, nls, ic, qm, flBase, acc)
+  else
+    let tok := sliceStr cs tokS tokE; let kw := kwFlags.getD tok 0
+    let (ic', qm') := if (kw &&& 2048) != 0 then
+        (ic + 1, qm + (if (sliceStr cs nls (skipLine cs n nls)).cliTrim == builtinQedFStrLine then 1 else 0)) else (ic, qm)
+    let fl1 := flBase ||| (if (kw &&& 6) != 0 then 32 else 0) |||
+      (if (kw &&& 256) != 0 || (maybeP && tok.endsWith "_parser") then 1024 else 0) |||
+      (if (flBase &&& 64) == 0 && ((kw &&& 64) != 0 || ((kw &&& 1024) != 0 && prevQualifierAt cs i == some "Command")) then 64 else 0) |||
+      (if (flBase &&& 128) == 0 && ((kw &&& 128) != 0 || ((tok == "atom" || tok == "mkStrLit") && prevQualifierAt cs i == some "Syntax")) then 128 else 0)
+    if isGuil || (i > 0 && (cs[i - 1]! == '.' || cs[i - 1]! == '`')) then (ni, nls, ic', qm', fl1, acc)
+    else
+      let fl2 := if (fl1 &&& 4) != 0 && (kw &&& 512) != 0 then fl1 ||| 16384 else fl1
+      let (tokAtStmt, tokAtDecl) := ((fl0 &&& 8) != 0, (fl0 &&& 16) != 0)
+      if quoteD > 0 && (kw &&& 8) != 0 then (ni, nls, ic', qm', fl2 ||| 64, acc)
+      else if (delimD == 0 || (quoteD == 0 && (tokAtDecl || ctx.ignoreDelim))) && (kw &&& 8) != 0 then
+        let (fl3, acc') := flushHdr fl2 acc; (ni, nls, ic', qm', fl3 ||| 4, acc')
+      else if (delimD == 0 || quoteD == 0) && tokAtStmt && (kw &&& 16) != 0 then
+        let (fl3, acc') := flushHdr fl2 acc; (ni, nls, ic', qm', (fl3 &&& ~~~4) ||| (if (kw &&& 32) != 0 then 16 else 0), acc')
+      else (ni, nls, ic', qm', if tok == "in" || (tokAtDecl && (kw &&& 32) != 0) then fl2 ||| 16 else fl2, acc)
+
 private partial def extractLoop (ctx : ExtractCtx) (i ls ic qm attrD delimD quoteD : Nat)
     (fl : UInt32) (qp : Array Bool) (acc : ExtractAcc) : SyntaxScanInfo :=
   let (cs, n) := (ctx.cs, ctx.n)
@@ -271,80 +307,47 @@ private partial def extractLoop (ctx : ExtractCtx) (i ls ic qm attrD delimD quot
       hasUnbalancedBrace := (fl &&& 2048) != 0 || ((hasSynGen || hasPDef) && (fl &&& 8192) != 0),
       hasUnbalancedDelim := (fl &&& 4096) != 0 }
   else
-    let c := cs[i]!; let prevId := (fl &&& 1) != 0; let prevEnd := (fl &&& 2) != 0; let fl0 := fl &&& ~~~3
+    let c := cs[i]!; let prevId := (fl &&& 1) != 0; let prevEnd := (fl &&& 2) != 0; let fl0 := fl &&& ~~~3; let flClr := fl0 &&& ~~~24
     match stepLexSkip cs n i 0 ls ctx.known prevId prevEnd false false with
     | .newline ni => extractLoop ctx ni ni ic qm attrD delimD quoteD (fl0 ||| 24) qp acc
     | .trivia ni _ nls => extractLoop ctx ni nls ic qm attrD delimD quoteD fl0 qp acc
     | .rawStr ni bs be _ nls =>
-      let (fl', acc') := recordStr (fl0 &&& ~~~24) acc (sliceStr cs bs be)
+      let (fl', acc') := recordStr flClr acc (sliceStr cs bs be)
       extractLoop ctx ni nls ic qm attrD delimD quoteD fl' qp acc'
-    | .custom cLen => extractLoop ctx (i + cLen) (countNewlines cs i cLen ls true) ic qm attrD delimD quoteD (fl0 &&& ~~~24) qp acc
-    | .other => match c with
-      | '"' =>
-        let (s, ni, nls) := decodeLeanStrLoop cs n true (i + 1) ls ""; let (fl', acc') := recordStr (fl0 &&& ~~~24) acc s
+    | .custom cLen => extractLoop ctx (i + cLen) (countNewlines cs i cLen ls true) ic qm attrD delimD quoteD flClr qp acc
+    | .other =>
+      if c == '"' then
+        let (s, ni, nls) := decodeLeanStrLoop cs n true (i + 1) ls ""; let (fl', acc') := recordStr flClr acc s
         extractLoop ctx ni nls ic qm attrD delimD quoteD fl' qp acc'
-      | '=' =>
-        let fl1 := fl0 &&& ~~~24
-        if i + 1 < n && cs[i + 1]! == '>' then
-          if delimD == 0 || quoteD == 0 then
-            let (fl2, acc') := flushHdr fl1 acc
-            extractLoop ctx (i + 2) ls ic qm attrD delimD quoteD (if delimD == 0 || ctx.ignoreDelim then fl2 &&& ~~~4 else fl2) qp acc'
-          else extractLoop ctx (i + 2) ls ic qm attrD delimD quoteD fl1 qp acc
-        else extractLoop ctx (i + 1) ls ic qm attrD delimD quoteD fl1 qp acc
-      | '@' =>
-        let isAttr := i + 1 < n && cs[i + 1]! == '[' && (fl0 &&& 16) != 0
-        extractLoop ctx (i + if isAttr then 2 else 1) ls ic qm (if isAttr then 1 else attrD) (if isAttr then delimD + 1 else delimD) quoteD (fl0 &&& ~~~24) qp acc
-      | '(' | '[' | '{' =>
+      else if isOpenDelim c then
         let isQ := c == '(' && i > 0 && cs[i - 1]! == '`'
         extractLoop ctx (i + 1) ls ic qm (if c == '[' && attrD > 0 then attrD + 1 else attrD) (delimD + 1)
-          (if isQ then quoteD + 1 else quoteD) (fl0 &&& ~~~24) (if c == '(' then qp.push isQ else qp) acc
-      | ')' | ']' | '}' =>
+          (if isQ then quoteD + 1 else quoteD) flClr (if c == '(' then qp.push isQ else qp) acc
+      else if isCloseDelim c then
         let (qp', qd') := if c == ')' && !qp.isEmpty then (qp.pop, if qp.back! then quoteD - 1 else quoteD) else (qp, quoteD)
-        let (ad', fl') := if c == ']' && attrD > 0 then (attrD - 1, if attrD == 1 then (fl0 &&& ~~~8) ||| 16 else fl0 &&& ~~~24) else (attrD, fl0 &&& ~~~24)
+        let (ad', fl') := if c == ']' && attrD > 0 then (attrD - 1, if attrD == 1 then (fl0 &&& ~~~8) ||| 16 else flClr) else (attrD, flClr)
         extractLoop ctx (i + 1) ls ic qm ad' (if delimD > 0 then delimD - 1 else 0) qd' fl' qp' acc
-      | ';' => extractLoop ctx (i + 1) ls ic qm attrD delimD quoteD (fl0 ||| 24) qp acc
-      | '\'' =>
-        let ni := if !prevId && i + 1 < n && cs[i + 1]! != '\'' then scanCharLit cs n i else i + 1
-        extractLoop ctx ni ls ic qm attrD delimD quoteD (fl0 &&& ~~~24) qp acc
-      | '#' =>
-        if (fl0 &&& 8) != 0 && (delimD == 0 || quoteD == 0) then
-          let (fl2, acc') := flushHdr (fl0 &&& ~~~24) acc; extractLoop ctx (i + 1) ls ic qm attrD delimD quoteD (fl2 &&& ~~~4) qp acc'
-        else extractLoop ctx (i + 1) ls ic qm attrD delimD quoteD (fl0 &&& ~~~24) qp acc
-      | '?' | '*' | '+' | '<' =>
+      else if isChoiceOp c then
         let mark := (fl0 &&& 4) != 0 && (c != '<' || (i + 2 < n && cs[i + 1]! == '|' && cs[i + 2]! == '>'))
         extractLoop ctx (i + 1) ls ic qm attrD delimD quoteD ((if mark then fl0 ||| 16384 else fl0) &&& ~~~24) qp acc
-      | _ =>
-        if c == '«' || Lean.isIdFirst c then
-          let isGuil := c == '«'
-          let (tokS, tokE, ni, nls) := if isGuil then
-              let (ge, ni, _, nls) := scanGuillemetLoop cs n (i + 1) 0 ls; (i + 1, ge, ni, nls)
-            else let ni := scanIdentEnd cs n (i + 1); (i, ni, ni, ls)
-          let len := tokE - tokS; let flBase := (fl0 &&& ~~~24) ||| (if isGuil then 2 else 3)
-          let maybeP := (fl0 &&& 1024) == 0 && len >= 7 && cs[tokE - 1]! == 'r' && cs[tokE - 7]! == '_'
-          let shortSkip := !isGuil && ((len == 2 && cs[tokS + 1]! != '!' && !(c == 'i' && cs[tokS + 1]! == 'n')) || (len == 3 && c != 'd' && c != 'e'))
-          if len < 2 || shortSkip || (!isGuil && !('a' ≤ c && c ≤ 'z') && !maybeP) then
-            extractLoop ctx ni nls ic qm attrD delimD quoteD flBase qp acc
-          else
-            let tok := sliceStr cs tokS tokE; let kw := kwFlags.getD tok 0
-            let (ic', qm') := if (kw &&& 2048) != 0 then
-                (ic + 1, qm + (if (sliceStr cs nls (skipLine cs n nls)).cliTrim == builtinQedFStrLine then 1 else 0)) else (ic, qm)
-            let fl1 := flBase ||| (if (kw &&& 6) != 0 then 32 else 0) |||
-              (if (kw &&& 256) != 0 || (maybeP && tok.endsWith "_parser") then 1024 else 0) |||
-              (if (flBase &&& 64) == 0 && ((kw &&& 64) != 0 || ((kw &&& 1024) != 0 && prevQualifierAt cs i == some "Command")) then 64 else 0) |||
-              (if (flBase &&& 128) == 0 && ((kw &&& 128) != 0 || ((tok == "atom" || tok == "mkStrLit") && prevQualifierAt cs i == some "Syntax")) then 128 else 0)
-            if isGuil || (i > 0 && (cs[i - 1]! == '.' || cs[i - 1]! == '`')) then
-              extractLoop ctx ni nls ic' qm' attrD delimD quoteD fl1 qp acc
-            else
-              let fl2 := if (fl1 &&& 4) != 0 && (kw &&& 512) != 0 then fl1 ||| 16384 else fl1
-              let (tokAtStmt, tokAtDecl) := ((fl0 &&& 8) != 0, (fl0 &&& 16) != 0)
-              if quoteD > 0 && (kw &&& 8) != 0 then extractLoop ctx ni nls ic' qm' attrD delimD quoteD (fl2 ||| 64) qp acc
-              else if (delimD == 0 || (quoteD == 0 && (tokAtDecl || ctx.ignoreDelim))) && (kw &&& 8) != 0 then
-                let (fl3, acc') := flushHdr fl2 acc; extractLoop ctx ni nls ic' qm' attrD delimD quoteD (fl3 ||| 4) qp acc'
-              else if (delimD == 0 || quoteD == 0) && tokAtStmt && (kw &&& 16) != 0 then
-                let (fl3, acc') := flushHdr fl2 acc
-                extractLoop ctx ni nls ic' qm' attrD delimD quoteD ((fl3 &&& ~~~4) ||| (if (kw &&& 32) != 0 then 16 else 0)) qp acc'
-              else extractLoop ctx ni nls ic' qm' attrD delimD quoteD (if tok == "in" || (tokAtDecl && (kw &&& 32) != 0) then fl2 ||| 16 else fl2) qp acc
-        else extractLoop ctx (i + 1) ls ic qm attrD delimD quoteD (fl0 &&& ~~~24) qp acc
+      else if c == '«' || Lean.isIdFirst c then
+        let (ni, nls, ic', qm', fl', acc') := stepExtractIdent ctx i ls ic qm delimD quoteD fl0 acc
+        extractLoop ctx ni nls ic' qm' attrD delimD quoteD fl' qp acc'
+      else match c with
+        | '=' =>
+          if i + 1 < n && cs[i + 1]! == '>' then
+            let (fl', acc') := if delimD == 0 || quoteD == 0 then let (fl2, a2) := flushHdr flClr acc; (if delimD == 0 || ctx.ignoreDelim then fl2 &&& ~~~4 else fl2, a2) else (flClr, acc)
+            extractLoop ctx (i + 2) ls ic qm attrD delimD quoteD fl' qp acc'
+          else extractLoop ctx (i + 1) ls ic qm attrD delimD quoteD flClr qp acc
+        | '@' =>
+          let isAttr := i + 1 < n && cs[i + 1]! == '[' && (fl0 &&& 16) != 0
+          extractLoop ctx (i + if isAttr then 2 else 1) ls ic qm (if isAttr then 1 else attrD) (if isAttr then delimD + 1 else delimD) quoteD flClr qp acc
+        | ';' => extractLoop ctx (i + 1) ls ic qm attrD delimD quoteD (fl0 ||| 24) qp acc
+        | '\'' => extractLoop ctx (if !prevId && i + 1 < n && cs[i + 1]! != '\'' then scanCharLit cs n i else i + 1) ls ic qm attrD delimD quoteD flClr qp acc
+        | '#' =>
+          let (fl', acc') := if (fl0 &&& 8) != 0 && (delimD == 0 || quoteD == 0) then let (fl2, a2) := flushHdr flClr acc; (fl2 &&& ~~~4, a2) else (flClr, acc)
+          extractLoop ctx (i + 1) ls ic qm attrD delimD quoteD fl' qp acc'
+        | _ => extractLoop ctx (i + 1) ls ic qm attrD delimD quoteD flClr qp acc
 
 /-! ### Pass B: Tail-Recursive Register-Pure Forbidden Token Scanner -/
 
@@ -378,6 +381,23 @@ private partial def scanStrLoop (cs : Array Char) (n : Nat) (interp : Bool) (k l
 private partial def popToSize (gs : Array (Char × UInt32)) (sz : Nat) : Array (Char × UInt32) :=
   if gs.size > sz then popToSize gs.pop sz else gs
 
+@[noinline] private def stepScanIdent (cs : Array Char) (n i line : Nat) (inc : Bool) (ic : UInt32) (hits : Array (Nat × String)) :
+    Nat × UInt32 × Array (Nat × String) :=
+  let c := cs[i]!; let ni := scanIdentEnd cs n (i + 1)
+  let hits' := match forbiddenAt? cs i ni with | some f => hits.push (line, f) | none => hits
+  let ic' : UInt32 := if !inc then 0
+    else if (ic &&& 8) != 0 then finishAtField ic
+    else if (ic >>> 4) > 0 then consumeAtArg ic
+    else if i >= 6 && cs[i - 1]! == '.' && matchWord cs i ni "trace" && matchWord cs (i - 6) (i - 1) "Macro" && (i == 6 || !Lean.isIdRest cs[i - 7]!) then 2
+    else if i > 0 && (cs[i - 1]! == '.' || cs[i - 1]! == '`') then 0
+    else if c == 'f' && ni == i + 1 && ni < n && cs[ni]! == '"' then 1
+    else if ni - i >= 2 && 'a' ≤ c && c ≤ 'z' then
+      let tok := sliceStr cs i ni; let kw := kwFlags.getD tok 0
+      if (kw &&& 4) != 0 then mkIc 2 else if (kw &&& 2) != 0 then mkIc 1
+      else mkIc (prev := (kw &&& 1) != 0) (after := tok == "trace" || tok == "trace_goal")
+    else 0
+  (ni, ic', hits')
+
 -- `sfl : UInt32`: bit 0=prevWasIdent, bit 1=prevIdentEnd, bit 2=inInterpStr
 private partial def scanForbiddenLoop (ctx : ScanCtx) (i line : Nat) (sfl ic : UInt32)
     (gs : Array (Char × UInt32)) (ib : Array (Nat × Nat)) (hits : Array (Nat × String)) : Array (Nat × String) :=
@@ -393,82 +413,62 @@ private partial def scanForbiddenLoop (ctx : ScanCtx) (i line : Nat) (sfl ic : U
     | .trivia ni nl _ => scanForbiddenLoop ctx ni nl 0 (ic &&& ~~~4) gs ib hits
     | .rawStr ni _ _ nl _ => scanForbiddenLoop ctx ni nl 0 0 gs ib hits
     | .custom cLen => scanForbiddenLoop ctx (i + cLen) (countNewlines cs i cLen line false) 0 (if inc then consumeAtArg ic else 0) gs ib hits
-    | .other => match c with
-      | '«' =>
-        let ic' := if !inc then 0 else if (ic &&& 8) != 0 then finishAtField ic else consumeAtArg ic
-        let (ge, ni, nl, _) := scanGuillemetLoop cs n (i + 1) line 0
-        scanForbiddenLoop ctx ni nl 2 ic' gs ib (match forbiddenAt? cs (i + 1) ge with | some f => hits.push (line, f) | none => hits)
-      | '$' | '@' | '↑' | '⇑' | '↥' | '`' =>
-        scanForbiddenLoop ctx (i + 1) line 0 (if inc && (ic >>> 4) > 0 then ic &&& ~~~15 else 0) gs ib hits
-      | '!' | '?' =>
+    | .other =>
+      if isAtPrefix c then scanForbiddenLoop ctx (i + 1) line 0 (if inc && (ic >>> 4) > 0 then ic &&& ~~~15 else 0) gs ib hits
+      else if isOpenGrp c then
+        let gs' := if inc then pushGroup gs (if c == '(' then ')' else if c == '[' then ']' else '⟩') ic (c == '[') else gs
+        scanForbiddenLoop ctx (i + 1) line 0 0 gs' ib hits
+      else if isCloseGrp c then
+        let (gs', ic') := if inc && !gs.isEmpty && gs.back!.1 == c then (gs.pop, gs.back!.2) else (gs, 0)
+        scanForbiddenLoop ctx (i + 1) line 0 ic' gs' ib hits
+      else if c == '!' || c == '?' then
         let ic' := if !inc then 0
           else if c == '!' && (ic >>> 4) > 0 && (ic &&& 4) == 0 then ic &&& ~~~15
           else if (ic &&& 4) != 0 then (if (ic >>> 4) == 0 then ic ||| 1 else ic &&& ~~~1) else 0
         scanForbiddenLoop ctx (i + 1) line 0 ic' gs ib hits
-      | ':' =>
-        let ic' := if inc && (ic &&& 4) != 0 && i + 1 < n && (Lean.isIdFirst cs[i + 1]! || cs[i + 1]! == '«') then mkIc (ic >>> 4) (field := true) else 0
-        scanForbiddenLoop ctx (i + 1) line 0 ic' gs ib hits
-      | '.' =>
-        let ic' := if inc && ((ic &&& 4) != 0 || (ic >>> 4) > 0) then mkIc (if (ic &&& 4) != 0 then ic >>> 4 else (ic >>> 4) - 1) (field := true) else 0
-        scanForbiddenLoop ctx (i + 1) line 0 ic' gs ib hits
-      | '#' =>
-        if inc && i + 1 < n && cs[i + 1]! == '[' then scanForbiddenLoop ctx (i + 2) line 0 0 (pushGroup gs ']' ic) ib hits
-        else if i + 6 <= n && matchWord cs i (i + 6) "#guard" && (i + 6 >= n || !Lean.isIdRest cs[i + 6]!) then
-          scanForbiddenLoop ctx (i + 6) line 0 0 gs ib (hits.push (line, "#guard"))
-        else scanForbiddenLoop ctx (i + 1) line 0 0 gs ib hits
-      | '(' | '[' | '⟨' =>
-        let gs' := if inc then pushGroup gs (if c == '(' then ')' else if c == '[' then ']' else '⟩') ic (c == '[') else gs
-        scanForbiddenLoop ctx (i + 1) line 0 0 gs' ib hits
-      | '{' =>
-        if !ib.isEmpty then
-          let (top, savedGs) := ib.back!
-          if ctx.braceMode >= 2 then scanForbiddenLoop ctx (i + 1) line 0 0 gs ib hits
-          else scanForbiddenLoop ctx (i + 1) line 0 0 (if inc then pushGroup gs '}' ic else gs) (if ctx.braceMode == 0 then ib.pop.push (top + 1, savedGs) else ib) hits
-        else scanForbiddenLoop ctx (i + 1) line 0 0 (if inc then pushGroup gs '}' ic else gs) ib hits
-      | '}' =>
-        if !ib.isEmpty then
-          let (top, savedGs) := ib.back!
-          if ctx.braceMode >= 2 then scanForbiddenLoop ctx (i + 1) line 0 0 gs ib hits
-          else if top == 0 then scanForbiddenLoop ctx (i + 1) line 4 0 (popToSize gs savedGs) ib.pop hits
+      else if Lean.isIdFirst c then
+        let (ni, ic', hits') := stepScanIdent cs n i line inc ic hits
+        scanForbiddenLoop ctx ni line 3 ic' gs ib hits'
+      else match c with
+        | '«' =>
+          let ic' := if !inc then 0 else if (ic &&& 8) != 0 then finishAtField ic else consumeAtArg ic
+          let (ge, ni, nl, _) := scanGuillemetLoop cs n (i + 1) line 0
+          scanForbiddenLoop ctx ni nl 2 ic' gs ib (match forbiddenAt? cs (i + 1) ge with | some f => hits.push (line, f) | none => hits)
+        | ':' =>
+          let ic' := if inc && (ic &&& 4) != 0 && i + 1 < n && (Lean.isIdFirst cs[i + 1]! || cs[i + 1]! == '«') then mkIc (ic >>> 4) (field := true) else 0
+          scanForbiddenLoop ctx (i + 1) line 0 ic' gs ib hits
+        | '.' =>
+          let ic' := if inc && ((ic &&& 4) != 0 || (ic >>> 4) > 0) then mkIc (if (ic &&& 4) != 0 then ic >>> 4 else (ic >>> 4) - 1) (field := true) else 0
+          scanForbiddenLoop ctx (i + 1) line 0 ic' gs ib hits
+        | '#' =>
+          if inc && i + 1 < n && cs[i + 1]! == '[' then scanForbiddenLoop ctx (i + 2) line 0 0 (pushGroup gs ']' ic) ib hits
+          else if i + 6 <= n && matchWord cs i (i + 6) "#guard" && (i + 6 >= n || !Lean.isIdRest cs[i + 6]!) then
+            scanForbiddenLoop ctx (i + 6) line 0 0 gs ib (hits.push (line, "#guard"))
+          else scanForbiddenLoop ctx (i + 1) line 0 0 gs ib hits
+        | '{' =>
+          let (gs', ib') := if !ib.isEmpty && ctx.braceMode >= 2 then (gs, ib)
+            else (if inc then pushGroup gs '}' ic else gs, if !ib.isEmpty && ctx.braceMode == 0 then let (top, savedGs) := ib.back!; ib.pop.push (top + 1, savedGs) else ib)
+          scanForbiddenLoop ctx (i + 1) line 0 0 gs' ib' hits
+        | '}' =>
+          if !ib.isEmpty && ctx.braceMode >= 2 then scanForbiddenLoop ctx (i + 1) line 0 0 gs ib hits
+          else if !ib.isEmpty && ib.back!.1 == 0 then scanForbiddenLoop ctx (i + 1) line 4 0 (popToSize gs ib.back!.2) ib.pop hits
           else
             let (gs', ic') := if inc && !gs.isEmpty && gs.back!.1 == '}' then (gs.pop, gs.back!.2) else (gs, 0)
-            scanForbiddenLoop ctx (i + 1) line 0 ic' gs' (ib.pop.push (top - 1, savedGs)) hits
-        else
-          let (gs', ic') := if inc && !gs.isEmpty && gs.back!.1 == '}' then (gs.pop, gs.back!.2) else (gs, 0)
-          scanForbiddenLoop ctx (i + 1) line 0 ic' gs' ib hits
-      | ')' | ']' | '⟩' =>
-        let (gs', ic') := if inc && !gs.isEmpty && gs.back!.1 == c then (gs.pop, gs.back!.2) else (gs, 0)
-        scanForbiddenLoop ctx (i + 1) line 0 ic' gs' ib hits
-      | '"' =>
-        if ctx.braceMode >= 2 && !ib.isEmpty then
-          let (ni, nl, _) := if ctx.braceMode == 2 then (0, 0, false) else scanStrLoop cs n false (i + 1) line
-          if ctx.braceMode >= 3 && ni <= n && ni > i + 1 && cs[ni - 1]! == '"' && (ctx.braceMode == 4 || nl == line) then
-            scanForbiddenLoop ctx ni nl 0 0 gs ib hits
-          else scanForbiddenLoop ctx (i + 1) line 0 0 (popToSize gs ib.back!.2) ib.pop hits
-        else
-          let (ni, nl, enterB) := scanStrLoop cs n (inc && (ctx.allInterp || (ic &&& 1) != 0)) (i + 1) line
-          scanForbiddenLoop ctx ni nl 0 0 gs (if enterB then ib.push (0, gs.size) else ib) hits
-      | '\'' =>
-        scanForbiddenLoop ctx (if !prevId && i + 1 < n && cs[i + 1]! != '\'' then scanCharLit cs n i else i + 1) line 0 0 gs ib hits
-      | _ =>
-        if inc && (ic &&& 8) != 0 && c.isDigit then scanForbiddenLoop ctx (skipDigits cs n (i + 1) false) line 0 (finishAtField ic) gs ib hits
-        else if inc && (ic >>> 4) > 0 && c.isDigit then scanForbiddenLoop ctx (skipDigits cs n (i + 1) true) line 0 (consumeAtArg ic) gs ib hits
-        else if Lean.isIdFirst c then
-          let ni := scanIdentEnd cs n (i + 1)
-          let hits' := match forbiddenAt? cs i ni with | some f => hits.push (line, f) | none => hits
-          let ic' : UInt32 := if !inc then 0
-            else if (ic &&& 8) != 0 then finishAtField ic
-            else if (ic >>> 4) > 0 then consumeAtArg ic
-            else if i >= 6 && cs[i - 1]! == '.' && matchWord cs i ni "trace" && matchWord cs (i - 6) (i - 1) "Macro" && (i == 6 || !Lean.isIdRest cs[i - 7]!) then 2
-            else if i > 0 && (cs[i - 1]! == '.' || cs[i - 1]! == '`') then 0
-            else if c == 'f' && ni == i + 1 && ni < n && cs[ni]! == '"' then 1
-            else if ni - i >= 2 && 'a' ≤ c && c ≤ 'z' then
-              let tok := sliceStr cs i ni; let kw := kwFlags.getD tok 0
-              if (kw &&& 4) != 0 then mkIc 2 else if (kw &&& 2) != 0 then mkIc 1
-              else mkIc (prev := (kw &&& 1) != 0) (after := tok == "trace" || tok == "trace_goal")
-            else 0
-          scanForbiddenLoop ctx ni line 3 ic' gs ib hits'
-        else scanForbiddenLoop ctx (i + 1) line 0 0 gs ib hits
+            let ib' := if !ib.isEmpty then let (top, savedGs) := ib.back!; ib.pop.push (top - 1, savedGs) else ib
+            scanForbiddenLoop ctx (i + 1) line 0 ic' gs' ib' hits
+        | '"' =>
+          if ctx.braceMode >= 2 && !ib.isEmpty then
+            let (ni, nl, _) := if ctx.braceMode == 2 then (0, 0, false) else scanStrLoop cs n false (i + 1) line
+            if ctx.braceMode >= 3 && ni <= n && ni > i + 1 && cs[ni - 1]! == '"' && (ctx.braceMode == 4 || nl == line) then scanForbiddenLoop ctx ni nl 0 0 gs ib hits
+            else scanForbiddenLoop ctx (i + 1) line 0 0 (popToSize gs ib.back!.2) ib.pop hits
+          else
+            let (ni, nl, enterB) := scanStrLoop cs n (inc && (ctx.allInterp || (ic &&& 1) != 0)) (i + 1) line
+            scanForbiddenLoop ctx ni nl 0 0 gs (if enterB then ib.push (0, gs.size) else ib) hits
+        | '\'' => scanForbiddenLoop ctx (if !prevId && i + 1 < n && cs[i + 1]! != '\'' then scanCharLit cs n i else i + 1) line 0 0 gs ib hits
+        | _ =>
+          if inc && (ic &&& 8) != 0 && c.isDigit then scanForbiddenLoop ctx (skipDigits cs n (i + 1) false) line 0 (finishAtField ic) gs ib hits
+          else if inc && (ic >>> 4) > 0 && c.isDigit then scanForbiddenLoop ctx (skipDigits cs n (i + 1) true) line 0 (consumeAtArg ic) gs ib hits
+          else scanForbiddenLoop ctx (i + 1) line 0 0 gs ib hits
 
 private def mergeHits (a b : Array (Nat × String)) : Array (Nat × String) :=
   b.foldl (init := a) fun acc h => if acc.contains h then acc else acc.push h
@@ -490,37 +490,36 @@ private def isBuiltinQedFStrOnly (inRepo : Bool) (f : FilePath) (info : SyntaxSc
 private def addAllUnique (src arr : Array String) (seen : Std.HashSet String) : Array String × Std.HashSet String × Bool :=
   src.foldl (init := (arr, seen, false)) fun (a, s, ch) t => if s.contains t then (a, s, ch) else (a.push t, s.insert t, true)
 
-private def scanFilesForbidden (fileSrcs : Array (FilePath × String)) (inRepo : Bool) : Array (FilePath × Nat × String) := Id.run do
-  if !fileSrcs.any (fun (_, s) => hasForbiddenSubstr s) then return #[]
-  let filesCs := fileSrcs.map fun (f, s) => (f, s, s.toList.toArray)
-  let maxIters := max 64 (max (fileSrcs.size * 8) ((fileSrcs.foldl (init := 0) fun a (_, s) => a + s.length) / 8))
-  let mut known : Array String := #[]; let mut knownSet : Std.HashSet String := {}
-  let mut prepared : CustomTokenMap := {}; let mut loaded : Array (FilePath × String × Array Char × SyntaxScanInfo) := #[]
-  let mut projInterp := false; let mut projSynGen := false; let mut projUnbalBrace := false; let mut projUnbalDelim := false
-  for _ in [0:maxIters] do
-    let mut iterLoaded : Array (FilePath × String × Array Char × SyntaxScanInfo) := Array.mkEmpty filesCs.size
-    let mut allHdr : Array String := #[]; let mut hdrSet : Std.HashSet String := {}
-    let mut allLex : Array String := #[]; let mut lexSet : Std.HashSet String := {}
-    let mut hasInterp := false; let mut hasSynGen := projSynGen; let mut hasUB := projUnbalBrace; let mut hasUD := projUnbalDelim
-    for (f, src, cs) in filesCs do
-      let info := extractLoop { cs, n := cs.size, known := prepared, ignoreDelim := projUnbalDelim } 0 0 0 0 0 0 0 24 #[] {}
-      let (h', hs', _) := addAllUnique info.headerTokens allHdr hdrSet; allHdr := h'; hdrSet := hs'
-      let (l', ls', _) := addAllUnique info.allLexerStrings allLex lexSet; allLex := l'; lexSet := ls'
-      hasSynGen := hasSynGen || info.hasSyntaxGen; hasUB := hasUB || info.hasUnbalancedBrace; hasUD := hasUD || info.hasUnbalancedDelim
-      if info.interpCount > 0 && !isBuiltinQedFStrOnly inRepo f info then hasInterp := true
-      iterLoaded := iterLoaded.push (f, src, cs, info)
-    loaded := iterLoaded; projInterp := hasInterp; projSynGen := hasSynGen; projUnbalBrace := hasUB
-    let delimFlipped := !projUnbalDelim && hasUD; projUnbalDelim := hasUD
-    let (k', ks', added) := addAllUnique (if hasSynGen then allLex else allHdr) known knownSet
-    known := k'; knownSet := ks'
-    if !added && !delimFlipped then break
-    if added then prepared := prepareCustomTokens known
-  let mut allHits : Array (FilePath × Nat × String) := #[]
-  for (f, src, cs, info) in loaded do
-    if !hasForbiddenSubstr src then continue
-    let useAllInterp := projInterp || info.hasAtInterpMacro || (info.interpCount > 0 && !isBuiltinQedFStrOnly inRepo f info)
-    for (ln, tok) in findForbiddenTokensWith cs prepared useAllInterp projUnbalBrace do allHits := allHits.push (f, ln, tok)
-  return allHits
+private def scanFixpoint (filesCs : Array (FilePath × String × Array Char)) (inRepo : Bool) :
+    Nat → Array String → Std.HashSet String → CustomTokenMap → Bool → Bool → Bool → Bool →
+    Array (FilePath × String × Array Char × SyntaxScanInfo) →
+    (Array (FilePath × String × Array Char × SyntaxScanInfo) × CustomTokenMap × Bool × Bool)
+  | 0, _, _, prepared, projInterp, _, projUB, _, loaded => (loaded, prepared, projInterp, projUB)
+  | fuel + 1, known, knownSet, prepared, _, projSynGen, projUB, projUD, _ =>
+      let (iterLoaded, allHdr, _, allLex, _, hasInterp, hasSynGen, hasUB, hasUD) :=
+        filesCs.foldl (init := (Array.mkEmpty filesCs.size, #[], ({} : Std.HashSet String), #[], ({} : Std.HashSet String), false, projSynGen, projUB, projUD))
+          fun (ld, ah, hs, al, ls, hi, hsg, hub, hud) (f, src, cs) =>
+            let info := extractLoop { cs, n := cs.size, known := prepared, ignoreDelim := projUD } 0 0 0 0 0 0 0 24 #[] {}
+            let (ah', hs', _) := addAllUnique info.headerTokens ah hs
+            let (al', ls', _) := addAllUnique info.allLexerStrings al ls
+            let hi' := hi || (info.interpCount > 0 && !isBuiltinQedFStrOnly inRepo f info)
+            (ld.push (f, src, cs, info), ah', hs', al', ls', hi', hsg || info.hasSyntaxGen, hub || info.hasUnbalancedBrace, hud || info.hasUnbalancedDelim)
+      let delimFlipped := !projUD && hasUD
+      let (k', ks', added) := addAllUnique (if hasSynGen then allLex else allHdr) known knownSet
+      if !added && !delimFlipped then (iterLoaded, prepared, hasInterp, hasUB)
+      else scanFixpoint filesCs inRepo fuel k' ks' (if added then prepareCustomTokens k' else prepared) hasInterp hasSynGen hasUB hasUD iterLoaded
+
+private def scanFilesForbidden (fileSrcs : Array (FilePath × String)) (inRepo : Bool) : Array (FilePath × Nat × String) :=
+  if !fileSrcs.any (fun (_, s) => hasForbiddenSubstr s) then #[]
+  else
+    let filesCs := fileSrcs.map fun (f, s) => (f, s, s.toList.toArray)
+    let maxIters := max 64 (max (fileSrcs.size * 8) ((fileSrcs.foldl (init := 0) fun a (_, s) => a + s.length) / 8))
+    let (loaded, prepared, projInterp, projUB) := scanFixpoint filesCs inRepo maxIters #[] {} {} false false false false #[]
+    loaded.foldl (init := #[]) fun acc (f, src, cs, info) =>
+      if !hasForbiddenSubstr src then acc
+      else
+        let useAllInterp := projInterp || info.hasAtInterpMacro || (info.interpCount > 0 && !isBuiltinQedFStrOnly inRepo f info)
+        (findForbiddenTokensWith cs prepared useAllInterp projUB).foldl (init := acc) fun a (ln, tok) => a.push (f, ln, tok)
 
 def findForbiddenTokens (src : String) : Array (Nat × String) :=
   (scanFilesForbidden #[(⟨""⟩, src)] false).map fun (_, ln, tok) => (ln, tok)
@@ -530,7 +529,7 @@ def grepForbidden : IO Bool := do
   let files := (← collect "." "lean" [".lake", ".qed", "dist", "scratch", "toolchains", "node_modules", ".git", "scripts", "Cli"]).filter
     (·.fileName != some "Cli.lean")
   let hits := scanFilesForbidden (← files.mapM fun f => return (f, ← IO.FS.readFile f)) inRepo
-  for (f, ln, tok) in hits do IO.eprintln (red s!"  forbidden token `{tok}` in {f}:{ln}")
+  hits.forM fun (f, ln, tok) => IO.eprintln (red s!"  forbidden token `{tok}` in {f}:{ln}")
   return hits.isEmpty
 
 /-! ### Axiom, Effect, Build-Graph, Kernel-Env & Extern Gates -/
@@ -549,14 +548,14 @@ def effectsCovered : IO Bool := do
   unless ← andB (← qedDir.pathExists) hostPath.pathExists do return true
   let after (marker close src : String) : List String :=
     match src.splitOn marker with | _ :: rest => rest.map fun c => (c.splitOn close).headD "" | [] => []
-  let mut emitted : List String := []
-  for f in ← collect qedDir "lean" do
+  let markers := [".fx \"", ".fxResult \"", "Dom.effect \"", "Dom.effectResult \""]
+  let emitted ← (← collect qedDir "lean").foldlM (init := ([] : List String)) fun acc f => do
     let src ← IO.FS.readFile f
-    for marker in [".fx \"", ".fxResult \"", "Dom.effect \"", "Dom.effectResult \""] do
-      for k in after marker "\"" src do if k != "" && !emitted.contains k then emitted := k :: emitted
+    return markers.foldl (init := acc) fun a m =>
+      (after m "\"" src).foldl (init := a) fun b k => if k != "" && !b.contains k then k :: b else b
   let handled := after "case '" "'" (← IO.FS.readFile hostPath)
   let missing := emitted.filter (!handled.contains ·)
-  for k in missing do IO.eprintln (red s!"  effect kind \"{k}\" is emitted by a Cmd but no qed_host.mjs case handles it")
+  missing.forM fun k => IO.eprintln (red s!"  effect kind \"{k}\" is emitted by a Cmd but no qed_host.mjs case handles it")
   return missing.isEmpty
 
 private def pathToModule (base p : FilePath) : Option String :=
@@ -564,47 +563,50 @@ private def pathToModule (base p : FilePath) : Option String :=
   let rel := if s.startsWith pref then (s.drop pref.length).toString else s
   if rel.endsWith ".lean" then some ((rel.dropEnd 5).toString.replace "/" ".") else none
 
+private partial def reachesGraph (adj : Std.HashMap String (Array String)) (target : String) : List String → Std.HashSet String → Bool
+  | [], _ => false
+  | cur :: rest, vis =>
+      if vis.contains cur then reachesGraph adj target rest vis
+      else
+        let deps := adj.getD cur #[]
+        if deps.any fun dep => dep == target || (target == "Lean" && dep.startsWith "Lean.") then true
+        else
+          let vis' := vis.insert cur
+          reachesGraph adj target (deps.foldl (init := rest) fun s dep => if !vis'.contains dep && adj.contains dep then dep :: s else s) vis'
+
 def buildGraphClean : IO Bool := do
   let qh ← frameworkHome; let qedDir := qh / "Qed"
   unless ← qedDir.pathExists do return true
-  let mut files ← collect qedDir "lean"
-  if ← (qh / "Qed.lean").pathExists then files := files.push (qh / "Qed.lean")
-  let mut adj : Std.HashMap String (Array String) := {}
-  for f in files do if let some mod := pathToModule qh f then adj := adj.insert mod (parseLeanImports (← IO.FS.readFile f))
-  let reaches (start target : String) : Bool := Id.run do
-    let mut visited : Std.HashSet String := {}; let mut stack : Array String := #[start]
-    while !stack.isEmpty do
-      let cur := stack.back!; stack := stack.pop
-      if !visited.contains cur then
-        visited := visited.insert cur
-        for dep in adj.getD cur #[] do
-          if dep == target || (target == "Lean" && dep.startsWith "Lean.") then return true
-          if !visited.contains dep && adj.contains dep then stack := stack.push dep
-    return false
-  let mut ok := true
+  let baseFiles ← collect qedDir "lean"
+  let files := if ← (qh / "Qed.lean").pathExists then baseFiles.push (qh / "Qed.lean") else baseFiles
+  let adj ← files.foldlM (init := ({} : Std.HashMap String (Array String))) fun m f => do
+    match pathToModule qh f with | some mod => return m.insert mod (parseLeanImports (← IO.FS.readFile f)) | none => return m
+  let reaches (start target : String) : Bool := reachesGraph adj target [start] {}
   let pureExact := #["Qed.Html", "Qed.Render", "Qed.View.Core", "Qed.Ssr", "Qed.Resource", "Qed.Socket", "Qed.Driver",
     "Qed.Schema.Codec", "Qed.Runtime.AppCore", "Qed.Runtime.LocalCore", "Qed.Runtime.Cmd", "Qed.Server.Core", "Qed.Server.Eval", "Qed.Server.Http", "Qed.Server.Net",
     "Qed.Server.Prim", "Qed.Server.Native", "Qed.Server.Db.Core", "Qed.Server.Db.Runtime", "Qed.Server.Db.PgWire",
     "Qed.Deploy", "Qed.Cloud.Env", "Qed.Cloud.Gcp", "Qed.Cloud.Protocol", "Qed.Cloud.Compile", "Qed.Cloud.Proofs", "Qed.Cloud.GcpApi", "Qed.Cloud.Executor"]
-  for (mod, _) in adj.toList do
+  let ok1 ← adj.toList.foldlM (init := true) fun ok (mod, _) => do
     if (pureExact.contains mod || #["Qed.Driver.", "Qed.Socket.", "Qed.Speculative.", "Qed.Proofs."].any (mod.startsWith ·)) && reaches mod "Lean" then
-      IO.eprintln (red s!"  build-graph regression: pure module `{mod}` transitively imports `Lean`"); ok := false
-  for (src, dst) in #[
+      IO.eprintln (red s!"  build-graph regression: pure module `{mod}` transitively imports `Lean`"); return false
+    else return ok
+  let ok2 ← #[
       ("Qed.Style.Syntax", "Qed.Style.Proofs"), ("Qed.Component.Speculative", "Qed.Speculative.Proofs"),
       ("Qed.Server.Core", "Qed.Json.Proofs"), ("Qed.Socket.Basic", "Qed.Json.Proofs"),
       ("Qed.Server.Syntax", "Qed.Server.Core"), ("Qed.Server.FnElab", "Qed.Server.Invariant"),
       ("Qed.Server.FnElab", "Qed.Server.External"), ("Qed.Invariant.State", "Qed.Runtime.App"),
       ("Qed.Invariant.View", "Qed.Runtime.App"), ("Qed.Invariant.ForEach", "Qed.Runtime.App"),
       ("Qed.Invariant.View", "Qed.Invariant.State"), ("Qed.Schema", "Qed.Runtime.Verify"),
-      ("Qed.Mapping", "Qed.Runtime.Verify"), ("Qed.Component.Rewrite", "Qed.Runtime.Verify")] do
+      ("Qed.Mapping", "Qed.Runtime.Verify"), ("Qed.Component.Rewrite", "Qed.Runtime.Verify")].foldlM (init := ok1) fun ok (src, dst) => do
     if adj.contains src && reaches src dst then
-      IO.eprintln (red s!"  build-graph regression: `{src}` reaches forbidden dependency `{dst}`"); ok := false
+      IO.eprintln (red s!"  build-graph regression: `{src}` reaches forbidden dependency `{dst}`"); return false
+    else return ok
   let lockPath := qh / "rust" / "qed_server" / "Cargo.lock"
   if ← lockPath.pathExists then
     let lockSrc ← IO.FS.readFile lockPath
     let pkgCount := (lockSrc.splitOn "\n[[package]]\n").length - 1 + (if lockSrc.startsWith "[[package]]\n" then 1 else 0)
-    if pkgCount > 50 then IO.eprintln (red s!"  build-graph regression: rust/qed_server/Cargo.lock has {pkgCount} packages (budget ≤ 50)"); ok := false
-  return ok
+    if pkgCount > 50 then IO.eprintln (red s!"  build-graph regression: rust/qed_server/Cargo.lock has {pkgCount} packages (budget ≤ 50)"); return false
+  return ok2
 
 private def ensureQedjsEnv (q? : Option QedjsEnv) (needBuild : Bool := true) : IO (Option QedjsEnv) :=
   match q? with | some e => pure (some e) | none => resolveQedjsEnv (needBuild := needBuild)

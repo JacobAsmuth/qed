@@ -12,7 +12,7 @@ structure GcpPlan where
   (serviceAccountId cloudRunName : String) (secretNames : List String)
   (managedDbs : List (String × DbCluster)) (assetPaths egressAllow : List String)
   (bindings : List GcpIamBinding) (denies : List GcpDenyRule)
-deriving Inhabited, DecidableEq, Repr
+deriving Inhabited, DecidableEq
 
 def compileInfra (key : DeployKey) (buildHash : String) (spec : DeploySpec) (m : Qed.Deploy.DeployManifest) : GcpPlan :=
   let fp := m.footprintFor key.env.toDeployEnv
@@ -51,7 +51,7 @@ def realizeOrgPolicy (plans : List GcpPlan) : GcpPolicyState :=
 
 structure GcpObservedState where
   (key : DeployKey) (secretNames managedDbs egressAllow : List String := []) (bindings : List GcpIamBinding := [])
-deriving Inhabited, DecidableEq, Repr
+deriving Inhabited, DecidableEq
 
 def planRollout (live : GcpObservedState) (desired : GcpPlan) : List GcpAction :=
   let sameKey := live.key == desired.key

@@ -39,19 +39,15 @@ bad_spec_act "Predicted response for `StoreSrv.placeOrder` does not satisfy serv
     let rem = await StoreSrv.placeOrder(1) predict 20000 catch:
       case _: pass
     remaining = rem
-expect_err "cannot run side effects or emit events inside a speculative continuation after `predict`" in
-component BadSpecPerform:
-  session user
-  port log : String
-  state remaining : Nat = 10
-  invariant validRemaining: remaining <= 10000
+bad_comp "cannot run side effects or emit events inside a speculative continuation after `predict`" BadSpecPerform :
+  session user | port log : String | state remaining : Nat = 10 | invariant validRemaining: remaining <= 10000 |
   action buy:
     if user.isSome and 1 <= remaining:
       let rem = await StoreSrv.placeOrder(1) predict remaining - 1 catch:
         case _: pass
       remaining = rem
       log.send("bought")
-  view: <span>{remaining}</span>
+  | view: <span>{remaining}</span>
 bad_spec_act "cannot `await` inside a speculative continuation after `predict`" BadSpecNestedAwait :
   if user.isSome and 1 <= remaining:
     let rem = await StoreSrv.placeOrder(1) predict remaining - 1 catch:

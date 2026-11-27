@@ -25,9 +25,7 @@ component Widget:
   state pinned = false
   event onReport(count: Int)
   view: <div><span>{note}</span><Tag key={f"t{id}"} label={label} onToggle={pinned = _}/></div>
-structure Row where
-  id : Nat
-  label : String
+structure Row where (id : Nat) (label : String)
 inductive ParentMsg | reported (id : Nat) (count : Int)
 end LocalNested
 def importedHelper (r : LocalNested.Row) : Html LocalNested.ParentMsg :=
@@ -36,18 +34,8 @@ component HelperApp:
   state draft : String = ""
   action localEvent(m: LocalNested.ParentMsg): pass
   view: importedHelper({ id = 8, label = draft }).map(.localEvent)
-expect_err "`label` is a read-only `prop` and cannot be assigned (`state` fields: `count`)" in
-component ReadOnly:
-  prop label : String
-  state count : Nat = 0
-  action change: label = "changed"
-  view: <span>{label}</span>
-expect_err "duplicate action name `save`" in
-component DuplicateAction:
-  state count : Nat = 0
-  action save: count = 1
-  action save: count = 2
-  view: <span>{count}</span>
+bad_comp "`label` is a read-only `prop` and cannot be assigned (`state` fields: `count`)" ReadOnly : prop label : String | state count : Nat = 0 | action change: label = "changed" | view: <span>{label}</span>
+bad_comp "duplicate action name `save`" DuplicateAction : state count : Nat = 0 | action save: count = 1 | action save: count = 2 | view: <span>{count}</span>
 component Owned:
   prop caption : String
   state id : Nat
@@ -72,11 +60,9 @@ invariant navExclusive : exactlyOneOf(["nav-overview", "nav-arch", "nav-bench"],
 component RoutedDehydrated:
   route r : DocRoute = .home
   view: <div>{Router.toURL(r)}</div>
-expect_err "Styling invariant `badVacuousRole` failed in `navView`:\n  • `roleHasOneOf(\"nonexistent\", [navOn, navOff])` does not hold in every state" in
-invariant badVacuousRole : roleHasOneOf("nonexistent", [navOn, navOff]) holds_in navView
+expect_err "Styling invariant `badVacuousRole` failed in `navView`:\n  • `roleHasOneOf(\"nonexistent\", [navOn, navOff])` does not hold in every state" in invariant badVacuousRole : roleHasOneOf("nonexistent", [navOn, navOff]) holds_in navView
 def bothStylesView (b : Bool) : Html Unit := <button role="btn" {navOn} {navOff if b else navOff}>{"x"}</button>
-expect_err "Styling invariant `badDualStyle` failed in `bothStylesView`:\n  • `roleHasOneOf(\"btn\", [navOn, navOff])` does not hold in every state" in
-invariant badDualStyle : roleHasOneOf("btn", [navOn, navOff]) holds_in bothStylesView
+expect_err "Styling invariant `badDualStyle` failed in `bothStylesView`:\n  • `roleHasOneOf(\"btn\", [navOn, navOff])` does not hold in every state" in invariant badDualStyle : roleHasOneOf("btn", [navOn, navOff]) holds_in bothStylesView
 structure AppModel where route : DocRoute deriving DecidableEq
 def activeSection : DocRoute → Section | .home => .overview | .sec s _ => s
 def compositeNav (m : AppModel) : Html Unit := <div>{navView(activeSection(m.route))}</div>
@@ -141,10 +127,7 @@ def jsxErgonomicsView (items : Array Nat) (note? : Option String) (highlight : B
 def jsxElseBranchesView (note? : Option String) (highlight : Bool) (extra : List (Html Unit)) : Html Unit :=
   <div>{if highlight: <span>yes</span> else: <span>no</span>}{if let some(note) = note?: <p>{note}</p> else: <p>empty</p>}{if highlight: extra else: <><b>f1</b><b>f2</b></>}{if let some(_) = note?: extra else: <><i>m1</i><i>m2</i></>}</div>
 inductive FilterTab | all | tagged (tag : String) deriving DecidableEq
-structure PlainNote where
-  id : Nat
-  text : String
-deriving DecidableEq
+structure PlainNote where (id : Nat) (text : String) deriving DecidableEq
 component RichAuto:
   state tab   : FilterTab = .all
   state notes : PlainNote[]
@@ -183,11 +166,7 @@ component GoodLazy:
 def sneakyBlock {msg : Type} : Html msg := <div>bad</div>
 bad_comp_view "Invalid HTML / XSS check failed for this view:\n  • `<div>` cannot be nested inside `<p>` or a heading (`<h1>-<h6>`)" BadOpaqueNesting u : Unit = () | <p>{sneakyBlock}</p>
 bad_comp_view "Qed.lazy function must not capture state directly" BadLazyCapturesModel m : Nat = 1 | <div>{Qed.lazy((k: Nat) => <span>{k + m}</span>, m / 2)}</div>
-expect_err "SSR hydration mismatch: `ephemeral` field affects the rendered view:\n  • view mismatch after rehydration:  \"hi\" = b" in
-component BadEphemeralReadByView:
-  state a : Nat = 1
-  ephemeral b : String = "hi"
-  view: <div>{a}{b}</div>
+bad_comp "SSR hydration mismatch: `ephemeral` field affects the rendered view:\n  • view mismatch after rehydration:  \"hi\" = b" BadEphemeralReadByView : state a : Nat = 1 | ephemeral b : String = "hi" | view: <div>{a}{b}</div>
 
 -- Sub-components, `Field`, `<Await>`, & fractional CSS checks
 style fracStyle:
@@ -261,25 +240,9 @@ component StyleLacksGood:
   state ok : Bool = true
   view: <div><button role="submit" {safeBtnStyle}>OK</button><span>safe</span></div>
   invariant noDanger: roleLacks("submit", dangerBtnStyle), tagLacks("span", dangerBtnStyle)
-expect_err "Styling invariant `BadRoleLacks.noDanger` failed in `BadRoleLacks.view`:\n  • `roleLacks(\"submit\", dangerBtnStyle)` does not hold in every state" in
-component BadRoleLacks:
-  state ok : Bool = true
-  view: <button role="submit" {dangerBtnStyle}>Bad</button>
-  invariant noDanger: roleLacks("submit", dangerBtnStyle)
-expect_err "Invariant `BadPropInit.nonNeg` failed on initial state `BadPropInit.init`:\n  • initial state must satisfy:  0 <= -1" in
-component BadPropInit:
-  prop offset : Int = 0
-  state count : Int = -1
-  action nop: pass
-  invariant nonNeg: 0 <= count
-  view: <span>{count}</span>
-expect_err "SSR rehydration can violate the component's state invariant:\n  • after rehydration must satisfy:  5 <= shown + 0" in
-component BadEphemeralInv:
-  state shown : Int = 5
-  ephemeral cache : Int = 0
-  action shift: shown = 0; cache = 5
-  invariant totalMin: 5 <= shown + cache
-  view: <span>{shown}</span>
+bad_comp "Styling invariant `BadRoleLacks.noDanger` failed in `BadRoleLacks.view`:\n  • `roleLacks(\"submit\", dangerBtnStyle)` does not hold in every state" BadRoleLacks : state ok : Bool = true | view: <button role="submit" {dangerBtnStyle}>Bad</button> | invariant noDanger: roleLacks("submit", dangerBtnStyle)
+bad_comp "Invariant `BadPropInit.nonNeg` failed on initial state `BadPropInit.init`:\n  • initial state must satisfy:  0 <= -1" BadPropInit : prop offset : Int = 0 | state count : Int = -1 | action nop: pass | invariant nonNeg: 0 <= count | view: <span>{count}</span>
+bad_comp "SSR rehydration can violate the component's state invariant:\n  • after rehydration must satisfy:  5 <= shown + 0" BadEphemeralInv : state shown : Int = 5 | ephemeral cache : Int = 0 | action shift: shown = 0; cache = 5 | invariant totalMin: 5 <= shown + cache | view: <span>{shown}</span>
 
 -- Self-hosted `<Schema.Form>` & unified syntax checks
 component SelfHostedFormKeep:
@@ -297,12 +260,8 @@ component MultiParamAndAutoDefaults:
 example : MultiParamAndAutoDefaults.update MultiParamAndAutoDefaults.init (.pushBoth 4 "hi") = ({ xs := #[4], x := some 4 }, some (.emitted 4 "hi")) ∧
     MultiParamAndAutoDefaults.init.xs = #[] ∧ MultiParamAndAutoDefaults.init.x = none := ⟨rfl, rfl, rfl⟩
 bad_comp_view "use `Nat[]` instead of `Array Nat`" BadArrayType xs : Array Nat = [] | <span>{xs.size}</span>
-expect_err "use `Nat?` instead of `Option Nat`" in
-schema BadOptType:
-  val : Option Nat
-expect_err "use `jsonOnly(String)` with parentheses instead of `jsonOnly String`" in
-schema BadJsonOnly:
-  id : jsonOnly String
+bad_schema "use `Nat?` instead of `Option Nat`" BadOptType : val : Option Nat
+bad_schema "use `jsonOnly(String)` with parentheses instead of `jsonOnly String`" BadJsonOnly : id : jsonOnly String
 
 -- Python-esque ergonomics checks
 component PythonicShowcase:
@@ -429,19 +388,10 @@ mapping RoomFrameMap:
   decode(frame):
     let bytes = Proto.decodeHex(frame)?
     return Proto.decode(bytes)?
-expect_err "duplicate variant `a` in `enum DupEnum`" in
-enum DupEnum:
-  a
-  a
-expect_err "duplicate field `x` in variant `pair` of `enum DupEnumField`" in
-enum DupEnumField:
-  pair(x: Nat, x: String)
-expect_err "Record `BadRecDefault` default for field `qty` failed `where` constraint" in
-record BadRecDefault:
-  qty : Nat = 99 where 1 <= qty <= 4
-expect_err "Record `UnsatRec` is unsatisfiable: field `qty` has contradictory `where` constraints" in
-record UnsatRec:
-  qty : Nat where 10 <= qty, qty <= 2
+bad_enum "duplicate variant `a` in `enum DupEnum`" DupEnum : a | a
+bad_enum "duplicate field `x` in variant `pair` of `enum DupEnumField`" DupEnumField : pair(x: Nat, x: String)
+bad_rec "Record `BadRecDefault` default for field `qty` failed `where` constraint" BadRecDefault : qty : Nat = 99 where 1 <= qty <= 4
+bad_rec "Record `UnsatRec` is unsatisfiable: field `qty` has contradictory `where` constraints" UnsatRec : qty : Nat where 10 <= qty, qty <= 2
 
 -- Pure `fn` contracts (`requires`, `ensures`, `if`, `blindTo`)
 record SecretRoom:
@@ -480,13 +430,11 @@ fn redactSingleField(room: SecretRoom, viewerId: String) -> String?:
   return some(room.secretLocation)
 check_decls [projectSecretRoom_ensures_1, projectSecretRoom_ensures_2, projectSecretRoom_blindTo,
   clampRoundMins_ensures, hideWholeParam_ensures, hideWholeParam_blindTo, redactSingleField_blindTo]
-expect_err "`blindTo room.secretLocation` failed in `leakyProjection`" in
-fn leakyProjection(room: SecretRoom, viewerId: String) -> RedactedView:
+bad_fn "`blindTo room.secretLocation` failed in `leakyProjection`" leakyProjection(room: SecretRoom, viewerId: String) -> RedactedView |
   if viewerId in room.spyIds:
     ensures result.secretLocation == none
     blindTo room.secretLocation
-  let isSpy = viewerId in room.spyIds
-  return { code = f"{room.code}:{room.secretLocation}", secretLocation = none if isSpy else some(room.secretLocation), secretPack = none, isSpy = isSpy }
+  : let isSpy = viewerId in room.spyIds | return { code = f"{room.code}:{room.secretLocation}", secretLocation = none if isSpy else some(room.secretLocation), secretPack = none, isSpy = isSpy }
 bad_fn "`ensures` contract failed for `badClamp`" badClamp(n: Nat) -> Nat | ensures result <= 10 : return n
 
 -- Component `fn` (pure + state-mutating), implication invariants, per-action `prove:`, and keyed hoisted sub-components
@@ -523,19 +471,12 @@ component CompFnAndProve:
       case inc: omega
   view: <div><span>{heading("Room")}</span><PureFnBadge name={title}/></div>
 check_decls [CompFnAndProve.homeClean, CompFnAndProve.nonNeg, CompFnAndProve.app_view_eq]
-expect_err "unknown action/message `noSuchAction` in `prove:` on invariant `BadProveCase.ok`" in
-component BadProveCase:
-  state n : Nat = 0
-  action inc: n += 1
+bad_comp "unknown action/message `noSuchAction` in `prove:` on invariant `BadProveCase.ok`" BadProveCase : state n : Nat = 0 | action inc: n += 1 |
   invariant ok: n >= 0
     prove:
       case noSuchAction: omega
-  view: <span>{n}</span>
-expect_err "`fn reset` has no `-> ReturnType` and mutates component state" in
-component BadMutFnInPure:
-  prop x : Nat = 0
-  fn reset(): pass
-  view: <span>{x}</span>
+  | view: <span>{n}</span>
+bad_comp "`fn reset` has no `-> ReturnType` and mutates component state" BadMutFnInPure : prop x : Nat = 0 | fn reset(): pass | view: <span>{x}</span>
 
 -- Keyed / conditional hoisted sub-components with lifecycle reset, `start`, and lifted `subscribe`
 server SubHostSrv:
@@ -690,29 +631,15 @@ component MultiStyleSpliceDemo:
 bad_style "duplicate CSS property `padding` in the same style block" BadDupCssProp :
   padding: 4px
   padding: 8px
-expect_err "recursive `await` call cycle in component `fn ping`" in
-component BadAsyncCycleComp:
-  state x : String = ""
+bad_comp "recursive `await` call cycle in component `fn ping`" BadAsyncCycleComp : state x : String = "" |
   fn ping():
     let _r = await PolishRpcSrv.saveItem("a") catch:
       case _: pass
     pong()
-  fn pong(): ping()
-  action go: ping()
-  view: <span>{x}</span>
-expect_err "cannot use `await` inside pure component `fn pureBad`; remove `-> ReturnType` for an async mutating helper, or perform `await` in the calling `action`" in
-component BadPureAwaitComp:
-  state x : String = ""
-  fn pureBad() -> String:
-    let r = await PolishRpcSrv.saveItem("a")
-    return r
-  view: <span>{x}</span>
-expect_err "duplicate wire name `dup` in `enum BadDupWireEnum`" in
-enum BadDupWireEnum:
-  a = "dup"
-  b = "dup"
-expect_err "Field `BadImpossibleField` is unsatisfiable" in
-field BadImpossibleField : Nat where n => n > 10, n < 5
+  | fn pong(): ping() | action go: ping() | view: <span>{x}</span>
+bad_comp "cannot use `await` inside pure component `fn pureBad`; remove `-> ReturnType` for an async mutating helper, or perform `await` in the calling `action`" BadPureAwaitComp : state x : String = "" | fn pureBad() -> String: let r = await PolishRpcSrv.saveItem("a"); return r | view: <span>{x}</span>
+bad_enum "duplicate wire name `dup` in `enum BadDupWireEnum`" BadDupWireEnum : a = "dup" | b = "dup"
+expect_err "Field `BadImpossibleField` is unsatisfiable" in field BadImpossibleField : Nat where n => n > 10, n < 5
 check_decls [ShortSlug.satisfiable, ServicePort.satisfiable, SessionParentShell.app_view_eq, MultiStyleSpliceDemo.app_view_eq]
 
 /-! ## Wide Schema Proof Synthesis (24 fields under default heartbeats) -/

@@ -104,17 +104,25 @@ private def isDangerousProjectRole (role : String) : Bool :=
    "roles/artifactregistry.", "roles/cloudbuild.", "roles/cloudfunctions.", "roles/deploymentmanager.", "roles/cloudkms.", "roles/compute."].any (base.startsWith ·) ||
   [".admin", "Admin", ".editor", "Editor", ".writer", "Writer", ".developer", "Developer", ".builder", "Decrypter"].any (base.contains ·)
 
+@[noinline] private def forListE {α : Type} : List α → (α → ExceptT String IO Unit) → ExceptT String IO Unit
+  | [], _ => pure () | x :: xs, f => do f x; forListE xs f
+@[noinline] private def getJsonOpt (cfg : GcpExecConfig) (tok? : Option String) (req : GcpHttpRequest) : ExceptT String IO (Option Json) := do
+  let (st, j) ← liftE (sendGcpJson cfg req tok? [200, 404]); return if st == 200 then some j else none
+@[noinline] private def sendAndPoll (cfg : GcpExecConfig) (tok? : Option String) (req : GcpHttpRequest) (fuel := 180) (okSt := [200, 201]) : ExceptT String IO Unit := do
+  pollLro cfg tok? (← liftE (sendGcpJson cfg req tok? okSt)).2 fuel
+@[noinline] private def forEachRegion (cfg : GcpExecConfig) (regions : List GcpRegion) (f : GcpRegion → ExceptT String IO Unit) : ExceptT String IO Unit :=
+  forListE (if regions.isEmpty then [cfg.region] else regions) f
+
 private def readIamPolicy (cfg : GcpExecConfig) (tok? : Option String) (key : DeployKey) (r : GcpRegion) (res : GcpResource) :
     ExceptT String IO (List GcpIamBinding × List (String × String × GcpResource)) := do
-  let (st, j) ← liftE (sendGcpJson cfg (reqGetIamPolicy cfg.endpoints r res) tok? [200, 404])
-  if st != 200 then return ([], [])
+  let some j ← getJsonOpt cfg tok? (reqGetIamPolicy cfg.endpoints r res) | return ([], [])
   return (← liftP (IamPolicyDoc.fromJson j)).partitionBindings cfg.edgeSaEmail cfg.builderSaEmail key res
 
 def observeGcpState (cfg : GcpExecConfig) (key : DeployKey) (knownDbs : List (String × DbCluster) := []) (regions : List GcpRegion := []) (assetsPublic : Bool := true) : IO (Except String GcpLiveSnapshot) := do
   let (targetRegions, projId) := (if regions.isEmpty then [cfg.region] else regions, key.shard.projectFor key.env)
   ExceptT.run do
     let tok? ← liftE (resolveToken cfg)
-    let getOpt (req : GcpHttpRequest) : ExceptT String IO (Option Json) := do let (st, j) ← liftE (sendGcpJson cfg req tok? [200, 404]); return if st == 200 then some j else none
+    let getOpt := getJsonOpt cfg tok?
     let secretNames ← listAllSecrets cfg tok? key none [] [] 100
     let secRes ← secretNames.mapM fun s => readIamPolicy cfg tok? key cfg.region (.secret key s)
     let (secretBindings, secRaw) := (secRes.flatMap Prod.fst, secRes.flatMap Prod.snd)
@@ -164,12 +172,12 @@ private def withEtagLro (cfg : GcpExecConfig) (tok? : Option String) (label : St
 
 private def mutateIamBindingInRegion (cfg : GcpExecConfig) (region : GcpRegion) (tok? : Option String) (b : GcpIamBinding) (grant : Bool) (allowMissingResource : Bool := false) (attempts : Nat := 3) : ExceptT String IO Unit :=
   discard <| withEtagRetry s!"IAM update for `{b.role.gcpName}`" (do
-    let (getSt, getJson) ← liftE (sendGcpJson cfg (reqGetIamPolicy cfg.endpoints region b.resource) tok? [200, 404])
-    if getSt == 404 && (!grant || allowMissingResource) then return none
-    let doc ← if getSt == 200 then liftP (IamPolicyDoc.fromJson getJson) else pure ({} : IamPolicyDoc)
+    let getJ? ← getJsonOpt cfg tok? (reqGetIamPolicy cfg.endpoints region b.resource)
+    if getJ?.isNone && (!grant || allowMissingResource) then return none
+    let doc ← match getJ? with | some j => liftP (IamPolicyDoc.fromJson j) | none => pure ({} : IamPolicyDoc)
     let member := b.principal.gcpMember cfg.edgeSaEmail cfg.builderSaEmail
     let nextDoc := if grant then doc.addBinding b.role.gcpName member else doc.removeBinding b.role.gcpName member (match b.resource with | .cloudRun _ | .secret _ _ => true | _ => false)
-    if getSt == 200 && nextDoc == doc then return none
+    if getJ?.isSome && nextDoc == doc then return none
     some <$> liftE (sendGcpJson cfg (reqSetIamPolicy cfg.endpoints region b.resource nextDoc) tok? [200, 201, 409, 412])) attempts
 
 private def buildCollisionFreeUpload (ep : GcpEndpoints) (key : DeployKey) (buildHash rel : String) (bytes : ByteArray) (isPublic : Bool) : Nat → ExceptT String IO (GcpHttpRequest × ByteArray)
@@ -196,21 +204,39 @@ private def executeHealthCheckInRegion (cfg : GcpExecConfig) (region : GcpRegion
   let (st, body, _) ← liftE (execHttpCall "GET" healthUrl hdrs ByteArray.empty cfg.ssrfGuard)
   if st != 200 then throw s!"health check GET {healthUrl} returned HTTP {st}: {(String.fromUTF8? body).getD ""}"
 
-def executeAction (cfg : GcpExecConfig) (plan : GcpPlan) (imageUri : String) (distDir : System.FilePath) (tok? : Option String) (a : GcpAction) (includeSqlUser : Bool := true) : IO (Except String Unit) := do
-  let regions := if plan.regions.isEmpty then [cfg.region] else plan.regions
+@[noinline] private def rollbackShifted (cfg : GcpExecConfig) (tok? : Option String) (key : DeployKey) (edgeRunB : GcpIamBinding)
+    (targets : List (GcpRegion × List Json × Bool)) : IO String := do
+  let addNote (acc : List String) (cond : Bool) (okMsg errPfx : String) (m : ExceptT String IO Unit) : IO (List String) :=
+    if !cond then pure acc else do match ← ExceptT.run m with | .ok () => pure (acc ++ [okMsg]) | .error e => pure (acc ++ [s!"{errPfx}: {e}"])
+  let notes ← targets.foldlM (init := []) fun acc (r, tr, hadEdge) => do
+    let a1 ← addNote acc (!tr.isEmpty) s!"rolled back {r}" s!"rollback {r} failed" (sendAndPoll cfg tok? (reqRestoreTraffic cfg.endpoints r key tr) 60)
+    addNote a1 (!hadEdge) s!"revoked edgeRouter on {r}" s!"edgeRouter revoke on {r} failed" (mutateIamBindingInRegion cfg r tok? edgeRunB false false)
+  return if notes.isEmpty then "" else s!" (compensating rollback: {"; ".intercalate notes})"
+
+private def shiftRegsLoop (cfg : GcpExecConfig) (tok? : Option String) (key : DeployKey) (buildHash : String) (edgeRunB : GcpIamBinding) (runGrants : List GcpIamBinding)
+    (shifted : List (GcpRegion × List Json × Bool)) : List (GcpRegion × List Json × Bool) → ExceptT String IO Unit
+  | [] => pure ()
+  | (r, prevTraffic, hadEdge) :: rest => do
+      let tryStep (lbl : String) (rb : List (GcpRegion × List Json × Bool)) (m : ExceptT String IO Unit) : ExceptT String IO Unit := do
+        if let .error err ← liftIO (ExceptT.run m) then throw s!"{lbl} in {r}: {err}{← liftIO (rollbackShifted cfg tok? key edgeRunB rb)}"
+      tryStep "shiftTraffic100 failed" shifted (sendAndPoll cfg tok? (reqShiftTraffic100 cfg.endpoints r key buildHash))
+      let nextShifted := shifted ++ [(r, prevTraffic, hadEdge)]
+      tryStep "shiftTraffic100 post-cutover IAM grant failed" nextShifted (forListE runGrants (mutateIamBindingInRegion cfg r tok? · true false))
+      shiftRegsLoop cfg tok? key buildHash edgeRunB runGrants nextShifted rest
+
+def executeAction (cfg : GcpExecConfig) (plan : GcpPlan) (imageUri : String) (distDir : System.FilePath) (tok? : Option String) (a : GcpAction) (includeSqlUser : Bool := true) : IO (Except String Unit) :=
   ExceptT.run do
-    let sendOk (req : GcpHttpRequest) (okSt : List Nat := [200, 201]) : ExceptT String IO Json := Prod.snd <$> liftE (sendGcpJson cfg req tok? okSt)
-    let delOk (req : GcpHttpRequest) : ExceptT String IO Unit := discard <| sendOk req [200, 204, 404]
+    let sendOk (req : GcpHttpRequest) (okSt := [200, 201]) := discard <| liftE (sendGcpJson cfg req tok? okSt)
+    let delOk (req : GcpHttpRequest) := sendOk req [200, 204, 404]
     let isRunRes : GcpResource → Bool | .cloudRun _ => true | _ => false
     let runGrants := plan.bindings.filter (isRunRes ·.resource)
-    let mutateRegions (b : GcpIamBinding) (grant allowMiss : Bool) := (if isRunRes b.resource then regions else [cfg.region]).forM fun r => mutateIamBindingInRegion cfg r tok? b grant allowMiss
+    let mutateRegions (b : GcpIamBinding) (grant allowMiss : Bool) := forEachRegion cfg (if isRunRes b.resource then plan.regions else [cfg.region]) (mutateIamBindingInRegion cfg · tok? b grant allowMiss)
     let sqlPair (cl : DbCluster) (key : DeployKey) (r1 r2 : GcpHttpRequest) (okSt : List Nat) : ExceptT String IO Unit := do
-      let sqlProj := key.shard.clusterProject cl; sendSqlMutationWithRetry cfg tok? sqlProj r1 okSt 5
-      if includeSqlUser then sendSqlMutationWithRetry cfg tok? sqlProj r2 okSt 5
+      let p := key.shard.clusterProject cl; sendSqlMutationWithRetry cfg tok? p r1 okSt 5; if includeSqlUser then sendSqlMutationWithRetry cfg tok? p r2 okSt 5
     match a with
     | .uploadAssets key buildHash paths =>
         let realDist ← realPathExcept distDir "uploadAssets: invalid distDir"; let distPrefix := trimTrailingSlash realDist.toString ++ "/"
-        for rel in paths do
+        forListE paths fun rel => do
           if !isSafeRelativeAssetPath rel then throw s!"uploadAssets: unsafe relative asset path `{rel}`"
           let filePath := distDir / trimLeadingSlash rel
           if !(← filePath.pathExists) then throw s!"uploadAssets: missing local asset file `{filePath}`"
@@ -219,55 +245,58 @@ def executeAction (cfg : GcpExecConfig) (plan : GcpPlan) (imageUri : String) (di
           let (req, payload) ← buildCollisionFreeUpload cfg.endpoints key buildHash rel (← liftIO (IO.FS.readBinFile realFile)) plan.assetsArePublic 4
           let (st, txt) ← liftE (sendGcpRaw cfg req payload tok?)
           if !(200 ≤ st && st < 300) then throw s!"uploadAssets `{rel}` failed (HTTP {st}): {txt}"
-    | .ensureSecret key s => discard <| sendOk (reqEnsureSecret cfg.endpoints key s) [200, 201, 409]
+    | .ensureSecret key s => sendOk (reqEnsureSecret cfg.endpoints key s) [200, 201, 409]
     | .ensureDb cl key db => sqlPair cl key (reqEnsureDb cfg.endpoints cl key db) (reqEnsureSqlIamUser cfg.endpoints cl key) [409]
     | .grantBinding b => if !(isRunRes b.resource && b.principal == .edgeRouter && b.role == .runInvoker) then mutateRegions b true (isRunRes b.resource)
     | .revokeBinding b => if !(match b.resource with | .cloudSqlDb _ _ _ => b.principal == .runtimeSa plan.key && !plan.managedDbs.isEmpty | _ => false) then mutateRegions b false false
     | .putDenyRule rule =>
         withEtagLro cfg tok? s!"IAM v2 deny policy `{rule.resource.denyPolicyId}`" do
-          let (getSt, getJ) ← liftE (sendGcpJson cfg (reqGetDenyRule cfg.endpoints rule) tok? [200, 404])
-          let (etag?, prevExcs) := if getSt == 200 then (some (getJ.strAtD "etag"), parseDenyExceptionPrincipals getJ) else (none, [])
+          let (etag?, prevExcs) := (← getJsonOpt cfg tok? (reqGetDenyRule cfg.endpoints rule)).elim (none, []) fun j => (some (j.strAtD "etag"), parseDenyExceptionPrincipals j)
           some <$> liftE (sendGcpJson cfg (reqUpsertDenyRule cfg.endpoints cfg.edgeSaEmail cfg.builderSaEmail rule etag? prevExcs (effectiveDeployerSaEmail? cfg)) tok? [200, 201, 409, 412])
-    | .setEgressRules key os | .narrowEgressRules key os => regions.forM fun r => discard <| sendOk (reqPutEgressPolicy cfg.endpoints r key os)
+    | .setEgressRules key os | .narrowEgressRules key os => forEachRegion cfg plan.regions fun r => sendOk (reqPutEgressPolicy cfg.endpoints r key os)
     | .deployRevisionZero key buildHash scale =>
-        discard <| sendOk (reqCreateServiceAccount cfg.endpoints key) [200, 201, 409]
-        regions.forM fun r => do
-          let (curSt, curJ) ← liftE (sendGcpJson cfg (reqGetCloudRunService cfg.endpoints r key) tok? [200, 404])
-          let existingTraffic ← if curSt == 200 then liftP (parseLiveTrafficTargets curJ) else pure []
-          pollLro cfg tok? (← sendOk (reqDeployRevisionZero cfg.endpoints r key buildHash imageUri scale plan.secretNames existingTraffic)) 180
-          for b in runGrants do if !existingTraffic.isEmpty || b.principal != .edgeRouter then mutateIamBindingInRegion cfg r tok? b true false
-    | .healthCheck key buildHash => regions.forM fun r => executeHealthCheckInRegion cfg r tok? key buildHash
+        sendOk (reqCreateServiceAccount cfg.endpoints key) [200, 201, 409]
+        forEachRegion cfg plan.regions fun r => do
+          let existingTraffic ← match ← getJsonOpt cfg tok? (reqGetCloudRunService cfg.endpoints r key) with | some j => liftP (parseLiveTrafficTargets j) | none => pure []
+          sendAndPoll cfg tok? (reqDeployRevisionZero cfg.endpoints r key buildHash imageUri scale plan.secretNames existingTraffic)
+          forListE runGrants fun b => if !existingTraffic.isEmpty || b.principal != .edgeRouter then mutateIamBindingInRegion cfg r tok? b true false else pure ()
+    | .healthCheck key buildHash => forEachRegion cfg plan.regions (executeHealthCheckInRegion cfg · tok? key buildHash)
     | .shiftTraffic100 key buildHash =>
         let edgeRunB : GcpIamBinding := { principal := .edgeRouter, role := .runInvoker, resource := .cloudRun key }
-        let preStates ← regions.mapM fun r => do
-          let (curSt, curJ) ← liftE (sendGcpJson cfg (reqGetCloudRunService cfg.endpoints r key) tok? [200, 404])
+        let preStates ← (if plan.regions.isEmpty then [cfg.region] else plan.regions).mapM fun r => do
+          let curJ? ← getJsonOpt cfg tok? (reqGetCloudRunService cfg.endpoints r key)
           let (kb, _) ← (try readIamPolicy cfg tok? key r (.cloudRun key) catch _ => pure ([], []))
-          return (r, if curSt == 200 then parseAllTrafficTargets curJ else [], kb.contains edgeRunB)
-        let mut shifted : List (GcpRegion × List Json × Bool) := []
-        let rollbackAll (targets : List (GcpRegion × List Json × Bool)) : IO String := do
-          let runNote (okMsg errPfx : String) (m : ExceptT String IO Unit) : IO String := do match ← ExceptT.run m with | .ok () => pure okMsg | .error e => pure s!"{errPfx}: {e}"
-          let mut notes : List String := []
-          for (rbReg, rbTraffic, rbHadEdge) in targets do
-            if !rbTraffic.isEmpty then notes := notes ++ [← runNote s!"rolled back {rbReg}" s!"rollback {rbReg} failed" (do pollLro cfg tok? (← sendOk (reqRestoreTraffic cfg.endpoints rbReg key rbTraffic)) 60)]
-            if !rbHadEdge then notes := notes ++ [← runNote s!"revoked edgeRouter on {rbReg}" s!"edgeRouter revoke on {rbReg} failed" (mutateIamBindingInRegion cfg rbReg tok? edgeRunB false false)]
-          return if notes.isEmpty then "" else s!" (compensating rollback: {"; ".intercalate notes})"
-        for (r, prevTraffic, hadEdge) in preStates do
-          if let .error err ← liftIO (ExceptT.run do pollLro cfg tok? (← sendOk (reqShiftTraffic100 cfg.endpoints r key buildHash)) 180) then
-            throw s!"shiftTraffic100 failed in {r}: {err}{← liftIO (rollbackAll shifted)}"
-          shifted := shifted ++ [(r, prevTraffic, hadEdge)]
-          if let .error err ← liftIO (ExceptT.run do for b in runGrants do mutateIamBindingInRegion cfg r tok? b true false) then
-            throw s!"shiftTraffic100 post-cutover IAM grant failed in {r}: {err}{← liftIO (rollbackAll shifted)}"
+          return (r, curJ?.elim [] parseAllTrafficTargets, kb.contains edgeRunB)
+        shiftRegsLoop cfg tok? key buildHash edgeRunB runGrants [] preStates
     | .deleteSecret key s => delOk (reqDeleteSecret cfg.endpoints key s)
-    | .deleteService key => regions.forM fun r => do let (st, opJ) ← liftE (sendGcpJson cfg (reqDeleteCloudRunService cfg.endpoints r key) tok? [200, 204, 404]); if st != 404 then pollLro cfg tok? opJ 180
+    | .deleteService key => forEachRegion cfg plan.regions fun r => do let (st, opJ) ← liftE (sendGcpJson cfg (reqDeleteCloudRunService cfg.endpoints r key) tok? [200, 204, 404]); if st != 404 then pollLro cfg tok? opJ 180
     | .dropPreviewDb key db => sqlPair .nonProdCluster key (reqDropPreviewDb cfg.endpoints key db) (reqDeleteSqlIamUser cfg.endpoints .nonProdCluster key) [404]
     | .pruneDenyException key =>
         withEtagLro cfg tok? s!"IAM v2 deny policy prune for `{renderSaId key}`" do
-          let (getSt, getJ) ← liftE (sendGcpJson cfg (reqGetDenyPolicyById cfg.endpoints (key.shard.projectFor key.env) "deny-qed-secrets-public") tok? [200, 404])
-          if getSt == 404 then return none
+          let some getJ ← getJsonOpt cfg tok? (reqGetDenyPolicyById cfg.endpoints (key.shard.projectFor key.env) "deny-qed-secrets-public") | return none
           let some req := reqPruneDenyException cfg.endpoints cfg.edgeSaEmail cfg.builderSaEmail key (getJ.strAtD "etag") (parseDenyExceptionPrincipals getJ) (effectiveDeployerSaEmail? cfg) | return none
           some <$> liftE (sendGcpJson cfg req tok? [200, 201, 409, 412])
     | .deleteServiceAccount key => delOk (reqDeleteServiceAccount cfg.endpoints key)
-    | .deleteEgressPolicy key => regions.forM fun r => delOk (reqDeleteEgressPolicy cfg.endpoints r key)
+    | .deleteEgressPolicy key => forEachRegion cfg plan.regions fun r => delOk (reqDeleteEgressPolicy cfg.endpoints r key)
+
+private def stepRolloutLoop (cfg : GcpExecConfig) (plan : GcpPlan) (imageUri : String) (distDir : System.FilePath) (tok? : Option String)
+    (onStep : GcpAction → IO Unit) (done : Nat) (seenDenyKeys : List (String × String × List GcpPermission))
+    (ensuredSqlUsers : List (DbCluster × DeployKey)) : List GcpAction → ExceptT String IO Nat
+  | [] => return done
+  | a :: rest => do
+      liftIO (onStep a)
+      let denyKey? := match a with | .putDenyRule r => some (r.resource.projectOf, r.resource.denyPolicyId, r.permissions) | _ => none
+      if denyKey?.any seenDenyKeys.contains then stepRolloutLoop cfg plan imageUri distDir tok? onStep (done + 1) seenDenyKeys ensuredSqlUsers rest
+      else
+        let includeSqlUser := match a with
+          | .ensureDb cl key _ => !ensuredSqlUsers.contains (cl, key)
+          | .dropPreviewDb key _ => !(rest.any fun | .dropPreviewDb k' _ => k' == key | _ => false) | _ => true
+        match ← liftIO (executeAction cfg plan imageUri distDir tok? a includeSqlUser) with
+        | .error e => throw s!"aborted after {done} step(s) at phase {a.phase.rank}: {e}"
+        | .ok () =>
+            let seen' := denyKey?.elim seenDenyKeys (· :: seenDenyKeys)
+            let ensured' := match a, includeSqlUser with | .ensureDb cl key _, true => (cl, key) :: ensuredSqlUsers | _, _ => ensuredSqlUsers
+            stepRolloutLoop cfg plan imageUri distDir tok? onStep (done + 1) seen' ensured' rest
 
 def executeRollout (cfg : GcpExecConfig) (plan : GcpPlan) (imageUri : String) (distDir : System.FilePath) (actions : List GcpAction) (onStep : GcpAction → IO Unit := fun _ => pure ()) : IO (Except String Nat) := do
   if actions.isEmpty then return .ok 0
@@ -275,22 +304,7 @@ def executeRollout (cfg : GcpExecConfig) (plan : GcpPlan) (imageUri : String) (d
     let tok? ← liftE (resolveToken cfg)
     if actions.any fun | .grantBinding b => (match b.principal with | .runtimeSa _ => true | _ => false) | .ensureDb _ _ _ | .deployRevisionZero _ _ _ => true | _ => false then
       discard <| liftP ((← liftIO (sendGcpJson cfg (reqCreateServiceAccount cfg.endpoints plan.key) tok? [200, 201, 409])).mapError (s!"failed to ensure runtime service account: {·}"))
-    let mut done : Nat := 0; let mut seenDenyKeys : List (String × String × List GcpPermission) := []; let mut ensuredSqlUsers : List (DbCluster × DeployKey) := []
-    for (a, idx) in actions.zipIdx do
-      liftIO (onStep a)
-      let denyKey? := match a with | .putDenyRule r => some (r.resource.projectOf, r.resource.denyPolicyId, r.permissions) | _ => none
-      if denyKey?.any seenDenyKeys.contains then done := done + 1
-      else
-        let includeSqlUser := match a with
-          | .ensureDb cl key _ => !ensuredSqlUsers.contains (cl, key)
-          | .dropPreviewDb key _ => !((actions.drop (idx + 1)).any fun | .dropPreviewDb k' _ => k' == key | _ => false) | _ => true
-        match ← liftIO (executeAction cfg plan imageUri distDir tok? a includeSqlUser) with
-        | .error e => throw s!"aborted after {done} step(s) at phase {a.phase.rank}: {e}"
-        | .ok () =>
-            if let some dk := denyKey? then seenDenyKeys := dk :: seenDenyKeys
-            if let .ensureDb cl key _ := a then if includeSqlUser then ensuredSqlUsers := (cl, key) :: ensuredSqlUsers
-            done := done + 1
-    return done
+    stepRolloutLoop cfg plan imageUri distDir tok? onStep 0 [] [] actions
 
 /-! ### Human-Readable Plan & Drift Formatters -/
 

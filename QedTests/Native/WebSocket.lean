@@ -77,8 +77,8 @@ def run : IO Bool := do
           | _ => c.check s!"{label} received event" false
         let expectChat (label : String) (ws : WsClient) (wantSid? : Option UInt32) (wantBody : String) :=
           expectEvent (α := LiveRoom.ChatMsg) label ws wantSid? (·.body.val) wantBody
-        for (lbl, orig?, hdrs) in [("CSWSH cross-origin WS upgrade rejected 403", some "https://evil.example.com", #[("Authorization", s!"Bearer {aliceTok}")]),
-            ("cross-site Sec-Fetch-Site WS upgrade rejected 403", none, #[("Sec-Fetch-Site", "cross-site"), ("Authorization", s!"Bearer {aliceTok}")])] do
+        forList [("CSWSH cross-origin WS upgrade rejected 403", some "https://evil.example.com", #[("Authorization", s!"Bearer {aliceTok}")]),
+            ("cross-site Sec-Fetch-Site WS upgrade rejected 403", none, #[("Sec-Fetch-Site", "cross-site"), ("Authorization", s!"Bearer {aliceTok}")])] fun (lbl, orig?, hdrs) => do
           c.expectOk lbl (← connectWs srv.port "/_qed/ws/Hub" orig? hdrs) fun (st, _, _) => c.checkEq lbl st 403
         withWsConn c "alice" srv.port sameOrigin #[("Authorization", s!"Bearer {aliceTok}")] fun accA wsA => do
           c.checkEq "RFC 6455 Sec-WebSocket-Accept matches" accA ((wsComputeAccept "dGhlIHNhbXBsZSBub25jZQ==").getD ""); subJoin "alice" wsA 1

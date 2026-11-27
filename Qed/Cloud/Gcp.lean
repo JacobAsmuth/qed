@@ -8,7 +8,7 @@ namespace Qed.Cloud
 
 inductive GcpRegion where
   | us_central1 | us_east1 | us_east4 | us_west1 | europe_west1 | europe_west4 | asia_east1 | asia_northeast1
-deriving Inhabited, DecidableEq, Repr
+deriving Inhabited, DecidableEq
 
 def GcpRegion.toString : GcpRegion → String
   | .us_central1 => "us-central1" | .us_east1 => "us-east1" | .us_east4 => "us-east4" | .us_west1 => "us-west1"
@@ -20,7 +20,7 @@ def GcpRegion.parse? (s : String) : Option GcpRegion := let norm := s.replace "_
 def GcpRegion.inEu : GcpRegion → Bool | .europe_west1 | .europe_west4 => true | _ => false
 
 inductive ComputeTier where | standard | performance | large | xlarge
-deriving Inhabited, DecidableEq, Repr
+deriving Inhabited, DecidableEq
 
 def ComputeTier.specs : ComputeTier → Nat × Nat | .standard => (2048, 1000) | .performance => (4096, 2000) | .large => (8192, 4000) | .xlarge => (16384, 8000)
 def ComputeTier.memoryMb (t : ComputeTier) : Nat := t.specs.1
@@ -32,7 +32,7 @@ def ComputeTier.parse? (s : String) : Option ComputeTier := ComputeTier.all.find
 
 structure ScaleSpec where
   (minInstances : Nat := 0) (maxInstances : Nat := 100) (memoryMb : Nat := 2048) (cpuMilli concurrency : Nat := 1000) (timeoutSec : Nat := 60)
-deriving Inhabited, DecidableEq, Repr
+deriving Inhabited, DecidableEq
 
 def minCpuRules : List (Nat × Nat × String) :=
   [(24576, 8000, "8 vCPU"), (16384, 6000, "at least 6 vCPU"), (8192, 4000, "at least 4 vCPU"),
@@ -58,12 +58,12 @@ theorem ScaleSpec.validate_default_ok : ({} : ScaleSpec).validate = .ok () := rf
 /-! ### 2. Preview & Top-Level `DeploySpec` -/
 
 inductive PreviewProtection where | team_only | pub
-deriving Inhabited, DecidableEq, Repr
+deriving Inhabited, DecidableEq
 
 structure PreviewSpec where
   (enabled : Bool := true) (subdomain? : Option String := some "preview") (host? : Option HostPattern := none)
   (protection : PreviewProtection := .team_only) (ttlSec : Nat := 7 * 86400)
-deriving Inhabited, DecidableEq, Repr
+deriving Inhabited, DecidableEq
 
 def PreviewSpec.resolvedHost? (p : PreviewSpec) (prodDomain? : Option String) : Option HostPattern :=
   p.host?.orElse fun _ => match prodDomain?, p.subdomain? with | some prod, some sub => some (derivePreviewHost prod sub) | _, _ => none
@@ -71,10 +71,10 @@ def PreviewSpec.resolvedHost? (p : PreviewSpec) (prodDomain? : Option String) : 
 structure DeploySpec where
   (name appName : String) (regions : List GcpRegion := [.us_central1]) (domain? : Option String := none)
   (compute : ComputeTier := .standard) (timeoutSec? : Option Nat := none) (preview : PreviewSpec := {})
-deriving Inhabited, DecidableEq, Repr
+deriving Inhabited, DecidableEq
 
 inductive DeploySection where | regions | timeout | domain | preview
-deriving Inhabited, DecidableEq, Repr
+deriving Inhabited, DecidableEq
 
 def DeploySpec.validateSectioned (d : DeploySpec) : Except (DeploySection × String) Unit := do
   let check (sec : DeploySection) (bad : Bool) (msg : String) : Except (DeploySection × String) Unit :=
@@ -102,20 +102,20 @@ def DeploySpec.validate (d : DeploySpec) : Except String Unit := d.validateSecti
 /-! ### 3. Canonical Proved-Injective GCP Naming (`DeployKey`, `renderSaId`, `renderCloudRunName`) -/
 
 structure BoundedId (bound : Nat) where (num : Nat) (valid : num < bound)
-deriving DecidableEq, Repr
+deriving DecidableEq
 instance {b : Nat} [NeZero b] : Inhabited (BoundedId b) := ⟨⟨0, Nat.pos_of_ne_zero (NeZero.ne b)⟩⟩
 abbrev TenantId := BoundedId 1000000
 abbrev AppId    := BoundedId 100000
 abbrev PrId     := BoundedId 100000
 
 inductive EnvInstance where | prod | staging | preview (pr : PrId)
-deriving Inhabited, DecidableEq, Repr
+deriving Inhabited, DecidableEq
 def EnvInstance.toDeployEnv : EnvInstance → DeployEnv | .prod => .prod | .staging => .staging | .preview _ => .preview
 def EnvInstance.isProd : EnvInstance → Bool | .prod => true | _ => false
 def EnvInstance.isPreview : EnvInstance → Bool | .preview _ => true | _ => false
 
 structure ShardProject where (prodProjectId nonProdProjectId : String) (separated : prodProjectId ≠ nonProdProjectId)
-deriving DecidableEq, Repr
+deriving DecidableEq
 instance : Inhabited ShardProject := ⟨⟨"qed-prod", "qed-nonprod", by decide⟩⟩
 def ShardProject.projectFor (s : ShardProject) : EnvInstance → String | .prod => s.prodProjectId | _ => s.nonProdProjectId
 def ShardProject.clusterProject (s : ShardProject) : DbCluster → String | .prodCluster => s.prodProjectId | .nonProdCluster => s.nonProdProjectId
@@ -123,7 +123,7 @@ def ShardProject.mkPair (prodId nonProdId : String) : Except String ShardProject
   if h : prodId = nonProdId then .error s!"shard projects must be distinct: prod (`{prodId}`) and non-prod (`{nonProdId}`) cannot share a GCP project" else .ok ⟨prodId, nonProdId, h⟩
 
 structure DeployKey where (shard : ShardProject) (tenant : TenantId) (app : AppId) (env : EnvInstance)
-deriving Inhabited, DecidableEq, Repr
+deriving Inhabited, DecidableEq
 
 def encNatAux : Nat → Nat → List Char → List Char
   | 0, _, acc => acc | k + 1, n, acc => let d := Char.ofNat (48 + n % 10); if n < 10 then d :: acc else encNatAux k (n / 10) (d :: acc)
@@ -237,15 +237,15 @@ theorem renderCloudRunName_gcp_length_valid (k : DeployKey) : 6 ≤ (renderCloud
 /-! ### 4. Open Principal Universe, Typed Roles (No `owner`/`editor`), & IAM Semantics -/
 
 inductive GcpPrincipal where | allUsers | allAuthenticatedUsers | builder | edgeRouter | runtimeSa (key : DeployKey) | external (email : String)
-deriving Inhabited, DecidableEq, Repr
+deriving Inhabited, DecidableEq
 
 inductive GcpPermission where
   | secretAccessor | runInvoke | cloudSqlClient | storageObjectViewer | storageObjectAdmin | iamSetPolicy | iamActAs | iamGetAccessToken | iamSignJwt
-deriving Inhabited, DecidableEq, Repr
+deriving Inhabited, DecidableEq
 def GcpPermission.isEscalation : GcpPermission → Bool | .iamSetPolicy | .iamActAs | .iamGetAccessToken | .iamSignJwt => true | _ => false
 
 inductive GcpRole where | secretManagerAccessor | runInvoker | cloudSqlClient | storageLegacyObjectReader | storageObjectAdmin
-deriving Inhabited, DecidableEq, Repr
+deriving Inhabited, DecidableEq
 def GcpRole.gcpName : GcpRole → String
   | .secretManagerAccessor => "roles/secretmanager.secretAccessor" | .runInvoker => "roles/run.invoker" | .cloudSqlClient => "roles/cloudsql.client"
   | .storageLegacyObjectReader => "roles/storage.legacyObjectReader" | .storageObjectAdmin => "roles/storage.objectAdmin"
@@ -259,7 +259,7 @@ inductive GcpResource where
   | secret (key : DeployKey) (secretName : String) | cloudRun (key : DeployKey)
   | cloudSqlDb (cluster : DbCluster) (key : DeployKey) (dbName : String)
   | assetPrefix (key : DeployKey) (buildHash : String) (isPublic : Bool := true) | project (projectId : String)
-deriving Inhabited, DecidableEq, Repr
+deriving Inhabited, DecidableEq
 
 def GcpResource.ownerKey? : GcpResource → Option DeployKey
   | .secret k _ | .cloudRun k | .cloudSqlDb _ k _ | .assetPrefix k _ _ => some k | .project _ => none
@@ -282,11 +282,11 @@ def GcpResource.isAsset : GcpResource → Bool | .assetPrefix _ _ _ => true | _ 
 def GcpResource.bindingApplies (bindingRes targetRes : GcpResource) : Prop := bindingRes = targetRes ∨ bindingRes = .project targetRes.projectOf
 
 structure GcpIamBinding where (principal : GcpPrincipal) (role : GcpRole) (resource : GcpResource)
-deriving Inhabited, DecidableEq, Repr
+deriving Inhabited, DecidableEq
 structure GcpDenyRule where (principals : List GcpPrincipal) (permissions : List GcpPermission) (resource : GcpResource)
-deriving Inhabited, DecidableEq, Repr
+deriving Inhabited, DecidableEq
 structure GcpPolicyState where (bindings : List GcpIamBinding := []) (denies : List GcpDenyRule := []) (egressAllow : List (DeployKey × String) := [])
-deriving Inhabited, DecidableEq, Repr
+deriving Inhabited, DecidableEq
 
 def GcpPolicyState.allows (st : GcpPolicyState) (p : GcpPrincipal) (perm : GcpPermission) (r : GcpResource) : Prop :=
   (∃ b ∈ st.bindings, b.principal = p ∧ b.resource.bindingApplies r ∧ perm ∈ b.role.permissions) ∧
@@ -302,7 +302,7 @@ def GcpPolicyState.egressAllowed (st : GcpPolicyState) (k : DeployKey) (origin :
 /-! ### 5. Four-Phase Zero-Downtime Cloud Run Rollout Model -/
 
 inductive RolloutPhase where | phase1_provision | phase2_deployZero | phase3_shiftTraffic | phase4_cleanup
-deriving Inhabited, DecidableEq, Repr
+deriving Inhabited, DecidableEq
 def RolloutPhase.rank : RolloutPhase → Nat | .phase1_provision => 1 | .phase2_deployZero => 2 | .phase3_shiftTraffic => 3 | .phase4_cleanup => 4
 
 inductive GcpAction where
@@ -315,7 +315,7 @@ inductive GcpAction where
   | narrowEgressRules (key : DeployKey) (origins : List String) | deleteService (key : DeployKey)
   | dropPreviewDb (key : DeployKey) (dbName : String) | pruneDenyException (key : DeployKey)
   | deleteServiceAccount (key : DeployKey) | deleteEgressPolicy (key : DeployKey)
-deriving Inhabited, DecidableEq, Repr
+deriving Inhabited, DecidableEq
 
 def GcpAction.phase : GcpAction → RolloutPhase
   | .uploadAssets _ _ _ | .ensureSecret _ _ | .ensureDb _ _ _ | .grantBinding _ | .putDenyRule _ | .setEgressRules _ _ => .phase1_provision

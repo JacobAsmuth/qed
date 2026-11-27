@@ -14,8 +14,8 @@ def maxSourceFiles      : Nat := 500
 def maxSourceFileBytes  : Nat := 2 * 1024 * 1024
 def maxTotalSourceBytes : Nat := 16 * 1024 * 1024
 
-def encodeBase64 (bs : ByteArray) : String := Qed.Base64.encode bs
-def decodeBase64? (s : String) : Option ByteArray := (Qed.Base64.decode s).toOption
+abbrev encodeBase64 (bs : ByteArray) : String := Qed.Base64.encode bs
+abbrev decodeBase64? (s : String) : Option ByteArray := (Qed.Base64.decode s).toOption
 
 def isValidAppSlug (s : String) : Bool := checkAsciiIdent 2 48 isDnsAlpha isDnsLabelChar (· != '-') s && !Qed.Str.contains s "--"
 def isValidEnvName (s : String) : Bool := ["prod", "staging", "preview"].contains s
@@ -63,31 +63,21 @@ def isValidCloudApiUrl (raw : String) : Bool :=
 
 /-! ### 2. Device Login & Account Protocol -/
 
-structure DeviceStartResp where
-  (deviceCode userCode verifyUrl : String) (expiresInSec : Nat := 600) (intervalSec : Nat := 2)
-deriving Inhabited, BEq, Repr
+structure DeviceStartResp where (deviceCode userCode verifyUrl : String) (expiresInSec : Nat := 600) (intervalSec : Nat := 2) deriving Inhabited
 json_obj_codec% DeviceStartResp [deviceCode, userCode, verifyUrl, expiresInSec, intervalSec]
 
-structure DevicePollReq where
-  deviceCode : String
-deriving Inhabited, BEq, Repr
+structure DevicePollReq where deviceCode : String deriving Inhabited
 json_obj_codec% DevicePollReq [deviceCode]
 
-structure DevicePollResp where
-  (status : String) (token userId email : Option String := none)
-deriving Inhabited, BEq, Repr
+structure DevicePollResp where (status : String) (token userId email : Option String := none) deriving Inhabited
 json_obj_codec% DevicePollResp [status, token, userId, email]
 
-structure WhoamiResp where
-  (userId email : String) (tenantId appsCount : Nat)
-deriving Inhabited, BEq, Repr
+structure WhoamiResp where (userId email : String) (tenantId appsCount : Nat) deriving Inhabited
 json_obj_codec% WhoamiResp [userId, email, tenantId, appsCount]
 
 /-! ### 3. Source Bundle & Deployment Protocol -/
 
-structure SourceFile where
-  (path content : String) (encoding : String := "utf8")
-deriving Inhabited, BEq, Repr
+structure SourceFile where (path content : String) (encoding : String := "utf8") deriving Inhabited, BEq
 
 private def SourceFile.withEncoding {α : Type} (f : SourceFile) (maxBytes? : Option Nat)
     (onUtf8 : String → α) (onBin : ByteArray → α) : Except String α := do
@@ -103,28 +93,25 @@ private def SourceFile.withEncoding {α : Type} (f : SourceFile) (maxBytes? : Op
 def SourceFile.decodedBytes (f : SourceFile) : Except String ByteArray := f.withEncoding none String.toUTF8 id
 json_obj_codec% SourceFile [path, content, encoding := "utf8"]
 
-structure SourceBundle where
-  files : Array SourceFile
-deriving Inhabited, BEq, Repr
+structure SourceBundle where files : Array SourceFile deriving Inhabited, BEq
 
 def SourceBundle.validate (b : SourceBundle) : Except String Unit := do
   if b.files.isEmpty then throw "source bundle cannot be empty"
   if b.files.size > maxSourceFiles then throw s!"source bundle has {b.files.size} files (max {maxSourceFiles})"
-  let mut totalBytes : Nat := 0; let mut seen : List String := []
-  for f in b.files do
+  discard <| b.files.foldlM (init := ((0 : Nat), ([] : List String))) fun (totalBytes, seen) f => do
     if !isValidSourceRelPath f.path then throw s!"invalid source file path `{f.path}`"
     if seen.contains f.path then throw s!"duplicate source file path `{f.path}`"
     let sz ← f.withEncoding (some maxSourceFileBytes) String.utf8ByteSize ByteArray.size
     if sz > maxSourceFileBytes then throw s!"source file `{f.path}` exceeds max size ({sz} > {maxSourceFileBytes} bytes)"
-    totalBytes := totalBytes + sz
-    if totalBytes > maxTotalSourceBytes then throw s!"source bundle exceeds max total size ({maxTotalSourceBytes} bytes)"
-    seen := f.path :: seen
+    let nextBytes := totalBytes + sz
+    if nextBytes > maxTotalSourceBytes then throw s!"source bundle exceeds max total size ({maxTotalSourceBytes} bytes)"
+    return (nextBytes, f.path :: seen)
   if !b.files.any (Qed.Str.endsWith ·.path ".lean") then throw "source bundle must include at least one `.lean` file"
 json_obj_codec% SourceBundle [files] validate SourceBundle.validate
 
 structure DeployUploadReq where
   (appSlug : String) (env : String := "prod") (pr : Nat := 0) (mod : String := "App") (deployName : String := "") (bundle : SourceBundle)
-deriving Inhabited, BEq, Repr
+deriving Inhabited
 
 def DeployUploadReq.validate (r : DeployUploadReq) : Except String Unit := do
   if !isValidAppSlug r.appSlug then throw s!"invalid app slug `{r.appSlug}` (use 2-48 lowercase letters, digits, or single hyphens)"
@@ -136,76 +123,54 @@ def DeployUploadReq.validate (r : DeployUploadReq) : Except String Unit := do
   r.bundle.validate
 json_obj_codec% DeployUploadReq [appSlug, env, pr, mod, deployName, bundle] validate DeployUploadReq.validate
 
-structure DeployUploadResp where
-  (deploymentId appSlug : String) (tenantId appId : Nat) (status dashboardUrl : String)
-deriving Inhabited, BEq, Repr
+structure DeployUploadResp where (deploymentId appSlug : String) (tenantId appId : Nat) (status dashboardUrl : String) deriving Inhabited
 json_obj_codec% DeployUploadResp [deploymentId, appSlug, tenantId, appId, status, dashboardUrl]
 
-structure DeployLogEntry where
-  (seq ts : Nat) (level message : String)
-deriving Inhabited, BEq, Repr
+structure DeployLogEntry where (seq ts : Nat) (level message : String) deriving Inhabited
 json_obj_codec% DeployLogEntry [seq, ts, level, message]
 
 structure DeploymentView where
   (id appSlug env : String) (pr : Nat) (status url buildHash : String) (verifiedDecls : Nat)
   (errorMsg : String) (createdAt updatedAt : Nat) (logs : Array DeployLogEntry := #[])
-deriving Inhabited, BEq, Repr
+deriving Inhabited
 json_obj_codec% DeploymentView [id, appSlug, env, pr, status, url, buildHash, verifiedDecls, errorMsg, createdAt, updatedAt, logs]
 
-structure AppSummary where
-  (slug : String) (tenantId appId : Nat) (prodUrl lastStatus : String) (deployCount createdAt : Nat)
-deriving Inhabited, BEq, Repr
+structure AppSummary where (slug : String) (tenantId appId : Nat) (prodUrl lastStatus : String) (deployCount createdAt : Nat) deriving Inhabited
 json_obj_codec% AppSummary [slug, tenantId, appId, prodUrl, lastStatus, deployCount, createdAt]
 
-structure AppsListResp where
-  apps : Array AppSummary
-deriving Inhabited, BEq, Repr
+structure AppsListResp where apps : Array AppSummary deriving Inhabited
 json_obj_codec% AppsListResp [apps]
 
-structure SecretSetReq where
-  (appSlug : String) (env : String := "prod") (name value : String)
-deriving Inhabited, BEq, Repr
+structure SecretSetReq where (appSlug : String) (env : String := "prod") (name value : String) deriving Inhabited, BEq
 def SecretSetReq.validate (r : SecretSetReq) : Except String Unit := do
   validateSecretTarget r.appSlug r.env r.name
   if r.value.isEmpty || r.value.utf8ByteSize > 65536 then throw "secret value must be 1..65536 bytes"
 json_obj_codec% SecretSetReq [appSlug, env, name, value] validate SecretSetReq.validate
 
-structure SecretsListResp where
-  (appSlug : String) (names : Array String)
-deriving Inhabited, BEq, Repr
+structure SecretsListResp where (appSlug : String) (names : Array String) deriving Inhabited
 json_obj_codec% SecretsListResp [appSlug, names]
 
-structure SecretDeleteReq where
-  (appSlug : String) (env : String := "prod") (name : String)
-deriving Inhabited, BEq, Repr
+structure SecretDeleteReq where (appSlug : String) (env : String := "prod") (name : String) deriving Inhabited, BEq
 def SecretDeleteReq.validate (r : SecretDeleteReq) : Except String Unit := validateSecretTarget r.appSlug r.env r.name
 json_obj_codec% SecretDeleteReq [appSlug, env := "prod", name] validate SecretDeleteReq.validate
 
-structure RollbackReq where
-  (appSlug deploymentId : String)
-deriving Inhabited, BEq, Repr
+structure RollbackReq where (appSlug deploymentId : String) deriving Inhabited
 json_obj_codec% RollbackReq [appSlug, deploymentId]
 
-structure CancelDeployReq where
-  deploymentId : String
-deriving Inhabited, BEq, Repr
+structure CancelDeployReq where deploymentId : String deriving Inhabited, BEq
 def CancelDeployReq.validate (r : CancelDeployReq) : Except String Unit := do
   if !isValidDeploymentId r.deploymentId then throw s!"invalid deployment id `{r.deploymentId}`"
 json_obj_codec% CancelDeployReq [deploymentId] validate CancelDeployReq.validate
 
-structure RuntimeLogView where
-  (id timestamp severity source message : String)
-deriving Inhabited, BEq, Repr
+structure RuntimeLogView where (id timestamp severity source message : String) deriving Inhabited, BEq
 json_obj_codec% RuntimeLogView [id, timestamp, severity, source, message]
 
 structure RuntimeLogsResp where
   (appSlug env : String) (pr : Nat := 0) (logs : Array RuntimeLogView) (nextPageToken : Option String := none)
-deriving Inhabited, BEq, Repr
+deriving Inhabited, BEq
 json_obj_codec% RuntimeLogsResp [appSlug, env, pr := 0, logs, nextPageToken]
 
-structure TokenRevokeResp where
-  revoked : Bool
-deriving Inhabited, BEq, Repr
+structure TokenRevokeResp where revoked : Bool deriving Inhabited, BEq
 json_obj_codec% TokenRevokeResp [revoked]
 
 end Qed.Cloud.Protocol

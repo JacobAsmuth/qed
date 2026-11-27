@@ -26,9 +26,9 @@ private def testCryptoAndJwtCore (c : TestChecker) : IO Unit := do
         let u := AuthChecks.CloudAuth.fromClaims vc.claims
         c.checkEq "ES256 extracted claims (sub, role, orgId, email, verified)" (u.id, u.role, u.orgId, u.email, u.verified) ("usr_42", "admin", some "org_7", "alice@test.dev", true)
       let noneTok := s!"{base64UrlEncode "{\"alg\":\"none\",\"typ\":\"JWT\"}".toUTF8}.{base64UrlEncode "{\"iss\":\"https://idp.test\",\"sub\":\"admin\",\"aud\":\"aud_app\",\"exp\":9999999999}".toUTF8}.sig"
-      for (lbl, cfg, tok, ts) in [("wrong audience", { vcfg with audience := "other_app" }, jwt, nowSec), ("wrong issuer", { vcfg with issuer := "https://evil.test" }, jwt, nowSec),
+      forList [("wrong audience", { vcfg with audience := "other_app" }, jwt, nowSec), ("wrong issuer", { vcfg with issuer := "https://evil.test" }, jwt, nowSec),
           ("wrong nonce", { vcfg with expectedNonce? := some "wrong" }, jwt, nowSec), ("expired token", vcfg, jwt, nowSec + 10000),
-          ("tampered signature", vcfg, jwt ++ "A", nowSec), ("alg:none", vcfg, noneTok, nowSec)] do
+          ("tampered signature", vcfg, jwt ++ "A", nowSec), ("alg:none", vcfg, noneTok, nowSec)] fun (lbl, cfg, tok, ts) => do
         c.check s!"JWT {lbl} rejected" (!(← verifyJwtWithKeys cfg #[jwk] tok ts).isOk)
   let sample := "hello+/world=123\x00\xff".toUTF8; let enc := base64UrlEncode sample
   c.checkAll [
@@ -37,13 +37,25 @@ private def testCryptoAndJwtCore (c : TestChecker) : IO Unit := do
     ("DeployManifest rejects bad version", !({ version := 2 } : Qed.Deploy.DeployManifest).validate.isOk),
     ("DeployManifest rejects unsafe auth callback", !(Qed.Deploy.validateAuthManifest { name := "Bad", issuerEnv := "QED_AUTH_ISSUER", audienceEnv := "QED_AUTH_AUDIENCE", callbackPath := "//evil.com/cb" }).isOk),
     ("RequestCtx.isAuthenticated rejects unverified Bearer token", !({ userId := none, bearerToken := some "forged-invalid-token", headers := [("authorization", "Bearer forged-invalid-token")] } : Qed.Server.RequestCtx).isAuthenticated),
-    ("RequestCtx.isAuthenticated accepts verified userId", ({ userId := some "usr_alice" } : Qed.Server.RequestCtx).isAuthenticated)]
+    ("RequestCtx.isAuthenticated accepts verified userId", ({ userId := some "usr_alice" } : Qed.Server.RequestCtx).isAuthenticated),
+    ("CloudAuth URLs, AuthRoute, sanitizeReturnTo, fromCtx, & parseJwtClaims email_verified",
+      isSafeReturnTo "/dashboard?tab=1" && (AuthChecks.CloudAuth.logoutUrl "/bye").raw == "/_qed/auth/logout?returnTo=%2Fbye" &&
+      (AuthChecks.CloudAuth.loginUrl AuthChecks.AuthRoute.dashboard).raw == (AuthChecks.CloudAuth.loginUrl "/dashboard").raw &&
+      (AuthChecks.CloudAuth.loginUrl (AuthChecks.AuthRoute.project "demo")).raw == (AuthChecks.CloudAuth.loginUrl "/projects/demo").raw &&
+      (AuthChecks.CloudAuth.logoutUrl AuthChecks.AuthRoute.home).raw == (AuthChecks.CloudAuth.logoutUrl "/").raw &&
+      AuthChecks.AuthRoute.dashboard.toPath == "/dashboard" && (AuthChecks.AuthRoute.project "demo").toPath == "/projects/demo" &&
+      (AuthChecks.AuthRoute.project "demo").toUrl.raw == "/projects/demo" && AuthChecks.AuthRoute.fromPath "/projects/demo?tab=1" == some (.project "demo") &&
+      toString (AuthChecks.AuthRoute.project "demo") == "/projects/demo" && s!"https://qed.cloud{AuthChecks.AuthRoute.project "demo"}" == "https://qed.cloud/projects/demo" &&
+      sanitizeReturnTo (some "//evil.com") == "/" && sanitizeReturnTo (some "/dashboard") == "/dashboard" &&
+      AuthChecks.CloudAuth.fromCtx { userId := some "u1", claims := [("email", "a@b.c"), ("role", "admin"), ("orgId", "org_1"), ("email_verified", "true")] } == some { id := "u1", emailVerified := true, email := "a@b.c", role := "admin", orgId := some "org_1", verified := true } &&
+      (match parseJwtClaims (.obj [("iss", .str "https://idp.test"), ("sub", .str "u1"), ("aud", .str "app"), ("exp", Qed.toJson (9999999999 : Nat)), ("email_verified", .str "true")]) with | .ok jc => !jc.emailVerified && jc.claim "email_verified" == some "false" | .error _ => false) &&
+      (match parseJwtClaims (.obj [("iss", .str "https://idp.test"), ("sub", .str "u1"), ("aud", .str "app"), ("exp", Qed.toJson (9999999999 : Nat)), ("email_verified", .bool true)]) with | .ok jc => jc.emailVerified && jc.claim "email_verified" == some "true" | .error _ => false))]
   let (testSecret, txBody) := ("qed-test-session-secret-32-bytes", "tx1.1700000600.eyJzdGF0ZSI6IjEyMyJ9")
   let v2Tok ← signSessionCookieV2 testSecret { userId := "usr_alice", claims := [("role", "admin")] } 60
   let signHex (msg : String) : IO String := return Qed.Proto.encodeHex (← Prim.hmacSha256 testSecret.toUTF8 msg.toUTF8)
   let txDomTok := s!"{txBody}.{← signHex s!"qed-tx:{txBody}"}"
-  for (lbl, tok, now) in [("raw-signed tx1.* cookie", s!"{txBody}.{← signHex txBody}", 1700000000), ("domain-separated tx1.* cookie", txDomTok, 1700000000),
-      ("qed-tx: prefixed tx1.* replay", s!"qed-tx:{txDomTok}", 1700000000), ("NUL-separated qed-tx\\0 replay", s!"qed-tx\x00{txBody}.{← signHex s!"qed-tx\x00{txBody}"}", 1700000000), ("expired v2.* cookie", v2Tok, 9999999999)] do
+  forList [("raw-signed tx1.* cookie", s!"{txBody}.{← signHex txBody}", 1700000000), ("domain-separated tx1.* cookie", txDomTok, 1700000000),
+      ("qed-tx: prefixed tx1.* replay", s!"qed-tx:{txDomTok}", 1700000000), ("NUL-separated qed-tx\\0 replay", s!"qed-tx\x00{txBody}.{← signHex s!"qed-tx\x00{txBody}"}", 1700000000), ("expired v2.* cookie", v2Tok, 9999999999)] fun (lbl, tok, now) => do
     c.checkEq s!"verifyUserTokenWithNow rejects {lbl}" (← Qed.Server.Native.verifyUserTokenWithNow [testSecret] tok now) none
   c.checkEq "verifySessionCookieV2 rejects expired v2.* cookie" (← verifySessionCookieV2 [testSecret] v2Tok 9999999999) none
 
@@ -54,11 +66,11 @@ private def testOidcFlowAndDeployManifest (c : TestChecker) : IO Unit :=
     c.check "qed_deploy.json emitted on build" existsM
     if existsM then
       c.expectOk "qed_deploy.json valid JSON" (Qed.Json.parse (← IO.FS.readFile manifestPath)) fun j => do
-        for (lbl, p, want) in [("mode is fullstack", "mode", "fullstack"), ("csp matches defaultCsp", "csp", Qed.Server.defaultCsp),
-            ("auth.name", "auth.name", "CloudAuth"), ("auth.callbackPath", "auth.callbackPath", "/_qed/auth/callback")] do c.checkJsonStr s!"manifest {lbl}" j p want
-        for (lbl, p, pred) in [("auth.claims has 4 typed claims", "auth.claims", fun xs : List Qed.Json => xs.length == 4),
+        forList [("mode is fullstack", "mode", "fullstack"), ("csp matches defaultCsp", "csp", Qed.Server.defaultCsp),
+            ("auth.name", "auth.name", "CloudAuth"), ("auth.callbackPath", "auth.callbackPath", "/_qed/auth/callback")] fun (lbl, p, want) => c.checkJsonStr s!"manifest {lbl}" j p want
+        forList [("auth.claims has 4 typed claims", "auth.claims", fun xs : List Qed.Json => xs.length == 4),
             ("auth.providers has 3 providers", "auth.providers", (·.length == 3)), ("egress contains BillingApi origin", "egress", (·.any (·.str? == some "https://billing.example.com"))),
-            ("databases contains AuthNotesDb", "databases", (·.any (·.pathStr? "name" == some "AuthNotesDb"))), ("secrets contains AUTH_NOTES_DB_URL", "secrets", (·.any (·.str? == some "AUTH_NOTES_DB_URL")))] do
+            ("databases contains AuthNotesDb", "databases", (·.any (·.pathStr? "name" == some "AuthNotesDb"))), ("secrets contains AUTH_NOTES_DB_URL", "secrets", (·.any (·.str? == some "AUTH_NOTES_DB_URL")))] fun (lbl, p, pred) =>
           c.checkJsonArr s!"manifest {lbl}" j p pred
     runTasks [
       checkLeakGate c "QedTests.AuthChecks" #["AuthChecks.CloudAuth.config", "AuthChecks.CloudAuth.secrets"],
@@ -115,14 +127,14 @@ private def testOidcFlowAndDeployManifest (c : TestChecker) : IO Unit :=
                 let logoutRaw := (AuthChecks.CloudAuth.logoutUrl "/").raw
                 c.checkHttp "GET logoutUrl(/) rejects Sec-Fetch-Site: cross-site (403)" (← httpReq appProc.port "GET" logoutRaw #[("Cookie", sessionCookie), ("Sec-Fetch-Site", "cross-site")])
                   (status? := some 403) (extra := fun r => c.check "cross-site GET logout does not clear qed_session" (r.cookie? "qed_session").isNone)
-                for (lbl, extraHdrs) in [("same-origin", #[("Sec-Fetch-Site", "same-origin")]), ("none", #[("Sec-Fetch-Site", "none")]), ("direct", #[])] do
+                forList [("same-origin", #[("Sec-Fetch-Site", "same-origin")]), ("none", #[("Sec-Fetch-Site", "none")]), ("direct", #[])] fun (lbl, extraHdrs) => do
                   c.checkHttp s!"GET logoutUrl(/) allows {lbl} (302)" (← httpReq appProc.port "GET" logoutRaw (#[("Cookie", sessionCookie)] ++ extraHdrs))
                     (status? := some 302) (headers := [("location", some "/")]) (extra := (·.checkCookieFlag c s!"{lbl} GET logout emits Max-Age=0 clear cookie" ["qed_session=", "Max-Age=0"]))
                 c.checkHttp "POST /_qed/auth/logout" (← httpReq appProc.port "POST" "/_qed/auth/logout" #[("Cookie", sessionCookie), ("Origin", s!"http://127.0.0.1:{appProc.port}")])
                   (extra := (·.checkCookieFlag c "logout emits Max-Age=0 clear cookie" ["qed_session=", "Max-Age=0"]))
                 let sessCookie2 ← doOidcLogin "2nd OIDC" "/" aliceParams
                 if !sessCookie2.isEmpty then checkProfile "2nd sign-in" sessCookie2 fun prof2 => c.checkEq "2nd sign-in skips onCreateAccount and increments logins == 2" prof2.logins 2
-              for (sub, role, checkAdminWant, checkWhoami) in [("usr_bob", "member", 403, true), ("usr_root", "admin", 200, false)] do
+              forList [("usr_bob", "member", 403, true), ("usr_root", "admin", 200, false)] fun (sub, role, checkAdminWant, checkWhoami) => do
                 let tok? := match ← postTokenForm [("grant_type", "direct_dev_token"), ("audience", "qed-cloud-test"), ("sub", sub), ("role", role), ("email", s!"{sub}@qed.dev")] with
                   | .ok r => if r.status == 200 then (Qed.Json.parse r.bodyStr).toOption.bind (·.strAt? "id_token") else none | .error _ => none
                 match tok? with
@@ -146,16 +158,16 @@ private def testRoadmapRuntimeFeatures (c : TestChecker) : IO Unit := do
   c.checkProto "[before] RPC hello returned greeting + helper bump" (← rpc okCtx "hello") "hi usr_alice:1"
   c.checkErrCode "[before] RPC rejects revoked bearer (401)" (← rpc revCtx "hello") 401 (some "token revoked")
   c.checkErrCode "[fn-private] private fn unreachable via dispatchM (404)" (← rpc okCtx "bump" (Qed.Proto.encode (1 : Nat))) 404
-  for (lbl, ctx, m, path, want) in [("[before] HTTP route allows good bearer", okCtx, "GET", "/api/ping", some (200, "pong")),
+  forList [("[before] HTTP route allows good bearer", okCtx, "GET", "/api/ping", some (200, "pong")),
       ("[before] unmatched HTTP route bypasses before hook", revCtx, "GET", "/unmatched", none),
-      ("[ctx-http] parseJson + queryParam succeeds", { okCtx with query := "?tag=hello+world", body := "{\"msg\":\"qed\"}" }, "POST", "/api/echo", some (200, "hello world:qed"))] do
+      ("[ctx-http] parseJson + queryParam succeeds", { okCtx with query := "?tag=hello+world", body := "{\"msg\":\"qed\"}" }, "POST", "/api/echo", some (200, "hello world:qed"))] fun (lbl, ctx, m, path, want) => do
     c.checkOkBy lbl (← http ctx m path) (·.map fun r => (r.status, utf8Str r.body)) want
-  for (lbl, ctx, m, path, code) in [("[before] HTTP route rejects revoked bearer (401)", revCtx, "GET", "/api/ping", 401),
-      ("[ctx-http] parseJson rejects malformed JSON (400)", { okCtx with body := "{not json" }, "POST", "/api/echo", 400)] do
+  forList [("[before] HTTP route rejects revoked bearer (401)", revCtx, "GET", "/api/ping", 401),
+      ("[ctx-http] parseJson rejects malformed JSON (400)", { okCtx with body := "{not json" }, "POST", "/api/echo", 400)] fun (lbl, ctx, m, path, code) => do
     c.checkErrCode lbl (← http ctx m path) code
-  for (lbl, ctx, op) in [("[before] WS join allows good bearer", okCtx, 1), ("[before] WS leave bypasses before hook", revCtx, 3)] do
+  forList [("[before] WS join allows good bearer", okCtx, 1), ("[before] WS leave bypasses before hook", revCtx, 3)] fun (lbl, ctx, op) => do
     c.expectOk lbl (← ws ctx op) fun _ => c.check lbl true
-  for (lbl, op, body) in [("[before] WS join rejects revoked bearer (401)", 1, ByteArray.empty), ("[before] WS send rejects revoked bearer (401)", 2, Qed.Proto.encode "hi")] do
+  forList [("[before] WS join rejects revoked bearer (401)", 1, ByteArray.empty), ("[before] WS send rejects revoked bearer (401)", 2, Qed.Proto.encode "hi")] fun (lbl, op, body) => do
     c.checkErrCode lbl (← ws revCtx op body) 401
   c.expectOk "[token] hashBearerToken deterministic 64-hex" (← Qed.Server.hashBearerToken (m := IO) "sample-token") fun h1 => do
     c.expectOk "[token] hashBearerToken second call" (← Qed.Server.hashBearerToken (m := IO) "sample-token") fun h2 =>

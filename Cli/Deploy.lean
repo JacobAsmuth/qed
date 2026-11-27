@@ -43,8 +43,9 @@ private def validateContainerImageUri (uri targetProjectId : String) : Except St
   let validHost := host == "gcr.io" || [".gcr.io", "-docker.pkg.dev"].any fun suf => host.endsWith suf && host.length > suf.length && isValidDnsLabel (host.dropEnd suf.length).toString
   if !validHost then return ← bad s!"host `{host}` must be `*-docker.pkg.dev` or `gcr.io`"
   if proj != targetProjectId then return ← bad s!"project `{proj}` does not match target GCP project `{targetProjectId}`"
-  for seg in rest do if !seg.toList.all (fun c => c.isAlphanum || "._-:@".contains c) then return ← bad s!"invalid character in path segment `{seg}`"
-  return uri
+  match rest.find? (!·.toList.all fun c => c.isAlphanum || "._-:@".contains c) with
+  | some seg => bad s!"invalid character in path segment `{seg}`"
+  | none => return uri
 
 private def canonicalizeBuildDir (outDir : FilePath) : ExceptT String IO FilePath := do
   let raw := outDir.toString
@@ -102,8 +103,8 @@ private def buildAndPushContainer (plan : GcpPlan) (region : GcpRegion) (outDir 
     "FROM debian:bookworm-slim\nRUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/* && useradd --system --uid 65532 --no-create-home --shell /usr/sbin/nologin qed\n" ++
     "WORKDIR /app\nCOPY . /app/dist\nRUN rm -f /app/dist/Dockerfile /app/dist/.dockerignore /app/dist/qed_deploy.json /app/dist/.env /app/dist/.env.* && chmod +x /app/dist/server && chown -R 65532:65532 /app\n" ++
     "USER 65532:65532\nEXPOSE 8080\nENV PORT=8080\nENTRYPOINT [\"/app/dist/server\", \"/app/dist\", \"8080\"]\n"))
-  for (lbl, dArgs, errLbl) in [(s!"building container image {imageUri}", #["build", "--platform", "linux/amd64", "-t", imageUri, "-f", dfPath.toString, realOutDir.toString], "build"),
-      (s!"pushing container image {imageUri}", #["push", imageUri], "push")] do
+  [(s!"building container image {imageUri}", #["build", "--platform", "linux/amd64", "-t", imageUri, "-f", dfPath.toString, realOutDir.toString], "build"),
+   (s!"pushing container image {imageUri}", #["push", imageUri], "push")].forM fun (lbl, dArgs, errLbl) => do
     liftIO (step lbl); if (← sh "docker" dArgs) != 0 then throw s!"docker {errLbl} failed for {imageUri}"
   return imageUri
 

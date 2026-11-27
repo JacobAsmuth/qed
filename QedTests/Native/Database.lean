@@ -26,7 +26,11 @@ private def pgFrame (tag : Char) (payload : ByteArray) : ByteArray := PgWire.enc
 private def pgAuthMsg (code : Nat) (extra : ByteArray := ByteArray.empty) : ByteArray := pgFrame 'R' (PgWire.pushU32BE ByteArray.empty code ++ extra)
 private def pgCmdDone (tag : String) : ByteArray := pgFrame 'C' (tag.toUTF8.push 0)
 private def pgErr (msg : String) : ByteArray := pgFrame 'E' ((("M".toUTF8 ++ msg.toUTF8).push 0).push 0)
-private def pgReady (tx? : Option UInt64 := none) : ByteArray := pgFrame 'Z' (if tx?.isSome then "T" else "I").toUTF8
+private def pgErrCode (sqlstate msg : String) : ByteArray :=
+  pgFrame 'E' (PgWire.pushCString (ByteArray.empty.push 0x53) "ERROR" ++ PgWire.pushCString (ByteArray.empty.push 0x43) sqlstate ++ PgWire.pushCString (ByteArray.empty.push 0x4D) msg |>.push 0)
+private def pgReady (tx? : Option UInt64 := none) (aborted : Bool := false) : ByteArray :=
+  pgFrame 'Z' (ByteArray.mk #[if tx?.isNone then 0x49 else if aborted then 0x45 else 0x54])
+private def pgAbortedErr : ByteArray := pgErrCode "25P02" "current transaction is aborted, commands ignored until end of transaction block"
 private def pgRowDescription (sampleRow : Array SqlVal) : ByteArray :=
   pgFrame 'T' <| sampleRow.zipIdx.foldl (init := PgWire.pushU16BE ByteArray.empty sampleRow.size) fun p (cell, i) =>
     let oid : Nat := match cell with | .int _ => 20 | .bool _ => 16 | .bytes _ => 17 | _ => 25
@@ -37,55 +41,123 @@ private def pgDataRow (row : Array SqlVal) : ByteArray :=
   pgFrame 'D' <| row.foldl (init := PgWire.pushU16BE ByteArray.empty row.size) fun p cell => match cell with
     | .null => PgWire.pushU32BE p 0xFFFFFFFF | .int i => pushVal p (toString i).toUTF8 | .text s => pushVal p s.toUTF8
     | .bool b => pushVal p (if b then "t" else "f").toUTF8 | .bytes bs => pushVal p ("\\x" ++ Qed.Proto.encodeHex bs).toUTF8
-private def translatePgSql (sql : String) (params : Array SqlVal) : String × Array SqlVal := Id.run do
-  let cs := (sql.replace "STRPOS(" "INSTR(").toList.toArray
-  let mut out : Array Char := #[]; let mut bound : Array SqlVal := #[]; let mut i := 0; let mut inQ := false
-  while i < cs.size do
-    let ch := cs[i]!
-    if ch == '\'' then inQ := !inQ; out := out.push ch; i := i + 1
-    else if !inQ && ch == '$' && i + 1 < cs.size && cs[i + 1]!.isDigit then
-      let mut j := i + 1; let mut num := ""
-      while j < cs.size && cs[j]!.isDigit do num := num.push cs[j]!; j := j + 1
-      bound := bound.push (params.getD (num.toNat?.getD 1 - 1) .null); out := out.push '?'; i := j
-    else out := out.push ch; i := i + 1
-  return (String.ofList out.toList, bound)
-private def findZeroByte (ba : ByteArray) (start : Nat) : Nat := Id.run do
-  for i in [start : ba.size] do if ba[i]! == 0 then return i
-  return ba.size
+
+private def readPgDigits (cs : Array Char) (j : Nat) (acc : Nat) : Nat × Nat :=
+  if h : j < cs.size then if cs[j].isDigit then readPgDigits cs (j + 1) (acc * 10 + (cs[j].toNat - 48)) else (j, acc) else (j, acc)
+private def translatePgSqlLoop (cs : Array Char) (params : Array SqlVal) : Nat → Nat → Bool → Array Char → Array SqlVal → String × Array SqlVal
+  | 0, _, _, out, bound => (String.ofList out.toList, bound)
+  | fuel + 1, i, inQ, out, bound =>
+      if h : i < cs.size then
+        let ch := cs[i]
+        if ch == '\'' then translatePgSqlLoop cs params fuel (i + 1) (!inQ) (out.push ch) bound
+        else if !inQ && ch == '$' && i + 1 < cs.size && cs[i + 1]!.isDigit then
+          let (j, num) := readPgDigits cs (i + 1) 0
+          translatePgSqlLoop cs params fuel j false (out.push '?') (bound.push (params.getD (num - 1) .null))
+        else translatePgSqlLoop cs params fuel (i + 1) inQ (out.push ch) bound
+      else (String.ofList out.toList, bound)
+private def translatePgSql (sql : String) (params : Array SqlVal) : String × Array SqlVal :=
+  let cs := (sql.replace "STRPOS(" "INSTR(").toList.toArray; translatePgSqlLoop cs params (cs.size + 1) 0 false #[] #[]
+private def findZeroByte (ba : ByteArray) (i : Nat) : Nat :=
+  if h : i < ba.size then if ba[i] == 0 then i else findZeroByte ba (i + 1) else ba.size
+termination_by ba.size - i
 private def xorBytes (a b : ByteArray) : ByteArray := ByteArray.mk <| Array.ofFn (n := min a.size b.size) fun i => a[i.val]! ^^^ b[i.val]!
 
 structure PgWireMock where (url : String) (parsedSqlRef : IO.Ref (Array String)) (scramCountRef : IO.Ref Nat) (startupOkRef : IO.Ref Bool) (stop : IO Unit)
 
-private partial def handlePgConn (conn : UInt64) (sqliteFile expectedUser expectedPass expectedDb : String)
+private def pgR32 (b : ByteArray) (o : Nat) : Nat := (PgWire.readU32BE b o).getD 0
+private def pgR16 (b : ByteArray) (o : Nat) : Nat := (PgWire.readU16BE b o).getD 0
+private def pgRi32 (b : ByteArray) (o : Nat) : Int := (PgWire.readI32BE b o).getD 0
+private def pgNextTagged (conn : UInt64) (b : ByteArray) : IO (Option (Char × ByteArray × ByteArray)) := do
+  let some b1 ← readExact conn b 5 | return none
+  let len := pgR32 b1 1
+  let some b2 ← readExact conn b1 (1 + len) | return none
+  return some (Char.ofNat (b1[0]!).toNat, b2.extract 5 (1 + len), b2.extract (1 + len) b2.size)
+private def pgScanKv : List String → String × String
+  | k :: v :: rest => let (u, d) := pgScanKv rest; (if k == "user" then v else u, if k == "database" then v else d) | _ => ("", "")
+private def pgStartupLoop (conn : UInt64) (expectedUser expectedDb : String) (startupOkRef : IO.Ref Bool) : Nat → ByteArray → IO (Option ByteArray)
+  | 0, _ => return none
+  | fuel + 1, buf => do
+      let some b1 ← readExact conn buf 4 | return none
+      let len := pgR32 b1 0
+      let some b2 ← readExact conn b1 len | return none
+      let (body, nextBuf) := (b2.extract 4 len, b2.extract len b2.size)
+      if pgR32 body 0 == 80877103 then discard <| Prim.outboundWriteAll conn "N".toUTF8; pgStartupLoop conn expectedUser expectedDb startupOkRef fuel nextBuf
+      else
+        if pgScanKv ((utf8Str (body.extract 4 body.size)).splitOn "\x00") == (expectedUser, expectedDb) then startupOkRef.set true
+        discard <| Prim.outboundWriteAll conn (pgAuthMsg 10 ((("SCRAM-SHA-256".toUTF8).push 0).push 0))
+        return some nextBuf
+private def pgReadBindParams (payload : ByteArray) : Nat → Nat → Array SqlVal → Array SqlVal
+  | 0, _, ps => ps
+  | n + 1, off, ps =>
+      let pLen := pgRi32 payload off; let o1 := off + 4
+      if pLen < 0 then pgReadBindParams payload n o1 (ps.push .null)
+      else pgReadBindParams payload n (o1 + pLen.toNat) (ps.push (.text (utf8Str (payload.extract o1 (o1 + pLen.toNat)))))
+private def pgSessionLoop (conn : UInt64) (sqliteFile : String) (parsedSqlRef : IO.Ref (Array String)) :
+    Nat → ByteArray → String → Array SqlVal → Option UInt64 → Bool → IO (Option UInt64)
+  | 0, _, _, _, tx?, _ => return tx?
+  | fuel + 1, buf, prepSql, bParams, tx?, aborted => do
+      let send (bs : ByteArray) : IO Unit := discard <| Prim.outboundWriteAll conn bs
+      let some (tag, payload, rest) ← pgNextTagged conn buf | return tx?
+      match tag with
+      | 'Q' =>
+          let sql := (utf8Str (payload.extract 0 (payload.size - 1))).trimAscii.toString; let upper := sql.toUpper
+          if upper == "BEGIN" then
+            match ← Prim.sqliteTxBegin sqliteFile with
+            | .ok tid => send (pgCmdDone "BEGIN" ++ pgReady (some tid)); pgSessionLoop conn sqliteFile parsedSqlRef fuel rest prepSql bParams (some tid) false
+            | .error e => send (pgErr e ++ pgReady tx?); pgSessionLoop conn sqliteFile parsedSqlRef fuel rest prepSql bParams tx? false
+          else if upper == "COMMIT" || upper == "ROLLBACK" then
+            let baseResp := pgCmdDone (if upper == "COMMIT" && aborted then "ROLLBACK" else upper)
+            let resp ← match tx? with
+              | some tid =>
+                  if upper == "COMMIT" && !aborted then
+                    match ← Prim.sqliteTxCommit tid with | .error e => pure (pgErr e) | .ok () => pure baseResp
+                  else Prim.sqliteTxRollback tid; pure baseResp
+              | none => pure baseResp
+            send (resp ++ pgReady); pgSessionLoop conn sqliteFile parsedSqlRef fuel rest prepSql bParams none false
+          else if aborted then send (pgAbortedErr ++ pgReady tx? true); pgSessionLoop conn sqliteFile parsedSqlRef fuel rest prepSql bParams tx? true
+          else match ← Prim.sqliteDdl sqliteFile sql with
+            | .ok () => send (pgCmdDone "CREATE TABLE" ++ pgReady tx?); pgSessionLoop conn sqliteFile parsedSqlRef fuel rest prepSql bParams tx? false
+            | .error e => let ab := tx?.isSome; send (pgErr e ++ pgReady tx? ab); pgSessionLoop conn sqliteFile parsedSqlRef fuel rest prepSql bParams tx? ab
+      | 'P' =>
+          let n1 := findZeroByte payload 0; let nextSql := utf8Str (payload.extract (n1 + 1) (findZeroByte payload (n1 + 1)))
+          send (pgFrame '1' ByteArray.empty); pgSessionLoop conn sqliteFile parsedSqlRef fuel rest nextSql bParams tx? aborted
+      | 'B' =>
+          let o2 := findZeroByte payload (findZeroByte payload 0 + 1) + 1; let o3 := o2 + 2 + pgR16 payload o2 * 2
+          let ps := pgReadBindParams payload (pgR16 payload o3) (o3 + 2) #[]
+          parsedSqlRef.modify (·.push prepSql); send (pgFrame '2' ByteArray.empty); pgSessionLoop conn sqliteFile parsedSqlRef fuel rest prepSql ps tx? aborted
+      | 'E' =>
+          if aborted then send pgAbortedErr; pgSessionLoop conn sqliteFile parsedSqlRef fuel rest prepSql bParams tx? true
+          else
+            let (sqliteSql, sqliteParams) := translatePgSql prepSql bParams
+            let execRes ← match tx? with | some tid => Prim.sqliteTxExec tid sqliteSql sqliteParams | none => Prim.sqliteExec sqliteFile sqliteSql sqliteParams
+            match execRes with
+            | .error e =>
+                let ab := tx?.isSome; send (pgErrCode (if e.contains "UNIQUE" then "23505" else "42000") e)
+                pgSessionLoop conn sqliteFile parsedSqlRef fuel rest prepSql bParams tx? ab
+            | .ok res =>
+                let upperSql := prepSql.trimAscii.toString.toUpper
+                let frames := if h : 0 < res.rows.size then res.rows.foldl (init := pgRowDescription res.rows[0]) fun f row => f ++ pgDataRow row
+                  else if ["SELECT COUNT", "SELECT SUM", "SELECT MIN", "SELECT MAX"].any (upperSql.startsWith ·) then pgRowDescription #[.int 0] else ByteArray.empty
+                let verb := (upperSql.splitOn " ").headD "OK"
+                send (frames ++ pgCmdDone (if verb == "INSERT" then s!"INSERT 0 {res.affected}" else s!"{verb} {if res.rows.size > 0 then res.rows.size else res.affected}"))
+                pgSessionLoop conn sqliteFile parsedSqlRef fuel rest prepSql bParams tx? false
+      | 'S' => send (pgReady tx? aborted); pgSessionLoop conn sqliteFile parsedSqlRef fuel rest prepSql bParams tx? aborted
+      | 'X' => return tx?
+      | _ => pgSessionLoop conn sqliteFile parsedSqlRef fuel rest prepSql bParams tx? aborted
+
+private def handlePgConn (conn : UInt64) (sqliteFile expectedUser expectedPass expectedDb : String)
     (parsedSqlRef : IO.Ref (Array String)) (scramCountRef : IO.Ref Nat) (startupOkRef : IO.Ref Bool) : IO Unit := do
-  let mut buf := ByteArray.empty
   let send (bs : ByteArray) : IO Unit := discard <| Prim.outboundWriteAll conn bs
-  let (r32, r16, ri32) := (fun b o => (PgWire.readU32BE b o).getD 0, fun b o => (PgWire.readU16BE b o).getD 0, fun b o => (PgWire.readI32BE b o).getD 0)
-  let nextTagged (b : ByteArray) : IO (Option (Char × ByteArray × ByteArray)) := do
-    let some b1 ← readExact conn b 5 | return none
-    let len := r32 b1 1
-    let some b2 ← readExact conn b1 (1 + len) | return none
-    return some (Char.ofNat (b1[0]!).toNat, b2.extract 5 (1 + len), b2.extract (1 + len) b2.size)
-  while true do
-    let some b1 ← readExact conn buf 4 | return
-    let len := r32 b1 0
-    let some b2 ← readExact conn b1 len | return
-    let body := b2.extract 4 len; buf := b2.extract len b2.size
-    if r32 body 0 == 80877103 then send "N".toUTF8; continue
-    let rec scanKv : List String → String × String
-      | k :: v :: rest => let (u, d) := scanKv rest; (if k == "user" then v else u, if k == "database" then v else d) | _ => ("", "")
-    if scanKv ((utf8Str (body.extract 4 body.size)).splitOn "\x00") == (expectedUser, expectedDb) then startupOkRef.set true
-    send (pgAuthMsg 10 ((("SCRAM-SHA-256".toUTF8).push 0).push 0)); break
+  let some buf0 ← pgStartupLoop conn expectedUser expectedDb startupOkRef 16 ByteArray.empty | return
   let (saltBytes, iters) := ("qedsalt012345678".toUTF8, 4096)
-  let some ('p', p1, b1) ← nextTagged buf | return
-  buf := b1; let nul := findZeroByte p1 0; let cf1 := utf8Str (p1.extract (nul + 5) (nul + 5 + (ri32 p1 (nul + 1)).toNat))
+  let some ('p', p1, b1) ← pgNextTagged conn buf0 | return
+  let nul := findZeroByte p1 0; let cf1 := utf8Str (p1.extract (nul + 5) (nul + 5 + (pgRi32 p1 (nul + 1)).toNat))
   if utf8Str (p1.extract 0 nul) != "SCRAM-SHA-256" || !cf1.startsWith "n,," then send (pgErr "unsupported SASL mechanism"); return
   let clientFirstBare := dropChars cf1 3
   let clientNonce := match (clientFirstBare.splitOn "r=").drop 1 with | r :: _ => (r.splitOn ",").headD "" | [] => ""
   let serverFirst := s!"r={clientNonce}qedservernonce9876,s={Net.base64Encode saltBytes},i={iters}"
   send (pgAuthMsg 11 serverFirst.toUTF8)
-  let some ('p', p2, b2) ← nextTagged buf | return
-  buf := b2
+  let some ('p', p2, b2) ← pgNextTagged conn b1 | return
   let [clientFinalNoProof, clientProofB64] := (utf8Str p2).splitOn ",p=" | send (pgErr "malformed SASLResponse"); return
   let salted ← Prim.pbkdf2HmacSha256 expectedPass.toUTF8 saltBytes iters.toUInt32
   let clientKey ← Prim.hmacSha256 salted "Client Key".toUTF8
@@ -94,57 +166,7 @@ private partial def handlePgConn (conn : UInt64) (sqliteFile expectedUser expect
   if clientProofB64 != Net.base64Encode (xorBytes clientKey (← Prim.hmacSha256 storedKey authMsg.toUTF8)) then send (pgErr "SCRAM-SHA-256 authentication failed"); return
   let serverSig ← Prim.hmacSha256 serverKey authMsg.toUTF8
   scramCountRef.modify (· + 1); send (pgAuthMsg 12 (s!"v={Net.base64Encode serverSig}").toUTF8 ++ pgAuthMsg 0 ++ pgReady)
-  let mut preparedSql := ""; let mut boundParams : Array SqlVal := #[]; let mut activeTxId? : Option UInt64 := none; let mut txAborted := false
-  let readyFrame (tid? : Option UInt64) (aborted : Bool) : ByteArray := pgFrame 'Z' (ByteArray.mk #[if tid?.isNone then 0x49 else if aborted then 0x45 else 0x54])
-  let pgErrCode (sqlstate msg : String) : ByteArray := pgFrame 'E' (PgWire.pushCString (ByteArray.empty.push 0x53) "ERROR" ++ PgWire.pushCString (ByteArray.empty.push 0x43) sqlstate ++ PgWire.pushCString (ByteArray.empty.push 0x4D) msg |>.push 0)
-  while true do
-    let some (tag, payload, rest) ← nextTagged buf | break
-    buf := rest
-    match tag with
-    | 'Q' =>
-        let sql := (utf8Str (payload.extract 0 (payload.size - 1))).trimAscii.toString; let upper := sql.toUpper
-        if upper == "BEGIN" then
-          txAborted := false
-          match ← Prim.sqliteTxBegin sqliteFile with | .ok tid => activeTxId? := some tid; send (pgCmdDone "BEGIN" ++ readyFrame activeTxId? false) | .error e => send (pgErr e ++ readyFrame activeTxId? false)
-        else if upper == "COMMIT" || upper == "ROLLBACK" then
-          let wasAborted := txAborted; txAborted := false
-          let mut resp := pgCmdDone (if upper == "COMMIT" && wasAborted then "ROLLBACK" else upper)
-          if let some tid := activeTxId? then
-            activeTxId? := none
-            if upper == "COMMIT" && !wasAborted then if let .error e ← Prim.sqliteTxCommit tid then resp := pgErr e
-            else Prim.sqliteTxRollback tid
-          send (resp ++ readyFrame none false)
-        else if txAborted then send (pgErrCode "25P02" "current transaction is aborted, commands ignored until end of transaction block" ++ readyFrame activeTxId? true)
-        else match ← Prim.sqliteDdl sqliteFile sql with
-          | .ok () => send (pgCmdDone "CREATE TABLE" ++ readyFrame activeTxId? false)
-          | .error e =>
-              if activeTxId?.isSome then txAborted := true
-              send (pgErr e ++ readyFrame activeTxId? txAborted)
-    | 'P' => let n1 := findZeroByte payload 0; preparedSql := utf8Str (payload.extract (n1 + 1) (findZeroByte payload (n1 + 1))); send (pgFrame '1' ByteArray.empty)
-    | 'B' =>
-        let o2 := findZeroByte payload (findZeroByte payload 0 + 1) + 1
-        let mut off := o2 + 2 + r16 payload o2 * 2; let paramCnt := r16 payload off; off := off + 2; let mut ps : Array SqlVal := #[]
-        for _ in [0 : paramCnt] do
-          let pLen := ri32 payload off; off := off + 4
-          if pLen < 0 then ps := ps.push .null else ps := ps.push (.text (utf8Str (payload.extract off (off + pLen.toNat)))); off := off + pLen.toNat
-        boundParams := ps; parsedSqlRef.modify (·.push preparedSql); send (pgFrame '2' ByteArray.empty)
-    | 'E' =>
-        if txAborted then send (pgErrCode "25P02" "current transaction is aborted, commands ignored until end of transaction block")
-        else
-          let (sqliteSql, sqliteParams) := translatePgSql preparedSql boundParams
-          let execRes ← match activeTxId? with | some tid => Prim.sqliteTxExec tid sqliteSql sqliteParams | none => Prim.sqliteExec sqliteFile sqliteSql sqliteParams
-          match execRes with
-          | .error e =>
-              if activeTxId?.isSome then txAborted := true
-              send (pgErrCode (if e.contains "UNIQUE" then "23505" else "42000") e)
-          | .ok res =>
-              let upperSql := preparedSql.trimAscii.toString.toUpper; let mut frames := ByteArray.empty
-              if h : 0 < res.rows.size then frames := frames ++ pgRowDescription res.rows[0]; for row in res.rows do frames := frames ++ pgDataRow row
-              else if ["SELECT COUNT", "SELECT SUM", "SELECT MIN", "SELECT MAX"].any (upperSql.startsWith ·) then frames := frames ++ pgRowDescription #[.int 0]
-              let verb := (upperSql.splitOn " ").headD "OK"
-              send (frames ++ pgCmdDone (if verb == "INSERT" then s!"INSERT 0 {res.affected}" else s!"{verb} {if res.rows.size > 0 then res.rows.size else res.affected}"))
-    | 'S' => send (readyFrame activeTxId? txAborted) | 'X' => break | _ => pure ()
-  if let some tid := activeTxId? then Prim.sqliteTxRollback tid
+  if let some tid ← pgSessionLoop conn sqliteFile parsedSqlRef 10000 b2 "" #[] none false then Prim.sqliteTxRollback tid
 
 private def startPgWireMock (sqliteFile user pass dbName : String) : IO (Except String PgWireMock) := do
   let (parsedSqlRef, scramCountRef, startupOkRef) := (← IO.mkRef #[], ← IO.mkRef 0, ← IO.mkRef false)
@@ -152,7 +174,6 @@ private def startPgWireMock (sqliteFile user pass dbName : String) : IO (Except 
   return res.map fun (port, stop) => { url := s!"postgres://{user}:{pass}@127.0.0.1:{port}/{dbName}?sslmode=disable", parsedSqlRef, scramCountRef, startupOkRef, stop }
 
 private def runMovedDbChecks (c : TestChecker) : IO Unit := do
-  let hasAll (s : String) (xs : List String) := xs.all (s.contains ·)
   let mk (p1 p2 i1 i2 : String) := SqlQuery.select (sql!"items") [sql!"id"]
     (.binOp .and (.startsWith (.col (sql!"title")) (.param (.text p1))) (.binOp .and (.contains (.col (sql!"title")) (.param (.text p2))) (.inList (.col (sql!"id")) [.text i1, .text i2])))
     (limit := some 10) (offset := some 5)
@@ -175,7 +196,29 @@ private def runMovedDbChecks (c : TestChecker) : IO Unit := do
       (DbChecks.RoadmapDb.config.backfills[0]?.map fun q => (q.compile .postgres).1.contains "UPDATE \"projects\" SET \"note\" = $1 WHERE (\"note\" IS NULL)") == some true),
     ("[ddl] MultiTenantDb cross-table EXISTS RLS DDL",
       hasAll DbChecks.MultiTenantDb.rlsDdl ["EXISTS (SELECT 1 FROM \"app_members\" AS \"m\" WHERE", "\"apps\".\"id\"", "EXISTS (SELECT 1 FROM \"org_members\" AS \"om\" WHERE", "\"m\".\"role\" IN ('owner', 'admin')"]),
-    ("[ddl] TxLeaseDb RLS DDL", hasAll DbChecks.TxLeaseDb.rlsDdl ["ENABLE ROW LEVEL SECURITY", "current_setting('qed.user_id', true)"])]
+    ("[ddl] TxLeaseDb RLS DDL", hasAll DbChecks.TxLeaseDb.rlsDdl ["ENABLE ROW LEVEL SECURITY", "current_setting('qed.user_id', true)"]),
+    ("[db-pure] SQLi parameterization, migration safety, mappings, Date/Int FromSql, empty select, & Meta codecs",
+      let mkN (v : String) := SqlQuery.select (sql!"notes") [sql!"id"] (.binOp .eq (.col (sql!"ownerId")) (.param (.text v)))
+      let (_, _, unsafeCol) := DbChecks.mkMigrationFixture (sql!"items")
+      let d? := Qed.Date.mk? 2026 11 25
+      let (tbl, col) := (sql!"projects", sql!"owner_id")
+      let emptySel := (SqlQuery.select tbl [] .litTrue).compile .postgres
+      let cents := DbChecks.DollarsToCentsMap.encode ⟨25, by decide⟩
+      let m : DbChecks.RotatingVaultDb.entries.Meta := { id := 7, ownerId := "u1", label := "api-key" }
+      DbChecks.sameCompiledSql (mkN "alice") (mkN "' OR 1=1; DROP TABLE notes; --") &&
+      steps.length == 3 && (verifyMigrationSafe steps).isOk && (diffTableSchemas [newTbl] [newTbl]).isEmpty &&
+      !(verifyMigrationSafe [.addColumn (sql!"items") unsafeCol none]).isOk &&
+      (match DbChecks.SecretNoteInput.parse { body := "hello" } with | some s => let ct := DbChecks.sealedNoteMap.encode s; 40 <= ct.val.length && ct.val.length <= 304 && (match DbChecks.sealedNoteMap.toSource ct.val with | .ok d => d.body.val == "hello" | .error _ => false) | none => false) &&
+      cents.val == 2500 && (match DbChecks.DollarsToCentsMap.decode cents.val with | .ok d => d.val == 25 | .error _ => false) &&
+      (match DbChecks.DollarsToCentsMap.decode 2550 with | .error msg => msg == "must be whole dollars" | .ok _ => false) &&
+      !(DbChecks.DollarsToCentsMap.decode 1000100).isOk && !DbChecks.EncVaultDb.secrets.contains "QED_TEST_ENC_KEY" &&
+      (match d?.map fun d => FromSql.fromSql (α := Qed.Date) (ToSql.toSql d) with | some (.ok d') => some d' == d? | _ => false) &&
+      DbChecks.RoadmapDb.config.backfills.length == 1 && FromSql.fromSql (α := Int) (.text "-42") == .ok (-42) && !(FromSql.fromSql (α := Int) (.text "not_int")).isOk &&
+      !emptySel.1.contains "*" && emptySel.1.contains "0 = 1" && ((SqlQuery.selectAll tbl .litTrue).compile .postgres).1 == "SELECT * FROM \"projects\" WHERE TRUE" &&
+      ((SqlQuery.insertOrIgnore tbl [(col, .text "a")] [] [col]).compile .postgres).1 == "INSERT INTO \"projects\" (\"owner_id\") VALUES ($1) ON CONFLICT DO NOTHING RETURNING \"owner_id\"" &&
+      DbChecks.RotatingVaultDb.secrets == #["VAULT_PRIMARY_KEY"] && DbChecks.RotatingVaultDb.entries.metaColNames == ["id", "ownerId", "label"] &&
+      Qed.fromJson (α := DbChecks.RotatingVaultDb.entries.Meta) (Qed.toJson m) == .ok m &&
+      Qed.Proto.decode (α := DbChecks.RotatingVaultDb.entries.Meta) (Qed.Proto.encode m) == .ok m)]
 
 private def runVaultSuite (c : TestChecker) (label : String) (srv : NativeServerProc) (aliceTok bobTok : String) (testRestart : Bool := false) : IO Unit := do
   let (sqli, lbl) := ("' OR 1=1; DROP TABLE notes; --", fun s => s!"[{label}] {s}")
@@ -191,29 +234,31 @@ private def runVaultSuite (c : TestChecker) (label : String) (srv : NativeServer
       c.checkRpcDomainOk (E := DbChecks.VaultApi.createNote.Error) (α := DbChecks.VaultDb.notes) (lbl s!"{tag} payload") (.ok (ε := String) r.body) k)
   checkCreate "alice createNote(1)" 1 "hello verified db" (c.checkEq (lbl "alice createNote(1) payload") · { id := 1, ownerId := "alice", body := "hello verified db", version := 0, status := "draft" })
   checkCreate "alice createNote(2) SQLi stored safely" 2 sqli fun got => c.checkEq (lbl "alice createNote(2) verbatim body") got.body sqli
-  for (tag, act, want) in [("alice countMyNotes == 2", alice "countMyNotes", 2), ("bob countMyNotes == 0 (RLS)", bob "countMyNotes", 0), ("bob deleteNote(1) == 0 (RLS)", bob "deleteNote" id1, 0)] do c.checkRpcProto (lbl tag) (← act) (want : Nat)
-  for (tag, act, want) in [("alice listMyNotes returns 2 notes", alice "listMyNotes", 2), ("bob listMyNotes == 0 (RLS)", bob "listMyNotes", 0)] do c.checkRpcProtoBy (α := Array DbChecks.VaultDb.notes) (lbl tag) (← act) (·.size) want
-  for (tag, act, want) in [("bob getNote(1) == none (RLS)", bob "getNote" id1, (none : Option DbChecks.VaultDb.notes)), ("bob editNote(1) == none (RLS)", bob "editNote" (encNote 1 "pwned"), none),
+  forList [("alice countMyNotes == 2", alice "countMyNotes", 2), ("bob countMyNotes == 0 (RLS)", bob "countMyNotes", 0), ("bob deleteNote(1) == 0 (RLS)", bob "deleteNote" id1, 0)] fun (tag, act, want) => do c.checkRpcProto (lbl tag) (← act) (want : Nat)
+  forList [("alice listMyNotes returns 2 notes", alice "listMyNotes", 2), ("bob listMyNotes == 0 (RLS)", bob "listMyNotes", 0)] fun (tag, act, want) => do c.checkRpcProtoBy (α := Array DbChecks.VaultDb.notes) (lbl tag) (← act) (·.size) want
+  forList [("bob getNote(1) == none (RLS)", bob "getNote" id1, (none : Option DbChecks.VaultDb.notes)), ("bob editNote(1) == none (RLS)", bob "editNote" (encNote 1 "pwned"), none),
       ("alice editNote(1) updated", alice "editNote" (encNote 1 "updated text"), some { id := 1, ownerId := "alice", body := "updated text", version := 1, status := "draft" }),
-      ("alice publishNote(1) draft -> published", alice "publishNote" id1, some publishedNote1), ("alice publishNote(1) twice returns none", alice "publishNote" id1, none)] do
+      ("alice publishNote(1) draft -> published", alice "publishNote" id1, some publishedNote1), ("alice publishNote(1) twice returns none", alice "publishNote" id1, none)] fun (tag, act, want) => do
     c.checkRpcProto (lbl tag) (← act) want
   if testRestart then
     c.check (lbl "server restarted cleanly") (← srv.restart)
     c.checkRpcProto (lbl "note 1 persisted across restart") (← alice "getNote" id1) (some publishedNote1)
     c.checkRpcProtoBy (α := Option DbChecks.VaultDb.notes) (lbl "SQLi note 2 persisted verbatim across restart") (← alice "getNote" id2) (·.map (·.body)) (some sqli)
-  for (tag, act, want) in [("alice deleteNote(2) == 1", alice "deleteNote" id2, 1), ("alice countMyNotes == 1 after delete", alice "countMyNotes", 1)] do c.checkRpcProto (lbl tag) (← act) (want : Nat)
+  forList [("alice deleteNote(2) == 1", alice "deleteNote" id2, 1), ("alice countMyNotes == 1 after delete", alice "countMyNotes", 1)] fun (tag, act, want) => do c.checkRpcProto (lbl tag) (← act) (want : Nat)
   c.checkStatus (lbl "seedBook status 200") (← alice "seedBook" (Qed.Proto.encode ("lean4", ("Theorem Proving in Lean 4", (10 : Nat))))) 200
   c.checkRpcProto (lbl "listBooks returns 1 book") (← call "listBooks") (#[{ id := "lean4", title := "Theorem Proving in Lean 4", stock := 10 }] : Array DbChecks.VaultDb.books)
   c.checkRpcProtoBy (α := Option DbChecks.VaultDb.books) (lbl "orderBook(3) stock 10 -> 7") (← alice "orderBook" (Qed.Proto.encode ("lean4", (3 : Nat)))) (·.map (·.stock)) (some 7)
   c.checkRpcProto (lbl "orderBook(10) when stock=7 returns none") (← alice "orderBook" (Qed.Proto.encode ("lean4", (10 : Nat)))) (none : Option DbChecks.VaultDb.books)
 
-@[implicit_reducible]
+set_option warn.classDefReducibility false in
+@[noinline, nospecialize]
 private def withRedirectedDb (ep : DbEndpoint) : MonadServer IO :=
   let (base, r) := (Native.mkNativeServerInst none none, fun cfg : DbConfig => { cfg with endpoint := ep, devFallback? := none })
   { exec := fun
       | .dbExec c q => base.exec (.dbExec (r c) q) | .dbExecDdl c => base.exec (.dbExecDdl (r c)) | .dbTxBegin c => base.exec (.dbTxBegin (r c))
       | .dbTxExec c t q => base.exec (.dbTxExec (r c) t q) | .dbTxCommit c t => base.exec (.dbTxCommit (r c) t) | .dbTxRollback c t => base.exec (.dbTxRollback (r c) t) | eff => base.exec eff }
 
+@[noinline, nospecialize]
 private def runShopDirectSuite (c : TestChecker) (label : String) (srvInst : MonadServer IO) (testConcurrentReaders : Bool := false) : IO Unit := do
   let lbl (s : String) := s!"[{label}] {s}"; let stBox ← Prim.mkStateBox DbChecks.ShopApi.initState; let atomicInst : MonadAtomic DbChecks.ShopApi.State IO := Native.withStateBox stBox
   c.expectOk (lbl "ShopDb schema init") (← @MonadServer.dbExecDdl IO srvInst DbChecks.ShopDb.config) fun () => do
@@ -225,19 +270,19 @@ private def runShopDirectSuite (c : TestChecker) (label : String) (srvInst : Mon
     c.checkProto (lbl "empty min == none") (← alice "cheapestPrice") (none : Option Nat)
     c.checkRpcDomainOk (E := DbChecks.ShopApi.createAuthorAndItem.Error) (α := DbChecks.ShopDb.items) (lbl "db.transaction: committed author + item")
       (← alice "createAuthorAndItem" (mkTxReq "a1" "Ada Lovelace" "i1" "Lean 4 Proofs" 100)) fun it => c.check (lbl "db.transaction: committed author + item") (it.id == "i1" && it.price == 100)
-    for (aid, aname, iid, title, price) in [("a2", "Alan Turing", "i2", "Lean 4 Compilers", 250), ("a3", "Grace Hopper", "i3", "Rust Systems 100%", 50)] do
+    forList [("a2", "Alan Turing", "i2", "Lean 4 Compilers", 250), ("a3", "Grace Hopper", "i3", "Rust Systems 100%", 50)] fun (aid, aname, iid, title, price) => do
       c.expectOk (lbl s!"createAuthorAndItem({iid})") (← alice "createAuthorAndItem" (mkTxReq aid aname iid title price)) fun _ => pure ()
     c.checkEq (lbl "atomic txOps incremented 3 times inside transactions") (← Prim.atomicRead stBox (·.txOps)) 3
     c.checkRpcDomainErr (E := DbChecks.ShopApi.createPairDotSyntax.Error) (α := DbChecks.ShopDb.items) (lbl "db.transaction: returned fail(.aborted)")
       (← alice "createPairDotSyntax" (mkTxReq "a_rolled_back" "Ghost Author" "i_ghost" "Ghost Item" 99999)) (·.tag == .aborted)
     c.checkOkBy (lbl "rolled-back author does NOT exist in DB") (← @MonadServer.dbExec IO srvInst DbChecks.ShopDb.config (SqlQuery.count (sql!"authors") (.binOp .eq (.col (sql!"id")) (.param (.text "a_rolled_back")))))
       (fun res => match res.rows[0]?.bind (·[0]?) with | some (SqlVal.int n) => n | _ => -1) (0 : Int)
-    for (tag, pfx, sub, off, want) in [("startsWith+contains+orderBy(-price) returns [i2, i1]", "Lean", "4", 0, #["i2", "i1"]), ("offset=1 returns [i1]", "Lean", "4", 1, #["i1"]), ("LIKE escapes literal % safely", "Rust", "100%", 0, #["i3"])] do
+    forList [("startsWith+contains+orderBy(-price) returns [i2, i1]", "Lean", "4", 0, #["i2", "i1"]), ("offset=1 returns [i1]", "Lean", "4", 1, #["i1"]), ("LIKE escapes literal % safely", "Rust", "100%", 0, #["i3"])] fun (tag, pfx, sub, off, want) => do
       c.checkProtoBy (α := Array DbChecks.ShopDb.items) (lbl tag) (← alice "searchItems" (Qed.Proto.encode (pfx, (sub, off)))) (·.map (·.id)) want
     c.checkProtoBy (α := Array DbChecks.ShopDb.items) (lbl "IN list returns [i1, i3]") (← alice "filterByIds" (Qed.Proto.encode (#["i3", "i1"] : Array String))) (·.map (·.id)) #["i1", "i3"]
     c.checkProtoBy (α := Array DbChecks.ShopDb.items) (lbl "empty IN list returns 0 rows") (← alice "filterByIds" (Qed.Proto.encode (#[] : Array String))) (·.size) 0
-    for (tag, act, want) in [("alice sum(price) == 400", alice "totalInventoryValue", 400), ("bob sum(price) == 0 (RLS)", bob "totalInventoryValue", 0)] do c.checkProto (lbl tag) (← act) (want : Nat)
-    for (tag, fn, want) in [("alice min(price) == some 50", "cheapestPrice", some (50 : Nat)), ("alice max(price) == some 250", "highestPrice", some 250)] do c.checkProto (lbl tag) (← alice fn) want
+    forList [("alice sum(price) == 400", alice "totalInventoryValue", 400), ("bob sum(price) == 0 (RLS)", bob "totalInventoryValue", 0)] fun (tag, act, want) => do c.checkProto (lbl tag) (← act) (want : Nat)
+    forList [("alice min(price) == some 50", "cheapestPrice", some (50 : Nat)), ("alice max(price) == some 250", "highestPrice", some 250)] fun (tag, fn, want) => do c.checkProto (lbl tag) (← alice fn) want
     c.checkProtoBy (α := Array (DbChecks.ShopDb.items × DbChecks.ShopDb.authors)) (lbl "FK join returns [(i2, Alan Turing), (i1, Ada Lovelace), (i3, Grace Hopper)]")
       (← alice "itemsWithAuthors") (·.map fun (it, au) => (it.id, au.name)) #[("i2", "Alan Turing"), ("i1", "Ada Lovelace"), ("i3", "Grace Hopper")]
     c.checkProtoBy (α := Array (DbChecks.ShopDb.items × DbChecks.ShopDb.authors)) (lbl "bob FK join returns 0 (RLS)") (← bob "itemsWithAuthors") (·.size) 0
@@ -258,6 +303,7 @@ private def runMigrationSuite (c : TestChecker) (tmpDir : String) : IO Unit := d
     c.checkOkBy "[migrate] v2 re-run is idempotent (0 steps)" (← Native.migrateDatabase v2Cfg) List.length 0
     c.checkErrContains "[migrate] unsafe v3 migration rejected" (← Native.migrateDatabase (mkCfg { v2Table with columns := v2Table.columns ++ [unsafeCol] })) "unsafe additive migration"
 
+@[noinline, nospecialize]
 private def runEncryptedColumnSuite (c : TestChecker) (srvInst : MonadServer IO) : IO Unit := do
   let cfg := DbChecks.EncVaultDb.config
   c.expectOk "[enc-db] schema init" (← @MonadServer.dbExecDdl IO srvInst cfg) fun () => do
@@ -304,10 +350,10 @@ private def runRoadmapSuite (c : TestChecker) (tmpDir : String) : IO Unit := do
     c.check "[roadmap] transaction returned error" (!txRes.isOk)
     c.checkOkBy "[roadmap] rollback verified" (← db.orgs.findOne (.eq "id" "org_rb")) Option.isNone true
     c.check "[roadmap] unknown column rejected" (!(← db.projects.select (.eq "nonexistent_col" "x")).isOk)
-    for (lbl, name, want) in [("[roadmap] insertOrIgnore returned some", "First", some "First"), ("[roadmap] duplicate ignored", "Second", none)] do
+    forList [("[roadmap] insertOrIgnore returned some", "First", some "First"), ("[roadmap] duplicate ignored", "Second", none)] fun (lbl, name, want) => do
       c.checkOkBy lbl (← db.orgs.insertOrIgnore { id := "org_ign", name }) (·.map (·.name)) want
     c.expectOk "[roadmap] insert service for atomic +=" (← db.services.insert { slug := DbChecks.ServiceSlug.make "web", port := DbChecks.ServicePort.make 8080, altPort := none }) fun _ => do
-      for (lbl, op, want) in [("[roadmap] port incremented atomically", sqlAdd "port" (5 : Nat), some 8085), ("[roadmap] port decremented atomically", sqlSub "port" (3 : Nat), some 8082)] do
+      forList [("[roadmap] port incremented atomically", sqlAdd "port" (5 : Nat), some 8085), ("[roadmap] port decremented atomically", sqlSub "port" (3 : Nat), some 8082)] fun (lbl, op, want) => do
         c.checkOkBy lbl (← db.services.updateOneReturning [op] (.eq "slug" "web")) (·.map (·.port.val)) want
     c.checkOkBy "[roadmap] deleted 1 row" (← db.projects.delete (.eq "id" "p1")) id 1
 
@@ -318,7 +364,7 @@ private def runKeyRotationAndMetaSuite (c : TestChecker) (tmpDir : String) : IO 
   let cfg := DbChecks.RotatingVaultDb.config
   c.expectOk "[enc-rot] schema init" (← @MonadServer.dbExecDdl IO srvInst cfg) fun () => do
     let alice (fn : String) (req := ByteArray.empty) := @DbChecks.RotatingVaultApi.dispatchM IO _ srvInst { userId := some "alice" } fn req
-    for (id, label, sec) in [((1 : Nat), "stripe-live", "sk_live_alpha"), (2, "github-pat", "ghp_beta")] do
+    forList [((1 : Nat), "stripe-live", "sk_live_alpha"), (2, "github-pat", "ghp_beta")] fun (id, label, sec) => do
       c.expectOk s!"[enc-rot] save row {id} under K1" (← alice "save" (Qed.Proto.encode (id, (label, sec)))) fun _ => pure ()
     envRef.set []; decCountRef.set 0
     c.checkProtoBy (α := Array DbChecks.RotatingVaultDb.entries.Meta) "[enc-meta] selectMeta succeeds without encryption key" (← alice "listMeta") (·.map fun m => (m.id, m.label)) #[(1, "stripe-live"), (2, "github-pat")]
@@ -341,21 +387,21 @@ private def runKeyRotationAndMetaSuite (c : TestChecker) (tmpDir : String) : IO 
 private def runMultiTenantCrossTableSuite (c : TestChecker) (tmpDir : String) : IO Unit := do
   let srvInst := withRedirectedDb (.sqlitePath s!"{tmpDir}/multi_tenant.db")
   c.expectOk "[cross-rls] schema init" (← @MonadServer.dbExecDdl IO srvInst DbChecks.MultiTenantDb.config) fun () => do
-    let asUser (u : String) (fn : String) (req := ByteArray.empty) := @DbChecks.MultiTenantApi.dispatchM IO _ srvInst { userId := some u } fn req
-    for (u, id, name, orgId) in [("alice", "app1", "Alpha", none), ("alice", "app2", "Beta Org", some "org1"), ("bob", "app3", "Bob Private", none)] do
+    let asUser (u fn : String) (req := ByteArray.empty) := @DbChecks.MultiTenantApi.dispatchM IO _ srvInst { userId := some u } fn req
+    forList [("alice", "app1", "Alpha", none), ("alice", "app2", "Beta Org", some "org1"), ("bob", "app3", "Bob Private", none)] fun (u, id, name, orgId) => do
       c.expectOk s!"[cross-rls] {u} creates {id}" (← asUser u "createApp" (Qed.Proto.encode (id, (name, orgId)))) fun _ => pure ()
-    for (id, appId, u, role, status) in [("m1", "app1", "charlie", "admin", "accepted"), ("m2", "app1", "dave", "viewer", "accepted"), ("m3", "app1", "eve", "admin", "pending")] do
+    forList [("m1", "app1", "charlie", "admin", "accepted"), ("m2", "app1", "dave", "viewer", "accepted"), ("m3", "app1", "eve", "admin", "pending")] fun (id, appId, u, role, status) => do
       c.expectOk s!"[cross-rls] add {u} ({status} {role}) on {appId}" (← asUser "alice" "addMember" (Qed.Proto.encode (id, (appId, (u, (role, status)))))) fun _ => pure ()
     c.expectOk "[cross-rls] add frank in org1" (← asUser "alice" "addOrgMember" (Qed.Proto.encode ("om1", ("org1", "frank")))) fun _ => pure ()
-    for (tag, u, want) in [("alice sees own app1, app2", "alice", #["app1", "app2"]), ("charlie sees shared app1", "charlie", #["app1"]),
+    forList [("alice sees own app1, app2", "alice", #["app1", "app2"]), ("charlie sees shared app1", "charlie", #["app1"]),
         ("dave sees shared app1", "dave", #["app1"]), ("eve (pending) sees nothing", "eve", #[]),
-        ("frank (org1) sees org app2", "frank", #["app2"]), ("bob sees only own app3", "bob", #["app3"]), ("outsider sees nothing", "mallory", #[])] do
+        ("frank (org1) sees org app2", "frank", #["app2"]), ("bob sees only own app3", "bob", #["app3"]), ("outsider sees nothing", "mallory", #[])] fun (tag, u, want) => do
       c.checkProtoBy (α := Array DbChecks.MultiTenantDb.apps) s!"[cross-rls] {tag}" (← asUser u "listAccessibleApps") (·.map (·.id)) want
     c.checkProtoBy (α := Array DbChecks.MultiTenantDb.apps) "[cross-rls] listSharedApps for charlie returns [app1]" (← asUser "charlie" "listSharedApps") (·.map (·.id)) #["app1"]
-    for (tag, u, fn, newName, want) in [("dave (viewer) cannot rename app1", "dave", "renameAppAsAdmin", "Hacked", none),
+    forList [("dave (viewer) cannot rename app1", "dave", "renameAppAsAdmin", "Hacked", none),
         ("eve (pending admin) cannot rename app1", "eve", "renameAppAsAdmin", "PendingHack", none),
         ("charlie (accepted admin) renames app1 via role in [owner, admin]", "charlie", "renameAppAsAdmin", "Alpha v2", some "Alpha v2"),
-        ("charlie renames app1 via role == admin", "charlie", "renameAppAsSpecificAdmin", "Alpha v3", some "Alpha v3")] do
+        ("charlie renames app1 via role == admin", "charlie", "renameAppAsSpecificAdmin", "Alpha v3", some "Alpha v3")] fun (tag, u, fn, newName, want) => do
       c.checkProtoBy (α := Option DbChecks.MultiTenantDb.apps) s!"[cross-rls] {tag}" (← asUser u fn (Qed.Proto.encode ("app1", newName))) (·.map (·.name)) want
 
 def run : IO Bool := do

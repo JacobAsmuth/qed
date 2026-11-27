@@ -22,7 +22,7 @@ private def checkSourceMapJson (c : TestChecker) (tag : String) (mapPath : FileP
       c.checkJsonPath s!"{tag} sourcemap has non-empty VLQ mappings" sm "mappings" fun | .str m => !m.isEmpty && m.contains ";" | _ => false
 
 private def runPureVlqAndWatcherChecks (c : TestChecker) (scratch : String) : IO Unit := do
-  for (n, want) in [(0, "A"), (1, "C"), (-1, "D"), (16, "gB"), (-16, "hB"), (123, "2H")] do c.checkEq s!"VLQ encode {n}" (Js.encodeVlqInt n) want
+  forList [(0, "A"), (1, "C"), (-1, "D"), (16, "gB"), (-16, "hB"), (123, "2H")] fun (n, want) => c.checkEq s!"VLQ encode {n}" (Js.encodeVlqInt n) want
   let (seenIds, _, idsClean) := (List.range 400).foldl (init := (({} : Std.HashSet String), 0, true)) fun (seen, idx, ok) _ =>
     let (nm, nextIdx) := Js.nextShortIdent Js.jsMinReservedSet idx
     (seen.insert nm, nextIdx, ok && !seen.contains nm && !Js.jsMinReservedSet.contains nm && !nm.startsWith "$" && !nm.startsWith "_")
@@ -35,13 +35,13 @@ private def runPureVlqAndWatcherChecks (c : TestChecker) (scratch : String) : IO
       IO.FS.createDirAll (watchRoot / ".lake"); IO.FS.createDirAll watchRt
       -- Write fixture files from a short-lived child so concurrent `IO.Process.spawn` calls in sibling suites cannot inherit non-CLOEXEC writable FDs and emit delayed Linux `IN_CLOSE_WRITE` events.
       let writeInChild (path content : String) : IO Unit := discard <| runCmd "sh" #["-c", "printf '%s' \"$1\" > \"$2\"", "--", content, path]
-      for (p, s) in [(watchRoot / "Demo.lean", "def x := 1\n"), (watchRoot / "site.css", "body{}\n"), (watchRt / "qed_dev.mjs", "// v1\n")] do writeInChild p.toString s
+      forList [(watchRoot / "Demo.lean", "def x := 1\n"), (watchRoot / "site.css", "body{}\n"), (watchRt / "qed_dev.mjs", "// v1\n")] fun (p, s) => writeInChild p.toString s
       c.expectOk "OS file watcher opens cleanly" (← FileWatcher.open watchRoot.toString watchRt.toString #[".lake", ".git"]) fun w => do
         try
           writeInChild (watchRoot / ".lake" / "ignored.lean").toString "-- ignore\n"
           let evSkip ← w.wait 80; c.check "OS watcher ignores skipped .lake/ directory" (!evSkip.any && !evSkip.error) (reprStr evSkip)
-          for (label, path, content, proj) in [(".lean", watchRoot / "Demo.lean", "def x := 2\n", fun (e : WatchEvents) => e.lean),
-              (".css", watchRoot / "site.css", "body{color:red}\n", fun e => e.css), ("runtime .mjs", watchRt / "qed_dev.mjs", "// v2\n", fun e => e.runtime)] do
+          forList [(".lean", watchRoot / "Demo.lean", "def x := 2\n", fun (e : WatchEvents) => e.lean),
+              (".css", watchRoot / "site.css", "body{color:red}\n", fun e => e.css), ("runtime .mjs", watchRt / "qed_dev.mjs", "// v2\n", fun e => e.runtime)] fun (label, path, content, proj) => do
             let t ← IO.asTask (prio := .dedicated) (w.wait 1500); IO.sleep 30; writeInChild path.toString content
             let ev := (← IO.wait t).toOption.getD { lean := false, css := false, runtime := false, error := true }
             c.check s!"OS watcher detects {label} modification" (proj ev && !ev.error) (reprStr ev)
@@ -79,9 +79,9 @@ def run : IO Bool := do
     runCli "qed build succeeds" appDir #["build"]
     let distDir := appDir / "dist"; let manifestRaw ← IO.FS.readFile (distDir / "qed_manifest.json")
     let (hostPath, appPath) := (Qed.Json.pathStr manifestRaw "host", Qed.Json.pathStr manifestRaw "app")
-    for (key, pfx, p) in [("host", "qed_host", hostPath), ("app", "app", appPath), ("rt", "qed_rt", Qed.Json.pathStr manifestRaw "rt"), ("dom", "qed_dom", Qed.Json.pathStr manifestRaw "dom")] do
+    forList [("host", "qed_host", hostPath), ("app", "app", appPath), ("rt", "qed_rt", Qed.Json.pathStr manifestRaw "rt"), ("dom", "qed_dom", Qed.Json.pathStr manifestRaw "dom")] fun (key, pfx, p) =>
       c.check s!"manifest {key} hashed" (isHashedMjs pfx p) p
-    for (lbl, p, want) in [("unhashed dist/app.mjs removed", distDir / "app.mjs", false), ("dev client qed_dev.mjs omitted from prod dist", distDir / "qed_dev.mjs", false), ("native dist/server binary built", distDir / "server", true)] do
+    forList [("unhashed dist/app.mjs removed", distDir / "app.mjs", false), ("dev client qed_dev.mjs omitted from prod dist", distDir / "qed_dev.mjs", false), ("native dist/server binary built", distDir / "server", true)] fun (lbl, p, want) => do
       c.check lbl ((← p.pathExists) == want)
     let appJs ← IO.FS.readFile (distDir / dropChars appPath)
     c.checkAll [("app bundle contains qed_init", appJs.contains "qed_init"), ("app bundle exports qed_dehydrate for HMR", appJs.contains "qed_dehydrate"),
@@ -94,7 +94,7 @@ def run : IO Bool := do
       (withNativeServer c "standalone native server healthy" distDir.toString #[] (dev := false) fun srv => do
         c.checkHttp "SSR GET /" (← httpReq srv.port "GET" "/") (contains := ["<span>1</span>", hostPath])
         c.checkHttp "GET hashed asset" (← httpReq srv.port "GET" appPath) (headers := [("cache-control", some "public, max-age=31536000, immutable"), ("x-content-type-options", some "nosniff")])
-        for (lbl, p) in [("blocks /../dist-secret/leak.txt", "/../dist-secret/leak.txt"), ("blocks /%2e%2e%2fdist-secret/leak.txt", "/%2e%2e%2fdist-secret/leak.txt"), ("blocks symlink /escape.txt", "/escape.txt")] do
+        forList [("blocks /../dist-secret/leak.txt", "/../dist-secret/leak.txt"), ("blocks /%2e%2e%2fdist-secret/leak.txt", "/%2e%2e%2fdist-secret/leak.txt"), ("blocks symlink /escape.txt", "/escape.txt")] fun (lbl, p) =>
           c.checkRawNoLeak srv.port lbl p "TOP_SECRET_SIBLING"),
       (do
         let staticPort ← Prim.freePort
@@ -121,10 +121,10 @@ def run : IO Bool := do
     let withBenign := (validSrc.replace "<span>{quantity}</span>" "<span>{my_handler(my_step(quantity + initState - 1))}</span>\n      <small>{admitted_sorry_msg}</small>").replace "open Qed\n"
       ("open Qed\n\n-- comments mentioning sorry, admit, native_decide must be ignored\n/- nested /- block comment with sorry and admit -/ still comment -/\n" ++
        "def initState : Nat := 1\ndef my_handler (n : Nat) : Nat := n\ndef my_step (n : Nat) : Nat := n\ndef admitted_sorry_msg : String := \"We are sorry, please admit this item\"\n")
-    for (label, src, wantOk, wantSub) in [("benign comments/strings/client helpers pass qed check", withBenign, true, ""),
+    forList [("benign comments/strings/client helpers pass qed check", withBenign, true, ""),
         ("real sorry inside interpolated string rejected", validSrc ++ "\ndef badInterp : String := s!\"{(by sorry : Nat)}\" -- never emit\n", false, "forbidden token `sorry`"),
         ("partial def rejected by kernel gate", validSrc ++ "\npartial def spin (n : Nat) : Nat := spin n\n", false, "kernel gate: `partial` or `opaque` declaration `spin`"),
-        ("repeatM loop rejected by kernel gate", validSrc ++ "\ndef badRepeat (n : Nat) : Id Nat := repeatM (fun i => if i < n then pure (.inl (i + 1)) else pure (.inr i)) 0\n", false, "kernel gate: unbounded `while`/`repeat`/`partial_fixpoint` loop inside `badRepeat`")] do
+        ("repeatM loop rejected by kernel gate", validSrc ++ "\ndef badRepeat (n : Nat) : Id Nat := repeatM (fun i => if i < n then pure (.inl (i + 1)) else pure (.inr i)) 0\n", false, "kernel gate: unbounded `while`/`repeat`/`partial_fixpoint` loop inside `badRepeat`")] fun (label, src, wantOk, wantSub) => do
       IO.FS.writeFile appLean src
       let (code, out, err) ← runCmd cli #["check"] (cwd := some appDir) (env := cleanEnv); let combined := out ++ err
       c.check label ((code == 0) == wantOk && (wantSub.isEmpty || combined.contains wantSub)) combined

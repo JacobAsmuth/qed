@@ -10,31 +10,33 @@ declare_syntax_cat deployPreviewClause
 
 section DeployParsers
 open Lean Parser Qed.Lang
-private def kwP (kw : Name) (p : Parser) : Parser := withPosition (atomic (identEq kw) >> p)
+private def clauseP (k kw : Name) (p : Parser) : Parser := node k (withPosition (atomic (identEq kw) >> p))
 def deployUnitLit : Parser := node `Qed.Cloud.unitLit (numLit >> checkNoWsBefore "expected unit suffix without space" >> ident)
-@[deployPreviewClause_parser] def deployPreviewOnPrClause : Parser := leading_parser kwP `on_pr (identEq `true <|> identEq `false)
-@[deployPreviewClause_parser] def deployPreviewSubdomainClause : Parser := leading_parser kwP `subdomain strLit
-@[deployPreviewClause_parser] def deployPreviewDomainClause : Parser := leading_parser kwP `domain strLit
-@[deployPreviewClause_parser] def deployPreviewProtectionClause : Parser := leading_parser kwP `protection (identEq `team_only <|> identEq `anyone <|> symbol "public")
-@[deployPreviewClause_parser] def deployPreviewTtlClause : Parser := leading_parser kwP `ttl deployUnitLit
-@[deployClause_parser] def deployAppClause : Parser := leading_parser kwP `app ident
-@[deployClause_parser] def deployRegionsClause : Parser := leading_parser kwP `regions ("[" >> sepBy1 ident "," >> "]")
-@[deployClause_parser] def deployDomainClause : Parser := leading_parser kwP `domain strLit
-@[deployClause_parser] def deployComputeClause : Parser := leading_parser kwP `compute ident
-@[deployClause_parser] def deployTimeoutClause : Parser := leading_parser kwP `timeout deployUnitLit
-@[deployClause_parser] def deployPreviewBlockClause : Parser := leading_parser
-  kwP `preview (":" >> checkColGt "expected indented `preview:` clauses" >> many1Indent (categoryParser `deployPreviewClause 0))
-@[deployClause_parser] def deployInvClause : Parser := leading_parser
-  withPosition ("invariant " >> ident >> ":" >> sepBy1 (categoryParser `qedExpr 0) ",")
-@[command_parser] def deployCmd : Parser := leading_parser
-  withPosition ("deploy " >> ident >> ":" >> checkColGt "expected indented `deploy` clauses" >> many1Indent (categoryParser `deployClause 0))
+def deployPreviewOnPrClause : Parser := clauseP `Qed.Cloud.deployPreviewOnPrClause `on_pr (identEq `true <|> identEq `false)
+def deployPreviewSubdomainClause : Parser := clauseP `Qed.Cloud.deployPreviewSubdomainClause `subdomain strLit
+def deployPreviewDomainClause : Parser := clauseP `Qed.Cloud.deployPreviewDomainClause `domain strLit
+def deployPreviewProtectionClause : Parser := clauseP `Qed.Cloud.deployPreviewProtectionClause `protection (identEq `team_only <|> identEq `anyone <|> symbol "public")
+def deployPreviewTtlClause : Parser := clauseP `Qed.Cloud.deployPreviewTtlClause `ttl deployUnitLit
+@[deployPreviewClause_parser] def deployPreviewClauseP : Parser := opaqueP (
+  deployPreviewOnPrClause <|> deployPreviewSubdomainClause <|> deployPreviewDomainClause <|> deployPreviewProtectionClause <|> deployPreviewTtlClause)
+def deployAppClause : Parser := clauseP `Qed.Cloud.deployAppClause `app ident
+def deployRegionsClause : Parser := clauseP `Qed.Cloud.deployRegionsClause `regions ("[" >> sepBy1 ident "," >> "]")
+def deployDomainClause : Parser := clauseP `Qed.Cloud.deployDomainClause `domain strLit
+def deployComputeClause : Parser := clauseP `Qed.Cloud.deployComputeClause `compute ident
+def deployTimeoutClause : Parser := clauseP `Qed.Cloud.deployTimeoutClause `timeout deployUnitLit
+def deployPreviewBlockClause : Parser := clauseP `Qed.Cloud.deployPreviewBlockClause `preview (":" >> checkColGt "expected indented `preview:` clauses" >> many1Indent (categoryParser `deployPreviewClause 0))
+def deployInvClause : Parser := node `Qed.Cloud.deployInvClause (withPosition ("invariant " >> ident >> ":" >> sepBy1 (categoryParser `qedExpr 0) ","))
+@[deployClause_parser] def deployClauseP : Parser := opaqueP (
+  deployAppClause <|> deployRegionsClause <|> deployDomainClause <|> deployComputeClause <|> deployTimeoutClause <|> deployPreviewBlockClause <|> deployInvClause)
+@[command_parser] def deployCmd : Parser := opaqueP (node `Qed.Cloud.deployCmd
+  (withPosition ("deploy " >> ident >> ":" >> checkColGt "expected indented `deploy` clauses" >> many1Indent (categoryParser `deployClause 0))))
 end DeployParsers
 
 open Lean Elab Command Qed.Lang Qed.Server
 
 structure DeployInfo where
   (deployName specConst : Lean.Name) (spec : DeploySpec)
-deriving Inhabited, Repr
+deriving Inhabited
 
 initialize deployRegistry : Lean.SimplePersistentEnvExtension DeployInfo (Lean.NameMap DeployInfo) ←
   Qed.Diag.mkNameMapExt (·.deployName)
@@ -48,18 +50,23 @@ initialize deployRegistry : Lean.SimplePersistentEnvExtension DeployInfo (Lean.N
 private def regionTerm (r : GcpRegion) : Term := mkIdent (`Qed.Cloud.GcpRegion ++ Name.mkSimple (r.toString.replace "-" "_"))
 private def computeTerm (t : ComputeTier) : Term := mkIdent (`Qed.Cloud.ComputeTier ++ Name.mkSimple t.toString)
 
+private def optTerm {α : Type} (f : α → Term) : Option α → PureQuotM Term
+  | none => `(Option.none) | some v => `(Option.some $(f v))
+
 @[noinline] private def mkDeployHeaderCmdsPure (depIdent : Ident) (depName : Name) (d : DeploySpec) : PureQuotM (Array Command) := do
   let (specId, regTms) := (mkIdentFrom depIdent (depName ++ `spec), d.regions.toArray.map regionTerm)
   let hostTm ← match d.preview.host? with
-    | none => `(Option.none) | some (.exact h) => `(Option.some (Qed.Cloud.HostPattern.exact $(quote h)))
-    | some (.wildcard s) => `(Option.some (Qed.Cloud.HostPattern.wildcard $(quote s)))
+    | none => `(Option.none) | some (.exact h) => `(Option.some (Qed.Cloud.HostPattern.exact $(Syntax.mkStrLit h)))
+    | some (.wildcard s) => `(Option.some (Qed.Cloud.HostPattern.wildcard $(Syntax.mkStrLit s)))
   let protTm := mkIdent (match d.preview.protection with | .team_only => `Qed.Cloud.PreviewProtection.team_only | .pub => `Qed.Cloud.PreviewProtection.pub)
+  let domTm ← optTerm (fun s => (Syntax.mkStrLit s : Term)) d.domain?; let toTm ← optTerm (fun n => (Syntax.mkNumLit (toString n) : Term)) d.timeoutSec?
+  let subTm ← optTerm (fun s => (Syntax.mkStrLit s : Term)) d.preview.subdomain?; let enTm := mkIdent (if d.preview.enabled then ``true else ``false)
   let specTm ← `(({
-      name := $(quote d.name), appName := $(quote d.appName), regions := [$[$regTms:term],*], domain? := $(quote d.domain?),
-      compute := $(computeTerm d.compute), timeoutSec? := $(quote d.timeoutSec?),
-      preview := { enabled := $(quote d.preview.enabled), subdomain? := $(quote d.preview.subdomain?), host? := $hostTm, protection := $protTm, ttlSec := $(quote d.preview.ttlSec) }
+      name := $(Syntax.mkStrLit d.name), appName := $(Syntax.mkStrLit d.appName), regions := [$[$regTms:term],*], domain? := $domTm,
+      compute := $(computeTerm d.compute), timeoutSec? := $toTm,
+      preview := { enabled := $enTm, subdomain? := $subTm, host? := $hostTm, protection := $protTm, ttlSec := $(Syntax.mkNumLit (toString d.preview.ttlSec)) }
     } : Qed.Cloud.DeploySpec))
-  return #[← `(command| theorem $(mkIdentFrom depIdent (depName ++ `_qed_deploy_marker)) : True := True.intro),
+  return #[← Lang.mkMarkerThmPure (mkIdentFrom depIdent (depName ++ `_qed_deploy_marker)),
     ← `(command| @[noinline] def $specId : Qed.Cloud.DeploySpec := $specTm),
     ← `(command| theorem $(mkIdentFrom depIdent (depName ++ `spec_valid)) : ($specId).validate.isOk = true := by decide)]
 
@@ -108,57 +115,73 @@ private structure ParsedDeploy where
   (invs : Array (Ident × Array Syntax) := #[])
 
 @[noinline] private def parsePreviewBlock (depShort : String) (block : Syntax) : CommandElabM PreviewSpec := do
-  let mut preview : PreviewSpec := {}; let mut seen : Array Name := #[]; let mut rawPreviewDomain? : Option (Syntax × String) := none
-  for pc in (block.getArg 2).getArgs do
+  let (preview, _, rawPreviewDomain?) ← Lang.foldlCmd (block.getArg 2).getArgs (({} : PreviewSpec), (#[] : Array Name), (none : Option (Syntax × String))) fun (preview, seen, rawDom?) pc => do
     let pk := pc.getKind
     if seen.contains pk then throwErrorAt pc s!"duplicate clause in `preview:` of `deploy {depShort}`"
-    seen := seen.push pk
+    let seen := seen.push pk
     match pk with
-    | ``deployPreviewOnPrClause => preview := { preview with enabled := (pc.getArg 1).getId.eraseMacroScopes == `true }
+    | ``deployPreviewOnPrClause => return ({ preview with enabled := (pc.getArg 1).getId.eraseMacroScopes == `true }, seen, rawDom?)
     | ``deployPreviewSubdomainClause | ``deployPreviewDomainClause =>
       if seen.contains ``deployPreviewSubdomainClause && seen.contains ``deployPreviewDomainClause then
         throwErrorAt pc s!"cannot specify both `subdomain` and `domain` in `preview:` of `deploy {depShort}`"
       let s := (⟨pc.getArg 1⟩ : TSyntax `str).getString
-      if pk == ``deployPreviewSubdomainClause then preview := { preview with subdomain? := some s, host? := none } else rawPreviewDomain? := some (pc.getArg 1, s)
+      if pk == ``deployPreviewSubdomainClause then return ({ preview with subdomain? := some s, host? := none }, seen, rawDom?)
+      else return (preview, seen, some (pc.getArg 1, s))
     | ``deployPreviewProtectionClause =>
       let arg := pc.getArg 1
-      preview := { preview with protection := if arg.getAtomVal == "public" || arg.getId.eraseMacroScopes == `anyone then .pub else .team_only }
-    | ``deployPreviewTtlClause => preview := { preview with ttlSec := ← parseDurationUnit (pc.getArg 1) }
+      return ({ preview with protection := if arg.getAtomVal == "public" || arg.getId.eraseMacroScopes == `anyone then .pub else .team_only }, seen, rawDom?)
+    | ``deployPreviewTtlClause => return ({ preview with ttlSec := ← parseDurationUnit (pc.getArg 1) }, seen, rawDom?)
     | _ => throwErrorAt pc "unexpected clause in `preview:`"
   if let some (dRef, rawDom) := rawPreviewDomain? then
     let hp? := HostPattern.parse? rawDom
     if preview.enabled && hp?.isNone then throwErrorAt dRef s!"`deploy {depShort}`: invalid preview `domain` `{rawDom}` (expected RFC 1123 host or `*.example.com`)"
-    preview := { preview with host? := hp?, subdomain? := none }
+    return { preview with host? := hp?, subdomain? := none }
   return preview
+
+@[noinline] private def proveDeployInv (depShort : String) (fullDepName : Name) (specId invId : Ident) (exprs : Array Syntax) : CommandElabM Unit := do
+  let combined ← liftMacroM <| Qed.mkConjBody (← Lang.mapCmd exprs (lowerDeployInvExpr specId)) (ascribeProp := false)
+  let invLeaf := invId.getId.eraseMacroScopes
+  let proof? ← liftTermElabM do
+    let propExpr ← instantiateMVars (← Term.elabTermEnsuringType combined (some (mkSort Level.zero)))
+    Term.synthesizeSyntheticMVarsNoPostponing
+    let propExpr ← instantiateMVars propExpr
+    let savedMsgs ← Core.getMessageLog; Core.resetMessageLog
+    let res ← try
+      let mvar ← Meta.mkFreshExprSyntheticOpaqueMVar propExpr
+      let rem ← Elab.Tactic.run mvar.mvarId! do Elab.Tactic.evalTactic (← Lang.runPQTactic `(tactic| first | decide | (simp [$specId:ident] <;> omega)))
+      if rem.isEmpty && !(← Core.getMessageLog).hasErrors then pure (some (propExpr, ← instantiateMVars mvar)) else pure none
+    catch _ => pure none
+    Core.setMessageLog savedMsgs; return res
+  let some (propExpr, proofVal) := proof? | throwErrorAt invId s!"deploy invariant `{depShort}.{invLeaf}` failed to prove"
+  liftCoreM <| addDecl (.thmDecl { name := fullDepName ++ invLeaf, levelParams := [], type := propExpr, value := proofVal })
 
 @[noinline, command_elab deployCmd]
 def elabDeployCmd : CommandElab := fun stx => do
   let depIdent : Ident := ⟨stx.getArg 1⟩; let depName := depIdent.getId.eraseMacroScopes
   let (currNs, depShort) := (← getCurrNamespace, depName.toString); let fullDepName := currNs ++ depName
-  let mut p : ParsedDeploy := {}
-  for c in (stx.getArg 3).getArgs do
+  let p ← Lang.foldlCmd (stx.getArg 3).getArgs ({} : ParsedDeploy) fun p c => do
     let k := c.getKind
-    if k != ``deployInvClause then
-      if p.seenTop.contains k then throwErrorAt c s!"duplicate clause in `deploy {depShort}`"
-      p := { p with seenTop := p.seenTop.push k }
+    let p ← if k != ``deployInvClause then
+        if p.seenTop.contains k then throwErrorAt c s!"duplicate clause in `deploy {depShort}`"
+        pure { p with seenTop := p.seenTop.push k }
+      else pure p
     match k with
-    | ``deployAppClause => p := { p with appIdent? := some ⟨c.getArg 1⟩ }
+    | ``deployAppClause => return { p with appIdent? := some ⟨c.getArg 1⟩ }
     | ``deployRegionsClause =>
-      let mut regs : Array GcpRegion := #[]
-      for rId in (c.getArg 2).getSepArgs do
+      let regs ← Lang.foldlCmd (c.getArg 2).getSepArgs (#[] : Array GcpRegion) fun regs rId => do
         let r ← parseNamedEnum rId "GCP region" GcpRegion.parse? GcpRegion.allNames
         if regs.contains r then throwErrorAt rId s!"duplicate region `{rId.getId.eraseMacroScopes}` in `deploy {depShort}`"
-        regs := regs.push r
-      p := { p with regions? := some regs.toList, regionsRef? := some c }
-    | ``deployDomainClause => p := { p with domain? := some (⟨c.getArg 1⟩ : TSyntax `str).getString, domainRef? := some (c.getArg 1) }
-    | ``deployComputeClause => p := { p with compute? := some (← parseNamedEnum (c.getArg 1) "`compute` tier" ComputeTier.parse? ComputeTier.allNames) }
-    | ``deployTimeoutClause => p := { p with timeoutSec? := some (← parseDurationUnit (c.getArg 1)), timeoutRef? := some (c.getArg 1) }
-    | ``deployPreviewBlockClause => p := { p with preview := ← parsePreviewBlock depShort c, previewRef? := some c }
+        return regs.push r
+      return { p with regions? := some regs.toList, regionsRef? := some c }
+    | ``deployDomainClause => return { p with domain? := some (⟨c.getArg 1⟩ : TSyntax `str).getString, domainRef? := some (c.getArg 1) }
+    | ``deployComputeClause => return { p with compute? := some (← parseNamedEnum (c.getArg 1) "`compute` tier" ComputeTier.parse? ComputeTier.allNames) }
+    | ``deployTimeoutClause => return { p with timeoutSec? := some (← parseDurationUnit (c.getArg 1)), timeoutRef? := some (c.getArg 1) }
+    | ``deployPreviewBlockClause => return { p with preview := ← parsePreviewBlock depShort c, previewRef? := some c }
     | ``deployInvClause =>
       let invId : Ident := ⟨c.getArg 1⟩; let leaf := invId.getId.eraseMacroScopes
       if leaf == `spec || leaf == `spec_valid then throwErrorAt invId s!"invariant name `{leaf}` is reserved in `deploy {depShort}`"
       if p.invs.any (·.1.getId.eraseMacroScopes == leaf) then throwErrorAt invId s!"duplicate invariant `{leaf}` in `deploy {depShort}`"
-      p := { p with invs := p.invs.push (invId, (c.getArg 3).getSepArgs) }
+      return { p with invs := p.invs.push (invId, (c.getArg 3).getSepArgs) }
     | _ => throwErrorAt c s!"unexpected clause in `deploy {depShort}`"
   let some appIdent := p.appIdent? | throwErrorAt depIdent s!"`deploy {depShort}` must specify `app <FullstackOrServerOrComponent>`"
   let (env, openDecls) := (← getEnv, ← getOpenDecls)
@@ -181,28 +204,23 @@ def elabDeployCmd : CommandElab := fun stx => do
       s!"server `{srvInfo.shortName}` uses in-memory `state`, which can only run in a single region (`regions.length = 1`) to preserve `atomic:` and state invariants.\n\nHint: Deploy to a single region, or move mutable state into a `database` block to deploy multi-region."
     if !srvInfo.channels.isEmpty then if let some t := spec.timeoutSec? then
       failIf (p.timeoutRef?.getD depIdent) (t < 60) s!"server `{srvInfo.shortName}` declares WebSocket `channel`s, which require `timeout` >= `60s` on Cloud Run (got `{t}s`; omit `timeout` for the 3600s WebSocket default)."
-    for (nm, osKey, def?) in srvInfo.envVars do
-      if let some d := def? then failIf depIdent (isLocalhostUrl d) s!"server `{srvInfo.shortName}` `env {nm}` (`{osKey}`) has a loopback default (`{d}`), which must not ship to production."
-    for db in (Qed.Server.databaseRegistry.getState env).toList.filterMap (fun (_, di) => if srvInfo.databases.contains di.configConst then some di else none) do
+    Lang.foldlCmd srvInfo.envVars () fun () (nm, osKey, def?) =>
+      if let some d := def? then failIf depIdent (isLocalhostUrl d) s!"server `{srvInfo.shortName}` `env {nm}` (`{osKey}`) has a loopback default (`{d}`), which must not ship to production." else pure ()
+    let dbs := ((Qed.Server.databaseRegistry.getState env).toList.filterMap fun (_, di) => if srvInfo.databases.contains di.configConst then some di else none).toArray
+    Lang.foldlCmd dbs () fun () db => do
       failIf depIdent db.envSpecs.prod.isEphemeral s!"database `{db.shortName}` uses ephemeral SQLite in `prod`, which loses all data when Cloud Run recycles containers.\n\nHint: Use `managed postgres` (or BYO `postgres` / `turso` / `d1`) for production."
       failIf depIdent db.envSpecs.staging.isEphemeral s!"database `{db.shortName}` uses ephemeral SQLite in `staging`, which is forbidden on Cloud Run."
-      for e in DeployEnv.all do for sr in (db.envSpecs.get e).secrets do
-        failIf depIdent (!sr.allowedIn e) s!"database `{db.shortName}` binds pinned secret `{sr.envVar}` into `{e}`, violating environment secret isolation."
+      Lang.foldlCmd DeployEnv.all.toArray () fun () e =>
+        Lang.foldlCmd (db.envSpecs.get e).secrets.toArray () fun () sr =>
+          failIf depIdent (!sr.allowedIn e) s!"database `{db.shortName}` binds pinned secret `{sr.envVar}` into `{e}`, violating environment secret isolation."
     if let some ai := srvInfo.authName?.bind (Qed.Server.authRegistry.getState env).find? then
       failIf (p.previewRef?.getD depIdent) (ai.spec.isManaged && spec.preview.enabled && spec.preview.protection == .pub)
         s!"`auth {ai.shortName}` uses `managed` auth (which enables the persona-switcher Preview IdP on previews), so `preview:` cannot set `protection public`.\n\nHint: Set `protection team_only` inside `preview:`."
       if let some issDef := ai.spec.issuerDefault? then
         failIf depIdent (isLocalhostUrl issDef) s!"`auth {ai.shortName}` has a loopback `issuer` default (`{issDef}`), which must not ship to production.\n\nHint: Switch to `managed [...]` or remove the `?? \"{issDef}\"` fallback for production deployments."
   let specId := mkIdentFrom depIdent (depName ++ `spec)
-  for cmd in ← runPureQuot (mkDeployHeaderCmdsPure depIdent depName spec) do elabCommand cmd
-  for (invId, exprs) in p.invs do
-    let combined ← liftMacroM <| Qed.mkConjBody (← exprs.mapM (lowerDeployInvExpr specId)) (ascribeProp := false)
-    liftTermElabM <| discard <| Term.elabTermEnsuringType combined (some (mkSort Level.zero))
-    let invLeaf := invId.getId.eraseMacroScopes; let thmId := mkIdentFrom invId (depName ++ invLeaf)
-    let savedEnv ← getEnv; let savedMsgs ← modifyGet fun s => (s.messages, { s with messages := {} })
-    let ok ← try elabCommand (← `(command| set_option Elab.async false in theorem $thmId : $combined := by first | decide | (simp [$specId:ident] <;> omega))); pure !(← get).messages.hasErrors catch _ => pure false
-    if ok then modify fun s => { s with messages := savedMsgs ++ s.messages }
-    else setEnv savedEnv; modify fun s => { s with messages := savedMsgs }; throwErrorAt invId s!"deploy invariant `{depShort}.{invLeaf}` failed to prove"
+  Lang.elabPureCmds (mkDeployHeaderCmdsPure depIdent depName spec)
+  Lang.foldlCmd p.invs () fun () (invId, exprs) => proveDeployInv depShort fullDepName specId invId exprs
   modifyEnv fun e => deployRegistry.addEntry e { deployName := fullDepName, specConst := fullDepName ++ `spec, spec }
 
 end Qed.Cloud

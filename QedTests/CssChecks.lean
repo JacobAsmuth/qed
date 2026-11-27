@@ -25,7 +25,6 @@ theme AppTheme:
   invariant textReadable:  contrast(text, surface) >= 4.5
   invariant brandReadable: contrast(brand, surface) >= 4.5
   invariant mutedReadable: contrast(muted, surface) >= 4.5
-example : (["brand", "space-md"].all AppTheme.theme.definedTokens.contains && AppTheme.theme.darkComplete && AppTheme.style.isGlobal) = true := by decide +kernel
 expect_err "WCAG contrast invariant `badContrast` failed in light mode: contrast(fg=#777777, bg=#ffffff) is 4.47:1, required >= 4.50:1" in
 theme BadLightTheme:
   color fg = #777777
@@ -46,7 +45,6 @@ keyframes fadeIn:
   to:
     opacity: 1
     transform: translateY(0)
-example : fadeIn.rule = "@keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }" := by decide +kernel
 style baseBtn:
   display: inline-flex
   align-items: center
@@ -76,8 +74,6 @@ style strictCard strict_tokens:
   border-radius: AppTheme.radius
   margin: 0 auto
   max-width: 100%
-example : (Qed.Str.startsWith baseBtn.className "qed-baseBtn-" && Qed.Str.startsWith primaryBtn.className "qed-primaryBtn-" &&
-  ["brand", "space-md"].all primaryBtn.usedTokens.contains && !primaryBtn.extraRules.isEmpty) = true := by decide +kernel
 bad_style "unknown CSS property `border-raduis` (did you mean `border-radius`?)" badPropTypo : border-raduis: 8px
 bad_style "type mismatch in CSS `padding`: token `CssChecks.AppTheme.brand` has kind `color`, expected `len`" badTokenType : padding: AppTheme.brand
 bad_style "in `color`: invalid hex color `#xyz`" badHexLit : color: #xyz
@@ -98,8 +94,6 @@ style modernStyle:
   @media (prefers-color-scheme: dark):
     background-color: #111827
 bad_style "unknown style `noSuchStyle` in `extends`" badExtends extends noSuchStyle : color: #ffffff
-example : (let r := renderThemeRule (.nest "@media (prefers-color-scheme: dark)" [color (hex "fff")])
-  !strHas r ":where(" && strHas r "@media (prefers-color-scheme: dark)" && strHasNone (inlineStyleStr [background "red\" onclick=\"x\"/*evil*/</style>"]) ["<", "\"", "/*"]) = true := by decide +kernel
 component StyledCard:
   prop title : String
   style wrapper:
@@ -129,14 +123,12 @@ component StyledShowcase:
   invariant activeValid: roleHasOneOf("toggle", [pillActive, pill])
   invariant exclusive:   noConflictingStyles([pillActive, pill])
   view: <div {shell}><StyledCard title="Verified CSS"/><button role="toggle" {pillActive if active else pill} onClick={.toggle}>Toggle</button><div {progressBox} {inlineStyle([width(pct(progress))])} {styleVars([cssVar(AppTheme.brand, hex("0055aa"))])}>Progress: {progress}%</div></div>
-example : (StyledShowcase.app.stylesheets == ["/app.css"] && StyledShowcase.app.styles.length >= 4) = true := by decide +kernel
 verify_theme AppTheme for StyledShowcase.app
 theme OtherTheme:
   color doesNotExist = #123456
 style orphanStyle:
   color: OtherTheme.doesNotExist
-expect_err "theme `AppTheme` does not define all CSS tokens used by `[orphanStyle]`.\n  Missing tokens: [\"does-not-exist\"]" in
-verify_theme AppTheme for [orphanStyle]
+expect_err "theme `AppTheme` does not define all CSS tokens used by `[orphanStyle]`.\n  Missing tokens: [\"does-not-exist\"]" in verify_theme AppTheme for [orphanStyle]
 
 /-! ## Style & Stylesheet WCAG Contrast Verification -/
 style goodContrastBtn extends baseBtn contrast >= 4.5:

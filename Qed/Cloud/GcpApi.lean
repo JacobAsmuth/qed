@@ -1,6 +1,5 @@
 import Qed.Cloud.Compile
 import Qed.Json.Basic
-import Qed.Server.Http
 
 /-! ## Pure Verified GCP REST Wire Codecs & Live Drift Verifier (`Qed.Cloud.GcpApi`) -/
 
@@ -53,9 +52,11 @@ def sanitizeToken (s : String) (maxLen : Nat := 24) : String :=
 private def mkBounded (bound n : Nat) (lbl : String) : Except String (BoundedId bound) :=
   if h : n < bound then .ok ⟨n, h⟩ else .error s!"{lbl} {n} out of bounds (< {bound})"
 
+private def checkGcpProj (lbl pid : String) : Except String Unit :=
+  if isValidGcpProjectId pid then .ok () else .error s!"invalid GCP {lbl} project id `{pid}` (expected 5-30 chars `[a-z][a-z0-9-]*[a-z0-9]`)"
+
 def DeployKey.mkChecked (prodProjectId nonProdProjectId : String) (tNum aNum : Nat) (envKind : String) (prNum? : Option Nat := none) : Except String DeployKey := do
-  for (lbl, pid) in [("prod", prodProjectId), ("non-prod", nonProdProjectId)] do
-    if !isValidGcpProjectId pid then .error s!"invalid GCP {lbl} project id `{pid}` (expected 5-30 chars `[a-z][a-z0-9-]*[a-z0-9]`)"
+  checkGcpProj "prod" prodProjectId; checkGcpProj "non-prod" nonProdProjectId
   let shard ← ShardProject.mkPair prodProjectId nonProdProjectId
   let tenant ← mkBounded 1000000 tNum "tenant id"; let app ← mkBounded 100000 aNum "app id"
   let env ← match envKind with
@@ -91,20 +92,34 @@ def parseGcpMember (edgeSaEmail builderSaEmail : String) (key : DeployKey) (memb
 
 def GcpRole.all : List GcpRole := [.secretManagerAccessor, .runInvoker, .cloudSqlClient, .storageLegacyObjectReader, .storageObjectAdmin]
 def GcpRole.parse? (s : String) : Option GcpRole := GcpRole.all.find? (·.gcpName == s)
-def GcpPermission.all : List GcpPermission :=
-  [.secretAccessor, .runInvoke, .cloudSqlClient, .storageObjectViewer, .storageObjectAdmin, .iamSetPolicy, .iamActAs, .iamGetAccessToken, .iamSignJwt]
-def GcpPermission.gcpV2Name : GcpPermission → String
-  | .secretAccessor => "secretmanager.googleapis.com/versions.access" | .runInvoke => "run.googleapis.com/routes.invoke"
-  | .cloudSqlClient => "cloudsql.googleapis.com/instances.connect" | .storageObjectViewer => "storage.googleapis.com/objects.get"
-  | .storageObjectAdmin => "storage.googleapis.com/objects.create" | .iamSetPolicy => "iam.googleapis.com/serviceAccounts.setIamPolicy"
-  | .iamActAs => "iam.googleapis.com/serviceAccounts.actAs" | .iamGetAccessToken => "iam.googleapis.com/serviceAccounts.getAccessToken"
-  | .iamSignJwt => "iam.googleapis.com/serviceAccounts.signJwt"
+private def permV2Table : List (GcpPermission × String) := [
+  (.secretAccessor, "secretmanager.googleapis.com/versions.access"), (.runInvoke, "run.googleapis.com/routes.invoke"),
+  (.cloudSqlClient, "cloudsql.googleapis.com/instances.connect"), (.storageObjectViewer, "storage.googleapis.com/objects.get"),
+  (.storageObjectAdmin, "storage.googleapis.com/objects.create"), (.iamSetPolicy, "iam.googleapis.com/serviceAccounts.setIamPolicy"),
+  (.iamActAs, "iam.googleapis.com/serviceAccounts.actAs"), (.iamGetAccessToken, "iam.googleapis.com/serviceAccounts.getAccessToken"),
+  (.iamSignJwt, "iam.googleapis.com/serviceAccounts.signJwt")]
+def GcpPermission.all : List GcpPermission := permV2Table.map Prod.fst
+def GcpPermission.gcpV2Name (p : GcpPermission) : String := (permV2Table.find? (·.1 == p)).map Prod.snd |>.getD ""
 def GcpResource.denyPolicyId : GcpResource → String
   | .cloudRun _ => "deny-qed-run-public" | .secret _ _ => "deny-qed-secrets-public" | .cloudSqlDb _ _ _ => "deny-qed-sql-public"
   | .assetPrefix _ _ _ => "deny-qed-gcs-public" | .project _ => "deny-qed-project-public"
 def isImmutableAssetPath (relPath : String) : Bool :=
-  let clean := trimLeadingSlash relPath; Qed.Server.Http.isContentHashedAsset (if clean.endsWith ".map" then (clean.dropEnd 4).toString else clean)
-def assetMimeType (relPath : String) : String := (Qed.Server.Http.guessMimeType relPath).getD "application/octet-stream"
+  let clean := trimLeadingSlash relPath; let base := if clean.endsWith ".map" then (clean.dropEnd 4).toString else clean
+  let leaf := (Qed.Str.splitChar base '/').reverse.headD base
+  match (Qed.Str.splitChar leaf '.').reverse with
+  | ext :: hash :: stem :: _ => !stem.isEmpty && ["mjs", "js", "css"].contains ext.toLower && 8 ≤ hash.length && hash.length ≤ 16 && hash.toList.all fun c => ('0' ≤ c && c ≤ '9') || ('a' ≤ c && c ≤ 'f')
+  | _ => false
+def assetMimeType (relPath : String) : String :=
+  match (relPath.splitOn ".").reverse with
+  | ext :: _ :: _ => match ext.toLower with
+      | "mjs" | "js" => "text/javascript; charset=utf-8" | "css" => "text/css; charset=utf-8" | "html" => "text/html; charset=utf-8"
+      | "json" | "map" => "application/json; charset=utf-8" | "webmanifest" => "application/manifest+json; charset=utf-8"
+      | "xml" => "application/xml; charset=utf-8" | "txt" => "text/plain; charset=utf-8" | "pdf" => "application/pdf"
+      | "svg" => "image/svg+xml" | "png" => "image/png" | "jpg" | "jpeg" => "image/jpeg" | "gif" => "image/gif"
+      | "webp" => "image/webp" | "avif" => "image/avif" | "ico" => "image/x-icon" | "wasm" => "application/wasm"
+      | "woff2" => "font/woff2" | "woff" => "font/woff" | "ttf" => "font/ttf" | "otf" => "font/otf"
+      | "mp4" => "video/mp4" | "webm" => "video/webm" | "mp3" => "audio/mpeg" | "ogg" => "audio/ogg" | _ => "application/octet-stream"
+  | _ => "application/octet-stream"
 
 /-! ### 3. Pure ETag-, Condition-, & AuditConfig-Safe IAM Policy Model -/
 
@@ -117,14 +132,16 @@ structure IamPolicyDoc where (version : Nat := 3) (etag : String := "") (binding
 deriving Inhabited
 instance : BEq IamPolicyDoc := ⟨fun a b => a.version == b.version && a.etag == b.etag && a.bindings == b.bindings && optJsonEq a.auditConfigs? b.auditConfigs?⟩
 
+@[noinline, nospecialize] private def fld {α : Type} [FromJsonField α] (j : Json) (k : String) : Except String α := fromField j k
+
 private instance : ToJson IamPolicyEntry := ⟨fun e => .obj <| [("role", .str e.role), ("members", toJson e.members)] ++ optJsonField "condition" e.condition?⟩
-private instance : FromJson IamPolicyEntry := ⟨fun j => do return { role := ← fromField j "role", members := ← fromField j "members", condition? := ← fromField j "condition" }⟩
+private instance : FromJson IamPolicyEntry := ⟨fun j => do return { role := ← fld j "role", members := ← fld j "members", condition? := ← fld j "condition" }⟩
 
 def IamPolicyDoc.toJson (p : IamPolicyDoc) : Json :=
   .obj <| [("version", ToJson.toJson p.version)] ++ optStrField "etag" p.etag ++ [("bindings", ToJson.toJson p.bindings)] ++ optJsonField "auditConfigs" p.auditConfigs?
 def IamPolicyDoc.fromJson (j : Json) : Except String IamPolicyDoc := do
   return { version := (j.natAt? "version").getD 3, etag := j.strAtD "etag",
-           bindings := (← fromField (α := Option (List IamPolicyEntry)) j "bindings").getD [], auditConfigs? := ← fromField j "auditConfigs" }
+           bindings := (← fld (α := Option (List IamPolicyEntry)) j "bindings").getD [], auditConfigs? := ← fld j "auditConfigs" }
 
 def IamPolicyDoc.addBinding (p : IamPolicyDoc) (role member : String) : IamPolicyDoc :=
   if p.bindings.any fun e => e.role == role && e.condition?.isNone then
@@ -426,7 +443,7 @@ deriving Inhabited
   ("env", match k.env with | .prod => mkKindObj "prod" | .staging => mkKindObj "staging" | .preview pr => mkKindObj "preview" [("pr", toJson pr.num)])]
 @[noinline] private def deployKeyFromJson (j : Json) : Except String DeployKey := do
   let envJ ← j.field "env"
-  DeployKey.mkChecked (← fromField j "prodProjectId") (← fromField j "nonProdProjectId") (← fromField j "tenant") (← fromField j "app") (← fromField envJ "kind") (← fromField envJ "pr")
+  DeployKey.mkChecked (← fld j "prodProjectId") (← fld j "nonProdProjectId") (← fld j "tenant") (← fld j "app") (← fld envJ "kind") (← fld envJ "pr")
 instance : ToJson DeployKey := ⟨deployKeyToJson⟩
 instance : FromJson DeployKey := ⟨deployKeyFromJson⟩
 private def dbClusterStr : DbCluster → String | .prodCluster => "prod" | .nonProdCluster => "nonProd"
@@ -444,37 +461,26 @@ private def unitPrincipals : List (String × GcpPrincipal) := [("allUsers", .all
   | .runtimeSa k => mkKindObj "runtimeSa" [("key", toJson k)] | .external e => mkKindObj "external" [("email", .str e)]
   | p => mkKindObj ((unitPrincipals.find? (·.2 == p)).map Prod.fst |>.getD "allUsers")
 @[noinline] private def gcpPrincipalFromJson (j : Json) : Except String GcpPrincipal := do
-  let k : String ← fromField j "kind"
+  let k : String ← fld j "kind"
   if let some (_, p) := unitPrincipals.find? (·.1 == k) then return p
-  match k with | "runtimeSa" => return .runtimeSa (← fromField j "key") | "external" => return .external (← fromField j "email") | other => .error s!"unknown principal kind `{other}`"
+  match k with | "runtimeSa" => return .runtimeSa (← fld j "key") | "external" => return .external (← fld j "email") | other => .error s!"unknown principal kind `{other}`"
 private instance : ToJson GcpPrincipal := ⟨gcpPrincipalToJson⟩
 private instance : FromJson GcpPrincipal := ⟨gcpPrincipalFromJson⟩
 @[noinline] private def gcpResourceToJson : GcpResource → Json
   | .secret k s => mkKindObj "secret" [("key", toJson k), ("name", .str s)] | .cloudRun k => mkKindObj "cloudRun" [("key", toJson k)]
   | .cloudSqlDb c k db => mkKindObj "cloudSqlDb" [("cluster", toJson c), ("key", toJson k), ("db", .str db)]
   | .assetPrefix k h pub => mkKindObj "assetPrefix" [("key", toJson k), ("hash", .str h), ("isPublic", .bool pub)] | .project p => mkKindObj "project" [("projectId", .str p)]
-@[noinline] private def gcpResourceFromJson (j : Json) : Except String GcpResource := do match (← fromField (α := String) j "kind") with
-  | "secret" => return .secret (← fromField j "key") (← fromField j "name") | "cloudRun" => return .cloudRun (← fromField j "key")
-  | "cloudSqlDb" => return .cloudSqlDb (← fromField j "cluster") (← fromField j "key") (← fromField j "db")
-  | "assetPrefix" => return .assetPrefix (← fromField j "key") (← fromField j "hash") ((← fromField (α := Option Bool) j "isPublic").getD true)
-  | "project" => let p : String ← fromField j "projectId"; if !isValidGcpProjectId p then .error s!"invalid project resource id `{p}`" else return .project p
+@[noinline] private def gcpResourceFromJson (j : Json) : Except String GcpResource := do match (← fld (α := String) j "kind") with
+  | "secret" => return .secret (← fld j "key") (← fld j "name") | "cloudRun" => return .cloudRun (← fld j "key")
+  | "cloudSqlDb" => return .cloudSqlDb (← fld j "cluster") (← fld j "key") (← fld j "db")
+  | "assetPrefix" => return .assetPrefix (← fld j "key") (← fld j "hash") ((← fld (α := Option Bool) j "isPublic").getD true)
+  | "project" => let p : String ← fld j "projectId"; if !isValidGcpProjectId p then .error s!"invalid project resource id `{p}`" else return .project p
   | other => .error s!"unknown resource kind `{other}`"
 private instance : ToJson GcpResource := ⟨gcpResourceToJson⟩
 private instance : FromJson GcpResource := ⟨gcpResourceFromJson⟩
-@[noinline] private def gcpIamBindingToJson (b : GcpIamBinding) : Json := .obj [("principal", toJson b.principal), ("role", toJson b.role), ("resource", toJson b.resource)]
-@[noinline] private def gcpIamBindingFromJson (j : Json) : Except String GcpIamBinding := do return { principal := ← fromField j "principal", role := ← fromField j "role", resource := ← fromField j "resource" }
-private instance : ToJson GcpIamBinding := ⟨gcpIamBindingToJson⟩
-private instance : FromJson GcpIamBinding := ⟨gcpIamBindingFromJson⟩
-@[noinline] private def gcpDenyRuleToJson (d : GcpDenyRule) : Json := .obj [("principals", toJson d.principals), ("permissions", toJson d.permissions), ("resource", toJson d.resource)]
-@[noinline] private def gcpDenyRuleFromJson (j : Json) : Except String GcpDenyRule := do return { principals := ← fromField j "principals", permissions := ← fromField j "permissions", resource := ← fromField j "resource" }
-private instance : ToJson GcpDenyRule := ⟨gcpDenyRuleToJson⟩
-private instance : FromJson GcpDenyRule := ⟨gcpDenyRuleFromJson⟩
-@[noinline] private def scaleSpecToJson (s : ScaleSpec) : Json := .obj [("minInstances", toJson s.minInstances), ("maxInstances", toJson s.maxInstances), ("memoryMb", toJson s.memoryMb), ("cpuMilli", toJson s.cpuMilli), ("concurrency", toJson s.concurrency), ("timeoutSec", toJson s.timeoutSec)]
-@[noinline] private def scaleSpecFromJson (j : Json) : Except String ScaleSpec := do
-  return { minInstances := ← fromField j "minInstances", maxInstances := ← fromField j "maxInstances", memoryMb := ← fromField j "memoryMb",
-           cpuMilli := ← fromField j "cpuMilli", concurrency := ← fromField j "concurrency", timeoutSec := ← fromField j "timeoutSec" }
-private instance : ToJson ScaleSpec := ⟨scaleSpecToJson⟩
-private instance : FromJson ScaleSpec := ⟨scaleSpecFromJson⟩
+json_obj_codec% private GcpIamBinding [principal, role, resource]
+json_obj_codec% private GcpDenyRule [principals, permissions, resource]
+json_obj_codec% private ScaleSpec [minInstances, maxInstances, memoryMb, cpuMilli, concurrency, timeoutSec]
 
 private def reqPlan (ok : Bool) (msg : String) : Except String Unit := if ok then .ok () else .error s!"GcpPlan.fromJson: {msg}"
 @[noinline, nospecialize] private def reqPlanAll {α : Type} (xs : List α) (ok : α → Bool) (msg : α → String) : Except String Unit := xs.forM fun x => reqPlan (ok x) (msg x)
@@ -516,10 +522,10 @@ private def reqPlan (ok : Bool) (msg : String) : Except String Unit := if ok the
 
 @[noinline] def GcpPlan.fromJson (j : Json) : Except String GcpPlan := do
   let p : GcpPlan := {
-    key := ← fromField j "key", buildHash := ← fromField j "buildHash", regions := ← fromField j "regions", scale := ← fromField j "scale",
-    serviceAccountId := ← fromField j "serviceAccountId", cloudRunName := ← fromField j "cloudRunName", secretNames := ← fromField j "secretNames",
-    managedDbs := ← fromField j "managedDbs", assetPaths := ← fromField j "assetPaths", egressAllow := ← fromField j "egressAllow",
-    bindings := ← fromField j "bindings", denies := ← fromField j "denies" }
+    key := ← fld j "key", buildHash := ← fld j "buildHash", regions := ← fld j "regions", scale := ← fld j "scale",
+    serviceAccountId := ← fld j "serviceAccountId", cloudRunName := ← fld j "cloudRunName", secretNames := ← fld j "secretNames",
+    managedDbs := ← fld j "managedDbs", assetPaths := ← fld j "assetPaths", egressAllow := ← fld j "egressAllow",
+    bindings := ← fld j "bindings", denies := ← fld j "denies" }
   validateGcpPlan p; return p
 
 /-! ### 6. Pure Live Security Drift Verifier (`checkDrift`, `checkDriftLive`) & Universal Theorems -/

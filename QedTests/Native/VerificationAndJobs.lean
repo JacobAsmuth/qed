@@ -4,6 +4,7 @@ import Cli.Common
 import QedTests.Native.Harness
 import QedTests.CssChecks
 import QedTests.SyntaxChecks
+import QedTests.VerificationChecks
 open System (FilePath)
 open Qed Qed.Server
 
@@ -81,7 +82,7 @@ private def runLocalDomJsTest (c : TestChecker) : IO Unit := do
   let (root, qedjs, lp) := (← IO.currentDir, ← qedjsBinPath, ← getLeanPath)
   withTempDir "qed-local-dom-test" fun dir => do
     let outDir := FilePath.mk dir
-    for f in ["qed_rt.mjs", "qed_dom.mjs", "qed_host.mjs"] do IO.FS.writeFile (outDir / f) (← IO.FS.readFile (root / "runtime" / f))
+    forList ["qed_rt.mjs", "qed_dom.mjs", "qed_host.mjs"] fun f => do IO.FS.writeFile (outDir / f) (← IO.FS.readFile (root / "runtime" / f))
     let entries := Qed.Cli.driverEntries.map (fun e => if e == "main:__main" then "JsGate.localBugsMain:__main" else e) ++ #["JsGate.localBugsSsrPage1:ssr_page1", "JsGate.localBugsStatePage1:state_page1"]
     let (jc, jo, je) ← runCmd qedjs (#["--rt", (root / "runtime" / "qed_rt.mjs").toString, (outDir / "app.mjs").toString, "QedTests.JsGate", "--"] ++ entries) (cwd := some root) (env := #[("LEAN_PATH", some lp)])
     c.check "qedjs compiles LocalBugsApp fixture" (jc == 0) (jo ++ je)
@@ -93,10 +94,48 @@ private def runLocalDomJsTest (c : TestChecker) : IO Unit := do
 section MovedChecks
 open CssChecks SyntaxChecks
 
-private def runMovedCssAndSyntaxChecks (c : TestChecker) : IO Unit := do
-  let hasAll (s : String) (xs : List String) := xs.all (s.contains ·)
-  let rt {α β : Type} [BEq α] (enc : α → β) (dec : β → Except String α) (x : α) := (dec (enc x)).toOption == some x
+@[noinline, nospecialize] private def rt {α β : Type} [BEq α] (enc : α → β) (dec : β → Except String α) (x : α) : Bool :=
+  (dec (enc x)).toOption == some x
+
+@[noinline] private def runMovedCssChecks (c : TestChecker) : IO Unit := do
   let showcaseCss := renderStyleSheet StyledShowcase.app.styles
+  c.checkAll [
+    ("[css] AppTheme.style.raw renders :root, dark media/attr, & reset + theme/keyframes/style metadata",
+      hasAll AppTheme.style.raw [":root {", "@media (prefers-color-scheme: dark)", "[data-theme=\"dark\"]", ":where(*) { box-sizing: border-box; margin: 0; }"] &&
+      ["brand", "space-md"].all AppTheme.theme.definedTokens.contains && AppTheme.theme.darkComplete && AppTheme.style.isGlobal &&
+      fadeIn.rule == "@keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }" &&
+      Qed.Str.startsWith baseBtn.className "qed-baseBtn-" && Qed.Str.startsWith primaryBtn.className "qed-primaryBtn-" &&
+      ["brand", "space-md"].all primaryBtn.usedTokens.contains && !primaryBtn.extraRules.isEmpty &&
+      (let r := renderThemeRule (.nest "@media (prefers-color-scheme: dark)" [color (hex "fff")])
+       !r.contains ":where(" && r.contains "@media (prefers-color-scheme: dark)" && ["<", "\"", "/*"].all (!(inlineStyleStr [background "red\" onclick=\"x\"/*evil*/</style>"]).contains ·)) &&
+      StyledShowcase.app.stylesheets == ["/app.css"] && StyledShowcase.app.styles.length >= 4),
+    ("[css] primaryBtn.raw extends baseBtn, overrides border, & attaches fadeIn keyframes",
+      hasAll primaryBtn.raw ["background-color: var(--brand);", "border: 1px solid var(--brand);", "&:hover { opacity: 1; transform: translateY(-1px); }", "@media (max-width: 600px) { width: 100%; }"] && !primaryBtn.raw.contains "#d1d5db" && primaryBtn.extraRules.any (·.contains "@keyframes fadeIn")),
+    ("[css] modernStyle.raw renders dvh/clamp/oklch/dark media", hasAll modernStyle.raw ["box-sizing: border-box;", "min-height: 100dvh;", "clamp(20rem, 50vw, 45rem)", "oklch(0.6 0.15 250)", "@media (prefers-color-scheme: dark)"]),
+    ("[css] renderStyleSheet StyledShowcase + renderDocument stylesheet link",
+      hasAll showcaseCss [":root {", "@media (prefers-color-scheme: dark)", StyledCard.wrapper.className, StyledShowcase.shell.className, StyledShowcase.pillActive.className, "border-radius: 999px;", "padding: 0.5rem; margin-top: 1rem;"] &&
+      (renderDocument "Demo" "" (stylesheets := StyledShowcase.app.stylesheets)).contains "<link rel=\"stylesheet\" href=\"/app.css\">")]
+
+@[noinline] private def runMovedVerChecks (c : TestChecker) : IO Unit := do
+  let d : Qed.Dict String Nat := Qed.Dict.ofList [("alice", 10), ("bob", 20)]
+  let (s0, _) := VerificationChecks.HoistedDashboard.update VerificationChecks.HoistedDashboard.init (._onSession (some "alice"))
+  let (s1, c1) := VerificationChecks.HoistedDashboard.update s0 (._sub_0 .tick)
+  let (s2, c2) := VerificationChecks.HoistedDashboard.update s1 (.setTab .t1)
+  let (s3, _) := VerificationChecks.HoistedDashboard.update s2 (._sub_1 .pick)
+  let (e1, eo1, _) := VerificationChecks.HoistedEmitter.update VerificationChecks.HoistedEmitter.init .finish
+  let (e2, eo2, _) := VerificationChecks.HoistedEmitter.update e1 .hide
+  c.check "[ver] Base64, FileBytes, pickFileBytes, Dict JSON/Proto, & HoistedDashboard/HoistedEmitter" (
+    Qed.Base64.encode (ByteArray.mk #[0, 1, 2, 255]) == "AAEC/w==" &&
+    (match Qed.FileBytes.decode "{\"name\":\"pic.png\",\"mime\":\"image/png\",\"size\":4,\"base64\":\"AAEC/w==\"}" with | .ok fb => (fb.name, fb.mime, fb.size, fb.bytes.data) == ("pic.png", "image/png", 4, #[0, 1, 2, 255]) | .error _ => false) &&
+    (match Qed.FileBytes.decode "{\"error\":\"file too large\"}" with | .error "file too large" => true | .error _ | .ok _ => false) &&
+    (match Qed.Cmd.pickFileBytes (msg := Unit) "image/*" 4096 (fun _ => ()) with | .fxResult "file.pickBytes" "image/*" "4096" _ => true | _ => false) &&
+    Qed.Json.render (Qed.toJson d) == "{\"alice\":10,\"bob\":20}" && Qed.Proto.decode (α := Qed.Dict String Nat) (Qed.Proto.encode d) == .ok d &&
+    s1._sub_0.ticks == 1 && (match c1 with | .none => true | _ => false) && s2._sub_0.ticks == 0 && s2._sub_1.user == some "alice" &&
+    (match c2 with | .batch [.none, .port "ping" "\"boot\""] => true | _ => false) && s3.lastPick == "b" &&
+    (match eo1 with | some (.done true) => true | _ => false) && eo2.isNone && e2.showPane == false)
+
+@[noinline] private def runMovedCssAndSyntaxChecks (c : TestChecker) : IO Unit := do
+  runMovedCssChecks c; runMovedVerChecks c
   let ssr := Html.renderWith Counter.regs (<div><style>{".a > .b { content: \"</style>\"; }"}</style><br/>{defaults}</div> : Html Unit)
   let (draft, vd) : Ticket.Draft × Ticket.Draft := ({ title := "Fix parser", priority := "2" }, { title := "Fix bug", priority := "3", kind := "bug" })
   let (jx, jxElseT, jxElseF) := (Html.render (jsxErgonomicsView #[1, 2] (some "ok") true), Html.render (jsxElseBranchesView (some "hi") true [<span>ex</span>]), Html.render (jsxElseBranchesView none false [<span>ex</span>]))
@@ -124,13 +163,6 @@ private def runMovedCssAndSyntaxChecks (c : TestChecker) : IO Unit := do
   let c0 : Cached Nat := ({} : Cached Nat).setKey "k" 10; let c1 := c0.updateCurrent "k" (· + 5); let c2 := c1.map (· * 2); let c3 := c2.invalidateKey "k"
   let (cOk, cLoad, cIdle) : Cached Nat × Cached Nat × Cached Nat := ({ state := .ok 8 }, { state := .loading }, { state := .idle })
   c.checkAll [
-    ("[css] AppTheme.style.raw renders :root, dark media/attr, & reset", hasAll AppTheme.style.raw [":root {", "@media (prefers-color-scheme: dark)", "[data-theme=\"dark\"]", ":where(*) { box-sizing: border-box; margin: 0; }"]),
-    ("[css] primaryBtn.raw extends baseBtn, overrides border, & attaches fadeIn keyframes",
-      hasAll primaryBtn.raw ["background-color: var(--brand);", "border: 1px solid var(--brand);", "&:hover { opacity: 1; transform: translateY(-1px); }", "@media (max-width: 600px) { width: 100%; }"] && !primaryBtn.raw.contains "#d1d5db" && primaryBtn.extraRules.any (·.contains "@keyframes fadeIn")),
-    ("[css] modernStyle.raw renders dvh/clamp/oklch/dark media", hasAll modernStyle.raw ["box-sizing: border-box;", "min-height: 100dvh;", "clamp(20rem, 50vw, 45rem)", "oklch(0.6 0.15 250)", "@media (prefers-color-scheme: dark)"]),
-    ("[css] renderStyleSheet StyledShowcase + renderDocument stylesheet link",
-      hasAll showcaseCss [":root {", "@media (prefers-color-scheme: dark)", StyledCard.wrapper.className, StyledShowcase.shell.className, StyledShowcase.pillActive.className, "border-radius: 999px;", "padding: 0.5rem; margin-top: 1rem;"] &&
-      (renderDocument "Demo" "" (stylesheets := StyledShowcase.app.stylesheets)).contains "<link rel=\"stylesheet\" href=\"/app.css\">"),
     ("[syn] SSR Counter, Owned, style escape, DocRoute/RepoRoute, Rehydrate, JSX ergonomics",
       (Html.renderWith Counter.regs defaults).contains "8</button>" && (Html.render (<Owned state={{ id = 4, count = 2 }} caption="Live" onMsg={Prod.mk}/> : Html (String × Owned.Msg))).contains "Live" &&
       hasAll ssr [".a > .b", "<\\/style>", "8</button>"] && !ssr.contains "</br>" && Router.toURL (DocRoute.sec .architecture 2) == "/docs/arch/2" &&
@@ -230,10 +262,10 @@ def run : IO Bool := do
     let srvInst : MonadServer IO := Qed.Server.Native.mkNativeServerInst none
     let mkJobs := do let box ← Prim.mkStateBox JobRunnerDemo.initState; return (box, JobRunnerDemo.jobs.map (·.toIoJob srvInst (Qed.Server.Native.withStateBox box)), ← IO.mkRef false)
     let (box, ioJobs, stopFlag) ← mkJobs; c.checkEq "JobRunnerDemo job count" ioJobs.size 2
-    for t in ← Qed.Server.runServerJobs ioJobs (stopFlag? := some stopFlag) (maxTicks := 5) do if let .error e ← IO.wait t then c.check "job task exited cleanly" false (toString e)
+    (← Qed.Server.runServerJobs ioJobs (stopFlag? := some stopFlag) (maxTicks := 5)).forM fun t => do if let .error e ← IO.wait t then c.check "job task exited cleanly" false (toString e)
     let st1 ← Prim.atomicRead box id; c.checkEq "heartbeat & markReset ran 5 ticks" (st1.ticks, st1.resets) (5, 5); c.check "final state preserves bounded invariant" (st1.ticks ≤ 50)
     let (box2, ioJobs2, stopFlag2) ← mkJobs; let tasks2 ← Qed.Server.spawnServerJobs ioJobs2 (stopFlag? := some stopFlag2) (maxTicks := 1000)
-    IO.sleep 60; stopFlag2.set true; for t in tasks2 do discard <| IO.wait t
+    IO.sleep 60; stopFlag2.set true; tasks2.forM fun t => discard <| IO.wait t
     let st2 ← Prim.atomicRead box2 id; c.check "background job ticked before stopFlag" (st2.ticks ≥ 1 && st2.ticks < 50))]
   c.finish
 

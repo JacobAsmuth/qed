@@ -5,6 +5,7 @@ import Cli.Verify
 import Cli.Build
 import Cli.Cloud
 import QedTests.Native.Harness
+import QedTests.CloudChecks
 open Qed Qed.Cloud Qed.Cloud.Protocol QedTests.Native
 
 namespace QedTests.Native.CloudDeploy
@@ -69,7 +70,7 @@ private structure MockSvc where
 deriving Inhabited
 private structure MockUpload where
   (bucket name cacheControl content boundary : String)
-deriving Inhabited, BEq, Repr
+deriving Inhabited
 private structure MockGcpState where
   reqs : Array MockReq := #[]
   etagSeq : Nat := 1
@@ -106,34 +107,34 @@ private def handleMockGcp (stRef : IO.Ref MockGcpState) (portRef : IO.Ref UInt16
     (method target : String) (hdrs : Array (String × String)) (body : ByteArray) : IO (Nat × String × ByteArray) := do
   let bodyStr := utf8Str body; let (path, query) := splitPathQuery target; let qParams := Qed.Auth.parseQueryParams query
   let lastSeg := (path.splitOn "/").getLastD ""; let jo (ps : List (String × Json)) := jsonResp 200 (.obj ps)
+  let withJson (k : Json → IO (Nat × String × ByteArray)) := match Json.parse bodyStr with | .ok j => k j | .error _ => return jsonErrResp 400 "bad json"
   let addUniq {α : Type} [BEq α] (get : MockGcpState → List α) (set : MockGcpState → List α → MockGcpState) (v : α) (resp : List (String × Json)) : IO (Nat × String × ByteArray) := do
     if (get (← stRef.get)).contains v then return jsonErrResp 409 "exists"
     stRef.modify fun s => set s (get s ++ [v]); return jo resp
   let delOk (f : MockGcpState → MockGcpState) := do stRef.modify f; return jsonResp
+  let svcMissing (s : MockGcpState) (k : String) := k.contains "/services/" && (s.services.lookup k).isNone
   stRef.modify fun s => { s with reqs := s.reqs.push { method, target, body := bodyStr } }
   if path == "/_qed/health" then let st := (← stRef.get).healthStatus; return txtResp st (if st == 200 then "ok" else "unhealthy")
   if path.endsWith ":getIamPolicy" || (method == "GET" && path.endsWith "/iam") then
-    let k := iamPolicyKey path; let cur ← stRef.get
-    if k.contains "/services/" && (cur.services.lookup k).isNone then return jsonErrResp 404 "service not found"
-    return lookupOr404 cur.iamPolicies k IamPolicyDoc.toJson
+    let (k, cur) := (iamPolicyKey path, ← stRef.get)
+    return if svcMissing cur k then jsonErrResp 404 "service not found" else lookupOr404 cur.iamPolicies k IamPolicyDoc.toJson
   if path.endsWith ":setIamPolicy" || (method == "PUT" && path.endsWith "/iam") then
-    let k := iamPolicyKey path; let cur ← stRef.get
-    if k.contains "/services/" && (cur.services.lookup k).isNone then return jsonErrResp 404 "service not found"
-    let .ok j := Json.parse bodyStr | return jsonErrResp 400 "bad json"
-    let .ok incoming := IamPolicyDoc.fromJson ((j.get? "policy").getD j) | return jsonErrResp 400 "bad policy"
-    if cur.force412Once then stRef.set { cur with force412Once := false }; return jsonErrResp 412 "simulated etag contention"
-    if let some existing := cur.iamPolicies.lookup k then
-      if !existing.etag.isEmpty && incoming.etag != existing.etag then return jsonErrResp 412 s!"etag mismatch: got `{incoming.etag}`, want `{existing.etag}`"
-    let saved : IamPolicyDoc := { incoming with etag := s!"etag-{cur.etagSeq}" }
-    stRef.set { cur with etagSeq := cur.etagSeq + 1, iamPolicies := setAssoc cur.iamPolicies k saved }; return jsonResp 200 saved.toJson
+    let (k, cur) := (iamPolicyKey path, ← stRef.get)
+    if svcMissing cur k then return jsonErrResp 404 "service not found"
+    return ← withJson fun j => do
+      let .ok incoming := IamPolicyDoc.fromJson ((j.get? "policy").getD j) | return jsonErrResp 400 "bad policy"
+      if cur.force412Once then stRef.set { cur with force412Once := false }; return jsonErrResp 412 "simulated etag contention"
+      if let some existing := cur.iamPolicies.lookup k then
+        if !existing.etag.isEmpty && incoming.etag != existing.etag then return jsonErrResp 412 s!"etag mismatch: got `{incoming.etag}`, want `{existing.etag}`"
+      let saved : IamPolicyDoc := { incoming with etag := s!"etag-{cur.etagSeq}" }
+      stRef.set { cur with etagSeq := cur.etagSeq + 1, iamPolicies := setAssoc cur.iamPolicies k saved }; return jsonResp 200 saved.toJson
   if path.contains "/serviceAccounts" then
     if method == "POST" then let e := s!"{Json.pathStr bodyStr "accountId"}@{pathSegAfter path "projects"}.iam.gserviceaccount.com"; return ← addUniq (·.sas) (fun s xs => { s with sas := xs }) e [("email", .str e)]
     if method == "DELETE" then return ← delOk fun s => { s with sas := s.sas.filter (· != lastSeg.replace "%40" "@") }
   if path.contains "/denypolicies" && !path.contains "/operations/" then
     let denyKey := if method == "POST" then s!"{path}/{(qParams.lookup "policyId").getD ""}" else path
     if method == "GET" then return lookupOr404 (← stRef.get).denyPolicies denyKey id
-    if method == "POST" || method == "PUT" then
-      let .ok j := Json.parse bodyStr | return jsonErrResp 400 "bad json"
+    if method == "POST" || method == "PUT" then return ← withJson fun j => do
       let cur ← stRef.get; let saved := match j with | .obj ms => Json.obj (("etag", .str s!"deny-{cur.etagSeq}") :: ms.filter (·.1 != "etag")) | other => other
       stRef.set { cur with etagSeq := cur.etagSeq + 1, denyPolicies := setAssoc cur.denyPolicies denyKey saved }; return jsonResp 200 saved
   if method == "GET" && path.contains "/operations/" then
@@ -161,9 +162,7 @@ private def handleMockGcp (stRef : IO.Ref MockGcpState) (portRef : IO.Ref UInt16
     if method == "DELETE" then return ← delOk fun s => { s with dbs := s.dbs.filter (· != (inst, lastSeg)) }
   if path.contains "/gatewaySecurityPolicies/" then
     if method == "GET" then return lookupOr404 (← stRef.get).egress path id
-    if method == "PUT" then
-      let .ok j := Json.parse bodyStr | return jsonErrResp 400 "bad json"
-      stRef.modify fun s => { s with egress := setAssoc s.egress path j }; return jsonResp 200 j
+    if method == "PUT" then return ← withJson fun j => do stRef.modify fun s => { s with egress := setAssoc s.egress path j }; return jsonResp 200 j
     if method == "DELETE" then return ← delOk fun s => { s with egress := s.egress.filter (·.1 != path) }
   if path.contains "/services/" then
     if method == "GET" then
@@ -181,27 +180,27 @@ private def handleMockGcp (stRef : IO.Ref MockGcpState) (portRef : IO.Ref UInt16
       let cur ← stRef.get
       if query.contains "updateMask=traffic" then
         if let some failReg := cur.failShiftRegion? then if path.contains s!"/locations/{failReg}/" then return jsonErrResp 500 s!"simulated traffic shift failure in {failReg}"
-      let .ok j := Json.parse bodyStr | return jsonErrResp 400 "bad json"
-      let targets := j.arrAt "traffic"; let pctSum := targets.foldl (init := 0) fun acc t => acc + (t.natAt? "percent").getD 0
-      if pctSum != 100 then return jsonErrResp 400 s!"traffic percentages must sum to 100 (got {pctSum})"
-      let prev := (cur.services.lookup path).getD {}
-      let (cand?, live?) := (targets.find? (·.strAt? "tag" == some "candidate"), targets.find? fun t => (t.strAt? "tag").isNone && (t.natAt? "percent").getD 0 == 100)
-      let (live, cand) := match live?, cand? with
-        | some lv, none => (((lv.strAt? "revision").getD prev.live.1, 100), ("", 0))
-        | some lv, some cv => (((lv.strAt? "revision").getD prev.live.1, 100), ((cv.strAt? "revision").getD "", (cv.natAt? "percent").getD 0))
-        | none, some cv => let r := (cv.strAt? "revision").getD ""; ((r, 100), (r, 100)) | none, none => (prev.live, prev.cand)
-      let arrOr (p k : String) := ((j.atPath p).bind (·.arr?)).getD (prev.jl k); let envJson := arrOr "template.containers.0.env" "env"
-      let deployEnv := (envJson.findSome? fun e => if e.strAt? "name" == some "QED_DEPLOY_ENV" then e.strAt? "value" else none).getD (prev.s "env")
-      let nextSvc : MockSvc := { prev with
-        live, cand, conc := ((j.get? "template").bind (·.natAt? "maxInstanceRequestConcurrency")).getD prev.conc,
-        strs := setAssocs prev.strs [("env", deployEnv), ("ing", (j.strAt? "ingress").getD (prev.s "ing")),
-          ("sa", (j.pathStr? "template.serviceAccount").getD (prev.s "sa")), ("vpc", (j.pathStr? "template.vpcAccess.egress").getD (prev.s "vpc"))],
-        jls := setAssocs prev.jls [("env", envJson), ("tr", targets), ("vpc", arrOr "template.vpcAccess.networkInterfaces" "vpc"), ("vol", arrOr "template.volumes" "vol")] }
-      stRef.modify fun s => { s with services := setAssoc s.services path nextSvc }
-      if (← stRef.get).pending.1 then
-        let opNm := (← stRef.get).pendingOpName?.getD "projects/qed-prod/locations/us-central1/operations/op-1"
-        stRef.modify fun s => { s with pending := (false, s.pending.2.1, s.pending.2.2), pendingOpName? := none }; return jo [("name", .str opNm)]
-      return jo [("done", .bool true)]
+      return ← withJson fun j => do
+        let targets := j.arrAt "traffic"; let pctSum := targets.foldl (init := 0) fun acc t => acc + (t.natAt? "percent").getD 0
+        if pctSum != 100 then return jsonErrResp 400 s!"traffic percentages must sum to 100 (got {pctSum})"
+        let prev := (cur.services.lookup path).getD {}
+        let (cand?, live?) := (targets.find? (·.strAt? "tag" == some "candidate"), targets.find? fun t => (t.strAt? "tag").isNone && (t.natAt? "percent").getD 0 == 100)
+        let (live, cand) := match live?, cand? with
+          | some lv, none => (((lv.strAt? "revision").getD prev.live.1, 100), ("", 0))
+          | some lv, some cv => (((lv.strAt? "revision").getD prev.live.1, 100), ((cv.strAt? "revision").getD "", (cv.natAt? "percent").getD 0))
+          | none, some cv => let r := (cv.strAt? "revision").getD ""; ((r, 100), (r, 100)) | none, none => (prev.live, prev.cand)
+        let arrOr (p k : String) := ((j.atPath p).bind (·.arr?)).getD (prev.jl k); let envJson := arrOr "template.containers.0.env" "env"
+        let deployEnv := (envJson.findSome? fun e => if e.strAt? "name" == some "QED_DEPLOY_ENV" then e.strAt? "value" else none).getD (prev.s "env")
+        let nextSvc : MockSvc := { prev with
+          live, cand, conc := ((j.get? "template").bind (·.natAt? "maxInstanceRequestConcurrency")).getD prev.conc,
+          strs := setAssocs prev.strs [("env", deployEnv), ("ing", (j.strAt? "ingress").getD (prev.s "ing")),
+            ("sa", (j.pathStr? "template.serviceAccount").getD (prev.s "sa")), ("vpc", (j.pathStr? "template.vpcAccess.egress").getD (prev.s "vpc"))],
+          jls := setAssocs prev.jls [("env", envJson), ("tr", targets), ("vpc", arrOr "template.vpcAccess.networkInterfaces" "vpc"), ("vol", arrOr "template.volumes" "vol")] }
+        stRef.modify fun s => { s with services := setAssoc s.services path nextSvc }
+        if (← stRef.get).pending.1 then
+          let opNm := (← stRef.get).pendingOpName?.getD "projects/qed-prod/locations/us-central1/operations/op-1"
+          stRef.modify fun s => { s with pending := (false, s.pending.2.1, s.pending.2.2), pendingOpName? := none }; return jo [("name", .str opNm)]
+        return jo [("done", .bool true)]
     if method == "DELETE" then
       stRef.modify fun s => { s with services := s.services.filter (·.1 != path) }
       if (← stRef.get).pending.2.1 then
@@ -221,7 +220,7 @@ private def denyKeyFor (projId denyId : String) : String :=
   s!"/v2/policies/{Qed.encodeSeg s!"cloudresourcemanager.googleapis.com/projects/{projId}"}/denypolicies/{denyId}"
 
 private def testPureCloudValidators (c : TestChecker) (cfg : GcpExecConfig) (prodKey : DeployKey) (plan : GcpPlan) : IO Unit := do
-  c.checkEq "GcpPlan JSON round-trip" (GcpPlan.fromJson plan.toJson) (.ok plan)
+  c.check "GcpPlan JSON round-trip" (GcpPlan.fromJson plan.toJson == .ok plan)
   let (parseUrl, fmtReq) := (Qed.Server.Net.parseHttpUrl, Qed.Server.Net.formatOutboundRequest)
   let (bearerCfg, aud) := ({ cfg with auth := .bearerToken "ya29.secret-oauth" }, some "https://svc-uc.a.run.app")
   let mkJwt (a : String) := s!"{Qed.Auth.base64UrlEncode "{\"alg\":\"RS256\"}".toUTF8}.{Qed.Auth.base64UrlEncode (Json.render (.obj [("aud", .str a)])).toUTF8}.sig"
@@ -292,7 +291,22 @@ private def testPureCloudValidators (c : TestChecker) (cfg : GcpExecConfig) (pro
       !req.body.contains "attacker@evil.com" && !(parseDenyExceptionPrincipals ((Json.parse req.body).toOption.getD (.obj []))).contains "principalSet://goog/public:all" && req.body.contains (renderSaEmail prodKey)),
     ("classifyStaticPath blocks GET/HEAD /qed_deploy.json, /qed_manifest.json, & /./ dot-segment bypasses",
       [("GET", "/qed_deploy.json", false), ("GET", "/qed_deploy.json", true), ("HEAD", "/qed_deploy.json", false), ("GET", "/QED_DEPLOY.JSON?v=1", false), ("GET", "/qed_manifest.json", false), ("GET", "/./app.0123456789ab.mjs", false), ("GET", "/./_qed/secret.json", false), ("GET", "//app.0123456789ab.mjs", false)].all fun (m, p, d) => Qed.Server.Http.classifyStaticPath m p d == none),
-    ("reqUploadAsset rejects colliding boundary bytes", !(reqUploadAsset cfg.endpoints prodKey "abc" "/app.mjs" "hi --fixed_b-- bye".toUTF8 "fixed_b").isOk)]
+    ("reqUploadAsset rejects colliding boundary bytes", !(reqUploadAsset cfg.endpoints prodKey "abc" "/app.mjs" "hi --fixed_b-- bye".toUTF8 "fixed_b").isOk),
+    ("CloudChecks specs, multiEnvManifest footprints, compileInfra & planPreviewTeardown",
+      let sh : ShardProject := ⟨"s1-prod", "s1-nonprod", by decide⟩
+      let (k, kp) : DeployKey × DeployKey := ({ shard := sh, tenant := ⟨1, by decide⟩, app := ⟨1, by decide⟩, env := .prod }, { shard := sh, tenant := ⟨1, by decide⟩, app := ⟨1, by decide⟩, env := .preview ⟨42, by decide⟩ })
+      let (cPlan, cPrev) := (compileInfra k "h1" CloudChecks.NotesDeploy.spec { version := 1, secrets := ["K"], egress := ["https://a.com"] }, compileInfra kp "h1" CloudChecks.NotesDeploy.spec { version := 1, secrets := ["K"], egress := ["https://a.com"] })
+      let (acts, td) := (planRollout { key := k, secretNames := ["K", "OLD"], egressAllow := ["https://a.com", "https://b.com"] } cPlan, planPreviewTeardown { key := kp, bindings := cPrev.bindings })
+      CloudChecks.NotesDeploy.spec.compute == .performance && CloudChecks.NotesDeploy.spec.timeoutSec? == some 300 && CloudChecks.NotesDeploy.spec.preview.ttlSec == 7 * 86400 &&
+      CloudChecks.MinimalDeploy.spec.compute == .standard && CloudChecks.MinimalDeploy.spec.timeoutSec? == none && CloudChecks.NotesDb.config.isManaged && CloudChecks.ManagedAuth.config.isManaged &&
+      CloudChecks.SplitPreviewSrv.secrets == #[] && CloudChecks.NotesDb.config.endpointForEnv .prod == .managedPostgres "NotesDb" .prod &&
+      CloudChecks.EphemeralPreviewDb.config.endpointForEnv .preview == .sqlitePath "/tmp/qed-preview-EphemeralPreviewDb.db" && CloudChecks.EphemeralPreviewDb.config.endpointForEnv .dev == .sqlitePath ".qed/custom-dev.db" &&
+      (CloudChecks.multiEnvManifest.footprintFor .preview).secrets.map (·.envVar) == ["PREVIEW_DB_URL"] &&
+      (CloudChecks.multiEnvManifest.footprintFor .prod).secrets.map (·.envVar) == ["PROD_DB_URL", "QED_AUTH_CLIENT_SECRET"] && (CloudChecks.multiEnvManifest.footprintFor .dev).secrets == [] &&
+      [.setEgressRules k ["https://a.com", "https://b.com"], .narrowEgressRules k ["https://a.com"], .deleteSecret k "OLD"].all acts.contains &&
+      cPlan.bindings.contains { principal := .allUsers, role := .storageLegacyObjectReader, resource := .assetPrefix k "h1" true } &&
+      cPrev.bindings.contains { principal := .edgeRouter, role := .storageLegacyObjectReader, resource := .assetPrefix kp "h1" false } && !cPrev.bindings.any (·.principal == .allUsers) &&
+      [.deleteEgressPolicy kp, .pruneDenyException kp, .deleteServiceAccount kp].all td.contains && !td.any fun | .revokeBinding b => b.resource.isAsset | _ => false)]
   let badTok := forbiddenTokenCases.find? fun (src, want) => Qed.Cli.findForbiddenTokens src != want
   c.check "findForbiddenTokens parses Lean 4 raw strings, interpolations, comments, custom syntax/macros, and unbalanced brackets" badTok.isNone (badTok.map (fun (s, w) => s!"got {Qed.Cli.findForbiddenTokens s}, want {w} for {s}") |>.getD "")
 
@@ -462,7 +476,7 @@ private def testCloudDeployEndToEnd (c : TestChecker) : IO Unit := do
         ("aborted rollout NEVER shifts traffic or deletes old secrets", !hasReq stAbort "PATCH" "updateMask=traffic" && !hasReq stAbort "DELETE" "OLD_ABORT_SECRET"),
         ("aborted rollout keeps existing live revision at 100% and candidate at 0%", match stAbort.services.lookup runKey with | some sv => sv.live.2 == 100 && sv.cand == (cloudRunRevisionName prodKey "bad999", 0) | none => false)]
       let freshKey : DeployKey := { shard, tenant := ⟨99, by decide⟩, app := ⟨1, by decide⟩, env := .prod }
-      for (lbl, rev) in [("first-deploy", "firstfail1"), ("retry after failed first-deploy", "firstfail2")] do
+      forList [("first-deploy", "firstfail1"), ("retry after failed first-deploy", "firstfail2")] fun (lbl, rev) => do
         c.checkAll [(s!"{lbl} aborts on /_qed/health 500", !(← roll (mkTestPlan freshKey rev [.us_central1] [] ["FIRST_KEY"] [] []) s!"img:{rev}").isOk),
           (s!"{lbl} leaves edgeRouter ungranted", !hasBind (polOf (← stRef.get) (svcPath freshKey)) GcpRole.runInvoker.gcpName edgeMember)]
       -- 8. Private team_only preview + sibling PR #43 + PR #42 preview teardown + prod teardown no-op
@@ -495,7 +509,7 @@ private def testCloudDeployEndToEnd (c : TestChecker) : IO Unit := do
                 ("preview teardown prunes PR #42 SA from deny-qed-secrets-public while keeping PR #43 SA", !excsAfter.any (·.contains (renderSaEmail prevKey42)) && excsAfter.any (·.contains (renderSaEmail prevKey43)))]
       stRef.modify fun s => { s with reqs := #[] }
       let prodTd := planPreviewTeardown { key := prodKey, secretNames := ["STRIPE_KEY"], managedDbs := ["DemoDb"] }
-      c.checkEq "prod teardown is strict no-op (0 actions)" prodTd []
+      c.check "prod teardown is strict no-op (0 actions)" (prodTd == [])
       c.expectOk "prod teardown executes 0 steps / 0 HTTP calls" (← executeRollout cfg plan "" tmpDir prodTd) fun n => do c.checkEq "prod teardown 0 steps & 0 reqs" (n, (← stRef.get).reqs.size) (0, 0)
       testCliDeployChecks c baseUrl
 
@@ -592,12 +606,12 @@ private def testCloudProtocolAndCli (c : TestChecker) : IO Unit := do
   -- 2. Filesystem collectSourceBundle test
   withTempDir "qed-bundle-test" fun projDir => do
     let root := System.FilePath.mk projDir
-    for sub in ["public", "fonts", ".git", ".lake", ".qed", "dist", "node_modules/pkg", "target"] do IO.FS.createDirAll (root / sub)
+    forList ["public", "fonts", ".git", ".lake", ".qed", "dist", "node_modules/pkg", "target"] fun sub => IO.FS.createDirAll (root / sub)
     let (woffBytes, icoBytes) := (ByteArray.mk #[0x77, 0x4F, 0x46, 0x32, 0x00, 0xFF, 0x80], ByteArray.mk #[0x00, 0x00, 0x01, 0x00])
-    for (p, bs) in [("public/logo.png", pngMagic), ("fonts/inter.woff2", woffBytes), ("public/favicon.ico", icoBytes)] do IO.FS.writeBinFile (root / p) bs
-    for (p, txt) in [("App.lean", "def main := 1\n"), ("robots.txt", "User-agent: *\n"), ("manifest.json", "{\"name\":\"demo\"}\n"),
+    forList [("public/logo.png", pngMagic), ("fonts/inter.woff2", woffBytes), ("public/favicon.ico", icoBytes)] fun (p, bs) => IO.FS.writeBinFile (root / p) bs
+    forList [("App.lean", "def main := 1\n"), ("robots.txt", "User-agent: *\n"), ("manifest.json", "{\"name\":\"demo\"}\n"),
         (".env", "SECRET=1"), (".env.local", "SECRET=2"), (".git/config.txt", "x"), (".lake/a.lean", "x"),
-        (".qed/x.json", "{}"), ("dist/app.js", "x"), ("node_modules/pkg/a.js", "x"), ("target/a.txt", "x")] do IO.FS.writeFile (root / p) txt
+        (".qed/x.json", "{}"), ("dist/app.js", "x"), ("node_modules/pkg/a.js", "x"), ("target/a.txt", "x")] fun (p, txt) => IO.FS.writeFile (root / p) txt
     withTempDir "qed-bundle-outside" fun outDir => do
       IO.FS.writeBinFile (System.FilePath.mk outDir / "outside.png") pngMagic
       withSymlink s!"{outDir}/outside.png" s!"{projDir}/public/escape.png" do
@@ -624,23 +638,26 @@ private def testCloudProtocolAndCli (c : TestChecker) : IO Unit := do
       let runCli (args : Array String) (extraEnv : Array (String × Option String) := #[]) : IO (UInt32 × String) := do
         let (code, o, e) ← runCmd qedBin args (env := baseEnv ++ extraEnv); return (code, o ++ e)
       let apiTok := #["--api", apiUrl, "--token", "tok_1"]
-      for (lbl, args, extraEnv, tok) in [
+      forList [
           ("qed whoami --token authenticates without credentials.json and never echoes token", #["whoami", "--api", apiUrl, "--token", "tok_flag_999"], #[], "tok_flag_999"),
           ("qed whoami --api=... --token=... works and never echoes token", #["whoami", s!"--api={apiUrl}", "--token=tok_eq_SECRET"], #[], "tok_eq_SECRET"),
-          ("qed whoami with QED_CLOUD_TOKEN authenticates without credentials.json and never echoes token", #["whoami", "--api", apiUrl], #[("QED_CLOUD_TOKEN", some "tok_env_888")], "tok_env_888")] do
+          ("qed whoami with QED_CLOUD_TOKEN authenticates without credentials.json and never echoes token", #["whoami", "--api", apiUrl], #[("QED_CLOUD_TOKEN", some "tok_env_888")], "tok_env_888")] fun (lbl, args, extraEnv, tok) => do
         let (rc, out) ← runCli args extraEnv; let st ← stRef.get
         c.check lbl (rc == 0 && out.contains "ci@qed.cloud" && !out.contains tok && st.reqs.any fun r => r.2.1 == "/api/v1/whoami" && r.2.2.1 == some s!"Bearer {tok}") out
-      let (rcList, outList) ← runCli (#["secrets", "list", "my-app", "--env", "staging"] ++ apiTok); let stList ← stRef.get
-      c.check "qed secrets list --env filters staging secrets and passes env query param" (rcList == 0 && outList.contains "staging:STAGE_KEY" && !outList.contains "prod:API_KEY" && stList.reqs.any fun r => r.2.1 == "/api/v1/secrets?app=my-app&env=staging") outList
       let rawWsSecret := "  secret val \n"
-      for (lbl, args, extraEnv, leak, want) in [
+      forList [
           ("qed secrets set <app> KEY=VALUE preserves `=` and never echoes value", #["secrets", "set", "my-app", "STRIPE_KEY=sk_live=abc==", "--env", "prod"] ++ apiTok, #[], "sk_live=abc==", ({ appSlug := "my-app", env := "prod", name := "STRIPE_KEY", value := "sk_live=abc==" } : SecretSetReq)),
           ("qed secrets set --app <app> KEY=VALUE works and never echoes value", #["secrets", "set", "--app", "my-app", "DB_URL=postgres://u:p@h/d?ssl=1", "--env", "staging"] ++ apiTok, #[], "postgres://", { appSlug := "my-app", env := "staging", name := "DB_URL", value := "postgres://u:p@h/d?ssl=1" }),
           ("qed secrets set --value=SECRET works and never echoes value", #["secrets", "set", "my-app", "EQ_SEC", "--value=VAL_SECRET_EQ", "--api", apiUrl, "--token=tok_1"], #[], "VAL_SECRET_EQ", { appSlug := "my-app", env := "prod", name := "EQ_SEC", value := "VAL_SECRET_EQ" }),
-          ("qed secrets set preserves leading/trailing whitespace & newline in QED_SECRET_VALUE", #["secrets", "set", "my-app", "ENV_SEC", "--env", "preview"] ++ apiTok, #[("QED_SECRET_VALUE", some rawWsSecret)], "secret val", { appSlug := "my-app", env := "preview", name := "ENV_SEC", value := rawWsSecret })] do
+          ("qed secrets set preserves leading/trailing whitespace & newline in QED_SECRET_VALUE", #["secrets", "set", "my-app", "ENV_SEC", "--env", "preview"] ++ apiTok, #[("QED_SECRET_VALUE", some rawWsSecret)], "secret val", { appSlug := "my-app", env := "preview", name := "ENV_SEC", value := rawWsSecret })] fun (lbl, args, extraEnv, leak, want) => do
         let (rc, out) ← runCli args extraEnv; let stSet ← stRef.get; c.check lbl (rc == 0 && !out.contains leak && stSet.lastSecretSet == some want) out
-      let (rcDel, outDel) ← runCli (#["secrets", "delete", "my-app", "STRIPE_KEY", "--env", "prod"] ++ apiTok); let stDel ← stRef.get
-      c.check "qed secrets delete sends SecretDeleteReq to /api/v1/secrets/delete" (rcDel == 0 && stDel.lastSecretDel == some { appSlug := "my-app", env := "prod", name := "STRIPE_KEY" }) outDel
+      forList (α := String × Array String × (UInt32 → String → MockCloudState → Bool)) [
+          ("qed secrets list --env filters staging secrets and passes env query param", #["secrets", "list", "my-app", "--env", "staging"] ++ apiTok, fun rc out st => rc == 0 && out.contains "staging:STAGE_KEY" && !out.contains "prod:API_KEY" && st.reqs.any fun r => r.2.1 == "/api/v1/secrets?app=my-app&env=staging"),
+          ("qed secrets delete sends SecretDeleteReq to /api/v1/secrets/delete", #["secrets", "delete", "my-app", "STRIPE_KEY", "--env", "prod"] ++ apiTok, fun rc _ st => rc == 0 && st.lastSecretDel == some { appSlug := "my-app", env := "prod", name := "STRIPE_KEY" }),
+          ("qed logs --runtime URL-encodes query params and formats runtime logs", #["logs", "my-app", "--runtime", "--env", "prod", "--severity", "error", "--search", "hello world&x=1"] ++ apiTok, fun rc out st => rc == 0 && out.contains "GET /boom -> 500" && st.reqs.any fun r => r.2.1 == "/api/v1/logs/runtime?app=my-app&env=prod&severity=error&search=hello%20world%26x%3D1"),
+          ("qed cancel sends CancelDeployReq to /api/v1/deployment/cancel", #["cancel", "dep_abc123"] ++ apiTok, fun rc _ st => rc == 0 && st.lastCancel == some { deploymentId := "dep_abc123" }),
+          ("qed logs <id> --follow exits cleanly on canceled status", #["logs", "dep_canceled_1", "--follow"] ++ apiTok, fun rc out _ => rc != 0 && out.contains "Deployment canceled")] fun (lbl, args, okFn) => do
+        let (rc, out) ← runCli args; c.check lbl (okFn rc out (← stRef.get)) out
       c.checkCliCases (runCli ·) [
         ("whoami --token=SECRET --bad=LEAK redacts errors", #["whoami", "--token=SECRET", "--bad=LEAK"], false, [], ["SECRET", "LEAK"]),
         ("secrets set -BAD=SECRET redacts flag", #["secrets", "set", "my-app", "-BAD=SECRET"], false, [], ["SECRET"]),
@@ -650,24 +667,18 @@ private def testCloudProtocolAndCli (c : TestChecker) : IO Unit := do
         ("rollback rejects leading-dash unknown flag", #["rollback", "my-app", "-bad=SECRET"] ++ apiTok, false, [], ["SECRET"]),
         ("status rejects leading-dash unknown flag", #["status", "--bad=SECRET"] ++ apiTok, false, [], ["SECRET"]),
         ("status rejects invalid app slug", #["status", "BAD_SLUG=SECRET"] ++ apiTok, false, [], ["SECRET"])] (parallel := true)
-      let (rcRt, outRt) ← runCli (#["logs", "my-app", "--runtime", "--env", "prod", "--severity", "error", "--search", "hello world&x=1"] ++ apiTok); let stRt ← stRef.get
-      c.check "qed logs --runtime URL-encodes query params and formats runtime logs" (rcRt == 0 && outRt.contains "GET /boom -> 500" && stRt.reqs.any fun r => r.2.1 == "/api/v1/logs/runtime?app=my-app&env=prod&severity=error&search=hello%20world%26x%3D1") outRt
-      let (rcCan, outCan) ← runCli (#["cancel", "dep_abc123"] ++ apiTok); let stCan ← stRef.get
-      c.check "qed cancel sends CancelDeployReq to /api/v1/deployment/cancel" (rcCan == 0 && stCan.lastCancel == some { deploymentId := "dep_abc123" }) outCan
-      let (rcFol, outFol) ← runCli (#["logs", "dep_canceled_1", "--follow"] ++ apiTok)
-      c.check "qed logs <id> --follow exits cleanly on canceled status" (rcFol != 0 && outFol.contains "Deployment canceled") outFol
       let seedJson := (toJson ({ apiBase := apiUrl, token := "tok_stored_777", userId := "u1", email := "u1@qed.cloud" } : Qed.Cli.CloudCredentials)).render ++ "\n"
-      for (lbl, seed, failRev, args, wantOk, has, omits, keepFile, wantTok?, noTok?) in [
+      forList [
           ("qed logout --token revokes explicit token when no credentials file exists", false, false, #["logout", "--api", apiUrl, "--token", "tok_ci_only"], true, [], ["tok_ci_only"], false, some "tok_ci_only", none),
           ("qed logout --token revokes explicit token without deleting unrelated credentials.json", true, false, #["logout", "--api", apiUrl, "--token=tok_ci_keep_file"], true, [], ["tok_ci_keep_file"], true, some "tok_ci_keep_file", some "tok_stored_777"),
           ("qed logout with mismatched --api warns, skips remote revoke, and removes local credentials", true, false, #["logout", "--api", "http://127.0.0.1:1"], true, ["warning:"], [], false, none, some "tok_stored_777"),
           ("qed logout calls POST /api/v1/tokens/revoke-current and removes credentials file", true, false, #["logout", "--api", apiUrl], true, [], ["tok_stored_777"], false, some "tok_stored_777", none),
           ("qed logout warns and still removes local credentials when remote revoke fails", true, true, #["logout", "--api", apiUrl], true, ["warning:"], [], false, none, none),
-          ("qed logout --token fails non-zero on server error without printing success or token", false, true, #["logout", "--api", apiUrl, "--token", "tok_fail_secret"], false, [], ["token revoked", "tok_fail_secret"], false, none, none)] do
+          ("qed logout --token fails non-zero on server error without printing success or token", false, true, #["logout", "--api", apiUrl, "--token", "tok_fail_secret"], false, [], ["token revoked", "tok_fail_secret"], false, none, none)] fun (lbl, seed, failRev, args, wantOk, has, omits, keepFile, wantTok?, noTok?) => do
         if seed then IO.FS.writeFile (System.FilePath.mk credsFile) seedJson
         stRef.modify fun s => { s with reqs := #[], failRevoke := failRev }
         let (rc, out) ← runCli args; let reqs := (← stRef.get).reqs; let existsF ← (System.FilePath.mk credsFile).pathExists
-        c.check lbl ((rc == 0) == wantOk && has.all (out.contains ·) && omits.all (!out.contains ·) && existsF == keepFile &&
+        c.check lbl ((rc == 0) == wantOk && hasAll out has && omits.all (!out.contains ·) && existsF == keepFile &&
           wantTok?.all (fun t => reqs.any fun r => r.1 == "POST" && r.2.1 == "/api/v1/tokens/revoke-current" && r.2.2.1 == some s!"Bearer {t}") &&
           noTok?.all (fun t => !reqs.any fun r => r.2.2.1 == some s!"Bearer {t}") && (!lbl.contains "mismatched" || reqs.isEmpty)) out
 

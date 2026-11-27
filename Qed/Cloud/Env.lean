@@ -5,7 +5,7 @@ namespace Qed.Cloud
 /-! ### 1. Deployment Environments & `EnvMap` -/
 
 inductive DeployEnv where | dev | preview | staging | prod
-deriving Inhabited, DecidableEq, Repr
+deriving Inhabited, DecidableEq
 
 def DeployEnv.all : List DeployEnv := [.dev, .preview, .staging, .prod]
 theorem DeployEnv.mem_all (e : DeployEnv) : e ∈ DeployEnv.all := by cases e <;> simp [DeployEnv.all]
@@ -21,7 +21,7 @@ structure EnvMap (α : Type) where
   preview : α
   staging : α
   prod : α
-deriving Inhabited, DecidableEq, Repr
+deriving Inhabited, DecidableEq
 
 def EnvMap.get {α : Type} (m : EnvMap α) : DeployEnv → α | .dev => m.dev | .preview => m.preview | .staging => m.staging | .prod => m.prod
 def EnvMap.ofDefault {α : Type} (x : α) : EnvMap α := { dev := x, preview := x, staging := x, prod := x }
@@ -37,12 +37,12 @@ theorem EnvMap.get_set_ne {α : Type} (m : EnvMap α) {e₁ e₂ : DeployEnv} (v
 /-! ### 2. Scoped Secrets -/
 
 inductive SecretScope where | envScoped | pinned (env : DeployEnv)
-deriving Inhabited, DecidableEq, Repr
+deriving Inhabited, DecidableEq
 
 structure SecretRef where
   envVar : String
   scope  : SecretScope := .envScoped
-deriving Inhabited, DecidableEq, Repr
+deriving Inhabited, DecidableEq
 
 def SecretRef.allowedIn (s : SecretRef) (e : DeployEnv) : Bool := match s.scope with | .envScoped => true | .pinned pe => pe == e
 theorem SecretRef.pinned_rejects_other (k : String) {e₁ e₂ : DeployEnv} (hne : e₁ ≠ e₂) :
@@ -51,7 +51,7 @@ theorem SecretRef.pinned_rejects_other (k : String) {e₁ e₂ : DeployEnv} (hne
 /-! ### 3. Typed Database Targets (`DbEnvSpec`) & `managed postgres` Expansion -/
 
 inductive DbCluster where | prodCluster | nonProdCluster
-deriving Inhabited, DecidableEq, Repr
+deriving Inhabited, DecidableEq
 
 def managedPostgresSecretVar (dbName : String) : String :=
   "QED_MANAGED_DB_" ++ String.ofList (dbName.toUpper.toList.map fun c => if ('A' ≤ c && c ≤ 'Z') || ('0' ≤ c && c ≤ '9') || c == '_' then c else '_')
@@ -66,7 +66,7 @@ inductive DbEnvSpec where
   | byoD1           (accountEnv : String) (dbEnv : String) (token : SecretRef)
   | byoTurso        (urlEnv : String) (token : SecretRef)
   | byoHttpSql      (urlEnv : String) (token? : Option SecretRef := none)
-deriving Inhabited, DecidableEq, Repr
+deriving Inhabited, DecidableEq
 
 def DbEnvSpec.isEphemeral : DbEnvSpec → Bool | .ephemeralSqlite _ | .byoSqlite _ | .byoSqliteEnv _ _ => true | _ => false
 def DbEnvSpec.cluster? : DbEnvSpec → Option DbCluster | .managedPostgres _ .prod => some .prodCluster | .managedPostgres _ _ => some .nonProdCluster | _ => none
@@ -99,7 +99,7 @@ theorem managedPostgresTargets_secrets_scoped (dbName : String) (ephem : Bool) (
 /-! ### 4. Managed Auth Targets -/
 
 inductive AuthEnvTarget where | localDev | previewIdp | managedOidc (providers : List String) | customOidc
-deriving Inhabited, DecidableEq, Repr
+deriving Inhabited, DecidableEq
 
 def managedAuthTargets (providers : List String) : EnvMap AuthEnvTarget :=
   { dev := .localDev, preview := .previewIdp, staging := .managedOidc providers, prod := .managedOidc providers }
@@ -196,7 +196,7 @@ def isDomainAncestor (anc child : String) : Bool :=
   acs == ccs || (let dotAnc := '.' :: acs; ccs.length > dotAnc.length && ccs.drop (ccs.length - dotAnc.length) == dotAnc)
 
 inductive HostPattern where | exact (host : String) | wildcard (suffix : String)
-deriving Inhabited, DecidableEq, Repr
+deriving Inhabited, DecidableEq
 
 def HostPattern.baseHost : HostPattern → String | .exact h | .wildcard h => h
 def HostPattern.render : HostPattern → String | .exact h => h | .wildcard s => "*." ++ s

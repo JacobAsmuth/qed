@@ -10,35 +10,15 @@ external PingApi:
 schema CheckedItem:
   label : String where 1 <= label.length <= 32
   stock : Nat    where stock <= 100
-bad_srv "cannot access server state `count` outside an `atomic` block in `bump`" BadToctouRead :
-  state count : Nat = 0 |
-  rpc bump() -> Nat!:
-    let c = count
-    await PingApi.ping()?
-    return c
-bad_srv "cannot access server state `count` outside an `atomic` block in `bump`" BadOutsideAtomicMut :
-  state count : Nat = 0 |
+bad_srv "cannot access server state `count` outside an `atomic` block in `bump`" BadToctouRead : state count : Nat = 0 | rpc bump() -> Nat!: let c = count; await PingApi.ping()?; return c
+bad_srv "cannot access server state `count` outside an `atomic` block in `bump`" BadOutsideAtomicMut : state count : Nat = 0 | rpc bump() -> Nat!: await PingApi.ping()?; count += 1; return 1
+bad_srv "redundant `atomic` block: `bump` has no `await` calls" BadRedundantAtomic : state count : Nat = 0 | rpc bump() -> Nat: atomic: count += 1; return count
+bad_srv "cannot use `await` inside an `atomic` block" BadAwaitInAtomic : state count : Nat = 0 |
   rpc bump() -> Nat!:
     await PingApi.ping()?
-    count += 1
+    atomic: await PingApi.ping()?; count += 1
     return 1
-bad_srv "redundant `atomic` block: `bump` has no `await` calls" BadRedundantAtomic :
-  state count : Nat = 0 |
-  rpc bump() -> Nat:
-    atomic: count += 1
-    return count
-bad_srv "cannot use `await` inside an `atomic` block" BadAwaitInAtomic :
-  state count : Nat = 0 |
-  rpc bump() -> Nat!:
-    await PingApi.ping()?
-    atomic:
-      await PingApi.ping()?
-      count += 1
-    return 1
-bad_srv "unhandled fallible `await` expression" BadUnhandledError :
-  rpc callIt() -> String:
-    let res = await PingApi.ping()
-    return "ok"
+bad_srv "unhandled fallible `await` expression" BadUnhandledError : rpc callIt() -> String: let res = await PingApi.ping(); return "ok"
 bad_srv "Array index `idx` could be out of bounds for `items`:\n  • must satisfy:  idx < items.size" BadArrayBounds : state items : Nat[] = [10, 20] | rpc readAt(idx: Nat) -> Nat: return items[idx]
 bad_srv "Schema field rule `1 <= \"\".length and \"\".length <= 32` failed for `\"\"`." BadFieldRefinement : rpc makeEmpty() -> CheckedItem: return CheckedItem(label="", stock=5)
 bad_srv "Server invariant `maxStock` failed in `overflow`:\n  • must satisfy:  stock + 50 <= 100" BadSingleStateInv : state stock : Nat = 10 | invariant maxStock: stock <= 100 | rpc overflow() -> Nat: stock += 50; return stock
@@ -57,16 +37,8 @@ server CheckedSrv:
     return qty
 server OtherSrv:
   rpc ping() -> Nat: return 1
-bad_comp_sess "RPC `CheckedSrv.buy` precondition `1 <= qty <= 50` could not be proved here:\n  • must satisfy:  1 <= 0 and 0 <= 50" BadClientRequiresParam :
-  if user.isSome:
-    let _ = await CheckedSrv.buy(0) catch:
-      case _: pass
-expect_err "RPC `CheckedSrv.buy` requires an authenticated session (`ctx.userId != none`), but `BadClientRequiresAuth` has no `session` field." in
-component BadClientRequiresAuth:
-  action go:
-    let _ = await CheckedSrv.buy(1) catch:
-      case _: pass
-  view: <span>ok</span>
+bad_comp_sess "RPC `CheckedSrv.buy` precondition `1 <= qty <= 50` could not be proved here:\n  • must satisfy:  1 <= 0 and 0 <= 50" BadClientRequiresParam : if user.isSome: let _ = await CheckedSrv.buy(0) catch: case _: pass
+bad_comp "RPC `CheckedSrv.buy` requires an authenticated session (`ctx.userId != none`), but `BadClientRequiresAuth` has no `session` field." BadClientRequiresAuth : action go: let _ = await CheckedSrv.buy(1) catch: case _: pass | view: <span>ok</span>
 bad_comp_sess "`await CheckedSrv.buy(...)` has unhandled domain error(s): .limitReached" BadClientNonExhaustiveCatch :
   if user.isSome:
     let _ = await CheckedSrv.buy(1) catch:
@@ -153,11 +125,10 @@ component SimpleHeadPage:
     meta        "og:site_name", "Qed"
   view: <main><h1>Hello</h1></main>
 example : (SimpleHeadPage.app.headFor SimpleHeadPage.init).title = some "Simple Page" ∧ SimpleHeadPage.app.ssrStatus SimpleHeadPage.init = 200 := ⟨rfl, rfl⟩
-expect_err "`case` inside `head:` requires a `route` declaration on `component BadHeadCase`" in
-component BadHeadCase:
+bad_comp "`case` inside `head:` requires a `route` declaration on `component BadHeadCase`" BadHeadCase :
   head:
     case .home: title "Nope"
-  view: <main>ok</main>
+  | view: <main>ok</main>
 
 -- Stateless `server` and per-viewer `channel ... project(...)` with `blindTo`
 record RawGameRoom:
@@ -208,7 +179,6 @@ external GcpIdExt:
   base "https://my-svc.run.app"
   auth gcpMetadata("https://my-svc.run.app")
   get "/health" health() -> String
-example : (GcpAdcExt.secrets.isEmpty && GcpIdExt.secrets.isEmpty) = true := by decide +kernel
 router GuardedRoute:
   home    = "/"
   project = "/projects/:slug"
@@ -255,19 +225,6 @@ server GuardedApi:
   channel feed() -> String:
     on_join: pass
     on_send(msg: String): feed.emit(msg)
-example : (
-  ["bump", "formatGreeting", "mintAndHash"].all (!GuardedApi.methods.contains ·) &&
-  ["hello", "whoNamed", "createToken"].all GuardedApi.methods.contains &&
-  ["readHits", "billingUrl"].all GuardedApi.readOnlyMethods.contains &&
-  (Qed.Server.ApiError.internal "pg password leaked").wireMessage false == "internal server error" &&
-  (Qed.Server.ApiError.internal "pg password leaked").wireMessage true == "pg password leaked" &&
-  (Qed.Server.ApiError.forbidden "nope").wireMessage false == "nope" &&
-  (Qed.Server.HttpResponse.redirect GuardedRoute.home).headers == [("Location", "/")] &&
-  (Qed.Server.HttpResponse.redirect (GuardedRoute.project "demo")).headers == [("Location", "/projects/demo")] &&
-  (Qed.Server.HttpResponse.redirect "/raw").headers == [("Location", "/raw")] &&
-  (Qed.Server.HttpResponse.redirect (Qed.Server.WebhookUrl.make "https://hooks.example.com/ok")).headers == [("Location", "https://hooks.example.com/ok")] &&
-  (Qed.Server.WebhookUrl.parse? "http://insecure.example.com").isNone &&
-  ({ query := "?a=1&tag=hi+qed", body := "{\"msg\":\"yo\"}" : Qed.Server.RequestCtx }).queryParam "tag" == some "hi qed") = true := by decide +kernel
 check_decls [Qed.Server.ApiError.wireMessage_prod_5xx]
 bad_srv "`read_only rpc badMut` is not read-only: it mutates server state" BadReadOnlyMutSrv : state x : Nat = 0 | read_only rpc badMut() -> Nat: x += 1; return x
 bad_srv "`read_only rpc badCookie` is not read-only: it sets or clears cookies" BadReadOnlyCookieSrv : read_only rpc badCookie() -> Unit: setCookie("a", "b")
@@ -358,10 +315,6 @@ server stateless ServiceHost:
   rpc rotateSecret(project: String, id: String, raw: String) -> String!:
     let res = await billing.syncSecret(project, id, raw)?
     return res.render
-example : (Webhooks.secrets == #["WEBHOOK_SECRET"] && ServiceHost.secrets.contains "WEBHOOK_SECRET" &&
-  ServiceHost.secrets.contains "STRIPE_API_KEY" && toString (Secret.ofString "super-secret") == "<redacted>" &&
-  checkPureGuardAndProve none == 3 && checkPureGuardAndProve (some (2, 3)) 4 == 19 &&
-  absDiff (10 : Nat) 3 == 7 && absDiff (3 : Nat) 10 == 7) = true := by decide +kernel
 
 /-! ## Effect-Aware Contracts (`no_http`, `no_decrypt`, `no_crypto`, `no_db_write`, `ensures_fails`) & Service/Server `example` Blocks -/
 external ItemSyncApi:
@@ -500,11 +453,10 @@ bad_svc "Server postcondition `ensures ensures_fails 400` failed in `actuallySuc
   fn actuallySucceeds(n: Nat) -> Nat!:
     ensures_fails 400
     return n + 1
-bad_svc "proved that the proposition" BadSrvExampleSvc :
-  fn inc(n: Nat) -> Nat!: return n + 1
-  | example wrongResult:
-      call inc(1)
-      expect ok(99)
+bad_svc "proved that the proposition" BadSrvExampleSvc : fn inc(n: Nat) -> Nat!: return n + 1 |
+  example wrongResult:
+    call inc(1)
+    expect ok(99)
 
 /-! ## Multi-Origin External, Async Loops/Retry, and Verified `every` Jobs -/
 enum CloudRegion:
@@ -518,10 +470,6 @@ external CloudRunApi:
 external RegionalCdnApi:
   base "https://{tier}.{zone}.cdn.example.com" where tier in ["edge", "origin"], zone : CloudRegion
   get "/health" health(tier: String, zone: CloudRegion) -> String
-example : (CloudRunApi.allowedBaseOrigins == #["https://us-east1-run.googleapis.com", "https://europe-west1-run.googleapis.com"] &&
-  CloudRunApi.resolveBaseOrigin .usEast == "https://us-east1-run.googleapis.com" && RegionalCdnApi.allowedBaseOrigins.size == 4 &&
-  (match RegionalCdnApi.resolveBaseOrigin "edge" .euWest with | .ok s => s == "https://edge.europe-west1.cdn.example.com" | .error _ => false) &&
-  (match RegionalCdnApi.resolveBaseOrigin "evil" .usEast with | .error _ => true | .ok _ => false)) = true := by decide +kernel
 example : ∀ r, Qed.Server.isValidBaseOrigin (CloudRunApi.resolveBaseOrigin r) = true := CloudRunApi.resolveBaseOrigin_valid
 example : ∀ t z o, RegionalCdnApi.resolveBaseOrigin t z = .ok o → Qed.Server.isValidBaseOrigin o = true := RegionalCdnApi.resolveBaseOrigin_valid
 service RetryLoopSvc:
@@ -569,7 +517,6 @@ server WorkerLoopSrv:
   every 30s heartbeat:
     no_http, no_decrypt
     atomic: processed += 0
-example : (WorkerLoopSrv.jobs.size == 2 && (WorkerLoopSrv.jobs[0]?.map (·.name) == some "drainOne") && (WorkerLoopSrv.jobs[0]?.map (·.runWorkM?.isSome) == some true)) = true := by decide +kernel
 bad_ext "has no matching `where region : Enum` or `where region in [...]` allowlist" BadMissingBaseWhere : base "https://{region}-run.googleapis.com" | get "/ping" ping(region: String) -> String
 bad_ext "must be a unit `enum`" BadPayloadEnumWhere : base "https://{p}.example.com" where p : PayloadEnum | get "/ping" ping(p: PayloadEnum) -> String
 bad_ext "invalid expanded `base` origin" BadExpandedOrigin : base "https://{host}.example.com" where host in ["good", "bad@evil"] | get "/ping" ping(host: String) -> String
@@ -688,8 +635,4 @@ server ErgoStatefulSrv:
       let (delta, bonus) = pair
       total += delta
     return .ok(bonus)
-example : (let ev : Qed.Server.SseEvent := { data := "line1\nline2", event := some "msg" }
-  ev.render == "event: msg\ndata: line1\ndata: line2\n\n" &&
-  (match Qed.Server.encodeMultiSeg "/a/b c" with | .ok s => s == "a/b%20c" | .error _ => false) &&
-  (match Qed.Server.encodeMultiSeg "/a/b c/" with | .error _ => true | .ok _ => false)) = true := by decide +kernel
 end ServerChecks

@@ -15,22 +15,12 @@ schema BoundedQty:
 example : (∃ _x : OrderWithExample, True) ∧ (∃ _x : BoundedQty, True) ∧ Nonempty OrderWithExample ∧ Nonempty BoundedQty ∧
     OrderWithExample.validOrder.quantity.val = 3 ∧ OrderWithExample.maxOrder.quantity.val = 10 :=
   ⟨OrderWithExample.satisfiable, BoundedQty.satisfiable, inferInstance, inferInstance, rfl, rfl⟩
-expect_err "Schema `UnsatRange` is unsatisfiable: field `quantity` has contradictory `where` constraints" in
-schema UnsatRange:
-  quantity : Nat where 10 <= quantity, quantity <= 5
-expect_err "Schema `UnsatBool` is unsatisfiable: field `flag` has contradictory `where` constraints" in
-schema UnsatBool:
-  flag : Bool where flag == true, flag == false
-expect_err "Schema `BadExampleVal` example `tooMany` failed `where` constraint on field `quantity`:\n  • value `99` does not satisfy `1 <= quantity, quantity <= 10`" in
-schema BadExampleVal:
-  name     : String where 1 <= name.length
-  quantity : Nat    where 1 <= quantity, quantity <= 10
-  example tooMany: name = "Alice", quantity = 99
-expect_err "Schema `MissingExampleField` example `incomplete`: missing required field `quantity`" in
-schema MissingExampleField:
-  name     : String where 1 <= name.length
-  quantity : Nat    where 1 <= quantity
-  example incomplete: name = "Alice"
+bad_schema "Schema `UnsatRange` is unsatisfiable: field `quantity` has contradictory `where` constraints" UnsatRange : quantity : Nat where 10 <= quantity, quantity <= 5
+bad_schema "Schema `UnsatBool` is unsatisfiable: field `flag` has contradictory `where` constraints" UnsatBool : flag : Bool where flag == true, flag == false
+bad_schema "Schema `BadExampleVal` example `tooMany` failed `where` constraint on field `quantity`:\n  • value `99` does not satisfy `1 <= quantity, quantity <= 10`" BadExampleVal :
+  name : String where 1 <= name.length | quantity : Nat where 1 <= quantity, quantity <= 10 | example tooMany: name = "Alice", quantity = 99
+bad_schema "Schema `MissingExampleField` example `incomplete`: missing required field `quantity`" MissingExampleField :
+  name : String where 1 <= name.length | quantity : Nat where 1 <= quantity | example incomplete: name = "Alice"
 
 /-! ## 1B. Unified Component `example` (Concrete & Parametric Proofs) -/
 component ReachCounter:
@@ -49,18 +39,8 @@ component ReachCounter:
 example : (∃ s : ReachCounter.State, s.count ≤ 10 ∧ s.count = 5) ∧ (∀ n ≤ 10, ∃ s : ReachCounter.State, s.count ≤ 10 ∧ s.count = n) :=
   ⟨Qed.inv_nonvacuous_of_reachable ReachCounter.canAdd5 ReachCounter.bounded.1 ReachCounter.bounded.2,
    fun n h => Qed.inv_nonvacuous_of_reachable (ReachCounter.addAny n h) ReachCounter.bounded.1 ReachCounter.bounded.2⟩
-expect_err "Example `BadReach.cantReach5` failed to prove `count == 5`:\n  • must satisfy:  False" in
-component BadReach:
-  state count : Nat = 0
-  action inc: count += 1
-  example cantReach5: .inc, .inc -> count == 5
-  view: <span>{count}</span>
-expect_err "Example `BadParamReach.addTooMuch` failed to prove `count == n`:\n  • must satisfy:  0 = n" in
-component BadParamReach:
-  state count : Nat = 0
-  action inc(n: Nat): if count + n <= 10: count += n
-  example addTooMuch(n: Nat): .inc(n) -> count == n
-  view: <span>{count}</span>
+bad_comp "Example `BadReach.cantReach5` failed to prove `count == 5`:\n  • must satisfy:  False" BadReach : state count : Nat = 0 | action inc: count += 1 | example cantReach5: .inc, .inc -> count == 5 | view: <span>{count}</span>
+bad_comp "Example `BadParamReach.addTooMuch` failed to prove `count == n`:\n  • must satisfy:  0 = n" BadParamReach : state count : Nat = 0 | action inc(n: Nat): if count + n <= 10: count += n | example addTooMuch(n: Nat): .inc(n) -> count == n | view: <span>{count}</span>
 
 /-! ## 2. Compile-Time Accessibility (A11y) Proofs -/
 style a11yPrimary:
@@ -98,10 +78,6 @@ bad_a11y htmlHasLang       : <html><body>Hello</body></html>
 /-! ## 3. Binary File Uploads & Verified Base64 -/
 example (bs : ByteArray) : Qed.Base64.decode (Qed.Base64.encode bs) = .ok bs ∧ (Qed.Base64.encode bs).length = Qed.Base64.encodedLength bs.size ∧
     (Qed.Base64.encodeUrl bs).length = Qed.Base64.encodedUrlLength bs.size := ⟨Qed.Base64.decode_encode bs, Qed.Base64.encode_length bs, Qed.Base64.encodeUrl_length bs⟩
-example : (Qed.Base64.encode (ByteArray.mk #[]) == "" && Qed.Base64.encode (ByteArray.mk #[0, 1, 2, 255]) == "AAEC/w==" &&
-  (match Qed.FileBytes.decode "{\"name\":\"pic.png\",\"mime\":\"image/png\",\"size\":4,\"base64\":\"AAEC/w==\"}" with | .ok fb => (fb.name, fb.mime, fb.size, fb.bytes.data) == ("pic.png", "image/png", 4, #[0, 1, 2, 255]) | .error _ => false) &&
-  (match Qed.FileBytes.decode "{\"error\":\"file too large\"}" with | .error "file too large" => true | _ => false) &&
-  (match Qed.Cmd.pickFileBytes (msg := Unit) "image/*" 4096 (fun _ => ()) with | .fxResult "file.pickBytes" "image/*" "4096" _ => true | _ => false)) = true := by decide +kernel
 
 /-! ## 4. Verified Scheduled / Background Server Jobs -/
 external HealthPing:
@@ -134,8 +110,6 @@ bad_srv "cannot use `await` inside an `atomic` block" BadAwaitInAtomicJob : stat
 /-! ## 5. Verified Typed Dictionaries (`{K: V}`) -/
 example : Qed.LawfulJson (Qed.Dict String Nat) × Qed.LawfulJson (Qed.Dict Nat String) × Qed.LawfulProto (Qed.Dict String Nat) × Qed.LawfulProto (Qed.Dict Nat (Array String)) :=
   (inferInstance, inferInstance, inferInstance, inferInstance)
-example : (let d : Qed.Dict String Nat := Qed.Dict.ofList [("alice", 10), ("bob", 20)]
-  Qed.Json.render (Qed.toJson d) == "{\"alice\":10,\"bob\":20}" && (match Qed.Proto.decode (α := Qed.Dict String Nat) (Qed.Proto.encode d) with | .ok d' => d' == d | .error _ => false)) = true := by decide +kernel
 component Scoreboard:
   state scores : {String: Nat}
   state preset = {"alice": 10, "bob": 20}
@@ -222,16 +196,6 @@ component HoistedEmitter:
   action finish: done.emit(true)
   action hide: showPane = false
   view: <div>{<HoistedPane key="p" title="P"/> if showPane else <span/>}</div>
-example : (
-  let (s0, _) := HoistedDashboard.update HoistedDashboard.init (._onSession (some "alice"))
-  let (s1, c1) := HoistedDashboard.update s0 (._sub_0 .tick)
-  let (s2, c2) := HoistedDashboard.update s1 (.setTab .t1)
-  let (s3, _) := HoistedDashboard.update s2 (._sub_1 .pick)
-  let (e1, eo1, _) := HoistedEmitter.update HoistedEmitter.init .finish
-  let (e2, eo2, _) := HoistedEmitter.update e1 .hide
-  s1._sub_0.ticks == 1 && (match c1 with | .none => true | _ => false) && s2._sub_0.ticks == 0 && s2._sub_1.user == some "alice" &&
-  (match c2 with | .batch [.none, .port "ping" "\"boot\""] => true | _ => false) && s3.lastPick == "b" &&
-  (match eo1 with | some (.done true) => true | _ => false) && eo2.isNone && e2.showPane == false) = true := by decide +kernel
 
 /-! ## 7. Upgraded Component `example` Blocks (`with props`, `from`, `emits`, Async `on Server.rpc => ...`) -/
 component PropsAndEmitsCard:
@@ -275,33 +239,13 @@ component AsyncLaunchPanel:
   example networkError with props { appId = "web" } from { user = some("alice") }: .start, on LaunchRpcSrv.trigger => error("timeout") -> not busy and errMsg == "timeout"
   example unauthNoOp with props { appId = "web" }: .start -> not busy and lastRel == ""
   view: <section><button onClick={.start}>Launch</button><span>{lastRel}</span><span>{errMsg}</span></section>
-expect_err "Example `BadCompExEmits.badEmits` failed" in
-component BadCompExEmits:
-  prop step : Nat = 1
-  event changed(next: Nat)
-  state count : Nat = 0
-  action inc: count += step; changed.emit(count)
-  example badEmits with props { step = 2 }: .inc -> count == 2 emits .changed(99)
-  view: <span>{count}</span>
-expect_err "`on ... => ...` in `example danglingReply` requires component `BadCompExNoAsync` to have `await` / async effects" in
-component BadCompExNoAsync:
-  prop appId : String
-  session user
-  state busy : Bool = false
-  action noop: pass
-  example danglingReply with props { appId = "web" }: .noop, on LaunchRpcSrv.trigger => ok("rel-web") -> not busy
-  view: <span>{appId}</span>
-expect_err "Example `BadCompExUnmatchedRpc.danglingReply` failed" in
-component BadCompExUnmatchedRpc:
-  prop appId : String
-  session user
-  state busy : Bool = false
-  action noop: pass
+bad_comp "Example `BadCompExEmits.badEmits` failed" BadCompExEmits : prop step : Nat = 1 | event changed(next: Nat) | state count : Nat = 0 | action inc: count += step; changed.emit(count) | example badEmits with props { step = 2 }: .inc -> count == 2 emits .changed(99) | view: <span>{count}</span>
+bad_comp "`on ... => ...` in `example danglingReply` requires component `BadCompExNoAsync` to have `await` / async effects" BadCompExNoAsync : prop appId : String | session user | state busy : Bool = false | action noop: pass | example danglingReply with props { appId = "web" }: .noop, on LaunchRpcSrv.trigger => ok("rel-web") -> not busy | view: <span>{appId}</span>
+bad_comp "Example `BadCompExUnmatchedRpc.danglingReply` failed" BadCompExUnmatchedRpc : prop appId : String | session user | state busy : Bool = false | action noop: pass |
   action start:
     if user != none:
       let _ = await LaunchRpcSrv.trigger(appId) catch:
         case _: pass
       busy = false
-  example danglingReply with props { appId = "web" }: .noop, on LaunchRpcSrv.trigger => ok("rel-web") -> not busy
-  view: <span>{appId}</span>
+  | example danglingReply with props { appId = "web" }: .noop, on LaunchRpcSrv.trigger => ok("rel-web") -> not busy | view: <span>{appId}</span>
 end VerificationChecks

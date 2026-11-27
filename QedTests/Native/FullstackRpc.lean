@@ -64,11 +64,11 @@ private def runMovedServerChecks (c : TestChecker) : IO Unit := do
   let bobOut := (ServerChecks.RedactedHub.wsProject { userId := some "bob" } "room" params payload).bind id
   c.checkAll [
     ("[srv-pure] SetCookie.mkSafe strips CRLF and emits flags",
-      ["qed_session=tokX-Evil: 1", "HttpOnly", "SameSite=Lax", "Secure", "Max-Age=3600"].all (ck.contains ·) && !ck.toList.contains '\r' && !ck.toList.contains '\n'),
+      hasAll ck ["qed_session=tokX-Evil: 1", "HttpOnly", "SameSite=Lax", "Secure", "Max-Age=3600"] && !ck.toList.contains '\r' && !ck.toList.contains '\n'),
     ("[srv-pure] parseRequestHead acceptsGzip", parseGz "br, gzip, deflate" == some true && parseGz "gzip;q=0" == some false),
     ("[srv-pure] renderDocument escapes head meta & strips javascript: canonical",
-      ["<title>Page &lt;/title&gt;&lt;script&gt;alert(1)&lt;/script&gt;</title>", "<meta name=\"description\" content=\"Desc &quot;quoted&quot; &lt;tag&gt;\">",
-       "<meta name=\"og:title\" content=\"OG &quot;bad&quot;\">", "<link rel=\"canonical\" href=\"https://example.com/posts/1\">"].all (doc.contains ·) &&
+      hasAll doc ["<title>Page &lt;/title&gt;&lt;script&gt;alert(1)&lt;/script&gt;</title>", "<meta name=\"description\" content=\"Desc &quot;quoted&quot; &lt;tag&gt;\">",
+       "<meta name=\"og:title\" content=\"OG &quot;bad&quot;\">", "<link rel=\"canonical\" href=\"https://example.com/\">".replace "example.com/" "example.com/posts/1"] &&
       !doc.contains "<script>alert(1)</script>" && !badDoc.contains "rel=\"canonical\"" && !badDoc.contains "javascript:"),
     ("[srv-pure] RedactedHub.wsProject exposes secrets to alice & redacts for bob",
       (aliceOut.bind fun bs => (Qed.Proto.decode (α := ServerChecks.RedactedGameView) bs).toOption) == some { code := "ABCD", secretLocation := some "Casino", secretPack := some "Classic", isSpy := false } &&
@@ -80,7 +80,35 @@ private def runMovedServerChecks (c : TestChecker) : IO Unit := do
       (Qed.Server.buildExternalSuffix [.lit "v1", .lit "projects", .seg "p1", .lit "secrets", .compound [.param "my-sec", .lit ":addVersion"]] [("pageSize", .omit), ("filter", .omit)]).toOption == some "v1/projects/p1/secrets/my-sec:addVersion" &&
       (Qed.Server.buildExternalSuffix [.lit "v1", .lit "customers"] [("starting_after", Qed.Server.ToQueryVal.toQueryVal (none : Option String)), ("limit", Qed.Server.ToQueryVal.toQueryVal (some (25 : Nat)))]).toOption == some "v1/customers?limit=25"),
     ("[srv-pure] encodeFormBodyOf StripeCheckoutReq",
-      String.fromUTF8? (Qed.Server.encodeFormBodyOf ({ mode := "payment", successUrl := "https://a.test/ok", quantity := 2, coupon := none : ServerChecks.StripeCheckoutReq })) == some "mode=payment&successUrl=https%3A%2F%2Fa.test%2Fok&quantity=2")]
+      String.fromUTF8? (Qed.Server.encodeFormBodyOf ({ mode := "payment", successUrl := "https://a.test/ok", quantity := 2, coupon := none : ServerChecks.StripeCheckoutReq })) == some "mode=payment&successUrl=https%3A%2F%2Fa.test%2Fok&quantity=2"),
+    ("[srv-pure] GuardedApi methods/readOnly/wireMessage/redirect/queryParam & GcpAdc/GcpId secrets",
+      ServerChecks.GcpAdcExt.secrets.isEmpty && ServerChecks.GcpIdExt.secrets.isEmpty &&
+      ["bump", "formatGreeting", "mintAndHash"].all (!ServerChecks.GuardedApi.methods.contains ·) &&
+      ["hello", "whoNamed", "createToken"].all ServerChecks.GuardedApi.methods.contains &&
+      ["readHits", "billingUrl"].all ServerChecks.GuardedApi.readOnlyMethods.contains &&
+      (ApiError.internal "pg password leaked").wireMessage false == "internal server error" &&
+      (ApiError.internal "pg password leaked").wireMessage true == "pg password leaked" &&
+      (ApiError.forbidden "nope").wireMessage false == "nope" &&
+      (HttpResponse.redirect ServerChecks.GuardedRoute.home).headers == [("Location", "/")] &&
+      (HttpResponse.redirect (ServerChecks.GuardedRoute.project "demo")).headers == [("Location", "/projects/demo")] &&
+      (HttpResponse.redirect "/raw").headers == [("Location", "/raw")] &&
+      (HttpResponse.redirect (WebhookUrl.make "https://hooks.example.com/ok")).headers == [("Location", "https://hooks.example.com/ok")] &&
+      (WebhookUrl.parse? "http://insecure.example.com").isNone &&
+      ({ query := "?a=1&tag=hi+qed", body := "{\"msg\":\"yo\"}" : RequestCtx }).queryParam "tag" == some "hi qed"),
+    ("[srv-pure] Webhooks/ServiceHost secrets, Secret redaction, checkPureGuardAndProve, absDiff",
+      ServerChecks.Webhooks.secrets == #["WEBHOOK_SECRET"] && ServerChecks.ServiceHost.secrets.contains "WEBHOOK_SECRET" &&
+      ServerChecks.ServiceHost.secrets.contains "STRIPE_API_KEY" && toString (Qed.Secret.ofString "super-secret") == "<redacted>" &&
+      ServerChecks.checkPureGuardAndProve none == 3 && ServerChecks.checkPureGuardAndProve (some (2, 3)) 4 == 19 &&
+      Qed.absDiff (10 : Nat) 3 == 7 && Qed.absDiff (3 : Nat) 10 == 7),
+    ("[srv-pure] Multi-origin CloudRunApi/RegionalCdnApi, WorkerLoopSrv jobs, SseEvent, encodeMultiSeg",
+      ServerChecks.CloudRunApi.allowedBaseOrigins == #["https://us-east1-run.googleapis.com", "https://europe-west1-run.googleapis.com"] &&
+      ServerChecks.CloudRunApi.resolveBaseOrigin .usEast == "https://us-east1-run.googleapis.com" && ServerChecks.RegionalCdnApi.allowedBaseOrigins.size == 4 &&
+      (match ServerChecks.RegionalCdnApi.resolveBaseOrigin "edge" .euWest with | .ok s => s == "https://edge.europe-west1.cdn.example.com" | .error _ => false) &&
+      !(ServerChecks.RegionalCdnApi.resolveBaseOrigin "evil" .usEast).isOk &&
+      ServerChecks.WorkerLoopSrv.jobs.size == 2 && ServerChecks.WorkerLoopSrv.jobs[0]?.map (·.name) == some "drainOne" &&
+      ServerChecks.WorkerLoopSrv.jobs[0]?.map (·.runWorkM?.isSome) == some true &&
+      ({ data := "line1\nline2", event := some "msg" : SseEvent }).render == "event: msg\ndata: line1\ndata: line2\n\n" &&
+      Qed.Server.encodeMultiSeg "/a/b c" == .ok "a/b%20c" && !(Qed.Server.encodeMultiSeg "/a/b c/").isOk)]
 
 private def runWebEssentialsSuite (c : TestChecker) : IO Unit :=
   withDevApp c "QedTests.WebEssentialsFixture" fun dir => do
@@ -89,13 +117,13 @@ private def runWebEssentialsSuite (c : TestChecker) : IO Unit :=
     let authSecret := "web-essentials-hmac-secret"; let aliceTok ← signSessionToken authSecret "alice"
     try
       withNativeServer c "[web-essentials] child native server healthy" dir #[("QED_WORKERS", some "2"), ("QED_AUTH_SECRET", some authSecret)] (dev := false) fun srv => do
-        for pass in [1, 2] do checkGzipResp c s!"[web-essentials] hashed JS gzip pass {pass}" (← httpReq srv.port "GET" "/bundle.deadbeef.mjs" #[("Accept-Encoding", "gzip")]) jsContent
+        forList [1, 2] fun pass => do checkGzipResp c s!"[web-essentials] hashed JS gzip pass {pass}" (← httpReq srv.port "GET" "/bundle.deadbeef.mjs" #[("Accept-Encoding", "gzip")]) jsContent
         c.checkHttp "[web-essentials] hashed JS plain" (← httpReq srv.port "GET" "/bundle.deadbeef.mjs") (headers := [("content-encoding", none)]) (bodyEq? := some jsContent)
         c.checkHttp "[web-essentials] GET /robots.txt" (← httpReq srv.port "GET" "/robots.txt") (bodyEq? := some "User-agent: *\nAllow: /\n")
         c.checkStatus "[web-essentials] unauth POST /webhook rejected 401" (← httpReq srv.port "POST" "/webhook" #[] "{}".toUTF8) 401
-        for (lbl, path, hdrs, body, cLbl, ckFlags) in [
+        forList [
             ("auth POST /webhook", "/webhook", #[("Authorization", s!"Bearer {aliceTok}")], "{}", "auth POST /webhook emitted Set-Cookie wh_seen=1", ["wh_seen=1", "HttpOnly", "SameSite=Lax"]),
-            ("POST /echo-cookie", "/echo-cookie", #[], "val123\r\nX-Inject: bad", "POST /echo-cookie emitted sanitized HttpOnly SameSite=Lax cookie", ["echo_ck=val123X-Inject: bad", "HttpOnly", "SameSite=Lax"])] do
+            ("POST /echo-cookie", "/echo-cookie", #[], "val123\r\nX-Inject: bad", "POST /echo-cookie emitted sanitized HttpOnly SameSite=Lax cookie", ["echo_ck=val123X-Inject: bad", "HttpOnly", "SameSite=Lax"])] fun (lbl, path, hdrs, body, cLbl, ckFlags) => do
           c.checkHttp s!"[web-essentials] {lbl}" (← httpReq srv.port "POST" path hdrs body.toUTF8) (bodyEq? := some "{\"ok\":true}") (extra := (·.checkCookieFlag c s!"[web-essentials] {cLbl}" ckFlags))
         c.checkHttp "[web-essentials] RPC login" (← httpRpc srv.port "WebEssentialsSrv" "login" (Qed.Proto.encode "sess_tok_42")) (extra := fun r => do
           c.checkEq "[web-essentials] RPC login payload" (Qed.Proto.decode (α := String) r.body) (.ok "ok")
@@ -139,9 +167,9 @@ private def runServiceAndExternalSuite (c : TestChecker) : IO Unit := do
       let goodSig ← Qed.Crypto.hmacSha256Hex (Qed.Secret.ofString "whsec_test_key_99") s!"{nowSec}.{payload}"
       let oldSig ← Qed.Crypto.hmacSha256Hex (Qed.Secret.ofString "whsec_test_key_99") s!"{oldTs}.{payload}"
       let callHost (fn : String) (req : ByteArray) := @ServerChecks.ServiceHost.dispatchM IO _ srvInst {} fn req
-      for (lbl, hdr, want) in [("accepts valid HMAC within tolerance", s!"{nowSec},{goodSig}", true),
+      forList [("accepts valid HMAC within tolerance", s!"{nowSec},{goodSig}", true),
           ("rejects tampered HMAC (constEq)", s!"{nowSec},0000000000000000000000000000000000000000000000000000000000000000", false),
-          ("rejects replayed timestamp outside tolerance", s!"{oldTs},{oldSig}", false)] do
+          ("rejects replayed timestamp outside tolerance", s!"{oldTs},{oldSig}", false)] fun (lbl, hdr, want) => do
         c.checkProto s!"[svc-ext] verifyWebhook {lbl}" (← callHost "verifyWebhook" (Qed.Proto.encode (payload, hdr))) want
       c.checkProto "[svc-ext] getOddToken proves ensures via prove: and returns 15" (← callHost "getOddToken" (Qed.Proto.encode (7 : Nat))) (15 : Nat)
       let checkoutReq : ServerChecks.StripeCheckoutReq := { mode := "payment", successUrl := "https://app.test/ok", quantity := 3, coupon := none }
@@ -173,7 +201,7 @@ private def runCloudBooksSuite (c : TestChecker) : IO Unit := do
     let tLeak ← IO.asTask (prio := .dedicated) (checkLeakGate c "Examples.CloudBooks" #["CloudBooks.Catalog.initState", "CloudBooks.Catalog.secrets", "CloudBooks.Catalog.dispatchM", "CloudBooks.Catalog.order_handler", "CloudBooks.CloudflareD1.secrets"])
     let (fcCode, _, fcErr) ← runCmd (dir ++ "/server") #[dir, "18999"] (env := #[("CF_D1_TOKEN", none), ("GCP_SA_JSON", none)])
     c.checkEq "fail-closed exit code without secrets" fcCode 1
-    for secret in ["GCP_SA_JSON", "CF_D1_TOKEN"] do c.check s!"stderr mentions {secret}" (fcErr.contains secret) fcErr
+    forList ["GCP_SA_JSON", "CF_D1_TOKEN"] fun secret => c.check s!"stderr mentions {secret}" (fcErr.contains secret) fcErr
     withMockServer c "startMockExternal" (startMockExternal pemKey) (·.2.2) fun (extBase, mockRef, _) => do
       let saJson := Qed.Json.render (.obj [("client_email", .str "qed-test@proj.iam.gserviceaccount.com"), ("private_key", .str pemKey), ("token_uri", .str s!"{extBase}/oauth2/token")])
       let (authSecret, prevSecret, nowSec) := ("super-secret-hmac-key", "previous-rotated-hmac-key", (← Prim.nowMs).toNat / 1000)
@@ -183,9 +211,9 @@ private def runCloudBooksSuite (c : TestChecker) : IO Unit := do
         ("QED_GCP_TOKEN_URL", some s!"{extBase}/oauth2/token"), ("QED_EXT_GCPSTORAGE_BASE", some extBase), ("QED_EXT_CLOUDFLARED1_BASE", some extBase)]
       runTasks [
         withNativeServer c "native server healthy" dir (baseEnv ++ #[("QED_WORKERS", some "4"), ("QED_AUTH_SECRET_PREV", some prevSecret)]) (dev := true) fun srv => do
-          for (lbl, raw) in [("HTTP/1.1 without Host rejected 400", "GET /_qed/health HTTP/1.1\r\nConnection: close\r\n\r\n"),
+          forList [("HTTP/1.1 without Host rejected 400", "GET /_qed/health HTTP/1.1\r\nConnection: close\r\n\r\n"),
               ("HTTP/1.1 duplicate Host rejected 400", "GET /_qed/health HTTP/1.1\r\nHost: 127.0.0.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"),
-              ("whitespace before colon rejected 400", "GET /_qed/health HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length : 0\r\nConnection: close\r\n\r\n")] do
+              ("whitespace before colon rejected 400", "GET /_qed/health HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length : 0\r\nConnection: close\r\n\r\n")] fun (lbl, raw) =>
             c.checkRaw400 srv.port lbl raw
           c.checkRawNoLeak srv.port "path traversal never leaks lakefile.lean" "/../lakefile.lean" "lean_lib Qed"
           c.checkHttp "missing static asset" (← httpReq srv.port "GET" "/does-not-exist.js") (status? := some 404) (headers := [("x-content-type-options", some "nosniff")])

@@ -2,7 +2,6 @@ import Lean
 import Qed.Lang
 import Qed.Diag
 import Qed.Collection
-import Qed.Html
 
 namespace Qed
 
@@ -42,33 +41,43 @@ def dbBaseSimpNames : Array Name := boolSimpNames ++ valUnwrapBaseNames ++ optCo
   `Qed.Str.toLower_length, `Qed.Str.toUpper_length, `Qed.Str.truncate_length, `Qed.Str.take_length, `Qed.Str.drop_length,
   ``true_and, ``and_true, ``false_or, ``or_false, ``true_or, ``or_true, ``id_eq, ``ne_eq]
 
-private def addSimpNamesWithEqns (st : SimpTheorems) (names : Array Name) (dsimpOnly : Bool := false) (withEqns : Bool := false) :
-    MetaM SimpTheorems := do
-  let env ← getEnv; let mut st := st
-  for n in names do
-    if let some ci := env.find? n then
-      match ci with
-      | .thmInfo _ => unless dsimpOnly do st ← st.addConst n
-      | _ =>
-          st ← st.addDeclToUnfold n
-          if withEqns && !dsimpOnly then
-            if let some eqns ← getEqnsFor? n then for eq in eqns do st ← st.addConst eq
-  return st
+@[noinline] def foldlMeta {α β : Type} (xs : Array α) (init : β) (f : β → α → MetaM β) : MetaM β :=
+  let rec go : Nat → β → MetaM β | 0, acc => pure acc | r + 1, acc => do let i := xs.size - (r + 1); if h : i < xs.size then go r (← f acc xs[i]) else pure acc
+  go xs.size init
+@[noinline] def mapMeta {α β : Type} (xs : Array α) (f : α → MetaM β) : MetaM (Array β) :=
+  foldlMeta xs (Array.mkEmpty xs.size) fun acc x => return acc.push (← f x)
 
-/-- Collect every local-module constant (including `_simp_*` aux lemmas and generated equations)
-    referenced by `st`, paired with its type, so cached `SimpTheorems` are never reused across
-    async elaboration branches that lack or differently number those local declarations. -/
+def mkBoolEq (lhs rhs : Expr) : Expr := mkApp3 (mkConst ``Eq [Level.one]) (mkConst ``Bool) lhs rhs
+def mkBoolEqTrue (lhs : Expr) : Expr := mkBoolEq lhs (mkConst ``Bool.true)
+def rflBoolTrue : Expr := mkApp2 (mkConst ``Eq.refl [Level.one]) (mkConst ``Bool) (mkConst ``Bool.true)
+def rflBoolFalse : Expr := mkApp2 (mkConst ``Eq.refl [Level.one]) (mkConst ``Bool) (mkConst ``Bool.false)
+
+@[noinline] def closeAllGoals (f : MVarId → MetaM Bool) : List MVarId → MetaM Bool
+  | [] => pure true | g :: r => do if ← f g then closeAllGoals f r else pure false
+@[noinline] def filterUnsolvedM (f : MVarId → MetaM Bool) : List MVarId → MetaM (List MVarId)
+  | [] => pure [] | g :: r => do if ← f g then filterUnsolvedM f r else return g :: (← filterUnsolvedM f r)
+
+private def addSimpNamesWithEqns (st : SimpTheorems) (names : Array Name) (dsimpOnly : Bool := false) (withEqns : Bool := false) : MetaM SimpTheorems := do
+  let env ← getEnv
+  foldlMeta names st fun st n => do
+    let some ci := env.find? n | return st
+    match ci with
+    | .thmInfo _ => if dsimpOnly then pure st else st.addConst n
+    | _ =>
+        let st ← st.addDeclToUnfold n
+        if withEqns && !dsimpOnly then
+          match ← getEqnsFor? n with | some eqns => foldlMeta eqns st fun s eq => s.addConst eq | none => pure st
+        else pure st
+
+/-- Collect every local-module constant referenced by `st`, paired with its type, so cached
+    `SimpTheorems` are never reused across async branches with different local decls. -/
 private def collectLocalSimpDeps (env : Environment) (st : SimpTheorems) : Array (Name × Expr) :=
   let map₂ := env.constants.map₂
   let addName (acc : Std.HashMap Name Expr) (c : Name) : Std.HashMap Name Expr :=
-    if acc.contains c then acc
-    else match map₂.find? c with
-      | some ci => acc.insert c ci.type
-      | none => acc
+    if acc.contains c then acc else match map₂.find? c with | some ci => acc.insert c ci.type | none => acc
   let collectTree (acc : Std.HashMap Name Expr) (tree : SimpTheoremTree) : Std.HashMap Name Expr :=
     tree.foldValues (init := acc) fun acc thm => thm.proof.getUsedConstants.foldl addName acc
-  let seen := collectTree (collectTree {} st.pre) st.post
-  let seen := st.toUnfold.fold (init := seen) addName
+  let seen := st.toUnfold.fold (init := collectTree (collectTree {} st.pre) st.post) addName
   seen.fold (init := #[]) fun acc k ty => acc.push (k, ty)
 
 initialize simpThmsCache : IO.Ref (Std.HashMap (String × Name × Bool × Bool × Bool) (SimpTheorems × Array (Name × Expr))) ← IO.mkRef {}
@@ -78,8 +87,9 @@ def getCachedSimprocs (names : Array Name) (post : Bool := true) : MetaM Simp.Si
   if names.isEmpty then return #[]
   let key := (names, post)
   if let some sp := (← simprocsCache.get).get? key then return sp
-  let env ← getEnv; let mut sp : Simp.Simprocs := {}; let mut any := false
-  for n in names do if env.contains n then sp ← sp.add n post; any := true
+  let env ← getEnv
+  let (sp, any) ← foldlMeta names (({} : Simp.Simprocs), false) fun (sp, any) n =>
+    if env.contains n then return (← sp.add n post, true) else pure (sp, any)
   let arr := if any then #[sp] else #[]
   if any then simprocsCache.modify (·.insert key arr)
   return arr
@@ -88,8 +98,7 @@ def getCachedSimpThms (key : String) (names : Array Name) (dsimpOnly : Bool := f
   let env ← getEnv
   let cacheKey := (key, env.header.mainModule, dsimpOnly, withEqns, env.contains `Qed.Codec.valid)
   if let some (st, needed) := (← simpThmsCache.get).get? cacheKey then
-    if needed.all fun (k, ty) => match env.find? k with | some ci => ci.type == ty | none => false then
-      return st
+    if needed.all fun (k, ty) => match env.find? k with | some ci => ci.type == ty | none => false then return st
   let st ← addSimpNamesWithEqns {} names dsimpOnly withEqns
   let deps := collectLocalSimpDeps (← getEnv) st
   simpThmsCache.modify (·.insert cacheKey (st, deps)); return st
@@ -99,41 +108,25 @@ def resolveCompUpdateUnfolds (idStx : Syntax) : CoreM (Array Name) := do
   let some cn ← try some <$> resolveGlobalConstNoOverload idStx catch _ => pure none | return #[]
   let env ← getEnv; let pfx := cn.getPrefix; let base := #[cn]
   if pfx.isAnonymous then return base
-  let extras := if cn.getString! == "app" then #[pfx ++ `update, pfx ++ `stepOwn, pfx ++ `_reconcileHoisted]
-                else #[pfx ++ `stepOwn, pfx ++ `_reconcileHoisted]
-  return extras.foldl (init := base) fun acc aux =>
-    if env.contains aux && !acc.contains aux then acc.push aux else acc
+  let extras := if cn.getString! == "app" then #[pfx ++ `update, pfx ++ `stepOwn, pfx ++ `_reconcileHoisted] else #[pfx ++ `stepOwn, pfx ++ `_reconcileHoisted]
+  return extras.foldl (init := base) fun acc aux => if env.contains aux && !acc.contains aux then acc.push aux else acc
 
 @[noinline, nospecialize] def withFreshHeartbeatsT {α : Type} (k : TacticM α) : TacticM α := Core.withCurrHeartbeats k
-@[noinline, nospecialize] def withFreshHeartbeatsM {α : Type} (k : MetaM α) : MetaM α := Core.withCurrHeartbeats k
 @[noinline] def isPropSafe (ty : Expr) : MetaM Bool := try isProp ty catch _ => pure false
 
 @[noinline] private def getUserLCtxDecls (includeLet : Bool) : MetaM (Array LocalDecl) := do
-  return (← getLCtx).foldl (init := #[]) fun acc d =>
-    if !d.isImplementationDetail && (includeLet || !d.isLet) then acc.push d else acc
+  return (← getLCtx).foldl (init := #[]) fun acc d => if !d.isImplementationDetail && (includeLet || !d.isLet) then acc.push d else acc
 
 @[noinline, nospecialize] def collectLCtxDecls {α : Type} (f : LocalDecl → MetaM (Option α)) (includeLet : Bool := true) : MetaM (Array α) := do
-  let rec go (acc : Array α) : List LocalDecl → MetaM (Array α)
-    | [] => pure acc
-    | d :: ds => do
-        match ← f d with
-        | some x => go (acc.push x) ds
-        | none   => go acc ds
-  go #[] (← getUserLCtxDecls includeLet).toList
+  foldlMeta (← getUserLCtxDecls includeLet) #[] fun acc d => do match ← f d with | some x => pure (acc.push x) | none => pure acc
 
 @[noinline, nospecialize] def findLCtxDecl? {α : Type} (f : LocalDecl → MetaM (Option α)) (includeLet : Bool := true) : MetaM (Option α) := do
-  let rec go : List LocalDecl → MetaM (Option α)
-    | [] => pure none
-    | d :: ds => do
-        match ← f d with
-        | some x => pure (some x)
-        | none   => go ds
+  let rec go : List LocalDecl → MetaM (Option α) | [] => pure none | d :: ds => do match ← f d with | some x => pure (some x) | none => go ds
   go (← getUserLCtxDecls includeLet).toList
 
 /-- Synthesize `rfl` projection simp lemmas `(_reconcileHoisted ... sOld res)[.1].<f> = res[.1].<f>`
     for non-`_sub_*` state fields when `goalConsts` references no `_sub_*` projection. -/
-@[noinline] def mkReconcileProjLemmas (reconName : Name) (goalConsts : Std.HashSet Name) :
-    MetaM (Option (Array (Name × Expr))) := do
+@[noinline] def mkReconcileProjLemmas (reconName : Name) (goalConsts : Std.HashSet Name) : MetaM (Option (Array (Name × Expr))) := do
   let env ← getEnv
   let some ci := env.find? reconName | return none
   forallTelescope ci.type fun args retTy => do
@@ -144,64 +137,69 @@ def resolveCompUpdateUnfolds (idStx : Syntax) : CoreM (Array Name) := do
     if goalConsts.any fun c => c.getPrefix == stateName && c.getString!.startsWith "_sub_" then return none
     let fields := Lean.getStructureFields env stateName
     if fields.isEmpty then return none
-    let reconApp := mkAppN (mkConst reconName) args
-    let resArg := args.back!
+    let reconApp := mkAppN (mkConst reconName) args; let resArg := args.back!
     let lhsBase ← if isPair then mkAppM ``Prod.fst #[reconApp] else pure reconApp
     let rhsBase ← if isPair then mkAppM ``Prod.fst #[resArg] else pure resArg
-    let mut out : Array (Name × Expr) := #[]
-    for f in fields do
-      unless f.toString.startsWith "_sub_" do
-        let projName := stateName ++ f
-        if env.contains projName then
-          if let some lhs ← try some <$> mkAppM projName #[lhsBase] catch _ => pure none then
-            if let some rhs ← try some <$> mkAppM projName #[rhsBase] catch _ => pure none then
-              if ← isDefEq lhs rhs then
-                let eqTy ← mkEq lhs rhs
-                let pf ← mkLambdaFVars args (mkApp2 (mkConst ``id [Level.zero]) eqTy (← mkEqRefl rhs))
-                out := out.push (reconName ++ f, pf)
+    let out ← foldlMeta fields #[] fun out f => do
+      if f.toString.startsWith "_sub_" then return out
+      let projName := stateName ++ f
+      if !env.contains projName then return out
+      let some lhs ← try some <$> mkAppM projName #[lhsBase] catch _ => pure none | return out
+      let some rhs ← try some <$> mkAppM projName #[rhsBase] catch _ => pure none | return out
+      if ← isDefEq lhs rhs then
+        let eqTy ← mkEq lhs rhs
+        return out.push (reconName ++ f, ← mkLambdaFVars args (mkApp2 (mkConst ``id [Level.zero]) eqTy (← mkEqRefl rhs)))
+      return out
     return if out.isEmpty then none else some out
 
-@[noinline] def addReconcileProjLemmas (st : SimpTheorems) (reconName : Name) (goalConsts : Std.HashSet Name) :
-    MetaM (Option SimpTheorems) := do
+@[noinline] def addReconcileProjLemmas (st : SimpTheorems) (reconName : Name) (goalConsts : Std.HashSet Name) : MetaM (Option SimpTheorems) := do
   let some lems ← mkReconcileProjLemmas reconName goalConsts | return none
-  let mut st' := st
-  for (nm, pf) in lems do
-    st' ← st'.add (.other nm) #[] pf
-  return some st'
+  some <$> foldlMeta lems st fun st' (nm, pf) => st'.add (.other nm) #[] pf
 
-elab "qedWithFreshHeartbeats" tac:tacticSeq : tactic =>
-  withFreshHeartbeatsT (evalTactic tac)
+elab "qedWithFreshHeartbeats" tac:tacticSeq : tactic => withFreshHeartbeatsT (evalTactic tac)
 
 private def mkSimpCtx (cfg : Simp.Config) (thms : Array SimpTheorems) : MetaM Simp.Context := do
   Simp.mkContext { cfg with failIfUnchanged := false } thms (← getSimpCongrTheorems)
-
 def mkCachedSimpCtx (key : String) (names : Array Name) (cfg : Simp.Config := { zetaDelta := false })
     (simprocNames : Array Name := #[]) (dsimpOnly : Bool := false) (withEqns : Bool := true) : MetaM (Simp.Context × Simp.SimprocsArray) := do
   return (← mkSimpCtx cfg #[← getCachedSimpThms key names dsimpOnly withEqns], ← getCachedSimprocs simprocNames)
-
 def mkDynamicSimpCtx (extraNames : Array Name) (baseKey? : Option (String × Array Name) := none)
     (cfg : Simp.Config := { zetaDelta := false }) (dsimpOnly : Bool := false) (withEqns : Bool := true) : MetaM Simp.Context := do
   let baseSt ← match baseKey? with | some (k, ns) => getCachedSimpThms k ns dsimpOnly withEqns | none => pure {}
   mkSimpCtx cfg #[← addSimpNamesWithEqns baseSt extraNames dsimpOnly withEqns]
-
 def mkEmptyDsimpCtx (cfg : Simp.Config := {}) : MetaM Simp.Context := mkSimpCtx cfg #[]
-
 def mkSimpCtxWithBase (extraNames : Array Name := #[]) (cfg : Simp.Config := {}) (cacheKey? : Option String := none)
     (withEqns : Bool := false) : MetaM Simp.Context := do
   let base ← getSimpTheorems
-  let thms ← if extraNames.isEmpty then pure #[base]
-    else match cacheKey? with
-      | some k => pure #[base, ← getCachedSimpThms k extraNames false withEqns]
-      | none   => pure #[← addSimpNamesWithEqns base extraNames false withEqns]
+  let thms ← if extraNames.isEmpty then pure #[base] else match cacheKey? with
+    | some k => pure #[base, ← getCachedSimpThms k extraNames false withEqns]
+    | none   => pure #[← addSimpNamesWithEqns base extraNames false withEqns]
   mkSimpCtx cfg thms
 
-@[noinline, nospecialize] def tryRestoreM {m : Type → Type} {s α : Type} [Monad m] [MonadBacktrack s m] [MonadExcept Exception m]
-    (fail : α) (ok : α → Bool) (k : m α) : m α := do
+class TryRestore (m : Type → Type) where
+  run {α : Type} : α → (α → Bool) → m α → m α
+
+@[noinline] def tryRestoreMeta {α : Type} (fail : α) (ok : α → Bool) (k : MetaM α) : MetaM α := do
   let st ← saveState
   try
-    let r ← k; unless ok r do restoreState st
+    let r ← k
+    unless ok r do restoreState st
     return r
   catch _ => restoreState st; return fail
+
+@[noinline] def tryRestoreTactic {α : Type} (fail : α) (ok : α → Bool) (k : TacticM α) : TacticM α := do
+  let st ← saveState
+  try
+    let r ← k
+    unless ok r do restoreState st
+    return r
+  catch _ => restoreState st; return fail
+
+instance : TryRestore MetaM := ⟨tryRestoreMeta⟩
+instance : TryRestore TacticM := ⟨tryRestoreTactic⟩
+
+@[inline] def tryRestoreM {m : Type → Type} [TryRestore m] {α : Type} (fail : α) (ok : α → Bool) (k : m α) : m α :=
+  TryRestore.run fail ok k
 
 def tryGoalM (g : MVarId) (k : MVarId → MetaM MVarId) : MetaM MVarId := tryRestoreM g (fun _ => true) (k g)
 def tryGoalOptM (g : MVarId) (k : MVarId → MetaM (Option MVarId)) : MetaM (Option MVarId) := tryRestoreM (some g) (fun _ => true) (k g)
@@ -213,31 +211,46 @@ def simpGoalOnly (g : MVarId) (ctx : Simp.Context) (simprocs : Simp.SimprocsArra
     return (← simpGoal g ctx simprocs none simplifyTarget fvarIds).1.map Prod.snd
 
 def simpGoalAllHyps (g : MVarId) (ctx : Simp.Context) (simprocs : Simp.SimprocsArray := #[]) (dsimpOnly : Bool := false) : MetaM (Option MVarId) := do
-  let fvs ← g.withContext <| collectLCtxDecls fun d => pure (some d.fvarId)
-  simpGoalOnly g ctx simprocs fvs true dsimpOnly
+  simpGoalOnly g ctx simprocs (← g.withContext <| collectLCtxDecls fun d => pure (some d.fvarId)) true dsimpOnly
 
-def trySimpAll (g : MVarId) (ctx : Simp.Context) (sp : Simp.SimprocsArray := #[]) : MetaM (Option MVarId) :=
-  tryGoalOptM g fun g => return (← simpAll g ctx sp).1
+def trySimpAll (g : MVarId) (ctx : Simp.Context) (sp : Simp.SimprocsArray := #[]) : MetaM (Option MVarId) := tryGoalOptM g fun g => return (← simpAll g ctx sp).1
 def trySplitTarget (g : MVarId) : MetaM (Option (List MVarId)) := tryRestoreM none Option.isSome (g.withContext (Meta.splitTarget? g))
 def trySplitLocalDecl (g : MVarId) (fv : FVarId) : MetaM (Option (List MVarId)) := tryRestoreM none Option.isSome (g.withContext (Meta.splitLocalDecl? g fv))
 def tryApplyConst (g : MVarId) (c : Name) : MetaM (Option (List MVarId)) := tryRestoreM none (fun _ => true) (some <$> g.applyConst c)
-def tryReflGoal (g : MVarId) : MetaM Bool := tryRestoreM false id do
-  g.withContext do
-    let tgt ← instantiateMVars (← g.getType)
-    if let some (_, lhs, rhs) := tgt.eq? then
-      if ← isDefEq lhs rhs then
-        let pf ← mkEqRefl lhs
-        g.assign (if ← withTransparency .reducible (isDefEq lhs rhs) then pf else mkApp2 (mkConst ``id [Level.zero]) tgt pf)
-        return true
-      return false
-    g.refl; return true
+
+def tryReflGoal (g : MVarId) : MetaM Bool := tryRestoreM false id <| g.withContext do
+  let tgt ← instantiateMVars (← g.getType)
+  if let some (_, lhs, rhs) := tgt.eq? then
+    if ← isDefEq lhs rhs then
+      let pf ← mkEqRefl lhs
+      g.assign (if ← withTransparency .reducible (isDefEq lhs rhs) then pf else mkApp2 (mkConst ``id [Level.zero]) tgt pf)
+      return true
+    return false
+  g.refl; return true
+
+@[noinline] def closeGoalsByRfl : TacticM Unit := do setGoals (← filterUnsolvedM tryReflGoal (← getGoals))
+
+@[noinline] private def splitGoalsWith (splitter : MVarId → MetaM (Option (List MVarId))) (post : MVarId → MetaM (Option MVarId)) : Nat → List MVarId → MetaM (List MVarId)
+  | 0, gs => pure gs | _, [] => pure []
+  | fuel + 1, g :: rest => do
+      match ← splitter g with
+      | none => return g :: (← splitGoalsWith splitter post fuel rest)
+      | some sub => splitGoalsWith splitter post fuel ((← sub.filterMapM post) ++ rest)
+
+@[noinline] def splitTargetsRec (fuel : Nat) (gs : List MVarId) (dCtx? : Option Simp.Context := none) : MetaM (List MVarId) :=
+  splitGoalsWith trySplitTarget (match dCtx? with | some dCtx => (simpGoalOnly · dCtx (dsimpOnly := true)) | none => (pure <| some ·)) fuel gs
+
+private def trySplitAny (g : MVarId) : MetaM (Option (List MVarId)) := do
+  if let some sub ← trySplitTarget g then return some sub
+  g.withContext <| findLCtxDecl? (includeLet := false) fun d => trySplitLocalDecl g d.fvarId
+
 def tryTac (mk : TacticM (TSyntax `tactic)) (requireClosed : Bool := false) : TacticM Bool :=
   tryRestoreM false id do withoutRecover <| evalTactic (← mk); if requireClosed then return (← getGoals).isEmpty else return true
 
-def forEachGoal (f : MVarId → TacticM Unit) : TacticM Unit := do
-  let mut rem := []
-  for g in (← getGoals) do setGoals [g]; f g; rem := rem ++ (← getGoals)
-  setGoals rem
+@[noinline] def forEachGoal (f : MVarId → TacticM Unit) : TacticM Unit := do
+  let rec go (rem : List MVarId) : List MVarId → TacticM (List MVarId)
+    | [] => pure rem | g :: rest => do setGoals [g]; f g; go (rem ++ (← getGoals)) rest
+  setGoals (← go [] (← getGoals))
 
 def extractForEachColl? (tgt : Expr) : Option Expr :=
   match tgt.consumeMData with
@@ -246,24 +259,31 @@ def extractForEachColl? (tgt : Expr) : Option Expr :=
   | _ => none
 
 def collectGoalConsts (g : MVarId) (includeLCtx : Bool := false) : MetaM (Std.HashSet Name) := g.withContext do
-  let mut s := (← instantiateMVars (← g.getType)).getUsedConstants.foldl (·.insert ·) {}
-  if includeLCtx then
-    for ty in (← collectLCtxDecls fun d => some <$> instantiateMVars d.type) do
-      s := ty.getUsedConstants.foldl (·.insert ·) s
-  return s
+  let s := (← instantiateMVars (← g.getType)).getUsedConstants.foldl (·.insert ·) {}
+  if !includeLCtx then return s
+  return (← collectLCtxDecls fun d => some <$> instantiateMVars d.type).foldl (init := s) fun acc ty => ty.getUsedConstants.foldl (·.insert ·) acc
+
+@[noinline] def buildFastReconThms? (g0 : MVarId) (reconNames : Array Name) : MetaM (Option SimpTheorems) := do
+  if reconNames.isEmpty then return none
+  let goalConsts ← collectGoalConsts g0 true
+  foldlMeta reconNames (some ({} : SimpTheorems)) fun acc? rn => match acc? with | none => pure none | some st => addReconcileProjLemmas st rn goalConsts
+
+@[noinline] def buildFastReconCtx? (updNames reconNames : Array Name) (baseKey? : Option (String × Array Name) := none) : TacticM (Option Simp.Context) := do
+  let g0 :: _ ← getGoals | return none
+  let some projSt ← buildFastReconThms? g0 reconNames | return none
+  let baseCtx ← mkDynamicSimpCtx (updNames.filter (·.getString! != "_reconcileHoisted")) baseKey? (withEqns := false)
+  some <$> Simp.mkContext baseCtx.config (baseCtx.simpTheorems.push projSt) baseCtx.congrTheorems
 
 def assertFacts (g0 : MVarId) (pfx : String) (facts : Array Expr) : MetaM (MVarId × Array FVarId) := do
-  let mut g := g0; let mut fvs := #[]
-  for idx in [0:facts.size] do
-    let p := facts[idx]!
+  let (g, fvs, _) ← foldlMeta facts (g0, Array.mkEmpty facts.size, 0) fun (g, fvs, idx) p => do
     let (fv, g') ← (← g.assert (Name.mkSimple s!"{pfx}{idx}") (← g.withContext (inferType p)) p).intro1P
-    g := g'; fvs := fvs.push fv
+    return (g', fvs.push fv, idx + 1)
   return (g, fvs)
 
 def namesToSimpLemmas (ns : Array Name) : TacticM (Array (TSyntax `Lean.Parser.Tactic.simpLemma)) :=
-  ns.mapM fun n => `(Lean.Parser.Tactic.simpLemma| $(mkIdent n):term)
+  Qed.Lang.runPQTactic (Qed.Lang.mapPQ ns fun n => `(Lean.Parser.Tactic.simpLemma| $(mkIdent n):term))
 def termsToSimpLemmas (ts : Array Term) : TacticM (Array (TSyntax `Lean.Parser.Tactic.simpLemma)) :=
-  ts.mapM fun t => `(Lean.Parser.Tactic.simpLemma| $t:term)
+  Qed.Lang.runPQTactic (Qed.Lang.mapPQ ts fun t => `(Lean.Parser.Tactic.simpLemma| $t:term))
 
 private def nonRefinedHeads : Std.HashSet Name :=
   #[``Nat, ``Int, ``String, ``Bool, ``Unit, ``ByteArray, ``Char, ``UInt8, ``UInt16, ``UInt32, ``UInt64, ``USize,
@@ -309,11 +329,10 @@ private def inspectSubtermForFacts (env : Environment) (cfg : FactScanConfig) (f
   if (cfg.includeDictRemove || cfg.includeCollectionRules) && sub.isAppOfArity `Qed.Dict.remove 5 then
     let a := sub.getAppArgs; tryEmitApp env `Qed.Dict.size_remove_le #[a[3]!, a[4]!] addFact
   if cfg.includeCollectionRules && sub.isAppOfArity ``GetElem.getElem 8 then
-    for fh in forallHyps do tryEmitApp env ``Array.forall_elem #[sub.getAppArgs[7]!, fh] addFact
+    foldlMeta forallHyps () fun _ fh => tryEmitApp env ``Array.forall_elem #[sub.getAppArgs[7]!, fh] addFact
   if let .const c _ := sub.getAppFn then
     let a := sub.getAppArgs
-    if let some (_, _, lem) := strLenFactRules.find? fun (fn, ar, _) => fn == c && ar == a.size then
-      tryEmitApp env lem a addFact
+    if let some (_, _, lem) := strLenFactRules.find? fun (fn, ar, _) => fn == c && ar == a.size then tryEmitApp env lem a addFact
     if skipInferFnHeads.contains c || nonRefinedHeads.contains c then return
   let some t ← try some <$> inferType sub catch _ => pure none | return
   let tC := t.consumeMData
@@ -333,32 +352,24 @@ private structure FactScanState where
     if (← stRef.get).factSet.contains p then return
     let pTy? ← if cfg.rounds > 1 then some <$> instantiateMVars (← inferType p) else pure none
     stRef.modify fun s => { s with factSet := s.factSet.insert p, facts := s.facts.push p, nextScan := match pTy? with | some t => s.nextScan.push t | none => s.nextScan }
-  let mut scanExprs : Array Expr := #[]; let mut forallHyps : Array Expr := #[]
-  if cfg.scanLCtx then
+  let (scan0, forallHyps) ← if !cfg.scanLCtx then pure (#[], #[]) else do
     let entries ← collectLCtxDecls fun decl => do
       let dty ← instantiateMVars decl.type
-      if cfg.includeMacroPropHyps && !decl.isLet && decl.userName.hasMacroScopes then
-        if ← isPropSafe dty then addFact decl.toExpr
-      let mut es : Array Expr := #[]
-      unless cfg.skipDecl decl dty do
-        if cfg.scanLCtxValues then
-          es := es.push decl.toExpr; if let some val := decl.value? then es := es.push val
-        else es := es.push dty
+      if cfg.includeMacroPropHyps && !decl.isLet && decl.userName.hasMacroScopes then if ← isPropSafe dty then addFact decl.toExpr
+      let es := if cfg.skipDecl decl dty then #[] else if cfg.scanLCtxValues then match decl.value? with | some val => #[decl.toExpr, val] | none => #[decl.toExpr] else #[dty]
       return some (es, if cfg.includeCollectionRules && dty.isForall then some decl.toExpr else none)
-    for (es, fh?) in entries do
-      scanExprs := scanExprs ++ es
-      if let some fh := fh? then forallHyps := forallHyps.push fh
-  for e in extraExprs do scanExprs := scanExprs.push (← instantiateMVars e)
-  for _ in [0:cfg.rounds] do
-    if scanExprs.isEmpty then break
-    stRef.modify fun s => { s with nextScan := #[] }
-    for e in scanExprs do
-      e.forEach fun sub => do
-        if !sub.hasLooseBVars then
-          if !(← stRef.get).seen.contains sub then
-            stRef.modify fun s => { s with seen := s.seen.insert sub }
-            inspectSubtermForFacts env cfg forallHyps sub addFact
-    scanExprs := (← stRef.get).nextScan
+    pure (entries.foldl (init := (#[], #[])) fun (esAcc, fhAcc) (es, fh?) => (esAcc ++ es, match fh? with | some fh => fhAcc.push fh | none => fhAcc))
+  let initScan ← foldlMeta extraExprs scan0 fun acc e => return acc.push (← instantiateMVars e)
+  let rec runRounds : Nat → Array Expr → MetaM Unit
+    | 0, _ => pure ()
+    | r + 1, scanExprs => do
+        if scanExprs.isEmpty then return
+        stRef.modify fun s => { s with nextScan := #[] }
+        foldlMeta scanExprs () fun _ e => e.forEach fun sub => do
+          if !sub.hasLooseBVars then if !(← stRef.get).seen.contains sub then
+            stRef.modify fun s => { s with seen := s.seen.insert sub }; inspectSubtermForFacts env cfg forallHyps sub addFact
+        runRounds r (← stRef.get).nextScan
+  runRounds cfg.rounds initScan
   return (← stRef.get).facts
 
 def collectAndAssertFacts (g0 : MVarId) (pfx : String) (cfg : FactScanConfig := {}) : MetaM (MVarId × Array FVarId) := do
@@ -371,16 +382,14 @@ def tryCloseTrivial (g : MVarId) (skipTarget : Expr → Bool := fun _ => false) 
   if reducibleOnly then
     return ← g.withContext <| withTransparency .reducible do
       if let some (_, lhs, rhs) := tgtC.eq? then if ← isDefEq lhs rhs then g.assign (← mkEqRefl lhs); return true
-      if let some fv ← findLCtxDecl? fun d => do if ← isDefEq d.type tgtC then pure (some d.fvarId) else pure none then
-        g.assign (mkFVar fv); return true
-      return false
+      g.assumptionCore
   if tgtC.isAppOfArity ``Eq 3 then if ← tryReflGoal g then return true
   if (tgtC.isAppOfArity ``LE.le 4 || tgtC.isAppOfArity ``GE.ge 4) && tgtC.getAppArgs[2]! == tgtC.getAppArgs[3]! then
     if ← tryRestoreM false id (return (← g.applyConst ``Nat.le_refl).isEmpty) then return true
-  if ← g.assumptionCore then return true
+  if ← withTransparency .reducible g.assumptionCore then return true
   if tgtC.isAppOfArity ``Or 2 then
     if ← tryRestoreM false id (do match ← g.applyConst ``Or.inl with | [gL] => gL.refl; return true | _ => return false) then return true
-    if ← tryRestoreM false id (do match ← g.applyConst ``Or.inr with | [gR] => gR.assumptionCore | _ => return false) then return true
+    if ← tryRestoreM false id (do match ← g.applyConst ``Or.inr with | [gR] => withTransparency .reducible gR.assumptionCore | _ => return false) then return true
   return false
 
 def tryDirectDecide (g : MVarId) : MetaM Bool := do
@@ -389,16 +398,90 @@ def tryDirectDecide (g : MVarId) : MetaM Bool := do
   tryRestoreM false id <| g.withContext do
     let decInst ← synthInstance (mkApp (mkConst ``Decidable) tgt)
     if ← isDefEq (mkApp2 (mkConst ``Decidable.decide) tgt decInst) (mkConst ``Bool.true) then
-      g.assign (mkApp3 (mkConst ``of_decide_eq_true) tgt decInst (← mkEqRefl (mkConst ``Bool.true))); return true
+      g.assign (mkApp3 (mkConst ``of_decide_eq_true) tgt decInst rflBoolTrue); return true
     return false
 
 def tryDirectOmega (g : MVarId) : MetaM Bool := tryRestoreM false id do
   let some g' ← g.falseOrByContra | return true
   g'.withContext do Omega.omega ((← getPropHyps).toList.map mkFVar) g' {}; return true
 
+private def classifyIneq? (tgt : Expr) : Option (Bool × Expr × Expr × Expr) :=
+  let a := tgt.getAppArgs
+  match tgt.getAppFn.constName? with
+  | some ``LE.le  => if a.size == 4 then some (true,  a[0]!, a[2]!, a[3]!) else none
+  | some ``GE.ge  => if a.size == 4 then some (true,  a[0]!, a[3]!, a[2]!) else none
+  | some ``LT.lt  => if a.size == 4 then some (false, a[0]!, a[2]!, a[3]!) else none
+  | some ``GT.gt  => if a.size == 4 then some (false, a[0]!, a[3]!, a[2]!) else none
+  | some ``Nat.le => if a.size == 2 then some (true,  mkConst ``Nat, a[0]!, a[1]!) else none
+  | some ``Nat.lt => if a.size == 2 then some (false, mkConst ``Nat, a[0]!, a[1]!) else none
+  | some ``Int.le => if a.size == 2 then some (true,  mkConst ``Int, a[0]!, a[1]!) else none
+  | some ``Int.lt => if a.size == 2 then some (false, mkConst ``Int, a[0]!, a[1]!) else none
+  | _ => none
+
+private def unwrapLetOnce (lctx : LocalContext) (e : Expr) : Expr :=
+  match e.consumeMData with
+  | .fvar fv => match lctx.find? fv with | some d => (d.value?.getD e).consumeMData | none => e.consumeMData
+  | e => e
+
+private def scanNonlinearOps (e : Expr) (flags : UInt8) : UInt8 :=
+  e.foldConsts flags fun c f => match c with
+    | ``HMul.hMul | ``Mul.mul | ``Nat.mul | ``Int.mul => f ||| 1
+    | ``HDiv.hDiv | ``Div.div | ``Nat.div             => f ||| 2
+    | ``HMod.hMod | ``Mod.mod | ``Nat.mod             => f ||| 4
+    | _ => f
+
+@[noinline] private def trySolveDivModBound (g : MVarId) (tgt lhs rhs : Expr) (isDiv : Bool) : MetaM Bool := do
+  let pair? := if isDiv then
+      if lhs.isAppOfArity ``HDiv.hDiv 6 then some (lhs.getAppArgs[4]!, lhs.getAppArgs[5]!)
+      else if lhs.isAppOfArity ``Nat.div 2 then some (lhs.getAppArgs[0]!, lhs.getAppArgs[1]!) else none
+    else
+      if lhs.isAppOfArity ``HMod.hMod 6 then some (lhs.getAppArgs[4]!, lhs.getAppArgs[5]!)
+      else if lhs.isAppOfArity ``Nat.mod 2 then some (lhs.getAppArgs[0]!, lhs.getAppArgs[1]!) else none
+  let some (n, k) := pair? | return false
+  tryRestoreM false id do
+    let pf ← if isDiv then
+        let m ← mkFreshExprSyntheticOpaqueMVar (mkApp2 (mkConst ``Nat.le) n rhs)
+        unless ← tryDirectOmega m.mvarId! do return false
+        mkAppM ``Nat.le_trans #[mkApp2 (mkConst ``Nat.div_le_self) n k, ← instantiateMVars m]
+      else
+        let m1 ← mkFreshExprSyntheticOpaqueMVar (mkApp2 (mkConst ``Nat.lt) (mkNatLit 0) k)
+        unless ← tryDirectOmega m1.mvarId! do return false
+        let m2 ← mkFreshExprSyntheticOpaqueMVar (mkApp2 (mkConst ``Nat.le) k rhs)
+        unless ← tryDirectOmega m2.mvarId! do return false
+        mkAppM ``Nat.lt_of_lt_of_le #[mkApp3 (mkConst ``Nat.mod_lt) n k (← instantiateMVars m1), ← instantiateMVars m2]
+    if ← isDefEq (← inferType pf) tgt then g.assign pf; return true else return false
+
+/-- Guarded MetaM nonlinear inequality closer: exits in 0ms unless the goal target is a Nat/Int
+    inequality involving `*`, `/`, or `%`, and never creates unconstrained metavariables. -/
+@[noinline] def tryCloseNonlinear (g : MVarId) : MetaM Bool := g.withContext do
+  let tgt := (← instantiateMVars (← g.getType)).consumeMData
+  let some (isLe, ty0, lhs0, rhs0) := classifyIneq? tgt | return false
+  let lctx ← getLCtx
+  let scanLet (e : Expr) (f : UInt8) : UInt8 := let u := unwrapLetOnce lctx e; if u != e then scanNonlinearOps u f else f
+  let f0 := scanNonlinearOps tgt 0
+  let flags := if f0 == 0 && tgt.hasFVar then scanLet rhs0 (scanLet lhs0 0) else f0
+  if flags == 0 then return false
+  let ty ← if ty0.isConstOf ``Nat || ty0.isConstOf ``Int then pure ty0 else whnf ty0
+  let tryArms (arms : Array Name) : MetaM Bool :=
+    foldlMeta arms false fun ok c => if ok then pure true else tryRestoreM false id (do closeAllGoals tryDirectOmega (← g.applyConst c))
+  if ty.isConstOf ``Nat then
+    if isLe then
+      if (flags &&& 1) != 0 then if ← tryArms #[``Nat.mul_le_mul, ``Nat.mul_le_mul_left, ``Nat.mul_le_mul_right] then return true
+      if (flags &&& 2) != 0 then
+        if ← tryArms #[``Nat.div_le_div_right] then return true
+        return ← trySolveDivModBound g tgt (unwrapLetOnce lctx lhs0) rhs0 true
+    else
+      if (flags &&& 1) != 0 then if ← tryArms #[``Nat.mul_lt_mul_of_pos_left, ``Nat.mul_lt_mul_of_pos_right] then return true
+      if (flags &&& 4) != 0 then return ← trySolveDivModBound g tgt (unwrapLetOnce lctx lhs0) rhs0 false
+  else if ty.isConstOf ``Int && isLe && (flags &&& 1) != 0 then
+    return ← tryArms #[``Int.mul_nonneg, ``Int.mul_le_mul_of_nonneg_left, ``Int.mul_le_mul_of_nonneg_right, ``Int.mul_le_mul]
+  return false
+
+elab "qedNonlinearClose" : tactic => do
+  if ← tryCloseNonlinear (← getMainGoal) then replaceMainGoal [] else throwError "qedNonlinearClose failed"
+
 @[noinline] private partial def buildGroundKernelProof (check : Bool) (e : Expr) : MetaM (Option Expr) := do
-  let isKDefEq (a b : Expr) : MetaM Bool := do
-    return match Kernel.isDefEq (← getEnv) (← getLCtx) a b with | .ok true => true | _ => false
+  let isKDefEq (a b : Expr) : MetaM Bool := do return match Kernel.isDefEq (← getEnv) (← getLCtx) a b with | .ok true => true | _ => false
   let e := e.consumeMData
   match e with
   | .letE n ty v b nondep =>
@@ -413,39 +496,28 @@ def tryDirectOmega (g : MVarId) : MetaM Bool := tryRestoreM false id do
         let some pb ← buildGroundKernelProof check b | return none
         return some (mkApp4 (mkConst ``And.intro) a b pa pb)
       if let some (ty, lhs, rhs) := e.eq? then
-        if !check then
-          return some (mkApp2 (mkConst ``Eq.refl [← getLevel ty]) ty lhs)
-        if ← isKDefEq lhs rhs then
-          return some (mkApp2 (mkConst ``Eq.refl [← getLevel ty]) ty lhs)
+        if !check then return some (mkApp2 (mkConst ``Eq.refl [← getLevel ty]) ty lhs)
+        if ← isKDefEq lhs rhs then return some (mkApp2 (mkConst ``Eq.refl [← getLevel ty]) ty lhs)
       match ← trySynthInstance (mkApp (mkConst ``Decidable) e) with
       | .some decInst =>
-          let reflTrue ← mkEqRefl (mkConst ``Bool.true)
-          if !check then
-            return some (mkApp3 (mkConst ``of_decide_eq_true) e decInst reflTrue)
+          if !check then return some (mkApp3 (mkConst ``of_decide_eq_true) e decInst rflBoolTrue)
           if ← isKDefEq (mkApp2 (mkConst ``Decidable.decide) e decInst) (mkConst ``Bool.true) then
-            return some (mkApp3 (mkConst ``of_decide_eq_true) e decInst reflTrue)
+            return some (mkApp3 (mkConst ``of_decide_eq_true) e decInst rflBoolTrue)
           return none
       | _ => return none
 
-/-- Close a ground goal quickly without blowing elaborator `maxRecDepth`: reducible-only trivial check
-first, then `let`-preserving proof construction (checked via `Kernel.isDefEq` when `check := true`,
-or delegated directly to `addDeclCore` with zero `toKernelEnv` sync stall when `check := false`). -/
+/-- Close a ground goal quickly without blowing elaborator `maxRecDepth`. -/
 def tryCloseGroundKernel (g : MVarId) (check : Bool := true) : MetaM Bool := do
   if ← tryCloseTrivial g (reducibleOnly := true) then return true
   let tgt ← g.withContext do instantiateMVars (← g.getType)
   if !tgt.hasFVar && !tgt.hasMVar && !tgt.hasLevelMVar then
-    if let some pf ← withLCtx {} {} (buildGroundKernelProof check tgt) then
-      g.assign pf
-      return true
+    if let some pf ← withLCtx {} {} (buildGroundKernelProof check tgt) then g.assign pf; return true
   return false
 
 elab "qedCloseGround" : tactic => do
-  if ← tryCloseGroundKernel (← getMainGoal) (check := true) then replaceMainGoal []
-  else throwError "qedCloseGround failed"
-
+  if ← tryCloseGroundKernel (← getMainGoal) (check := true) then replaceMainGoal [] else throwError "qedCloseGround failed"
 elab "qedCloseGroundKernel" : tactic => do
-  if ← tryCloseGroundKernel (← getMainGoal) (check := false) then replaceMainGoal []
-  else throwError "qedCloseGroundKernel failed"
+  if ← tryCloseGroundKernel (← getMainGoal) (check := false) then replaceMainGoal [] else throwError "qedCloseGroundKernel failed"
 
 def tryCloseBasic (g : MVarId) (skipTarget : Expr → Bool := fun _ => false) (reducibleOnly : Bool := false) : MetaM Bool := do
   if ← tryCloseTrivial g skipTarget reducibleOnly then return true
@@ -454,16 +526,16 @@ def tryCloseBasic (g : MVarId) (skipTarget : Expr → Bool := fun _ => false) (r
 
 def splitAndHypsGoal (g0 : MVarId) (existsOnly : Bool := false) (maxIters : Nat := 32) : MetaM (MVarId × Bool) := do
   let isMatchTy (t : Expr) := t.isAppOfArity ``Exists 2 || (!existsOnly && (t.isAppOfArity ``And 2 || t.isAppOfArity ``Qed.Lang.QedAndProp 2))
-  let mut g := g0; let mut didSplit := false
-  for _ in [0:maxIters] do
-    let nextG? ← g.withContext <| findLCtxDecl? (includeLet := false) fun decl => do
-      let tC := decl.type.consumeMData
-      if isMatchTy tC || match tC.getAppFn with | .const c _ => !nonRefinedHeads.contains c | _ => true then
-        tryRestoreM none Option.isSome do
-          if isMatchTy (← whnf tC) then return ((← g.cases decl.fvarId)[0]?).map (·.mvarId) else return none
-      else return none
-    match nextG? with | some g' => g := g'; didSplit := true | none => break
-  return (g, didSplit)
+  let rec go (g : MVarId) (didSplit : Bool) : Nat → MetaM (MVarId × Bool)
+    | 0 => pure (g, didSplit)
+    | r + 1 => do
+        let nextG? ← g.withContext <| findLCtxDecl? (includeLet := false) fun decl => do
+          let tC := decl.type.consumeMData
+          if isMatchTy tC || match tC.getAppFn with | .const c _ => !nonRefinedHeads.contains c | _ => true then
+            tryRestoreM none Option.isSome do if isMatchTy (← whnf tC) then return ((← g.cases decl.fvarId)[0]?).map (·.mvarId) else return none
+          else return none
+        match nextG? with | some g' => go g' true r | none => pure (g, didSplit)
+  go g0 false maxIters
 
 def splitGoalAnds (g0 : MVarId) (maxIters : Nat := 64) : MetaM (List MVarId) := do
   let rec loop : Nat → List MVarId → MetaM (List MVarId)
@@ -475,6 +547,11 @@ def splitGoalAnds (g0 : MVarId) (maxIters : Nat := 64) : MetaM (List MVarId) := 
         return g :: (← loop fuel rest)
   loop maxIters [g0]
 
+@[noinline] private def tryGrindGoal (g : MVarId) : TacticM Bool := do
+  let saved ← getGoals; setGoals [g]
+  let ok ← tryTac (requireClosed := true) (Qed.Lang.runPQTactic `(tactic| grind))
+  setGoals saved; return ok
+
 structure CloseFallbackConfig where
   skipTarget : Expr → Bool := fun _ => false
   trySimpStarOmega : Bool := false
@@ -485,21 +562,22 @@ structure CloseFallbackConfig where
   if cfg.trySimpStarOmega then
     if ← tryRestoreM false id do
       let stWithHyps ← g.withContext do
-        let mut st ← getSimpTheorems
-        for (fv, e) in (← collectLCtxDecls (includeLet := false) fun d => do if ← isPropSafe d.type then pure (some (d.fvarId, d.toExpr)) else pure none) do
-          st ← try st.add (.fvar fv) #[] e catch _ => pure st
-        return st
+        let hyps ← collectLCtxDecls (includeLet := false) fun d => do if ← isPropSafe d.type then pure (some (d.fvarId, d.toExpr)) else pure none
+        foldlMeta hyps (← getSimpTheorems) fun st (fv, e) => try st.add (.fvar fv) #[] e catch _ => pure st
       match ← simpGoalOnly g (← mkSimpCtx cfg.simpAllCfg #[stWithHyps]) with | none => return true | some g' => tryDirectOmega g'
     then return true
   if ← tryRestoreM false id do
     match ← trySimpAll g (← mkSimpCtxWithBase #[] cfg.simpAllCfg) with
     | none => return true | some g' => tryCloseBasic g' cfg.skipTarget
   then return true
-  let saved ← getGoals; setGoals [g]
-  let ok ← tryTac (requireClosed := true) do
-    let simpArgs ← namesToSimpLemmas cfg.deepExtraSimpAll
-    `(tactic| first | qedNonlinearClose | (try simp_all [$[$simpArgs],*]; try (repeat' (split <;> try simp_all [$[$simpArgs],*])); all_goals (first | omega | decide | rfl)) | grind)
-  setGoals saved; return ok
+  if ← tryCloseNonlinear g then return true
+  if ← tryRestoreM false id do
+    let deepCtx ← mkSimpCtxWithBase cfg.deepExtraSimpAll (withEqns := true); let sp := #[← Simp.getSimprocs]
+    let some g1 ← trySimpAll g deepCtx sp | return true
+    let gs ← splitGoalsWith trySplitAny (trySimpAll · deepCtx sp) 16 [g1]
+    closeAllGoals (fun sg => do if ← tryDirectOmega sg then pure true else if ← tryDirectDecide sg then pure true else tryReflGoal sg) gs
+  then return true
+  tryGrindGoal g
 
 @[noinline] def solveWithUnfolds (unfoldNames extraSimpNames : Array Name) (simprocNames : Array Name := #[])
     (simpCfg : Simp.Config := { zetaDelta := true }) (harvestFacts : Bool := false)
@@ -517,13 +595,13 @@ structure CloseFallbackConfig where
           pure g'
     let g2 ← if !withFacts then pure g2 else do pure (← collectAndAssertFacts g2 "_dbFact" { scanLCtx := true, scanLCtxValues, includeFin := true }).1
     let some g3 ← simpGoalAllHyps g2 allCtx sp | return none
-    let g3 := (← splitAndHypsGoal g3).1
-    trySimpAll g3 extraCtx sp
+    trySimpAll (← splitAndHypsGoal g3).1 extraCtx sp
   let runPass (close : Bool) : TacticM Unit := forEachGoal fun g => do
     let some g' ← simplify g (close && harvestFacts) | setGoals []
     if !close then setGoals [g']
     else if ← tryCloseBasic g' then setGoals []
-    else do setGoals [g']; discard <| tryTac `(tactic| grind)
+    else if ← tryGrindGoal g' then setGoals []
+    else setGoals [g']
   if ← tryRestoreM false id (do runPass true; return (← getGoals).isEmpty) then return true
   if !clearErrorsOnFail then try runPass false catch _ => pure ()
   return false
@@ -543,10 +621,8 @@ private def boundaryLemmaGroups : Array (Name × Array Name) := #[
 
 def relevantBoundaryLemmas (cs : Std.HashSet Name) : Array Name :=
   boundaryLemmaGroups.foldl (init := #[``Qed.Lang.QedVal.val_id]) fun acc (k, ns) => if cs.contains k then acc ++ ns else acc
-
 def collectTriggered (env : Environment) (cs : Std.HashSet Name) (init : Array Name) (groups : Array (Array Name × Array Name)) : Array Name :=
   groups.foldl (init := init) fun acc (triggers, lemmas) => if triggers.any cs.contains then acc ++ lemmas.filter env.contains else acc
-
 def relevantAppLemmas (env : Environment) (cs : Std.HashSet Name) : Array Name :=
   collectTriggered env cs #[``InvTarget.proj_id, ``InvTarget.proj_fst] #[
     (appWrapperBases ++ #[`Qed.App.init, `Qed.App.update], appProjSimpNames env #["init", "update"] ++
@@ -561,34 +637,43 @@ def relevantAppLemmas (env : Environment) (cs : Std.HashSet Name) : Array Name :
   Qed.qedUnfoldHelperLoop 12 (fun env n => if skip.contains n || !Qed.qedIsHelper env n then return false else return (← getProjectionFnInfo? n).isNone)
     fixedL (includeLCtx := true) (useSimpAll := true)
 
-private def runFastClose : TacticM Unit := do
-  if ← tryCloseTrivial (← getMainGoal) (reducibleOnly := true) then replaceMainGoal []
-  else throwError "qedFastClose: not trivially closed"
+@[noinline] private def tryCloseAutoAtom (g : MVarId) : MetaM Bool := do
+  if ← tryCloseTrivial g (reducibleOnly := true) then return true
+  if ← tryRestoreM false id (g.contradictionCore {}) then return true
+  if ← tryCloseBasic g then return true
+  if ← tryCloseNonlinear g then return true
+  tryRestoreM false id g.assumptionCore
+
+@[noinline] private def runAutoClose : TacticM Unit := do
+  let g ← getMainGoal
+  if ← tryCloseAutoAtom g then replaceMainGoal []; return
+  let ok ← tryRestoreM false id do
+    let gs ← splitGoalAnds g
+    let rec go : List MVarId → TacticM Bool
+      | [] => pure true
+      | sg :: rest => do
+          if ← tryCloseAutoAtom sg then go rest
+          else if ← tryGrindGoal sg then go rest
+          else pure false
+    go gs
+  if ok then replaceMainGoal [] else throwError "qedAutoClose failed"
 
 elab "qedUnfoldPresent" "[" extra:term,* "]" : tactic => runUnfoldPresent extra.getElems
-elab "qedFastClose" : tactic => runFastClose
-
-macro "qedAutoClose" : tactic => `(tactic|
-  (first
-    | qedFastClose | contradiction | omega | decide | assumption | rfl | (qedNonlinearClose; done)
-    | (try (repeat' (apply And.intro)); all_goals (first | qedFastClose | contradiction | omega | decide | (qedNonlinearClose; done) | grind); done)))
+elab "qedFastClose" : tactic => do
+  if ← tryCloseTrivial (← getMainGoal) (reducibleOnly := true) then replaceMainGoal [] else throwError "qedFastClose: not trivially closed"
+elab "qedAutoClose" : tactic => runAutoClose
 
 structure ParsedBlindTarget where
   paramId : Ident
   fields  : Array Ident
 
 def parseBlindTarget (stx : Syntax) (includeGot : Bool := true) : Command.CommandElabM ParsedBlindTarget := do
-  let rawId : Ident := ⟨stx.getArg 0⟩
-  let optBraces := stx.getArg 1
-  if optBraces.getNumArgs == 3 then
-    return { paramId := rawId, fields := (optBraces.getArg 1).getSepArgs.map (⟨·⟩) }
+  let rawId : Ident := ⟨stx.getArg 0⟩; let optBraces := stx.getArg 1
+  if optBraces.getNumArgs == 3 then return { paramId := rawId, fields := (optBraces.getArg 1).getSepArgs.map (⟨·⟩) }
   match rawId.getId.eraseMacroScopes with
   | .str .anonymous _ => return { paramId := rawId, fields := #[] }
-  | .str (.str .anonymous p) f =>
-      return { paramId := mkIdentFrom rawId (Name.mkSimple p), fields := #[mkIdentFrom rawId (Name.mkSimple f)] }
-  | _ =>
-      let tail := if includeGot then s!", got `{rawId.getId}`" else ""
-      throwErrorAt rawId s!"`blindTo` expects `<param>`, `<param>.<field>`, or `<param>.\{f1, f2}`{tail}"
+  | .str (.str .anonymous p) f => return { paramId := mkIdentFrom rawId (Name.mkSimple p), fields := #[mkIdentFrom rawId (Name.mkSimple f)] }
+  | _ => throwErrorAt rawId s!"`blindTo` expects `<param>`, `<param>.<field>`, or `<param>.\{f1, f2}`{if includeGot then s!", got `{rawId.getId}`" else ""}"
 
 def fmtBlindTarget (t : ParsedBlindTarget) : String :=
   if t.fields.isEmpty then t.paramId.getId.toString
@@ -598,8 +683,7 @@ def fmtBlindTarget (t : ParsedBlindTarget) : String :=
 @[noinline] def buildBlindToArgs (targets : Array ParsedBlindTarget) (validParamNames : Array Name)
     (binderIds : Array Ident) (binderTys : Array Term) (fnErrCtx? : Option String := none) :
     Command.CommandElabM (Array (Ident × Option Term) × Array Term × Array Term) := do
-  let mut paramBlinds : Array (Name × Bool × Array Ident) := #[]
-  for t in targets do
+  let paramBlinds ← Qed.Lang.foldlCmd targets (#[] : Array (Name × Bool × Array Ident)) fun paramBlinds t => do
     let pn := t.paramId.getId.eraseMacroScopes
     unless validParamNames.contains pn do
       match fnErrCtx? with
@@ -609,31 +693,21 @@ def fmtBlindTarget (t : ParsedBlindTarget) : String :=
       let (_, whole, flds) := paramBlinds[pos]!
       let whole' := whole || t.fields.isEmpty
       let flds' := if whole' then #[] else t.fields.foldl (fun acc f => if acc.any (·.getId.eraseMacroScopes == f.getId.eraseMacroScopes) then acc else acc.push f) flds
-      paramBlinds := paramBlinds.set! pos (pn, whole', flds')
-    else
-      paramBlinds := paramBlinds.push (pn, t.fields.isEmpty, t.fields)
-  let mut freshVars : Array (Ident × Option Term) := #[]
-  let mut lhsArgs : Array Term := #[]
-  let mut rhsArgs : Array Term := #[]
-  for (bId, bTy) in binderIds.zip binderTys do
-    let bn := bId.getId.eraseMacroScopes
-    rhsArgs := rhsArgs.push ⟨bId.raw⟩
+      return paramBlinds.set! pos (pn, whole', flds')
+    else return paramBlinds.push (pn, t.fields.isEmpty, t.fields)
+  Qed.Lang.runPQ <| Qed.Lang.foldlPQ (binderIds.zip binderTys) (#[], #[], #[]) fun (freshVars, lhsArgs, rhsArgs) (bId, bTy) => do
+    let bn := bId.getId.eraseMacroScopes; let rhsArgs := rhsArgs.push ⟨bId.raw⟩
     match paramBlinds.find? (·.1 == bn) with
-    | none => lhsArgs := lhsArgs.push ⟨bId.raw⟩
-    | some (_, true, _) =>
-        let fv := mkIdent (Name.mkSimple s!"_qed_blind_{bn}")
-        freshVars := freshVars.push (fv, some bTy); lhsArgs := lhsArgs.push ⟨fv.raw⟩
+    | none => return (freshVars, lhsArgs.push ⟨bId.raw⟩, rhsArgs)
+    | some (_, true, _) => let fv := mkIdent (Name.mkSimple s!"_qed_blind_{bn}"); return (freshVars.push (fv, some bTy), lhsArgs.push ⟨fv.raw⟩, rhsArgs)
     | some (_, false, flds) =>
-        let mut updIds : Array Ident := #[]; let mut updVals : Array Term := #[]
-        for f in flds do
-          let fv := mkIdent (Name.mkSimple s!"_qed_blind_{bn}_{f.getId.eraseMacroScopes}")
-          freshVars := freshVars.push (fv, none); updIds := updIds.push f; updVals := updVals.push ⟨fv.raw⟩
-        lhsArgs := lhsArgs.push (← `({ $bId with $[$updIds:ident := $updVals:term],* }))
-  return (freshVars, lhsArgs, rhsArgs)
+        let (freshVars, updIds, updVals) := flds.foldl (init := (freshVars, #[], #[])) fun (fvA, uI, uV) f =>
+          let fv := mkIdent (Name.mkSimple s!"_qed_blind_{bn}_{f.getId.eraseMacroScopes}"); (fvA.push (fv, none), uI.push f, uV.push ⟨fv.raw⟩)
+        return (freshVars, lhsArgs.push (← `({ $bId with $[$updIds:ident := $updVals:term],* })), rhsArgs)
 
-@[noinline] def mkBlindToEqProp (freshVars : Array (Ident × Option Term)) (lhsCall rhsCall : Term) : Command.CommandElabM Term := do
-  freshVars.foldrM (init := ← `($lhsCall = $rhsCall)) fun (fv, ty?) acc => match ty? with
-    | some ty => `(∀ ($fv:ident : $ty), $acc)
-    | none    => `(∀ $fv:ident, $acc)
+@[noinline] def mkBlindToEqProp (freshVars : Array (Ident × Option Term)) (lhsCall rhsCall : Term) : Command.CommandElabM Term :=
+  Qed.Lang.runPQ do
+    Qed.Lang.foldrPQ freshVars (← `($lhsCall = $rhsCall)) fun (fv, ty?) acc => match ty? with
+      | some ty => `(∀ ($fv:ident : $ty), $acc) | none => `(∀ $fv:ident, $acc)
 
 end Qed.Verify.Core

@@ -22,34 +22,40 @@ def onCheck (handler : Bool → msg) : Attr msg := .onValue "change" (fun s => h
 def key {α} [ToString α] (k : α) : Attr msg := .key (toString k)
 def value {α} [ToString α] (v : α) : Attr msg := .attr "value" (toString v)
 
-local macro "def_attrs" kind:ident "[" items:("(" ident "," str ")"),* "]" : command => do
-  let cmds ← items.getElems.mapM fun it => do
-    let id : Lean.Ident := ⟨it.raw[1]⟩
-    let lit : Lean.TSyntax `str := ⟨it.raw[3]⟩
-    match kind.getId with
-    | `on   => `(def $id {msg : Type} (m : msg) : Attr msg := .on $lit m)
-    | `val  => `(def $id {msg : Type} (handler : String → msg) : Attr msg := .onValue $lit handler)
-    | `str  => `(def $id {msg : Type} (v : String) : Attr msg := .attr $lit v)
-    | _     => `(def $id {msg : Type} (present : Bool) : Attr msg := .flag $lit present)
-  return ⟨Lean.mkNullNode cmds⟩
+def onClick {msg : Type} (m : msg) : Attr msg := .on "click" m
+def onSubmit {msg : Type} (m : msg) : Attr msg := .on "submit" m
+def onBlur {msg : Type} (m : msg) : Attr msg := .on "blur" m
+def onFocus {msg : Type} (m : msg) : Attr msg := .on "focus" m
+def onDoubleClick {msg : Type} (m : msg) : Attr msg := .on "dblclick" m
+def onMouseDown {msg : Type} (m : msg) : Attr msg := .on "mousedown" m
+def onMouseUp {msg : Type} (m : msg) : Attr msg := .on "mouseup" m
 
-def_attrs on   [(onClick, "click"), (onSubmit, "submit"), (onBlur, "blur"), (onFocus, "focus"),
-                (onDoubleClick, "dblclick"), (onMouseDown, "mousedown"), (onMouseUp, "mouseup")]
-def_attrs val  [(onInput, "input"), (onChange, "input"), (onKeydown, "keydown"), (onKeyup, "keyup")]
-def_attrs str  [(placeholder, "placeholder"), (name, "name"), (alt, "alt"), (title, "title"), (style, "style"), (type', "type")]
-def_attrs flag [(disabled, "disabled"), (required, "required"), (checked, "checked"), (readOnly, "readonly")]
+def onInput {msg : Type} (handler : String → msg) : Attr msg := .onValue "input" handler
+def onChange {msg : Type} (handler : String → msg) : Attr msg := .onValue "input" handler
+def onKeydown {msg : Type} (handler : String → msg) : Attr msg := .onValue "keydown" handler
+def onKeyup {msg : Type} (handler : String → msg) : Attr msg := .onValue "keyup" handler
+
+def placeholder {msg : Type} (v : String) : Attr msg := .attr "placeholder" v
+def name {msg : Type} (v : String) : Attr msg := .attr "name" v
+def alt {msg : Type} (v : String) : Attr msg := .attr "alt" v
+def title {msg : Type} (v : String) : Attr msg := .attr "title" v
+def style {msg : Type} (v : String) : Attr msg := .attr "style" v
+def type' {msg : Type} (v : String) : Attr msg := .attr "type" v
+
+def disabled {msg : Type} (present : Bool) : Attr msg := .flag "disabled" present
+def required {msg : Type} (present : Bool) : Attr msg := .flag "required" present
+def checked {msg : Type} (present : Bool) : Attr msg := .flag "checked" present
+def readOnly {msg : Type} (present : Bool) : Attr msg := .flag "readonly" present
 
 theorem ToHref.valid_attr {msg α : Type} [ToHref α] (k : String) (target : α)
     (hk : isSafeAttrName k = true) : (Attr.attr k (ToHref.toHref target) : Attr msg).valid = true := by
   simp [Attr.valid, Attr.validKeyValue, hk, ToHref.isSafeUrl_toHref]
 
-local macro "def_url_attr " id:ident thm:ident k:str : command =>
-  `(def $id {msg α : Type} [ToHref α] (v : α) : Attr msg := .attr $k (ToHref.toHref v)
-    @[simp] theorem $thm {msg α : Type} [ToHref α] (v : α) : ($id v : Attr msg).valid = true :=
-      ToHref.valid_attr $k v rfl)
-
-def_url_attr href   Attr.valid_href   "href"
-def_url_attr src    Attr.valid_src    "src"
-def_url_attr action Attr.valid_action "action"
+def href {msg α : Type} [ToHref α] (v : α) : Attr msg := .attr "href" (ToHref.toHref v)
+@[simp] theorem Attr.valid_href {msg α : Type} [ToHref α] (v : α) : (href v : Attr msg).valid = true := ToHref.valid_attr "href" v rfl
+def src {msg α : Type} [ToHref α] (v : α) : Attr msg := .attr "src" (ToHref.toHref v)
+@[simp] theorem Attr.valid_src {msg α : Type} [ToHref α] (v : α) : (src v : Attr msg).valid = true := ToHref.valid_attr "src" v rfl
+def action {msg α : Type} [ToHref α] (v : α) : Attr msg := .attr "action" (ToHref.toHref v)
+@[simp] theorem Attr.valid_action {msg α : Type} [ToHref α] (v : α) : (action v : Attr msg).valid = true := ToHref.valid_attr "action" v rfl
 
 end Qed

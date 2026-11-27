@@ -1,6 +1,6 @@
 import Qed.Router.Basic
 import Qed.Json
-import Qed.Proto
+import Qed.Proto.Lawful
 import Qed.Lang
 import Lean
 

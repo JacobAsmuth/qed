@@ -1,9 +1,10 @@
-import Qed.Component.Core
+import Qed.Collection
 import Qed.Component.Codegen
 import Qed.Component.AwaitLift
 import Qed.Component.Speculative
 import Qed.Component.Invariants
-import Qed.Speculative
+import Qed.Speculative.Core
+import Qed.Speculative.Proofs
 import Qed.View
 import Qed.Runtime
 import Qed.Resource

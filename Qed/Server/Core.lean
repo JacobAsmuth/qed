@@ -1,6 +1,6 @@
 import Qed.Field
 import Qed.Json.Lawful
-import Qed.Proto
+import Qed.Proto.Lawful
 import Qed.Dict
 import Qed.Router.Basic
 import Qed.Collection
@@ -805,17 +805,11 @@ structure ServerJob (σ : Type) extends JobMeta where
   runWorkM? : Option ({m : Type → Type} → [Monad m] → [MonadServer m] → [MonadAtomic σ m] → m (Except ApiError Bool)) := none
 structure VerifiedJob (σ : Type) (Inv : σ → Prop) extends ServerJob σ where
   preserves : ProgPreservesInv Inv (runM (m := ThreadProg σ))
-structure StatelessJob extends JobMeta where
-  runM      : {m : Type → Type} → [Monad m] → [MonadServer m] → m (Except ApiError Unit)
-  runWorkM? : Option ({m : Type → Type} → [Monad m] → [MonadServer m] → m (Except ApiError Bool)) := none
+abbrev StatelessJob := ServerJob Unit
 structure IoJob extends JobMeta where
   runOnce     : IO (Except ApiError Unit)
   runWorkOnce : IO (Except ApiError Bool) := runOnce.map fun | .ok () => .ok false | .error e => .error e
 
-def StatelessJob.toUnitJob (j : StatelessJob) : ServerJob Unit :=
-  { j.toJobMeta with
-    runM := fun {m} [Monad m] [MonadServer m] [MonadAtomic Unit m] => @j.runM m _ _
-    runWorkM? := j.runWorkM?.map fun rw => fun {m} [Monad m] [MonadServer m] [MonadAtomic Unit m] => @rw m _ _ }
 def ServerJob.toIoJob {σ : Type} (srvInst : MonadServer IO) (atomicInst : MonadAtomic σ IO) (j : ServerJob σ) : IoJob :=
   { j.toJobMeta with
     runOnce := @j.runM IO _ srvInst atomicInst

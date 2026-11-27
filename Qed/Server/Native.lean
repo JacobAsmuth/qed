@@ -3,7 +3,6 @@ import Qed.Server.Core
 import Qed.Server.Net
 import Qed.Server.Http
 import Qed.Server.Prim
-import Qed.Server.Db.HttpSql
 import Qed.Server.Db.PgWire
 import Qed.Auth.Oidc
 

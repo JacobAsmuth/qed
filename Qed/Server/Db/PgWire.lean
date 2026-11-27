@@ -121,17 +121,12 @@ def parsePgUrl (rawUrl : String) : Except String PgConnParams := do
   let (userInfo?, hostPort) := match split2 authAndHost "@" with | (a, some b) => (some a, b) | (_, none) => (none, authAndHost)
   let (user, password) := match userInfo? with
     | none => ("postgres", "") | some ui => let (u, p?) := split2 ui ":"; (Qed.decodeSeg u, (p?.map Qed.decodeSeg).getD "")
-  let (host, portStr?) := split2 hostPort ":"
-  let port ← match portStr? with
-    | none => .ok (5432 : UInt16)
-    | some pStr => ((Net.parseStrictU64 pStr 65535).filter (· > 0)).elim (.error s!"invalid postgres port `{pStr}`") (.ok ∘ UInt16.ofNat)
+  let (host, _, port) ← Net.parseHostPort hostPort hostPort 5432
   let sslMode : PgSslMode := (queryOpt.getD "").splitOn "&" |>.foldl (init := .prefer) fun acc kv => match kv.splitOn "=" with
     | ["sslmode", "disable"] => .disable | ["sslmode", "require"] | ["sslmode", "verify-ca"] | ["sslmode", "verify-full"] => .require | _ => acc
-  if host.isEmpty then .error "missing postgres host"
-  else
-    let dbPart := dbOpt.getD "postgres"
-    .ok { user := if user.isEmpty then "postgres" else user, password, host, port,
-          database := if dbPart.isEmpty then "postgres" else Qed.decodeSeg dbPart, sslMode }
+  let dbPart := dbOpt.getD "postgres"
+  .ok { user := if user.isEmpty then "postgres" else user, password, host, port,
+        database := if dbPart.isEmpty then "postgres" else Qed.decodeSeg dbPart, sslMode }
 
 private def xorBytes (a b : ByteArray) : ByteArray := ByteArray.mk <| (Array.range (min a.size b.size)).map fun i => a.get! i ^^^ b.get! i
 

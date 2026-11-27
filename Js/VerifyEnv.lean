@@ -330,7 +330,7 @@ def isServerOnlyDeclName (env : Environment) : Name → Bool
 
 private def serverOnlyModules : Std.HashSet Name := Std.HashSet.ofList [
   `Qed.Server.Prim, `Qed.Server.Native, `Qed.Server.Http, `Qed.Server.Net, `Qed.Server.Db.PgWire,
-  `Qed.Server.Db.HttpSql, `Qed.Auth.Oidc, `Qed.Deploy, `Qed.Cloud.Compile, `Qed.Cloud.Proofs,
+  `Qed.Auth.Oidc, `Qed.Deploy, `Qed.Cloud.Compile, `Qed.Cloud.Proofs,
   `Qed.Cloud.GcpApi, `Qed.Cloud.Executor
 ]
 private def serverOnlyDecls : Std.HashSet Name := Std.HashSet.ofList [
@@ -351,7 +351,7 @@ def clientLeakReason? (env : Environment) (n : Name) : Option String :=
   let modName := definingModule env n
   if serverOnlyModules.contains modName then
     some s!"client bundle leak gate: server runtime primitive `{n}` (`{modName}`) cannot be bundled into client JavaScript"
-  else if serverOnlyDecls.contains n || n.getPrefix == `Qed.Server.ServerEffect then
+  else if serverOnlyDecls.contains n || n.getPrefix == `Qed.Server.ServerEffect || withPriv (hasNamePrefix (· == `Qed.Server.Db.HttpSql)) n then
     some s!"client bundle leak gate: server I/O or state primitive `{n}` cannot be bundled into client JavaScript"
   else if isServerOnlyDeclName env n then
     some s!"client bundle leak gate: server secret/state/handler `{n}` cannot be bundled into client JavaScript"

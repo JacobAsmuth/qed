@@ -253,10 +253,6 @@ def splitCallArgsPure (callName : String) (rawArgs : Array Syntax) (validKeys : 
     (validKeys : Option (List String) := none) (allowWhere : Bool := false) (errRef : Syntax := Syntax.missing) : m (Array Syntax × Array (String × Syntax)) :=
   match splitCallArgsPure callName rawArgs validKeys allowWhere errRef with | .ok r => pure r | .error (r, mg) => throwErrorAt r mg
 
-@[noinline] def splitCallArgsMacro (callName : String) (rawArgs : Array Syntax) (validKeys : Option (List String) := none)
-    (allowWhere : Bool := false) (errRef : Syntax := Syntax.missing) : MacroM (Array Syntax × Array (String × Syntax)) :=
-  match splitCallArgsPure callName rawArgs validKeys allowWhere errRef with | .ok r => pure r | .error (r, mg) => Macro.throwErrorAt r mg
-
 structure ParsedEnvRef where mk :: (isSecret : Bool) (envKey : String) (default? : Option String) deriving Inhabited, Repr
 
 @[noinline, nospecialize] def parseQedEnvRef {m : Type → Type} [Monad m] [MonadError m] (ctxDesc : String) (stx : Syntax) : m ParsedEnvRef := do

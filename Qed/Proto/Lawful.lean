@@ -199,4 +199,15 @@ instance : ToProto Url := .ofEquiv Url.raw
 instance : FromProto Url := .ofRetract (parseUrlWire "protobuf: ")
 instance : LawfulProto Url := .ofRetract Url.raw (parseUrlWire "protobuf: ") (parseUrlWire_raw "protobuf: ")
 
+/-- Typed application-level RPC failure transmitted cleanly inside binary Protobuf responses. -/
+structure RpcDomainError (ε : Type) where
+  tag     : ε
+  message : String
+deriving Inhabited, DecidableEq, Repr
+
+qed_equiv_codec% json [ε] (RpcDomainError ε,
+  fun e => (e.tag, e.message), fun p : ε × String => ⟨p.1, p.2⟩, fun ⟨_, _⟩ => rfl)
+qed_equiv_codec% proto [ε] (RpcDomainError ε,
+  fun e => (e.tag, e.message), fun p : ε × String => RpcDomainError.mk p.1 p.2, fun ⟨_, _⟩ => rfl)
+
 end Qed

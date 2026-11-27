@@ -1,7 +1,7 @@
 import Lean
 import Qed.Diag
 import Qed.Lang
-import Qed.Proto
+import Qed.Proto.Lawful
 
 namespace Qed
 

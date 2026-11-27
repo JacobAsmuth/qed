@@ -582,9 +582,9 @@ def buildGraphClean : IO Bool := do
           if !visited.contains dep && adj.contains dep then stack := stack.push dep
     return false
   let mut ok := true
-  let pureExact := #["Qed.Html", "Qed.Render", "Qed.View.Core", "Qed.Ssr", "Qed.Resource", "Qed.Socket", "Qed.Driver", "Qed.Speculative",
+  let pureExact := #["Qed.Html", "Qed.Render", "Qed.View.Core", "Qed.Ssr", "Qed.Resource", "Qed.Socket", "Qed.Driver",
     "Qed.Schema.Codec", "Qed.Runtime.AppCore", "Qed.Runtime.LocalCore", "Qed.Runtime.Cmd", "Qed.Server.Core", "Qed.Server.Eval", "Qed.Server.Http", "Qed.Server.Net",
-    "Qed.Server.Prim", "Qed.Server.Native", "Qed.Server.Db.Core", "Qed.Server.Db.Runtime", "Qed.Server.Db.HttpSql", "Qed.Server.Db.PgWire",
+    "Qed.Server.Prim", "Qed.Server.Native", "Qed.Server.Db.Core", "Qed.Server.Db.Runtime", "Qed.Server.Db.PgWire",
     "Qed.Deploy", "Qed.Cloud.Env", "Qed.Cloud.Gcp", "Qed.Cloud.Protocol", "Qed.Cloud.Compile", "Qed.Cloud.Proofs", "Qed.Cloud.GcpApi", "Qed.Cloud.Executor"]
   for (mod, _) in adj.toList do
     if (pureExact.contains mod || #["Qed.Driver.", "Qed.Socket.", "Qed.Speculative.", "Qed.Proofs."].any (mod.startsWith ·)) && reaches mod "Lean" then

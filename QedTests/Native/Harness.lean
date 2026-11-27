@@ -1,7 +1,7 @@
 import Qed.Server.Prim
 import Qed.Server.Http
 import Qed.Server.Net
-import Qed.Proto
+import Qed.Proto.Lawful
 import Qed.Json.Lawful
 open System (FilePath)
 open Qed.Server Qed.Server.Http

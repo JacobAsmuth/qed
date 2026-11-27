@@ -1,6 +1,6 @@
 import Qed.Html
 import Qed.Date
-import Qed.Proto
+import Qed.Proto.Lawful
 import Qed.Base64
 import Qed.Router.Basic
 import Qed.Socket.Basic

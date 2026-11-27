@@ -145,7 +145,8 @@ def parseReconnectExpr (exprStx : Syntax) : MacroM Reconnect := do
     | nm => Macro.throwErrorAt u s!"unknown `reconnect` policy `{nm}`; use `off`, `fixed(ms[, max])`, or `backoff(initMs, maxMs[, max])`"
   else if u.getKind == ``qedCall && (u.getArg 0).getKind == ``qedIdent then
     let fn := ((u.getArg 0).getArg 0).getId.eraseMacroScopes
-    let (pos, named) ← splitCallArgsMacro "reconnect" (u.getArg 2).getSepArgs (some ["maxRetries", "max"])
+    let (pos, named) ← match splitCallArgsPure "reconnect" (u.getArg 2).getSepArgs (some ["maxRetries", "max"]) with
+      | .ok r => pure r | .error (r, mg) => Macro.throwErrorAt r mg
     let maxRet? ← named.foldlM (init := none) fun _ (_, v) => some <$> parseOptNatLitArg v
     let getMax (i : Nat) := if pos.size == i + 1 then parseOptNatLitArg pos[i]! else pure (maxRet?.getD none)
     match fn with

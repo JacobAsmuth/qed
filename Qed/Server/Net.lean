@@ -242,7 +242,7 @@ private theorem splitAuthorityAndPathGo_no_hash (authRev cs : List Char) (auth p
 
 def isIdempotentHttpMethod (method : String) : Bool := method == "GET" || method == "HEAD" || method == "PUT" || method == "DELETE" || method == "OPTIONS"
 
-private def parseHostPort (url auth : String) (defaultPort : UInt16) : Except String (String × Bool × UInt16) := do
+def parseHostPort (url auth : String) (defaultPort : UInt16) : Except String (String × Bool × UInt16) := do
   if auth.isEmpty || auth.utf8ByteSize >= 256 || auth.contains '@' || auth.contains '\\' then throw s!"invalid URL authority: {url}"
   let (host, isIpv6, portStr?) ←
     if auth.startsWith "[" then match auth.splitOn "]" with

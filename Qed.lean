@@ -4,9 +4,13 @@ import Qed.Notation
 import Qed.Render
 import Qed.Runtime
 import Qed.Diff
-import Qed.Invariant
+import Qed.Invariant.Predicates
+import Qed.Invariant.State
+import Qed.Invariant.View
+import Qed.Invariant.ForEach
+import Qed.Invariant.Reachability
 import Qed.Json
-import Qed.Proto
+import Qed.Proto.Lawful
 import Qed.Dict
 import Qed.Router
 import Qed.Date
@@ -18,11 +22,28 @@ import Qed.Collection
 import Qed.View
 import Qed.Jsx
 import Qed.Resource
-import Qed.Speculative
+import Qed.Speculative.Core
+import Qed.Speculative.Proofs
 import Qed.Socket
 import Qed.Ssr
-import Qed.Style
-import Qed.Auth
-import Qed.Server
-import Qed.Cloud
--- `Qed.Dom`, `Qed.Driver`, and `Qed.Server.Native` are omitted so pure app modules compile cleanly to both JS and native SSR/RPC targets.
+import Qed.Style.Core
+import Qed.Style.Contrast
+import Qed.Style.Proofs
+import Qed.Style.Syntax
+import Qed.Auth.Core
+import Qed.Auth.Elab
+import Qed.Server.Core
+import Qed.Server.Eval
+import Qed.Server.Syntax
+import Qed.Server.Db.Core
+import Qed.Server.Db.Runtime
+import Qed.Server.Db.Elab
+import Qed.Server.Db.QueryLower
+import Qed.Server.External
+import Qed.Server.Invariant
+import Qed.Server.Elab
+import Qed.Cloud.Env
+import Qed.Cloud.Gcp
+import Qed.Cloud.Elab
+-- `Qed.Dom`, `Qed.Driver`, `Qed.Server.Native`, `Qed.Deploy`, `Qed.Cloud.Compile`, and `Qed.Cloud.Proofs`
+-- are omitted so pure app modules compile cleanly to both JS and native SSR/RPC targets.

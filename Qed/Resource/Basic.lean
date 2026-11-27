@@ -1,4 +1,4 @@
-import Qed.Proto
+import Qed.Proto.Lawful
 
 namespace Qed
 

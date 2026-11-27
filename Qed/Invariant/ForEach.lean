@@ -1,4 +1,4 @@
-import Qed.Component.Core
+import Qed.Collection
 import Qed.Verify.Core
 import Qed.Invariant.View
 

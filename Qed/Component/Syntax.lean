@@ -1,4 +1,4 @@
-import Qed.Component.Core
+import Qed.Collection
 import Qed.Style.Syntax
 import Qed.Jsx
 import Qed.Lang

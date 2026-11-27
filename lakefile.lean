@@ -36,7 +36,7 @@ lean_lib Qed where
 
 lean_lib QedServer where
   roots := #[`Qed.Server.Net, `Qed.Server.Http, `Qed.Server.Prim,
-    `Qed.Server.Db.HttpSql, `Qed.Server.Db.PgWire, `Qed.Auth.Oidc, `Qed.Server.Native,
+    `Qed.Server.Db.PgWire, `Qed.Auth.Oidc, `Qed.Server.Native,
     `Qed.Cloud.Protocol, `Qed.Cloud.Executor]
   moreLinkArgs := #["-pthread"]
 

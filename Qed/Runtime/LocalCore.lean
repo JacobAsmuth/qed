@@ -17,12 +17,12 @@ def LocalDef.viewForProps (ldef : LocalDef) (props : String) : String → Html L
 private def dedupeStep (acc : Array LocalDef) (d : LocalDef) : Array LocalDef := if acc.any (·.id == d.id) then acc else acc.push d
 def LocalDef.dedupe (ds : List LocalDef) : List LocalDef := (ds.foldl dedupeStep #[]).toList
 
-def Attr.localProps {msg P : Type} [ToJson P] (a : Attr msg) (props : P) : Attr msg :=
+@[noinline, nospecialize] def Attr.localProps {msg P : Type} [ToJson P] (a : Attr msg) (props : P) : Attr msg :=
   match a with | .localCell k c i _ b => .localCell k c i (Json.render (toJson props)) b | x => x
 def localMount (component key : String) : Attr msg := .localCell key component none "" (fun _ => none)
-def localMountWith {O msg : Type} [FromJson O] (component key : String) (onOut : O → Option msg) : Attr msg :=
+@[noinline, nospecialize] def localMountWith {O msg : Type} [FromJson O] (component key : String) (onOut : O → Option msg) : Attr msg :=
   .localCell key component none "" fun s => (((Json.parse s).bind FromJson.fromJson : Except String O)).toOption.bind onOut
-def Attr.localInit {msg S : Type} [ToJson S] (a : Attr msg) (init : S) : Attr msg :=
+@[noinline, nospecialize] def Attr.localInit {msg S : Type} [ToJson S] (a : Attr msg) (init : S) : Attr msg :=
   match a with | .localCell k c _ p b => .localCell k c (some (Json.render (ToJson.toJson init))) p b | x => x
 
 @[simp] theorem Attr.localProps_localCell {msg P : Type} [ToJson P] (k c : String) (i : Option String) (p0 : String) (b : String → Option msg) (props : P) :

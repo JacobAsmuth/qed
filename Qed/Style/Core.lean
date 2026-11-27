@@ -67,7 +67,7 @@ mutual
   decreasing_by all_goals (simp_wf; omega)
 end
 
-structure CssNum where raw : String deriving Inhabited, BEq, Repr
+structure CssNum where raw : String deriving Inhabited, BEq
 namespace CssNum
 private def ofMantissaExp (m e : Nat) : String :=
   if e == 0 then toString m else
@@ -82,7 +82,7 @@ instance : Neg CssNum := ⟨fun x => ⟨if x.raw.startsWith "-" || x.raw == "0" 
 instance : OfScientific CssNum := ⟨fun m neg e => ⟨if neg then ofMantissaExp m e else toString (m * 10 ^ e)⟩⟩
 end CssNum
 
-structure Len where raw : String deriving Inhabited, BEq, Repr
+structure Len where raw : String deriving Inhabited, BEq
 instance : OfNat Len 0 := ⟨⟨"0"⟩⟩
 instance : ToString Len := ⟨Len.raw⟩
 def Len.auto : Len := ⟨"auto"⟩
@@ -90,7 +90,7 @@ def px  (n : CssNum) : Len := ⟨n.raw ++ "px"⟩
 def rem (n : CssNum) : Len := ⟨n.raw ++ "rem"⟩
 def em  (n : CssNum) : Len := ⟨n.raw ++ "em"⟩
 def pct (n : CssNum) : Len := ⟨n.raw ++ "%"⟩
-structure Time where raw : String deriving Inhabited, BEq, Repr
+structure Time where raw : String deriving Inhabited, BEq
 instance : ToString Time := ⟨Time.raw⟩
 
 abbrev hexDigitVal? : Char → Option Nat := unhexNat?
@@ -106,7 +106,7 @@ def parseHexRgb? (raw : String) : Option (Nat × Nat × Nat) :=
   | [r1, r2, g1, g2, b1, b2, a1, a2] => do let c ← rgb r1 r2 g1 g2 b1 b2; guard ((← hexPair? a1 a2) == 255); pure c
   | _ => none
 
-structure Color where mk :: (raw : String) (rgb? : Option (Nat × Nat × Nat) := none) deriving Inhabited, BEq, Repr
+structure Color where mk :: (raw : String) (rgb? : Option (Nat × Nat × Nat) := none) deriving Inhabited, BEq
 instance : ToString Color := ⟨Color.raw⟩
 def Color.transparent  : Color := ⟨"transparent", none⟩
 def Color.currentColor : Color := ⟨"currentColor", none⟩
@@ -123,7 +123,7 @@ instance : CssValue CssNum := ⟨CssNum.raw⟩
 instance : CssValue Time   := ⟨Time.raw⟩
 instance : CssValue String := ⟨id⟩
 
-structure TypedToken (α : Type) where mk :: (name : String) (lightVal : Option α := none) (darkVal : Option α := none) deriving Inhabited, BEq, Repr
+structure TypedToken (α : Type) where mk :: (name : String) (lightVal : Option α := none) (darkVal : Option α := none) deriving Inhabited, BEq
 instance {α : Type} : ToString (TypedToken α) := ⟨fun t => s!"var(--{t.name})"⟩
 instance : Coe (TypedToken Color)  Color  := ⟨fun t => ⟨s!"var(--{t.name})", t.lightVal.bind Color.rgb?⟩⟩
 instance : Coe (TypedToken Len)    Len    := ⟨fun t => ⟨s!"var(--{t.name})"⟩⟩
@@ -162,10 +162,10 @@ def cssHashLoop : List UInt8 → UInt64 → UInt64 | [], h => h | b :: bs, h => 
 def cssHash (s : String) : UInt64 := cssHashLoop s.toUTF8.data.toList 1469598103934665603
 def shortHexHash (h : UInt64) : String := String.ofList ([28, 24, 20, 16, 12, 8, 4, 0].map fun sh => hexDigitLower (h.toNat >>> sh))
 
-structure ThemeColorEntry where mk :: (cssName : String) (lightRgb : Nat × Nat × Nat) (darkRgb? : Option (Nat × Nat × Nat) := none) deriving Inhabited, BEq, Repr
+structure ThemeColorEntry where mk :: (cssName : String) (lightRgb : Nat × Nat × Nat) (darkRgb? : Option (Nat × Nat × Nat) := none) deriving Inhabited, BEq
 structure StyleColorCheck where mk ::
   (scope fgCss bgCss : String) (fgRgb? bgRgb? : Option (Nat × Nat × Nat) := none) (fgTok? bgTok? : Option String := none) (forcedDark : Bool := false)
-deriving Inhabited, BEq, Repr
+deriving Inhabited, BEq
 structure Style where mk ::
   (className raw : String) (items : List Item := []) (usedTokens extraRules : List String := []) (isGlobal : Bool := false)
   (colorChecks : List StyleColorCheck := []) (themePalette : List ThemeColorEntry := [])

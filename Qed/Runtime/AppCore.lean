@@ -8,7 +8,7 @@ namespace Qed
 
 structure HeadMeta where
   (title description : Option String := none) (metaTags : List (String × String) := []) (canonical redirect : Option String := none)
-deriving Inhabited, DecidableEq, Repr
+deriving Inhabited, DecidableEq
 
 structure App (Model Msg : Type) where
   private mk ::
@@ -39,7 +39,7 @@ def mkAppCore (init : Model) (update : Model → Msg → Model × Cmd Msg) (temp
     (locals : List LocalDef := []) (styles : List Style := []) (onPort : Option (String → String → Option Msg) := none)
     (onSession : Option (Option String → Msg) := none) (valid_view : ∀ m, Html.valid (View.render template m) = true) : App Model Msg :=
   { init := (init, start), update, template, locals, styles, onPort, onSession, valid_view }
-def mkRoutedAppCore {R : Type} [Router R] [Inhabited R] (init : Model) (update : Model → Msg → Model × Cmd Msg) (template : View Model Msg)
+@[noinline, nospecialize] def mkRoutedAppCore {R : Type} [Router R] [Inhabited R] (init : Model) (update : Model → Msg → Model × Cmd Msg) (template : View Model Msg)
     (onRoute : R → Msg) (start : Cmd Msg := .none) (locals : List LocalDef := []) (styles : List Style := [])
     (onPort : Option (String → String → Option Msg) := none) (onSession : Option (Option String → Msg) := none)
     (valid_view : ∀ m, Html.valid (View.render template m) = true) : App Model Msg :=
@@ -47,7 +47,7 @@ def mkRoutedAppCore {R : Type} [Router R] [Inhabited R] (init : Model) (update :
 def App.setInitAndUpdate (app : App Model Msg) (init : Model × Cmd Msg) (u : Model → Msg → Model × Cmd Msg) : App Model Msg := { app with init, update := u }
 def App.setInitUpdateHydrate (app : App Model Msg) (init : Model × Cmd Msg) (u : Model → Msg → Model × Cmd Msg) (onHydrate : Model → Cmd Msg) : App Model Msg := { app with init, update := u, onHydrate }
 
-def App.liftModel {Model Model' Msg : Type} (embed : Model → Model') (proj : Model' → Model)
+@[noinline, nospecialize] def App.liftModel {Model Model' Msg : Type} (embed : Model → Model') (proj : Model' → Model)
     (hproj : ∀ m, proj (embed m) = m) (u : Model' → Msg → Model' × Cmd Msg) (app : App Model Msg) : App Model' Msg where
   init := (embed app.init.1, app.init.2); update := u; template := app.template.mapScope proj
   onUrlChange := app.onUrlChange; onSession := app.onSession; onHydrate := app.onHydrate ∘ proj
@@ -68,13 +68,13 @@ structure Dehydrate (Model : Type) where
   (round_trip : ∀ m, rehydrate (dehydrate m) = some (project m))
 
 namespace Dehydrate
-private def parseLawful (α : Type) [LawfulJson α] (s : String) : Option α := ((Json.parse s (max 64 (LawfulJson.depthBound α))).bind fromJson).toOption
+@[noinline, nospecialize] private def parseLawful (α : Type) [LawfulJson α] (s : String) : Option α := ((Json.parse s (max 64 (LawfulJson.depthBound α))).bind fromJson).toOption
 private theorem parseLawful_render {α : Type} [LawfulJson α] (a : α) : parseLawful α (Json.render (toJson a)) = some a := by
   simp [parseLawful, LawfulJson.parse_render_toJson a (Nat.le_max_right 64 _), Except.toOption]
-def full {Model : Type} [LawfulJson Model] : Dehydrate Model := ⟨id, fun m => Json.render (toJson m), parseLawful Model, parseLawful_render⟩
-def slice {Model α : Type} [LawfulJson α] (init : Model) (get : Model → α) (set : Model → α → Model) : Dehydrate Model :=
+@[noinline, nospecialize] def full {Model : Type} [LawfulJson Model] : Dehydrate Model := ⟨id, fun m => Json.render (toJson m), parseLawful Model, parseLawful_render⟩
+@[noinline, nospecialize] def slice {Model α : Type} [LawfulJson α] (init : Model) (get : Model → α) (set : Model → α → Model) : Dehydrate Model :=
   ⟨fun m => set init (get m), fun m => Json.render (toJson (get m)), fun s => (parseLawful α s).map (set init), fun m => by simp [parseLawful_render]⟩
-def const {Model : Type} (init : Model) : Dehydrate Model := slice (α := Unit) init (fun _ => ()) (fun m _ => m)
+@[noinline, nospecialize] def const {Model : Type} (init : Model) : Dehydrate Model := slice (α := Unit) init (fun _ => ()) (fun m _ => m)
 @[simp] theorem full_project {Model : Type} [LawfulJson Model] (m : Model) : (full : Dehydrate Model).project m = m := rfl
 @[simp] theorem slice_project {Model α : Type} [LawfulJson α] (init : Model) (get : Model → α) (set : Model → α → Model) (m : Model) : (slice init get set).project m = set init (get m) := rfl
 @[simp] theorem const_project {Model : Type} (init m : Model) : (const init).project m = init := rfl
@@ -84,7 +84,7 @@ theorem dehydrate_view_of_project {Model Msg : Type} (d : Dehydrate Model) (tmpl
 end Dehydrate
 
 namespace Internal
-def App.withDehydrateCore {Model Msg : Type} (d : Dehydrate Model) (app : App Model Msg)
+@[noinline, nospecialize] def App.withDehydrateCore {Model Msg : Type} (d : Dehydrate Model) (app : App Model Msg)
     (hview : ∀ m, View.render app.template (d.project m) = View.render app.template m) : App Model Msg :=
   { app with dehydrate := d.dehydrate, rehydrate := d.rehydrate, dehydrate_view := Dehydrate.dehydrate_view_of_project d app.template hview }
 theorem App.dehydrate_preserves_of_project {Model Msg : Type} (Inv : Model → Prop) (app : App Model Msg) (proj : Model → Model)
@@ -97,7 +97,7 @@ theorem App.guardRehydrate_step_eq_some {Model : Type} (Inv : Model → Prop) [D
   cases hr : rehydrate raw with | none => simp [hr] at h | some m => simp only [hr] at h; split at h <;> simp at h; subst h; exact ⟨rfl, of_decide_eq_true ‹_›⟩
 
 set_option linter.unusedVariables false in
-def App.guardRehydrateCore {Model Msg : Type} (Inv : Model → Prop) [DecidablePred Inv] (app : App Model Msg)
+@[noinline, nospecialize] def App.guardRehydrateCore {Model Msg : Type} (Inv : Model → Prop) [DecidablePred Inv] (app : App Model Msg)
     (hpres : ∀ m m', Inv m → app.rehydrate (app.dehydrate m) = some m' → Inv m') : App Model Msg :=
   { app with rehydrate := fun s => match app.rehydrate s with | some m => if decide (Inv m) then some m else none | none => none
              dehydrate_view := fun m m' h => app.dehydrate_view m m' (App.guardRehydrate_step_eq_some Inv app.rehydrate h).1 }

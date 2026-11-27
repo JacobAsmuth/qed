@@ -1,5 +1,5 @@
 import Qed.View.Core
-import Lean
+import Qed.Verify.Core
 
 namespace Qed.ValidLemmas
 
@@ -100,9 +100,12 @@ private def validThmName (pfx s : String) : Lean.Name := .str (.str (.str .anony
 private def modeStepInfo : String → TagMode × TagMode × Bool
   | "li" => (.ulOl, .normal, true) | "thead" | "tbody" => (.table, .tableSection, true)
   | "tr" => (.tableSection, .tableRow, true) | "option" => (.select, .option, false) | _ => (.tableRow, .normal, true)
-private def tagModeConst : TagMode → Lean.Name
-  | .normal => ``TagMode.normal | .ulOl => ``TagMode.ulOl | .table => ``TagMode.table | .tableSection => ``TagMode.tableSection
-  | .tableRow => ``TagMode.tableRow | .select => ``TagMode.select | .option => ``TagMode.option | .textarea => ``TagMode.textarea | _ => ``TagMode.normal
+def tagModeTable : Array (Lean.Name × TagMode) := #[
+  (``TagMode.normal, .normal), (``TagMode.ulOl, .ulOl), (``TagMode.dl, .dl), (``TagMode.table, .table),
+  (``TagMode.colgroup, .colgroup), (``TagMode.tableSection, .tableSection), (``TagMode.tableRow, .tableRow),
+  (``TagMode.select, .select), (``TagMode.optgroup, .optgroup), (``TagMode.option, .option),
+  (``TagMode.rawStyle, .rawStyle), (``TagMode.textarea, .textarea), (``TagMode.svg, .svg)]
+def tagModeConst (m : TagMode) : Lean.Name := (tagModeTable.find? (·.2 == m)).map Prod.fst |>.getD ``TagMode.normal
 
 private def snuRaw : String := "data-role data-qed-link value placeholder name alt title style type class id for role aria-label aria-invalid aria-live rows cols min max step tabindex target rel accept autocomplete"
 private def saRaw : String := "click input change keydown keyup submit blur focus dblclick mousedown mouseup disabled required checked readonly selected multiple hidden"
@@ -117,22 +120,18 @@ private def modeStepRaw : String := "li thead tbody tr td th option"
 private def nvRaw : String := "div span p a button form label ul ol li h1 h2 h3 h4 h5 h6 section article aside header footer main nav blockquote pre code strong em small b i u s mark time kbd table thead tbody tr td th select option textarea fieldset legend figure figcaption summary"
 
 section GenValid
-open Lean Elab Command
-
-@[noinline] private def forWords (raw : String) (f : String → CommandElabM Unit) : CommandElabM Unit :=
-  let rec go : List String → CommandElabM Unit | [] => pure () | s :: ss => do f s; go ss
-  go (raw.splitOn " ")
+open Lean Elab Command Qed.Verify.Core
 
 @[noinline] private def emitValidThms : CommandElabM Unit := do
   let boolT := mkConst ``Bool; let bT := mkConst ``Bool.true; let bF := mkConst ``Bool.false
   let bE (b : Bool) := if b then bT else bF
-  let eqB (l r : Expr) := mkApp3 (mkConst ``Eq [Level.one]) boolT l r
-  let rflB (b : Expr) := mkApp2 (mkConst ``Eq.refl [Level.one]) boolT b
+  let rflB (b : Bool) := if b then rflBoolTrue else rflBoolFalse
+  let forWords (raw : String) (f : String → CommandElabM Unit) := Qed.Lang.foldlCmd (raw.splitOn " ").toArray () fun _ => f
   let addT (pfx s : String) (type value : Expr) : CommandElabM Unit := liftCoreM (addDecl (.thmDecl { name := validThmName pfx s, levelParams := [], type, value }))
-  forWords snuRaw fun s => let se := mkStrLit s; let t1 := eqB (mkApp (mkConst ``Qed.isSafeAttrName) se) bT; let t2 := eqB (mkApp (mkConst ``Qed.isUrlAttrName) se) bF
-    addT "snu_" s (mkApp2 (mkConst ``And) t1 t2) (mkApp4 (mkConst ``And.intro) t1 t2 (mkApp2 (mkConst ``Qed.isSafeAttrName_of_bytes) se (rflB bT)) (rflB bF))
-  forWords saRaw fun s => let se := mkStrLit s; addT "sa_" s (eqB (mkApp (mkConst ``Qed.isSafeAttrName) se) bT) (mkApp2 (mkConst ``Qed.isSafeAttrName_of_bytes) se (rflB bT))
-  forWords nvRaw fun s => let se := mkStrLit s; addT "nv_" s (eqB (mkApp (mkConst ``Qed.isVoidTag) se) bF) (mkApp2 (mkConst ``mk_nv) se (rflB bF))
+  forWords snuRaw fun s => let se := mkStrLit s; let t1 := mkBoolEqTrue (mkApp (mkConst ``Qed.isSafeAttrName) se); let t2 := mkBoolEq (mkApp (mkConst ``Qed.isUrlAttrName) se) bF
+    addT "snu_" s (mkApp2 (mkConst ``And) t1 t2) (mkApp4 (mkConst ``And.intro) t1 t2 (mkApp2 (mkConst ``Qed.isSafeAttrName_of_bytes) se rflBoolTrue) rflBoolFalse)
+  forWords saRaw fun s => let se := mkStrLit s; addT "sa_" s (mkBoolEqTrue (mkApp (mkConst ``Qed.isSafeAttrName) se)) (mkApp2 (mkConst ``Qed.isSafeAttrName_of_bytes) se rflBoolTrue)
+  forWords nvRaw fun s => let se := mkStrLit s; addT "nv_" s (mkBoolEq (mkApp (mkConst ``Qed.isVoidTag) se) bF) (mkApp2 (mkConst ``mk_nv) se rflBoolFalse)
   let optCtxT := mkApp (mkConst ``Option [Level.zero]) (mkConst ``HtmlCtx)
   let mkStepTy (m1 m2 : TagMode) (pIn iIn pOut iOut fE se : Expr) :=
     mkApp3 (mkConst ``Eq [Level.one]) optCtxT (mkApp2 (mkConst ``Qed.stepHtmlCtx) (mkApp4 (mkConst ``HtmlCtx.mk) (mkConst (tagModeConst m1)) pIn iIn fE) se)
@@ -141,30 +140,31 @@ open Lean Elab Command
     let mk1 (n : Name) (b : Expr) := if isTy then Expr.forallE n boolT b .default else Expr.lam n boolT b .default
     let e2 := if iVar then mk1 `i (mk1 `f e) else mk1 `f e
     if pVar then mk1 `p e2 else e2
-  let addNormal (pVar iVar wHead wInter : Bool) (m2Of : String → TagMode) (raw : String) : CommandElabM Unit :=
+  let normalSpecs : Array (Bool × Bool × Bool × Bool × (String → TagMode) × String) := #[
+    (false, true,  false, false, fun _ => .normal, blockRaw),
+    (false, true,  true,  false, fun _ => .normal, headingRaw),
+    (false, true,  false, false, fun s => if s == "table" then .table else .ulOl, modeBlockRaw),
+    (true,  true,  false, false, fun _ => .normal, inlineRaw),
+    (true,  false, false, true,  fun _ => .normal, interRaw),
+    (true,  false, false, false, fun _ => .normal, inputRaw),
+    (true,  false, false, true,  fun s => if s == "select" then .select else .textarea, modeInterRaw)]
+  Qed.Lang.foldlCmd normalSpecs () fun _ (pVar, iVar, wHead, wInter, m2Of, raw) =>
     forWords raw fun s => do
       let se := mkStrLit s; let m2 := m2Of s; let fE := mkBVar 0; let iE := if iVar then mkBVar 1 else bF
       let pE := if pVar then mkBVar (if iVar then 2 else 1) else bF
       let pOut := if pVar then pE else bE wHead; let iOut := if iVar then iE else bE wInter
-      let optPf (flag : Bool) (lem : Name) (v dflt : Expr) := if flag then mkApp (mkConst lem) v else rflB dflt
+      let optPf (flag : Bool) (lem : Name) (v : Expr) (dflt : Bool) := if flag then mkApp (mkConst lem) v else rflB dflt
       let bodyTy := mkStepTy .normal m2 pE iE pOut iOut fE se
-      let bodyPf := mkAppN (mkConst ``mk_normalStep) #[se, mkConst (tagModeConst m2), bE pVar, bE iVar, bE wHead, bE wInter, rflB bT, pE, iE, fE, pOut, iOut,
-        optPf pVar ``Bool.and_false pE bF, optPf iVar ``Bool.and_false iE bF, optPf pVar ``Bool.or_false pE (bE wHead), optPf iVar ``Bool.or_false iE (bE wInter)]
+      let bodyPf := mkAppN (mkConst ``mk_normalStep) #[se, mkConst (tagModeConst m2), bE pVar, bE iVar, bE wHead, bE wInter, rflBoolTrue, pE, iE, fE, pOut, iOut,
+        optPf pVar ``Bool.and_false pE false, optPf iVar ``Bool.and_false iE false, optPf pVar ``Bool.or_false pE wHead, optPf iVar ``Bool.or_false iE wInter]
       addT "step_" s (wrap pVar iVar true bodyTy) (wrap pVar iVar false bodyPf)
-  addNormal false true false false (fun _ => .normal) blockRaw
-  addNormal false true true false (fun _ => .normal) headingRaw
-  addNormal false true false false (fun s => if s == "table" then .table else .ulOl) modeBlockRaw
-  addNormal true true false false (fun _ => .normal) inlineRaw
-  addNormal true false false true (fun _ => .normal) interRaw
-  addNormal true false false false (fun _ => .normal) inputRaw
-  addNormal true false false true (fun s => if s == "select" then .select else .textarea) modeInterRaw
   let prodM := mkApp2 (mkConst ``Prod [Level.zero, Level.zero]) (mkConst ``TagMode) boolT
   forWords modeStepRaw fun s => do
     let se := mkStrLit s; let (m1, m2, rst) := modeStepInfo s; let (pE, iE, fE) := (mkBVar 2, mkBVar 1, mkBVar 0)
     let rflOpt := mkApp2 (mkConst ``Eq.refl [Level.one]) (mkApp (mkConst ``Option [Level.zero]) prodM)
       (mkApp2 (mkConst ``Option.some [Level.zero]) prodM (mkApp4 (mkConst ``Prod.mk [Level.zero, Level.zero]) (mkConst ``TagMode) boolT (mkConst (tagModeConst m2)) (bE rst)))
     addT "step_" s (wrap true true true (mkStepTy m1 m2 pE iE (if rst then bF else pE) iE fE se))
-      (wrap true true false (mkAppN (mkConst ``mk_modeStep) #[mkConst (tagModeConst m1), mkConst (tagModeConst m2), se, bE rst, rflB bT, rflB bF, rflOpt, pE, iE, fE]))
+      (wrap true true false (mkAppN (mkConst ``mk_modeStep) #[mkConst (tagModeConst m1), mkConst (tagModeConst m2), se, bE rst, rflBoolTrue, rflBoolFalse, rflOpt, pE, iE, fE]))
 
 local elab "#genValidLemmas" : command => emitValidThms
 #genValidLemmas
@@ -224,9 +224,7 @@ def fastAttrValidProof? (msgTy a : Expr) : Option Expr :=
   a.getAppFn.constName?.bind fun fn => match fn, args.size with
     | ``VAttr.eval, 4 =>
         let va := args[3]!.consumeMData
-        if va.getAppFn.constName? == some ``V.onCheck' && va.getAppArgs.size == 3 then
-          some (mkApp4 (mkConst ``valid_vOnCheck) args[0]! args[1]! args[2]! va.getAppArgs[2]!)
-        else none
+        if va.isAppOfArity ``V.onCheck' 3 then some (mkApp4 (mkConst ``valid_vOnCheck) args[0]! args[1]! args[2]! va.getAppArgs[2]!) else none
     | ``Qed.value, 4 => some (mkApp4 (mkConst ``valid_value) args[0]! args[1]! args[2]! args[3]!)
     | ``Qed.onCheck, 2 => some (mkApp2 (mkConst ``valid_onCheck) args[0]! args[1]!)
     | ``Qed.attr, 5 => (strLitVal? args[3]! >>= (safeNonUrlAttrMap[·]?)).map fun lem =>

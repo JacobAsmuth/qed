@@ -15,17 +15,14 @@ private structure ParsedFnEnsures where (ref : Syntax) (guards preds : Array Syn
 private structure ParsedFnBlindTo where (ref : Syntax) (guards : Array Syntax) (targets : Array ParsedBlindTarget) (tac? : Option (TSyntax ``Lean.Parser.Tactic.tacticSeq))
 private structure ParsedFnExample where (ref : Syntax) (name : Ident) (params wheres preds : Array Syntax) (tac? : Option (TSyntax ``Lean.Parser.Tactic.tacticSeq))
 private structure ParsedFnContracts where
-  requires : Array Syntax := #[]
-  ensures  : Array ParsedFnEnsures := #[]
-  blinds   : Array ParsedFnBlindTo := #[]
-  examples : Array ParsedFnExample := #[]
+  (requires : Array Syntax := #[]) (ensures : Array ParsedFnEnsures := #[]) (blinds : Array ParsedFnBlindTo := #[]) (examples : Array ParsedFnExample := #[])
 
 syntax qedProveCase := ident,+ " => " Lean.Parser.Tactic.tacticSeq
 syntax "qedDischargeInit " "[" term,* "]" term:max ident term:max : tactic
 syntax "qedDischargePreserved " "[" term,* "]" term:max ident term:max (" from " term)? (" _qedProve " "[" qedProveCase,* "]")? : tactic
 syntax "qedProveFnEnsures " ident ident : tactic
 syntax "qedProveBlindTo " ident ident str : tactic
-syntax "qedProveFnExample " ident ident : tactic
+syntax "qedProveFnExample " ("ground ")? ident ident : tactic
 
 private def relevantOptResLemmas (env : Environment) (cs : Std.HashSet Name) : Array Name :=
   collectTriggered env cs #[] #[
@@ -51,24 +48,18 @@ private def impHypSimpNames : Array Name :=
       ``Qed.Lang.QedMemProp.memProp_list, ``Qed.Lang.QedMemProp.memProp_string,
       ``Array.contains_iff_mem, ``List.contains_iff_mem]
 
-private def mkBoolEq (lhs rhs : Expr) : Expr := mkApp3 (mkConst ``Eq [1]) (mkConst ``Bool) lhs rhs
 private def mkStrToList (s : Expr) : Expr := mkApp (mkConst ``String.toList) s
 private def mkNot (p : Expr) : Expr := mkApp (mkConst ``Not) p
 private def mkListAll (ty xs p : Expr) : Expr := mkApp3 (mkConst ``List.all [0]) ty xs p
-private def closeAllGoals (f : MVarId → MetaM Bool) : List MVarId → MetaM Bool
-  | [] => pure true | g :: r => do if ← f g then closeAllGoals f r else pure false
-private def filterUnsolvedM (f : MVarId → MetaM Bool) : List MVarId → MetaM (List MVarId)
-  | [] => pure [] | g :: r => do if ← f g then filterUnsolvedM f r else return g :: (← filterUnsolvedM f r)
+@[noinline] private def filterMapGoalsM (f : MVarId → MetaM (Option MVarId)) : List MVarId → MetaM (List MVarId)
+  | [] => pure [] | g :: r => do match ← f g with | some g' => return g' :: (← filterMapGoalsM f r) | none => filterMapGoalsM f r
+private def filterMapGoalsT (f : MVarId → MetaM (Option MVarId)) : TacticM Unit := do setGoals (← filterMapGoalsM f (← getGoals))
+@[noinline] private def foldlT {α β : Type} (xs : Array α) (init : β) (f : β → α → TacticM β) : TacticM β :=
+  let rec go : Nat → β → TacticM β | 0, acc => pure acc | r + 1, acc => do let i := xs.size - (r + 1); if h : i < xs.size then go r (← f acc xs[i]) else pure acc
+  go xs.size init
 
 private def tryCloseContradiction (g : MVarId) : MetaM Bool :=
   tryRestoreM false id (Meta.withTransparency .reducible (g.contradictionCore {}))
-
-@[noinline] private def splitAndDsimpState (dCtx : Meta.Simp.Context) : Nat → List MVarId → MetaM (List MVarId)
-  | 0, gs => pure gs | _, [] => pure []
-  | fuel + 1, g :: rest => do
-      match ← trySplitTarget g with
-      | none => return g :: (← splitAndDsimpState dCtx fuel rest)
-      | some sub => splitAndDsimpState dCtx fuel ((← sub.filterMapM (simpGoalOnly · dCtx (dsimpOnly := true))) ++ rest)
 
 @[noinline] private def tryProvePremise (g : MVarId) (p : Expr) : MetaM (Option Expr) := g.withContext do
   tryRestoreM none Option.isSome do
@@ -87,7 +78,7 @@ private def tryCloseContradiction (g : MVarId) : MetaM Bool :=
           if q.hasLooseBVars || seen.contains q then return none
           if ← isPropSafe p then if ← isPropSafe q then return some (d.fvarId, p, q)
           return none
-        let (g', seen', added) ← hyps.toList.foldlM (init := (g, seen, false)) fun (cg, sn, add) (hfv, p, q) => do
+        let (g', seen', added) ← foldlMeta hyps (g, seen, false) fun (cg, sn, add) (hfv, p, q) => do
           if sn.contains q then return (cg, sn, add)
           match ← tryProvePremise cg p with
           | none => return (cg, sn, add)
@@ -98,30 +89,26 @@ private def tryCloseContradiction (g : MVarId) : MetaM Bool :=
 private def tryCloseWithImp (g : MVarId) : MetaM (Option MVarId) := do
   if ← tryCloseContradiction g then return none
   let g ← specializeImpHyps g
-  if ← tryCloseContradiction g then return none
-  if ← tryCloseBasic g (reducibleOnly := true) then return none
-  return some g
+  if ← tryCloseContradiction g then return none else if ← tryCloseBasic g (reducibleOnly := true) then return none else return some g
 
 @[noinline] private def runCloseStateGoal (extra : Array Term) : TacticM Unit := do
   let g0 :: rest ← getGoals | return
   let some g0 ← tryCloseWithImp g0 | setGoals rest; return
   setGoals (g0 :: rest)
-  let cs ← collectGoalConsts g0 true
-  let relNames := relevantOptResLemmas (← getEnv) cs ++ relevantBoundaryLemmas cs
-  let relL? ← if extra.isEmpty then pure none else do pure (some ((← namesToSimpLemmas relNames) ++ (← termsToSimpLemmas extra)))
-  let g ← match relL? with
-    | none =>
-        if relNames.isEmpty then pure g0
-        else match ← trySimpAll g0 (← mkDynamicSimpCtx relNames) with | none => setGoals rest; return | some g' => setGoals (g' :: rest); pure g'
-    | some relL =>
-        if !relL.isEmpty then discard <| tryTac `(tactic| simp_all only [$[$relL],*])
-        let g' :: _ ← getGoals | return
-        pure g'
-  let _ :: rest2 ← getGoals | return
+  let relNames := let cs := (← collectGoalConsts g0 true); relevantOptResLemmas (← getEnv) cs ++ relevantBoundaryLemmas cs
+  let getRelL : TacticM (Array (TSyntax `Lean.Parser.Tactic.simpLemma)) := (· ++ ·) <$> namesToSimpLemmas relNames <*> termsToSimpLemmas extra
+  let relL? ← if extra.isEmpty then
+      if !relNames.isEmpty then match ← trySimpAll g0 (← mkDynamicSimpCtx relNames) with | none => setGoals rest; return | some g' => setGoals (g' :: rest)
+      pure none
+    else
+      let relL ← getRelL; if !relL.isEmpty then discard <| tryTac (Qed.Lang.runPQTactic `(tactic| simp_all only [$[$relL],*]))
+      pure (some relL)
+  let g :: rest2 ← getGoals | return
   let some g2 ← tryCloseWithImp g | setGoals rest2; return
+  if ← tryCloseNonlinear g2 then setGoals rest2; return
   setGoals (g2 :: rest2)
-  let relL ← match relL? with | some l => pure l | none => do pure ((← namesToSimpLemmas relNames) ++ (← termsToSimpLemmas extra))
-  evalTactic (← `(tactic| first | (qedNonlinearClose; done) | (qedAutoClose; done) | (simp_all [$[$relL],*] <;> qedAutoClose; done) | skip))
+  let relL ← match relL? with | some l => pure l | none => getRelL
+  evalTactic (← Qed.Lang.runPQTactic `(tactic| first | (qedAutoClose; done) | (simp_all [$[$relL],*] <;> qedAutoClose; done) | skip))
 
 @[noinline] private def closeCachedPutGoal (extraL : Array Term) (extraSimpL : Array (TSyntax `Lean.Parser.Tactic.simpLemma))
     (progRef : IO.Ref Bool) (g : MVarId) : TacticM Unit := do
@@ -133,8 +120,8 @@ private def tryCloseWithImp (g : MVarId) : MetaM (Option MVarId) := do
     if arg.isAppOfArity `Qed.Cached.put 5 || isRev then
       if ← tryRestoreM false id do
           let some [gHall, gHr] ← tryApplyConst g (if isRev then `Qed.Cached.all_putRev else `Qed.Cached.all_put) | return false
-          let hallClosed ← if ← gHall.assumptionCore then pure true else return (← trySimpAll gHall (← mkSimpCtxWithBase)).isNone
-          if !hallClosed then return false
+          unless ← Meta.withTransparency .reducible gHall.assumptionCore do
+            if (← trySimpAll gHall (← mkSimpCtxWithBase)).isSome then return false
           let gHr1 ← match ← tryApplyConst gHr `Qed.Resource.all_stripEnsured_of_imp with
             | some [gh] =>
                 let (fvs, gh1) ← gh.introN 2
@@ -142,14 +129,14 @@ private def tryCloseWithImp (g : MVarId) : MetaM (Option MVarId) := do
                 | none => setGoals []; return true | some gh2 => pure gh2
             | _ => pure gHr
           setGoals [(← splitAndHypsGoal gHr1 true 16).1]; runUnfoldPresent extraL
-          if !extraSimpL.isEmpty then discard <| tryTac `(tactic| simp_all [$[$extraSimpL],*])
-          else setGoals <| ← (← getGoals).filterMapM (trySimpAll · (← mkSimpCtxWithBase))
+          if !extraSimpL.isEmpty then discard <| tryTac (Qed.Lang.runPQTactic `(tactic| simp_all [$[$extraSimpL],*]))
+          else let baseCtx ← mkSimpCtxWithBase; filterMapGoalsT (trySimpAll · baseCtx)
           closeAllGoals (tryCloseBasic ·) (← getGoals)
       then progRef.set true; setGoals []
 
 @[noinline] private def runCloseCachedPut (extraL : Array Term) : TacticM Unit := do
   unless (← getEnv).contains `Qed.Cached.all_put do return
-  unless ← (← getGoals).anyM fun g => return (← g.withContext (instantiateMVars (← g.getType))).getUsedConstants.contains `Qed.Cached.all do return
+  unless ← foldlMeta (← getGoals).toArray false fun ok g => if ok then pure true else return (← g.withContext (instantiateMVars (← g.getType))).getUsedConstants.contains `Qed.Cached.all do return
   let extraSimpL ← termsToSimpLemmas extraL
   let rec go : Nat → TacticM Unit
     | 0 => pure ()
@@ -159,13 +146,12 @@ private def tryCloseWithImp (g : MVarId) : MetaM (Option MVarId) := do
 private def simpIdentAtAll (t : Term) : TacticM Unit := do
   let t := match t with | `(($p)) => p | p => p
   if t.raw.isIdent then if let some nm ← try some <$> realizeGlobalConstNoOverload t.raw catch _ => pure none then
-    setGoals <| ← (← getGoals).filterMapM (simpGoalAllHyps · (← mkDynamicSimpCtx #[nm] none (withEqns := false)))
+    let ctx ← mkDynamicSimpCtx #[nm] none (withEqns := false); filterMapGoalsT (simpGoalAllHyps · ctx)
 
 @[noinline] private def runInitPass (usingL : Array Term) (pred initT : Term) : TacticM Unit := do
-  simpIdentAtAll pred; let dCtx ← mkEmptyDsimpCtx
-  setGoals <| ← (← getGoals).filterMapM (simpGoalAllHyps · dCtx (dsimpOnly := true))
+  simpIdentAtAll pred; let dCtx ← mkEmptyDsimpCtx; filterMapGoalsT (simpGoalAllHyps · dCtx (dsimpOnly := true))
   simpIdentAtAll initT; runUnfoldPresent usingL
-  setGoals (← splitAndDsimpState dCtx 32 (← getGoals))
+  setGoals (← splitTargetsRec 32 (← getGoals) (some dCtx))
   forEachGoal fun _ => try runCloseStateGoal usingL catch _ => pure ()
 
 private def formatTargetName (t : Term) : String :=
@@ -184,34 +170,22 @@ private def formatTargetName (t : Term) : String :=
     (extraCtx? : Option (Meta.Simp.Context × Meta.Simp.SimprocsArray) := none)
     (hypSplitFuel : Nat := 0) (skipUnfold : Array Name := #[]) (g : MVarId) : TacticM Unit := do
   if ← tryCloseContradiction g then setGoals []; return
-  if ← tryCloseTrivial g (reducibleOnly := reducibleOnly) then setGoals []; return
-  if ← tryDirectOmega g then setGoals []; return
+  if ← tryCloseBasic g (reducibleOnly := reducibleOnly) then setGoals []; return
   let dCtx ← mkEmptyDsimpCtx
-  setGoals <| ← (← splitAndDsimpState dCtx 16 [(← g.intros).2]).filterMapM (simpGoalAllHyps · dCtx (dsimpOnly := true))
+  setGoals (← filterMapGoalsM (simpGoalAllHyps · dCtx (dsimpOnly := true)) (← splitTargetsRec 16 [(← g.intros).2] (some dCtx)))
   forEachGoal fun gSub => do
     if ← tryCloseContradiction gSub then setGoals []; return
     runAddFieldFacts
     if let g1 :: r1 ← getGoals then setGoals ((← splitAndHypsGoal g1 true 16).1 :: r1)
     runUnfoldPresent usingL skipUnfold
-    if let some (eCtx, eSP) := extraCtx? then
-      setGoals <| ← ((← getGoals).filterMapM (trySimpAll · eCtx eSP) : MetaM _)
-      if (← getGoals).isEmpty then return
+    if let some (eCtx, eSP) := extraCtx? then filterMapGoalsT (trySimpAll · eCtx eSP); if (← getGoals).isEmpty then return
     runCloseStateGoal usingL
     if hypSplitFuel > 0 then
       if let gRem :: _ ← getGoals then
-        let splitFVar? ← gRem.withContext <| findLCtxDecl? (includeLet := false) fun d => do
-          if ← isPropSafe (← instantiateMVars d.type) then if (← trySplitLocalDecl gRem d.fvarId).isSome then return some d.fvarId
-          return none
-        if let some fv := splitFVar? then
-          if let some subgoals ← trySplitLocalDecl gRem fv then
-            setGoals subgoals; forEachGoal (closeSplitBranch usingL reducibleOnly extraCtx? (hypSplitFuel - 1) skipUnfold)
+        if let some subgoals ← gRem.withContext <| findLCtxDecl? (includeLet := false) fun d => do
+          if ← isPropSafe (← instantiateMVars d.type) then trySplitLocalDecl gRem d.fvarId else return none
+        then setGoals subgoals; forEachGoal (closeSplitBranch usingL reducibleOnly extraCtx? (hypSplitFuel - 1) skipUnfold)
 termination_by hypSplitFuel
-
-@[noinline] private def runDischargeInit (usingL : Array Term) (initT : Term) (nm : Ident) (pred : Term) : TacticM Unit :=
-  withFreshHeartbeatsT do
-    (← getMainGoal).setTag `init; runInitPass usingL pred initT
-    throwUnsolvedInvGoals nm m!"Invariant `{nm.getId}` failed on initial state `{formatTargetName initT}`:"
-      m!"Hint: Update the initial `state` values so `{nm.getId}` holds, add `using [lemma]`, or supply a `:= by` proof."
 
 @[noinline] private def runPreservedBranchCore (usingL : Array Term) (updNames : Array Name) (ctx dCtx : Meta.Simp.Context) (isFastRecon : Bool) (g : MVarId) : TacticM Unit := do
   match ← trySimpAll g ctx with
@@ -220,57 +194,17 @@ termination_by hypSplitFuel
       setGoals [g1]
       if ← tryCloseBasic g1 (reducibleOnly := true) then setGoals []; return
       if isFastRecon then
-        if ← tryRestoreM false id (do
-          if ← closeAllGoals (tryCloseBasic · (reducibleOnly := true)) (← splitAndDsimpState dCtx 16 [g1]) then setGoals []; return true else return false)
-        then return
+        if ← tryRestoreM false id (do if ← closeAllGoals (tryCloseBasic · (reducibleOnly := true)) (← splitTargetsRec 16 [g1] (some dCtx)) then setGoals []; return true else return false) then return
   runUnfoldPresent usingL updNames; try runCloseCachedPut usingL catch _ => pure ()
-  setGoals (← splitAndDsimpState dCtx 16 (← getGoals))
+  setGoals (← splitTargetsRec 16 (← getGoals) (some dCtx))
   forEachGoal (closeSplitBranch usingL true none 3 updNames)
-
-@[noinline] private def runPreservedBranch (usingL : Array Term) (updNames : Array Name) (updCtx dCtx : Meta.Simp.Context)
-    (fastUpdCtx? : Option Meta.Simp.Context) (caseMap : Std.HashMap Name (Ident × TSyntax ``Lean.Parser.Tactic.tacticSeq))
-    (seenCasesRef : IO.Ref (Std.HashSet Name)) (allCtorsRef : IO.Ref (Array Name)) (g : MVarId) : TacticM Unit := withFreshHeartbeatsT do
-  let ctorTag := stripStepPrefix (← g.getTag)
-  allCtorsRef.modify (Qed.Lang.pushUnique · ctorTag)
-  if let some (_, tacSeq) := caseMap[ctorTag]? then
-    seenCasesRef.modify (·.insert ctorTag)
-    let runUser (ctx : Meta.Simp.Context) : TacticM Bool := do
-      let some g1 ← simpGoalOnly g ctx | setGoals []; return true
-      let some g2 ← simpGoalAllHyps g1 dCtx (dsimpOnly := true) | setGoals []; return true
-      setGoals [g2]; evalTactic tacSeq; return (← getGoals).isEmpty
-    if let some fCtx := fastUpdCtx? then if ← tryRestoreM false id (runUser fCtx) then return
-    discard <| runUser updCtx; return
-  if let some fCtx := fastUpdCtx? then
-    if ← tryRestoreM false id (do runPreservedBranchCore usingL updNames fCtx dCtx true g; return (← getGoals).isEmpty) then return
-  runPreservedBranchCore usingL updNames updCtx dCtx false g
-
-@[noinline] private def buildFastReconCtx? (updNames reconNames : Array Name) : TacticM (Option Meta.Simp.Context) := do
-  if reconNames.isEmpty then return none
-  let g0 :: _ ← getGoals | return none
-  let goalConsts ← collectGoalConsts g0 true
-  let projSt? ← reconNames.toList.foldlM (init := some ({} : Meta.SimpTheorems)) fun acc? rn =>
-    match acc? with | none => pure none | some st => addReconcileProjLemmas st rn goalConsts
-  let some projSt := projSt? | return none
-  let baseCtx ← mkDynamicSimpCtx (updNames.filter (·.getString! != "_reconcileHoisted")) none (withEqns := false)
-  some <$> Meta.Simp.mkContext baseCtx.config (baseCtx.simpTheorems.push projSt) baseCtx.congrTheorems
-
-@[noinline] private def runPreservedStep (usingL : Array Term) (pred : Term) (updUnfolds updNames : Array Name)
-    (updCtx dCtx : Meta.Simp.Context) (caseMap : Std.HashMap Name (Ident × TSyntax ``Lean.Parser.Tactic.tacticSeq))
-    (seenCasesRef : IO.Ref (Std.HashSet Name)) (allCtorsRef : IO.Ref (Array Name)) : TacticM Unit := do
-  let (_, g1) ← (← getMainGoal).introN 3 [`m, `msg, `h]
-  setGoals [g1]; simpIdentAtAll pred
-  setGoals <| ← (← getGoals).filterMapM (simpGoalAllHyps · dCtx (dsimpOnly := true))
-  if (← getGoals).isEmpty then return
-  let fastUpdCtx? ← buildFastReconCtx? updNames (updUnfolds.filter (·.getString! == "_reconcileHoisted"))
-  evalTactic (← `(tactic| cases $(mkIdent `msg):ident))
-  forEachGoal (runPreservedBranch usingL updNames updCtx dCtx fastUpdCtx? caseMap seenCasesRef allCtorsRef)
 
 @[noinline] private def parseProveCases (nm : Ident) (proveCases : Option (Array (TSyntax ``qedProveCase))) :
     TacticM (Std.HashMap Name (Ident × TSyntax ``Lean.Parser.Tactic.tacticSeq) × Array Ident) := do
   let some pcs := proveCases | return ({}, #[])
-  pcs.toList.foldlM (init := ({}, #[])) fun (m, ids) (pc : TSyntax ``qedProveCase) => match pc with
+  foldlT pcs ({}, #[]) fun (m, ids) (pc : TSyntax ``qedProveCase) => match pc with
     | `(qedProveCase| $[$cIds:ident],* => $tacSeq) =>
-        cIds.toList.foldlM (init := (m, ids)) fun (acc, os) (cid : Ident) => do
+        foldlT cIds (m, ids) fun (acc, os) (cid : Ident) => do
           let cn := cid.getId.eraseMacroScopes
           if acc.contains cn then throwErrorAt cid s!"duplicate `case {cn}` in `prove:` on invariant `{nm.getId}`"
           return (acc.insert cn (cid, tacSeq), os.push cid)
@@ -285,7 +219,25 @@ termination_by hypSplitFuel
   let updCtx ← mkDynamicSimpCtx updNames none (withEqns := false); let dCtx ← mkEmptyDsimpCtx
   let (caseMap, orderedCaseIds) ← parseProveCases nm proveCases
   let seenCasesRef ← IO.mkRef ({} : Std.HashSet Name); let allCtorsRef ← IO.mkRef (#[] : Array Name)
-  let step := runPreservedStep usingL pred updUnfolds updNames updCtx dCtx caseMap seenCasesRef allCtorsRef
+  let step : TacticM Unit := do
+    let (_, g1) ← (← getMainGoal).introN 3 [`m, `msg, `h]
+    setGoals [g1]; simpIdentAtAll pred; filterMapGoalsT (simpGoalAllHyps · dCtx (dsimpOnly := true))
+    if (← getGoals).isEmpty then return
+    let fastUpdCtx? ← buildFastReconCtx? updNames (updUnfolds.filter (·.getString! == "_reconcileHoisted"))
+    evalTactic (← Qed.Lang.runPQTactic `(tactic| cases $(mkIdent `msg):ident))
+    forEachGoal fun g => withFreshHeartbeatsT do
+      let ctorTag := stripStepPrefix (← g.getTag); allCtorsRef.modify (Qed.Lang.pushUnique · ctorTag)
+      if let some (_, tacSeq) := caseMap[ctorTag]? then
+        seenCasesRef.modify (·.insert ctorTag)
+        let runUser (ctx : Meta.Simp.Context) : TacticM Bool := do
+          let some g1 ← simpGoalOnly g ctx | setGoals []; return true
+          let some g2 ← simpGoalAllHyps g1 dCtx (dsimpOnly := true) | setGoals []; return true
+          setGoals [g2]; evalTactic tacSeq; return (← getGoals).isEmpty
+        if let some fCtx := fastUpdCtx? then if ← tryRestoreM false id (runUser fCtx) then return
+        discard <| runUser updCtx; return
+      if let some fCtx := fastUpdCtx? then
+        if ← tryRestoreM false id (do runPreservedBranchCore usingL updNames fCtx dCtx true g; return (← getGoals).isEmpty) then return
+      runPreservedBranchCore usingL updNames updCtx dCtx false g
   match init with
   | some initT =>
       let [gInit, gStep] ← (← getMainGoal).apply (mkConst ``And.intro) | throwError "internal error splitting invariant init/step goals"
@@ -302,7 +254,10 @@ termination_by hypSplitFuel
     m!"Hint: Guard the failing branch with `if ...:`, fix the update, or weaken the invariant.\n      If the rule does hold, add `using [lemma]`, a per-action `prove:` block, or a manual `:= by` proof."
 
 elab_rules : tactic
-  | `(tactic| qedDischargeInit [$[$usingL],*] $initT $nm $pred) => runDischargeInit usingL initT nm pred
+  | `(tactic| qedDischargeInit [$[$usingL],*] $initT $nm $pred) => withFreshHeartbeatsT do
+      (← getMainGoal).setTag `init; runInitPass usingL pred initT
+      throwUnsolvedInvGoals nm m!"Invariant `{nm.getId}` failed on initial state `{formatTargetName initT}`:"
+        m!"Hint: Update the initial `state` values so `{nm.getId}` holds, add `using [lemma]`, or supply a `:= by` proof."
   | `(tactic| qedDischargePreserved [$[$usingL],*] $upd $nm $pred $[from $init]? $[_qedProve [$[$proveCases],*]]?) =>
     runDischargePreserved usingL upd nm pred init proveCases
 
@@ -354,22 +309,14 @@ private def simpOneFVar (g : MVarId) (ctx : Meta.Simp.Context) (fv : FVarId) : M
     | none => return none | some (newFvs, g') => return some (newFvs.getD 0 fv, g')
 private def isDefEqFast (a b : Expr) : MetaM Bool := if a == b then pure true else Meta.withTransparency .reducible (Meta.isDefEq a b)
 
-private def stripValWrapAux (e : Expr) : Nat → Expr
+private def stripValWrap (e : Expr) (fuel : Nat := 32) : Expr := match fuel with
   | 0 => e.consumeMData
   | fuel + 1 =>
       let e := e.consumeMData
-      if e.isAppOfArity ``Qed.Lang.QedVal.val 4 then stripValWrapAux e.getAppArgs[3]! fuel
-      else if e.isAppOfArity ``toString 3 && e.getAppArgs[0]!.isConstOf ``String then stripValWrapAux e.getAppArgs[2]! fuel
-      else e
-private def stripValWrap (e : Expr) : Expr := stripValWrapAux e 32
-
+      if e.isAppOfArity ``Qed.Lang.QedVal.val 4 then stripValWrap e.getAppArgs[3]! fuel
+      else if e.isAppOfArity ``toString 3 && e.getAppArgs[0]!.isConstOf ``String then stripValWrap e.getAppArgs[2]! fuel else e
 private def matchIteSide? (e : Expr) : Option (Bool × Expr) :=
   if e.isAppOfArity ``dite 5 then some (true, e) else if e.isAppOfArity ``ite 5 then some (false, e) else none
-
-private def isOuterIteEq (ty : Expr) : Bool :=
-  match ty.consumeMData.eq? with
-  | some (_, l, r) => (matchIteSide? (stripValWrap l)).isSome || (matchIteSide? (stripValWrap r)).isSome
-  | none => false
 
 @[noinline] private def tryFastSplitIteEqHyp (g : MVarId) (fv : FVarId) (fvName : Name) : MetaM (Option (List MVarId)) :=
   tryRestoreM none Option.isSome do
@@ -385,7 +332,7 @@ private def isOuterIteEq (ty : Expr) : Bool :=
     g.withContext do
       let tgt ← instantiateMVars (← g.getType); let u ← Meta.getLevel eqTy
       let mkBranch (isPos : Bool) (branchExpr : Expr) : MetaM MVarId := do
-        let bTy ← Meta.withLocalDeclD `_qedCond (if isPos then c else mkApp (mkConst ``Not) c) fun hc => do
+        let bTy ← Meta.withLocalDeclD `_qedCond (if isPos then c else mkNot c) fun hc => do
           let v := if isDite then branchExpr.beta #[hc] else branchExpr
           let eqE := mkApp3 (mkConst ``Eq [u]) eqTy (if isLeft then v else other) (if isLeft then other else v)
           Meta.mkForallFVars #[hc] (Expr.forallE fvName eqE tgt .default)
@@ -403,7 +350,8 @@ private def isOuterIteEq (ty : Expr) : Bool :=
     | some nm => match ← findFVarByName? g0 nm with
         | none => pure (g0, none)
         | some fv =>
-            if isOuterIteEq (← g0.withContext do instantiateMVars (← fv.getType)) then pure (g0, some fv)
+            let ty ← g0.withContext do instantiateMVars (← fv.getType)
+            if ty.consumeMData.eq?.any fun (_, l, r) => (matchIteSide? (stripValWrap l)).isSome || (matchIteSide? (stripValWrap r)).isSome then pure (g0, some fv)
             else match ← simpOneFVar g0 (← getPruneCtx) fv with | none => return none | some (fv', g') => pure (g', some fv')
     | none => match ← simpGoalOnly g0 (← getPruneCtx) #[] #[] (simplifyTarget := true) with | none => return none | some g' => pure (g', none)
   if ← isClosed g1 then return none
@@ -427,7 +375,7 @@ private def isOuterIteEq (ty : Expr) : Bool :=
         | [] => return done.reverse
         | g :: rest => do
             if done.length + work.length > 16 then return done.reverse ++ work
-            match ← splitOne g with | none => go rest (g :: done) fuel | some kids => go ((← kids.filterMapM (tryPruneBranch · pruneName?)) ++ rest) done fuel
+            match ← splitOne g with | none => go rest (g :: done) fuel | some kids => go ((← filterMapGoalsM (tryPruneBranch · pruneName?) kids) ++ rest) done fuel
   go [g0] [] 32
 
 @[noinline] private def linearSplitHyp (g0 : MVarId) (fvName : Name) (substTargetName? : Option Name := none) : MetaM (List MVarId) := do
@@ -435,12 +383,12 @@ private def isOuterIteEq (ty : Expr) : Bool :=
     let some fv ← findFVarByName? g fvName | return none
     match ← tryFastSplitIteEqHyp g fv fvName with | some kids => pure (some kids) | none => trySplitLocalDecl g fv) (some fvName)
   let some targetNm := substTargetName? | return survived
-  survived.filterMapM fun g => do
+  filterMapGoalsM (fun g => do
     let some fv ← findFVarByName? g fvName | return some g
     let some targetFv ← findFVarByName? g targetNm | return some g
     let shouldSubst := (← g.withContext do instantiateMVars (← fv.getType)).consumeMData.eq?.any fun (_, l, r) =>
       (l.consumeMData == mkFVar targetFv && !r.containsFVar targetFv) || (r.consumeMData == mkFVar targetFv && !l.containsFVar targetFv)
-    if shouldSubst then match ← trySubstFVar g fv with | some gSub => tryPruneBranch gSub none | none => pure (some g) else pure (some g)
+    if shouldSubst then match ← trySubstFVar g fv with | some gSub => tryPruneBranch gSub none | none => pure (some g) else pure (some g)) survived
 
 private def linearSplitTarget (g0 : MVarId) : MetaM (List MVarId) := linearSplit g0 trySplitTarget none
 
@@ -461,10 +409,12 @@ private def extractStrAppend? (e : Expr) : Option (Expr × Expr) :=
   let e := (stripValWrap e).consumeMData
   if e.isAppOfArity ``HAppend.hAppend 6 && e.getAppArgs[0]!.isConstOf ``String then some (e.getAppArgs[4]!, e.getAppArgs[5]!)
   else if e.isAppOfArity ``String.append 2 then some (e.getAppArgs[0]!, e.getAppArgs[1]!) else none
-private def extractToStringOf? (tyNm reprNm : Name) (e : Expr) : Option Expr :=
+private def extractNumToString? (e : Expr) : Option (Bool × Expr) :=
   let e := (stripValWrap e).consumeMData
-  if e.isAppOfArity ``toString 3 && e.getAppArgs[0]!.isConstOf tyNm then some (stripValWrap e.getAppArgs[2]!)
-  else if e.isAppOfArity reprNm 1 then some (stripValWrap e.getAppArgs[0]!) else none
+  let check (tyNm reprNm : Name) (isInt : Bool) :=
+    if e.isAppOfArity ``toString 3 && e.getAppArgs[0]!.isConstOf tyNm then some (isInt, stripValWrap e.getAppArgs[2]!)
+    else if e.isAppOfArity reprNm 1 then some (isInt, stripValWrap e.getAppArgs[0]!) else none
+  (check ``Nat ``Nat.repr false).orElse fun _ => check ``Int ``Int.repr true
 private def tryMkDecideProof (prop : Expr) : MetaM (Option Expr) := do
   let m ← Meta.mkFreshExprSyntheticOpaqueMVar (← instantiateMVars prop)
   if ← tryDirectDecide m.mvarId! then some <$> instantiateMVars m else return none
@@ -500,7 +450,7 @@ private def extractStrMemColl? (ty : Expr) : Option (Expr × Expr × Bool) :=
 
 @[noinline] private def tryProveFromStrMemColl (hMem coll checkFn : Expr) (isArr : Bool) (arrLem listLem : Name) : MetaM (Option Expr) := do
   let listExpr := if isArr then mkApp2 (mkConst ``Array.toList [0]) (mkConst ``String) coll else coll
-  let some hall ← tryMkDecideProof (mkBoolEq (mkListAll (mkConst ``String) listExpr checkFn) (mkConst ``Bool.true)) | return none
+  let some hall ← tryMkDecideProof (mkBoolEqTrue (mkListAll (mkConst ``String) listExpr checkFn)) | return none
   some <$> Meta.mkAppM (if isArr then arrLem else listLem) #[hMem, hall]
 
 private def mkEqTransChain : List Expr → MetaM Expr
@@ -527,32 +477,31 @@ mutual
     if ← isDefEqFast elem a then
       if let some pf ← tryProveFromStrMemColl decl.toExpr coll (mkApp (mkConst ``strNotContainsChar) dExpr) isArr ``Qed.Str.str_not_mem_of_mem_array ``Qed.Str.str_not_mem_of_mem_list then
         return some pf
-  if depth > 0 then
-    if let some (_, lhs, rhs) := ty.eq? then
-      if rhs.consumeMData.isConstOf ``Bool.true then
-        if let .const fnNm _ := lhs.getAppFn then
-          if qedIsHelper env fnNm && lhs.getAppArgs.any (stripValWrap · == a) then
-            return ← tryRestoreM none Option.isSome do
-              let m ← Meta.mkFreshExprSyntheticOpaqueMVar goalTy
-              let ctx ← mkDynamicSimpCtx (strGuardNormNames.push fnNm) none { zetaDelta := true }
-              match ← simpGoalOnly m.mvarId! ctx #[] #[decl.fvarId] (simplifyTarget := false) with
-              | none => some <$> instantiateMVars m
-              | some m1 =>
-                  let m2 := (← splitAndHypsGoal m1 false 16).1
-                  match ← m2.withContext (proveCharNotMem? d a (depth - 1)) with
-                  | some pf => m2.assign pf; some <$> instantiateMVars m | none => return none
-  return none
+  if depth == 0 then return none
+  let some (_, lhs, rhs) := ty.eq? | return none
+  unless rhs.consumeMData.isConstOf ``Bool.true do return none
+  let .const fnNm _ := lhs.getAppFn | return none
+  unless qedIsHelper env fnNm && lhs.getAppArgs.any (stripValWrap · == a) do return none
+  tryRestoreM none Option.isSome do
+    let m ← Meta.mkFreshExprSyntheticOpaqueMVar goalTy
+    let ctx ← mkDynamicSimpCtx (strGuardNormNames.push fnNm) none { zetaDelta := true }
+    match ← simpGoalOnly m.mvarId! ctx #[] #[decl.fvarId] (simplifyTarget := false) with
+    | none => some <$> instantiateMVars m
+    | some m1 =>
+        let m2 := (← splitAndHypsGoal m1 false 16).1
+        match ← m2.withContext (proveCharNotMem? d a (depth - 1)) with
+        | some pf => m2.assign pf; some <$> instantiateMVars m | none => return none
 
 @[noinline] private partial def proveCharNotMem? (d : Char) (a0 : Expr) (depth : Nat := 2) : MetaM (Option Expr) := do
   let a := stripValWrap a0; let dExpr := toExpr d
   let goalTy := mkNot (← Meta.mkAppM ``Membership.mem #[mkStrToList a, dExpr])
   if d < '0' || '9' < d then
-    let digitOut := do return mkApp2 (mkConst ``Or) (← Meta.mkAppM ``LT.lt #[dExpr, toExpr '0']) (← Meta.mkAppM ``LT.lt #[toExpr '9', dExpr])
-    if let some n := extractToStringOf? ``Nat ``Nat.repr a then
-      if let some hd ← tryMkDecideProof (← digitOut) then return some (← Meta.mkAppM ``Qed.Str.nat_toString_not_mem #[hd, n])
-    if d != '-' then if let some i := extractToStringOf? ``Int ``Int.repr a then
-      if let some hd ← tryMkDecideProof (mkApp2 (mkConst ``And) (mkApp3 (mkConst ``Ne [1]) (mkConst ``Char) dExpr (toExpr '-')) (← digitOut)) then
-        return some (← Meta.mkAppM ``Qed.Str.int_toString_not_mem #[hd, i])
+    if let some (isInt, arg) := extractNumToString? a then
+      if !isInt || d != '-' then
+        let digitOut := mkApp2 (mkConst ``Or) (← Meta.mkAppM ``LT.lt #[dExpr, toExpr '0']) (← Meta.mkAppM ``LT.lt #[toExpr '9', dExpr])
+        let cond := if isInt then mkApp2 (mkConst ``And) (mkApp3 (mkConst ``Ne [1]) (mkConst ``Char) dExpr (toExpr '-')) digitOut else digitOut
+        if let some hd ← tryMkDecideProof cond then
+          return some (← Meta.mkAppM (if isInt then ``Qed.Str.int_toString_not_mem else ``Qed.Str.nat_toString_not_mem) #[hd, arg])
   if let some s := extractStrLit? a then
     if !s.contains d then if let some pf ← tryMkDecideProof goalTy then return some pf
   if let some (x, y) := extractStrAppend? a then
@@ -562,16 +511,13 @@ mutual
 end
 
 @[noinline] private partial def normStrLeaf (e0 : Expr) : MetaM (Expr × Expr) := do
-  let e := e0.consumeMData
+  let e := e0.consumeMData; let a := e.getAppArgs
   if e.isAppOfArity ``Qed.Lang.QedVal.val 4 then
-    let inner := e.getAppArgs[3]!; let (e', h2) ← normStrLeaf inner
-    return (e', ← Meta.mkEqTrans (← Meta.mkAppM ``Qed.Lang.QedVal.val_id #[inner]) h2)
-  if e.isAppOfArity ``toString 3 && e.getAppArgs[0]!.isConstOf ``String then
-    let inner := e.getAppArgs[2]!; let (e', h2) ← normStrLeaf inner
-    return (e', ← Meta.mkEqTrans (mkApp (mkConst ``Qed.Str.str_toString) inner) h2)
-  if e.isAppOfArity ``toString 3 && e.getAppArgs[2]!.consumeMData.isAppOfArity ``Qed.Lang.QedVal.val 4 then
-    let a := e.getAppArgs; let inner := a[2]!.consumeMData.getAppArgs[3]!
-    return (mkApp3 e.getAppFn a[0]! a[1]! inner, ← Meta.mkAppM ``toString_qedVal_eq #[inner])
+    let (e', h2) ← normStrLeaf a[3]!; return (e', ← Meta.mkEqTrans (← Meta.mkAppM ``Qed.Lang.QedVal.val_id #[a[3]!]) h2)
+  if e.isAppOfArity ``toString 3 && a[0]!.isConstOf ``String then
+    let (e', h2) ← normStrLeaf a[2]!; return (e', ← Meta.mkEqTrans (mkApp (mkConst ``Qed.Str.str_toString) a[2]!) h2)
+  if e.isAppOfArity ``toString 3 && a[2]!.consumeMData.isAppOfArity ``Qed.Lang.QedVal.val 4 then
+    let inner := a[2]!.consumeMData.getAppArgs[3]!; return (mkApp3 e.getAppFn a[0]! a[1]! inner, ← Meta.mkAppM ``toString_qedVal_eq #[inner])
   return (e, ← Meta.mkEqRefl e)
 
 private def mkStrAppendExpr (x y : Expr) : MetaM Expr := Meta.mkAppM ``HAppend.hAppend #[x, y]
@@ -579,9 +525,7 @@ private def mkStrAppendExpr (x y : Expr) : MetaM Expr := Meta.mkAppM ``HAppend.h
 @[noinline] private partial def reassocStrAcc (t acc : Expr) : MetaM (Expr × Expr) := do
   let (t0, hLeaf) ← normStrLeaf t; let hLift ← Meta.mkAppM ``str_append_congr_right #[acc, hLeaf]
   match extractStrAppend? t0 with
-  | none =>
-      if extractStrLit? t0 == some "" then return (acc, ← Meta.mkEqTrans hLift (mkApp (mkConst ``String.empty_append) acc))
-      return (← mkStrAppendExpr t0 acc, hLift)
+  | none => if extractStrLit? t0 == some "" then return (acc, ← Meta.mkEqTrans hLift (mkApp (mkConst ``String.empty_append) acc)) else return (← mkStrAppendExpr t0 acc, hLift)
   | some (a, b) =>
       let (r1, h1) ← reassocStrAcc b acc; let (r2, h2) ← reassocStrAcc a r1
       return (r2, ← mkEqTransChain [hLift, mkApp3 (mkConst ``String.append_assoc) a b acc, ← Meta.mkAppM ``str_append_congr_left #[a, h1], h2])
@@ -592,15 +536,12 @@ private def mkStrAppendExpr (x y : Expr) : MetaM Expr := Meta.mkAppM ``HAppend.h
   | none => return (t0, hLeaf)
   | some (a, b) =>
       let (rb, hb) ← reassocStr b; let h1 ← Meta.mkAppM ``str_append_congr_left #[a, hb]
-      if extractStrLit? rb == some "" then
-        let (ra, ha) ← reassocStr a
-        return (ra, ← mkEqTransChain [hLeaf, h1, mkApp (mkConst ``String.append_empty) a, ha])
+      if extractStrLit? rb == some "" then let (ra, ha) ← reassocStr a; return (ra, ← mkEqTransChain [hLeaf, h1, mkApp (mkConst ``String.append_empty) a, ha])
       let (res, hAcc) ← reassocStrAcc a rb; return (res, ← mkEqTransChain [hLeaf, h1, hAcc])
 
 private def mkStrPrefixSplitPf (lit head tail rest : Expr) : MetaM (Option (Expr × Expr)) := do
   let some hSplit ← tryMkDecideProof (mkApp3 (mkConst ``Eq [1]) (mkConst ``String) lit (← mkStrAppendExpr head tail)) | return none
-  let h1 ← Meta.mkAppM ``str_append_congr_right #[rest, hSplit]
-  return some (← mkStrAppendExpr tail rest, ← Meta.mkEqTrans h1 (mkApp3 (mkConst ``String.append_assoc) head tail rest))
+  return some (← mkStrAppendExpr tail rest, ← Meta.mkEqTrans (← Meta.mkAppM ``str_append_congr_right #[rest, hSplit]) (mkApp3 (mkConst ``String.append_assoc) head tail rest))
 
 @[noinline] private def tryStrSepSplit? (p₁ p₂ x y eqPf' : Expr) : MetaM (Option (Expr × Expr × Expr × Expr)) := do
   let (some (sep₁, r₁), some (sep₂, r₂)) := (extractStrAppend? x, extractStrAppend? y) | return none
@@ -611,8 +552,7 @@ private def mkStrPrefixSplitPf (lit head tail rest : Expr) : MetaM (Option (Expr
   let some h₂ ← proveCharNotMem? d₁ p₂ | return none
   let runSep (sepExpr rhs₁ rhs₂ eqTerm : Expr) : MetaM (Option (Expr × Expr × Expr × Expr)) := do
     let optChar := mkApp (mkConst ``Option [0]) (mkConst ``Char)
-    let headEqTy := mkApp3 (mkConst ``Eq [1]) optChar (mkApp2 (mkConst ``List.head? [0]) (mkConst ``Char) (mkStrToList sepExpr)) (mkApp2 (mkConst ``Option.some [0]) (mkConst ``Char) (toExpr d₁))
-    let some hsep ← tryMkDecideProof headEqTy | return none
+    let some hsep ← tryMkDecideProof (mkApp3 (mkConst ``Eq [1]) optChar (mkApp2 (mkConst ``List.head? [0]) (mkConst ``Char) (mkStrToList sepExpr)) (mkApp2 (mkConst ``Option.some [0]) (mkConst ``Char) (toExpr d₁))) | return none
     let pairPf := mkAppN (mkConst ``Qed.Str.str_split_sep_inj) #[sepExpr, p₁, p₂, rhs₁, rhs₂, toExpr d₁, hsep, h₁, h₂, eqTerm]
     return some (rhs₁, rhs₂, ← Meta.mkAppM ``And.left #[pairPf], ← Meta.mkAppM ``And.right #[pairPf])
   if s₁ == s₂ then runSep sep₁ r₁ r₂ eqPf'
@@ -620,8 +560,7 @@ private def mkStrPrefixSplitPf (lit head tail rest : Expr) : MetaM (Option (Expr
     let dStr := Expr.lit (.strVal (String.singleton d₁))
     let some (nr₁, hL) ← mkStrPrefixSplitPf sep₁ dStr (Expr.lit (.strVal (String.ofList (s₁.toList.drop 1)))) r₁ | return none
     let some (nr₂, hR) ← mkStrPrefixSplitPf sep₂ dStr (Expr.lit (.strVal (String.ofList (s₂.toList.drop 1)))) r₂ | return none
-    let pL ← Meta.mkAppM ``str_append_congr_left #[p₁, hL]; let pR ← Meta.mkAppM ``str_append_congr_left #[p₂, hR]
-    runSep dStr nr₁ nr₂ (← mkEqTransChain [← Meta.mkEqSymm pL, eqPf', pR])
+    runSep dStr nr₁ nr₂ (← mkEqTransChain [← Meta.mkEqSymm (← Meta.mkAppM ``str_append_congr_left #[p₁, hL]), eqPf', ← Meta.mkAppM ``str_append_congr_left #[p₂, hR]])
 
 @[noinline] private def collectStringEqFacts (lhs0 rhs0 eqPf0 : Expr) (fuel0 : Nat := 32) : MetaM (Sum Expr (Array Expr)) := do
   let (lInit, hlInit) ← reassocStr lhs0; let (rInit, hrInit) ← reassocStr rhs0
@@ -634,7 +573,7 @@ private def mkStrPrefixSplitPf (lit head tail rest : Expr) : MetaM (Option (Expr
         if p₁ == p₂ then return ← go x y (← Meta.mkAppM ``Qed.Str.str_append_left_cancel #[eqPf']) fuel
         if let (some s₁, some s₂) := (extractStrLit? p₁, extractStrLit? p₂) then
           if strDiffPrefix s₁ s₂ then
-            if let some hdiff ← tryMkDecideProof (mkBoolEq (mkApp2 (mkConst ``strDiffPrefix) p₁ p₂) (mkConst ``Bool.true)) then
+            if let some hdiff ← tryMkDecideProof (mkBoolEqTrue (mkApp2 (mkConst ``strDiffPrefix) p₁ p₂)) then
               return .inl (← Meta.mkAppM ``Qed.Str.str_append_ne_of_diff_prefix #[hdiff, eqPf'])
           else if s₁.length != s₂.length then
             let swap := s₂.length < s₁.length
@@ -648,10 +587,8 @@ private def mkStrPrefixSplitPf (lit head tail rest : Expr) : MetaM (Option (Expr
           | .inl f => return .inl f
           | .inr fsL => match ← go rhs₁ rhs₂ pfR fuel with | .inl f => return .inl f | .inr fsR => return .inr (fsL ++ fsR)
         if x == y then return ← go p₁ p₂ (← Meta.mkAppM ``Qed.Str.str_append_right_cancel #[eqPf']) fuel
-      if (extractToStringOf? ``Nat ``Nat.repr l).isSome && (extractToStringOf? ``Nat ``Nat.repr r).isSome then
-        return .inr #[← Meta.mkAppM ``Qed.Str.nat_toString_injective #[eqPf']]
-      if (extractToStringOf? ``Int ``Int.repr l).isSome && (extractToStringOf? ``Int ``Int.repr r).isSome then
-        return .inr #[← Meta.mkAppM ``Qed.Str.int_toString_injective #[eqPf']]
+      if let (some (isIntL, _), some (isIntR, _)) := (extractNumToString? l, extractNumToString? r) then
+        if isIntL == isIntR then return .inr #[← Meta.mkAppM (if isIntL then ``Qed.Str.int_toString_injective else ``Qed.Str.nat_toString_injective) #[eqPf']]
       if let (some s₁, some s₂) := (extractStrLit? l, extractStrLit? r) then
         if s₁ != s₂ then if let some hne ← tryMkDecideProof (mkApp3 (mkConst ``Ne [1]) (mkConst ``String) l r) then return .inl (mkApp hne eqPf')
       return .inr #[eqPf']
@@ -672,15 +609,14 @@ private def isStringEqTy (ty : Expr) : Option (Expr × Expr) :=
     match ← simpGoalOnly g0 guardCtx #[] guardFvs (simplifyTarget := false) with
     | none => return none | some g' => pure (← splitAndHypsGoal g' false 32).1
   let strEqs ← g1.withContext <| collectLCtxDecls (includeLet := false) fun d => return (isStringEqTy (← instantiateMVars d.type)).map fun (l, r) => (l, r, d.toExpr)
-  let rec go (acc : Array Expr) : List (Expr × Expr × Expr) → MetaM (Option (Array Expr))
-    | [] => pure (some acc)
-    | (lhs, rhs, pf) :: rest => do
+  let newFacts? ← foldlMeta strEqs (some #[]) fun acc? (lhs, rhs, pf) => match acc? with
+    | none => pure none
+    | some acc => do
         match ← g1.withContext (collectStringEqFacts lhs rhs pf) with
-        | .inl falsePf => g1.assign (mkApp2 (mkConst ``False.elim [0]) (← g1.withContext (instantiateMVars (← g1.getType))) falsePf); return none
-        | .inr facts => go (acc ++ facts) rest
-  let some newFacts ← go #[] strEqs.toList | return none
-  if newFacts.isEmpty then return some g1
-  return some (← assertFacts g1 "_qedStr" newFacts).1
+        | .inl falsePf => g1.assign (mkApp2 (mkConst ``False.elim [0]) (← g1.withContext (instantiateMVars (← g1.getType))) falsePf); pure none
+        | .inr facts => pure (some (acc ++ facts))
+  let some newFacts := newFacts? | return none
+  if newFacts.isEmpty then return some g1 else return some (← assertFacts g1 "_qedStr" newFacts).1
 
 private def extractStrLitListAux (e : Expr) : Nat → Option (List String)
   | 0 => none
@@ -702,7 +638,7 @@ private def extractStrLitListAux (e : Expr) : Nat → Option (List String)
 
 private def goalHasStrRepr (g : MVarId) : MetaM Bool := do
   let cs ← collectGoalConsts g true
-  return #[``ToString.toString, ``Nat.repr, ``Int.repr, ``Nat.toDigits].any cs.contains
+  return cs.contains ``ToString.toString || cs.contains ``Nat.repr || cs.contains ``Int.repr || cs.contains ``Nat.toDigits
 
 @[noinline] private def tryProveCharImp (impTy : Expr) : MetaM (Option Expr) := tryRestoreM none Option.isSome do
   let mImp ← if impTy.hasFVar then Meta.mkFreshExprSyntheticOpaqueMVar impTy else Meta.withLCtx {} {} (Meta.mkFreshExprSyntheticOpaqueMVar impTy)
@@ -718,22 +654,22 @@ private def goalHasStrRepr (g : MVarId) : MetaM Bool := do
   if ← tryCloseBasic sg (reducibleOnly := true) then return true
   let some (seg, p, true) := extractStrAll? (← sg.withContext (instantiateMVars (← sg.getType))) | return false
   sg.withContext do
-    let closeAlpha (chars : String) (lem : Name) (arg : Expr) : MetaM Bool := do
-      let some hp ← tryMkDecideProof (mkBoolEq (mkListAll (mkConst ``Char) (mkStrToList (Expr.lit (.strVal chars))) p) (mkConst ``Bool.true)) | return false
-      sg.assign (← Meta.mkAppM lem #[hp, arg]); return true
-    if let some n := extractToStringOf? ``Nat ``Nat.repr seg then if ← closeAlpha "0123456789" ``Qed.Str.nat_toString_all n then return true
-    if let some i := extractToStringOf? ``Int ``Int.repr seg then if ← closeAlpha "-0123456789" ``Qed.Str.int_toString_all i then return true
-    (← collectLCtxDecls (includeLet := false) fun d => return some (d.toExpr, (← instantiateMVars d.type).consumeMData)).toList.anyM fun (de, dty) => do
+    if let some (isInt, arg) := extractNumToString? seg then
+      let chars := if isInt then "-0123456789" else "0123456789"
+      if let some hp ← tryMkDecideProof (mkBoolEqTrue (mkListAll (mkConst ``Char) (mkStrToList (Expr.lit (.strVal chars))) p)) then
+        sg.assign (← Meta.mkAppM (if isInt then ``Qed.Str.int_toString_all else ``Qed.Str.nat_toString_all) #[hp, arg]); return true
+    return (← findLCtxDecl? (includeLet := false) fun d => do
+      let (de, dty) := (d.toExpr, (← instantiateMVars d.type).consumeMData)
       if let some (elem, coll, isArr) := extractStrMemColl? dty then if ← isDefEqFast elem seg then
         let checkFn := Expr.lam `x (mkConst ``String) (mkListAll (mkConst ``Char) (mkStrToList (.bvar 0)) (p.liftLooseBVars 0 1)) .default
-        if let some pf ← tryProveFromStrMemColl de coll checkFn isArr ``Qed.Str.str_all_of_mem_array ``Qed.Str.str_all_of_mem_list then sg.assign pf; return true
+        if let some pf ← tryProveFromStrMemColl de coll checkFn isArr ``Qed.Str.str_all_of_mem_array ``Qed.Str.str_all_of_mem_list then sg.assign pf; return some ()
       if let some (s', p', isToList) := extractStrAll? dty then if ← isDefEqFast s' seg then
         let hList := if isToList then de else mkApp3 (mkConst ``str_all_toList_of_all) s' p' de
-        if ← isDefEqFast p' p then sg.assign hList; return true
+        if ← isDefEqFast p' p then sg.assign hList; return some ()
         let impTy ← Meta.withLocalDeclD `c (mkConst ``Char) fun c =>
-          Meta.mkForallFVars #[c] (Expr.forallE `_h (mkBoolEq (p'.beta #[c]) (mkConst ``Bool.true)) (mkBoolEq (p.beta #[c]) (mkConst ``Bool.true)) .default)
-        if let some pfImp ← tryProveCharImp impTy then sg.assign (← Meta.mkAppM ``Qed.Str.list_all_mono #[hList, pfImp]); return true
-      return false
+          Meta.mkForallFVars #[c] (Expr.forallE `_h (mkBoolEqTrue (p'.beta #[c])) (mkBoolEqTrue (p.beta #[c])) .default)
+        if let some pfImp ← tryProveCharImp impTy then sg.assign (← Meta.mkAppM ``Qed.Str.list_all_mono #[hList, pfImp]); return some ()
+      return none).isSome
 
 @[noinline] private def tryCloseStringAllGoal (g0 : MVarId) : MetaM Bool := do
   if (extractStrAll? (← g0.withContext (instantiateMVars (← g0.getType)))).isNone then return false
@@ -743,22 +679,19 @@ private def goalHasStrRepr (g : MVarId) : MetaM Bool := do
 
 @[noinline] private def finishStringGoals (gs : List MVarId) (withLenBounds : Bool := false) : MetaM (List MVarId) := do
   let closeSub (sg : MVarId) : MetaM Bool := do if ← tryCloseBasic sg (reducibleOnly := true) then pure true else tryCloseStringAllGoal sg
-  let rec go (acc : List MVarId) : List MVarId → MetaM (List MVarId)
-    | [] => pure acc.reverse
-    | g :: rest => do
-        match ← decomposeStringEqs g with
-        | none => go acc rest
-        | some g1 =>
-            let g2 ← if withLenBounds then assertStrMemLenBounds g1 else pure g1
-            go ((← filterUnsolvedM closeSub (← splitGoalAnds g2)).reverse ++ acc) rest
-  go [] gs
-
-private def preSplitOuterMatch (g0 : MVarId) : MetaM (List MVarId) := do
-  let tgt := (← g0.withContext (instantiateMVars (← g0.getType))).consumeMData
-  unless match tgt.getAppFn with | .const c _ => c.toString.contains ".match_" | _ => false do return [g0]
-  match ← trySplitTarget g0 with | none => return [g0] | some kids => kids.filterMapM (tryPruneBranch · none)
+  return (← foldlMeta gs.toArray #[] fun acc g => do
+    match ← decomposeStringEqs g with
+    | none => pure acc
+    | some g1 =>
+        let g2 ← if withLenBounds then assertStrMemLenBounds g1 else pure g1
+        return acc ++ (← filterUnsolvedM closeSub (← splitGoalAnds g2)).toArray).toList
 
 @[noinline] private def unfoldAndLinearSplitFn (g0 : MVarId) (fnConst : Name) (skipName? : Option Name := none) : MetaM (List MVarId) := do
+  let initGs ← do
+    let tgt := (← g0.withContext (instantiateMVars (← g0.getType))).consumeMData
+    if match tgt.getAppFn with | .const c _ => c.toString.contains ".match_" | _ => false then
+      match ← trySplitTarget g0 with | none => pure [g0] | some kids => filterMapGoalsM (tryPruneBranch · none) kids
+    else pure [g0]
   let rec splitHyps (work done : List MVarId) : Nat → MetaM (List MVarId)
     | 0 => return done.reverse ++ work
     | fuel + 1 => match work with
@@ -775,78 +708,73 @@ private def preSplitOuterMatch (g0 : MVarId) : MetaM (List MVarId) := do
             | none => splitHyps rest (g :: done) fuel
             | some (hNm, substNm?) => match ← unfoldConstIn g fnConst (some hNm) with
                 | none => splitHyps rest done fuel | some gU => splitHyps ((← linearSplitHyp gU hNm substNm?) ++ rest) done fuel
-  (← (← splitHyps (← preSplitOuterMatch g0) [] 8).mapM fun g => do
+  return (← foldlMeta (← splitHyps initGs [] 8).toArray #[] fun acc g => do
     if (← g.withContext (instantiateMVars (← g.getType))).getUsedConstants.contains fnConst then
-      match ← unfoldConstIn g fnConst none with | none => pure [] | some gU => linearSplitTarget gU
-    else pure [g]).flatten |> pure
+      match ← unfoldConstIn g fnConst none with | none => pure acc | some gU => return acc ++ (← linearSplitTarget gU).toArray
+    else pure (acc.push g)).toList
 
 private def tryCloseFnAtom (g : MVarId) : MetaM Bool := do
   if ← tryCloseGroundKernel g (check := true) then return true
   tryCloseBasic g (reducibleOnly := true)
+private def tryCloseFnOrContra (g : MVarId) : MetaM Bool := do if ← tryCloseContradiction g then pure true else tryCloseFnAtom g
 
-@[noinline] private def finishFnSubgoal (fnSimpCtx : Meta.Simp.Context) (fnSimpSP : Meta.Simp.SimprocsArray) (sg : MVarId) : TacticM (List MVarId) := do
+@[noinline] private def finishFnSubgoal (fnSimpCtx : Meta.Simp.Context) (fnSimpSP : Meta.Simp.SimprocsArray) (sg : MVarId) : TacticM Unit := do
   if ← goalHasStrRepr sg then
-    let rec goBranches (acc : List MVarId) : List MVarId → MetaM (List MVarId)
-      | [] => pure acc.reverse
-      | bg :: r => do
-          if ← tryCloseContradiction bg then return ← goBranches acc r
-          match ← simpGoalAllHyps bg fnSimpCtx fnSimpSP with
-          | none => goBranches acc r
-          | some bg1 => goBranches ((← filterUnsolvedM tryCloseFnAtom (← finishStringGoals [(← splitAndHypsGoal bg1 false 32).1] true)).reverse ++ acc) r
-    return ← goBranches [] (← linearSplitTarget sg)
-  let some sg1 ← trySimpAll sg fnSimpCtx fnSimpSP | return []
+    let out ← foldlMeta (← linearSplitTarget sg).toArray #[] fun acc bg => do
+      if ← tryCloseContradiction bg then return acc
+      match ← simpGoalAllHyps bg fnSimpCtx fnSimpSP with
+      | none => pure acc
+      | some bg1 => return acc ++ (← filterUnsolvedM tryCloseFnAtom (← finishStringGoals [(← splitAndHypsGoal bg1 false 32).1] true)).toArray
+    setGoals out.toList; return
+  let some sg1 ← trySimpAll sg fnSimpCtx fnSimpSP | setGoals []; return
   setGoals (← linearSplitTarget sg1)
   forEachGoal (closeSplitBranch #[] false (some (fnSimpCtx, fnSimpSP)) 3)
   if !(← getGoals).isEmpty then
     setGoals (← filterUnsolvedM (fun s => do if ← tryCloseStringAllGoal s then pure true else tryCloseFnAtom s) (← getGoals))
-  getGoals
 
 @[noinline] private def runProveFnGoal (fnId : Ident) (isBlind : Bool) : TacticM Unit := do
   let fnConst? : Option Name ← try some <$> (realizeGlobalConstNoOverload fnId : CoreM Name) catch _ => pure none
   let g0 :: rest0 ← getGoals | return
-  let shared? ← if isBlind then pure none else shareLetResult? g0
-  match shared?, fnConst? with
+  match ← (if isBlind then pure none else shareLetResult? g0), fnConst? with
   | some (resFv, hResFv, g1), some fnConst =>
       let (resNm, hResNm) ← g1.withContext do return (← resFv.getUserName, ← hResFv.getUserName)
       let g3 := (← splitAndHypsGoal (← g1.intros).2 false 32).1
       let step1 ← match ← unfoldConstIn g3 fnConst (some hResNm) with | none => pure [] | some gU => linearSplitHyp gU hResNm (some resNm)
-      setGoals ((← finishStringGoals (← (step1.mapM (unfoldAndLinearSplitFn · fnConst (some hResNm)) : MetaM _)).flatten) ++ rest0)
+      let step2 ← foldlMeta step1.toArray #[] fun acc sg => return acc ++ (← unfoldAndLinearSplitFn sg fnConst (some hResNm)).toArray
+      setGoals ((← finishStringGoals step2.toList) ++ rest0)
   | _, _ =>
       let some g0' ← (if isBlind then pure (some g0) else do simpGoalOnly g0 (← mkEmptyDsimpCtx) (dsimpOnly := true)) | setGoals rest0; return
       let g2 := (← splitAndHypsGoal (← g0'.intros).2 false 32).1
       match fnConst? with
       | some fnConst => setGoals ((← finishStringGoals (← unfoldAndLinearSplitFn g2 fnConst none)) ++ rest0)
-      | none => setGoals (g2 :: rest0); discard <| tryTac `(tactic| (try unfold $fnId:ident; try simp only [$fnId:ident]; try dsimp only at *))
+      | none => setGoals (g2 :: rest0); discard <| tryTac (Qed.Lang.runPQTactic `(tactic| (try unfold $fnId:ident; try simp only [$fnId:ident]; try dsimp only at *)))
   if (← getGoals).isEmpty then return
   let (fnSimpCtx, fnSimpSP) ← mkCachedSimpCtx "fnContract" fnContractSimpNames { zetaDelta := false } #[``fnReduceStrLen]
   forEachGoal fun g => do
     if ← tryCloseBasic g (reducibleOnly := true) then setGoals []; return
-    setGoals [g]; runUnfoldPresent #[]
+    runUnfoldPresent #[]
     if let g1 :: rest1 ← getGoals then
       match ← simpGoalAllHyps g1 fnSimpCtx fnSimpSP with | none => setGoals rest1 | some g2 => setGoals ((← splitAndHypsGoal g2 false 32).1 :: rest1)
     if (← getGoals).isEmpty then return
     setGoals (← finishStringGoals (← getGoals) (withLenBounds := true))
-    if !(← getGoals).isEmpty then setGoals (← (← getGoals).mapM (finishFnSubgoal fnSimpCtx fnSimpSP)).flatten
+    forEachGoal (finishFnSubgoal fnSimpCtx fnSimpSP)
 
 @[noinline] private partial def splitFiniteEnumsAndProve (fnId : Ident) (fnSimpCtx? : Option Meta.Simp.Context) (budget : Nat) (g : MVarId) : TacticM Unit := do
-  setGoals [g]
-  if ← tryCloseContradiction g then setGoals []; return
-  if ← tryCloseFnAtom g then setGoals []; return
+  setGoals [g]; if ← tryCloseFnOrContra g then setGoals []; return
   let nextEnum? ← g.withContext <| findLCtxDecl? (includeLet := false) fun d => do
     if let some k := nullaryEnumCtorCount? (← getEnv) (← Meta.whnf d.type) then if k > 0 && k ≤ budget then return some (d.fvarId, k)
     return none
   let some (fv, k) := nextEnum? | runProveFnGoal fnId false
-  let rem ← (← g.cases fv).toList.foldlM (init := []) fun acc sg => do
+  let rem ← foldlT (← g.cases fv) [] fun acc sg => do
     match ← (match fnSimpCtx? with | some ctx => simpGoalAllHyps sg.mvarId ctx | none => pure (some sg.mvarId)) with
     | none => pure acc
-    | some g1 =>
-        if ← tryCloseContradiction g1 then pure acc
-        else if ← tryCloseFnAtom g1 then pure acc
-        else do splitFiniteEnumsAndProve fnId fnSimpCtx? (budget / k) g1; return acc ++ (← getGoals)
+    | some g1 => if ← tryCloseFnOrContra g1 then pure acc else do splitFiniteEnumsAndProve fnId fnSimpCtx? (budget / k) g1; return acc ++ (← getGoals)
   setGoals rem
 
-@[noinline] private def runProveFnExample (fnId thmId : Ident) : TacticM Unit := do
-  if let g0 :: _ ← getGoals then if ← tryCloseFnAtom g0 then replaceMainGoal []; return
+@[noinline] private def runProveFnExample (fnId thmId : Ident) (isGround : Bool) : TacticM Unit := do
+  if let g0 :: _ ← getGoals then
+    if isGround then if ← tryCloseGroundKernel g0 (check := false) then replaceMainGoal []; return
+    if ← tryCloseFnAtom g0 then replaceMainGoal []; return
   let saved ← saveState; runProveFnGoal fnId false
   if !(← getGoals).isEmpty then
     restoreState saved
@@ -855,16 +783,15 @@ private def tryCloseFnAtom (g : MVarId) : MetaM Bool := do
   throwUnsolvedInvGoals thmId m!"`example` failed for `{fnId.getId}`:"
     m!"Hint: Check the expected output in the `example`, fix `{fnId.getId}`, or supply a `prove:` / `:= by` proof."
 
-@[noinline] private def runProveFnContract (fnId thmId : Ident) (blindDesc? : Option String) : TacticM Unit := do
-  runProveFnGoal fnId blindDesc?.isSome
-  match blindDesc? with
-  | none => throwUnsolvedInvGoals thmId m!"`ensures` contract failed for `{fnId.getId}`:" m!"Hint: Strengthen `requires` / `if` guards, fix the return value, or supply a `:= by` proof."
-  | some desc => throwUnsolvedInvGoals thmId m!"`blindTo {desc}` failed in `{fnId.getId}` (output may depend on blinded field/parameter):" m!"Hint: Redact every branch that reads {desc} under this guard, strengthen the `if` condition, or supply a `:= by` proof."
-
 elab_rules : tactic
-  | `(tactic| qedProveFnEnsures $fnId $thmId) => runProveFnContract fnId thmId none
-  | `(tactic| qedProveBlindTo $fnId $thmId $desc) => runProveFnContract fnId thmId (some desc.getString)
-  | `(tactic| qedProveFnExample $fnId $thmId) => runProveFnExample fnId thmId
+  | `(tactic| qedProveFnEnsures $fnId $thmId) => do
+      runProveFnGoal fnId false
+      throwUnsolvedInvGoals thmId m!"`ensures` contract failed for `{fnId.getId}`:" m!"Hint: Strengthen `requires` / `if` guards, fix the return value, or supply a `:= by` proof."
+  | `(tactic| qedProveBlindTo $fnId $thmId $desc) => do
+      runProveFnGoal fnId true
+      throwUnsolvedInvGoals thmId m!"`blindTo {desc.getString}` failed in `{fnId.getId}` (output may depend on blinded field/parameter):" m!"Hint: Redact every branch that reads {desc.getString} under this guard, strengthen the `if` condition, or supply a `:= by` proof."
+  | `(tactic| qedProveFnExample ground $fnId $thmId) => runProveFnExample fnId thmId true
+  | `(tactic| qedProveFnExample $fnId $thmId) => runProveFnExample fnId thmId false
 
 section FnElab
 open Lean Elab Command Qed.Lang
@@ -874,88 +801,76 @@ def parseOptTacSeq (optNode : Syntax) : Option (TSyntax ``Lean.Parser.Tactic.tac
     let i := optNode.getArg 0; if i.getKind == `Qed.fnProofBy || i.getKind == `Qed.fnProofProve then some ⟨i.getArg 2⟩ else none
   else none
 
-@[noinline] private partial def collectFnContracts (guards : Array Syntax) (clauses : List Syntax) (acc : ParsedFnContracts) : CommandElabM ParsedFnContracts :=
-  match clauses with
-  | [] => pure acc
-  | cl :: rest => do
-      let acc' ← match cl.getKind with
-        | ``fnRequiresClause =>
-            unless guards.isEmpty do throwErrorAt cl "`requires` must appear at the top level of `fn` (combine guard conditions inside `if ...:`)"
-            pure { acc with requires := acc.requires ++ (cl.getArg 1).getSepArgs }
-        | ``fnEnsuresClause => pure { acc with ensures := acc.ensures.push { ref := cl, guards, preds := (cl.getArg 1).getSepArgs, tac? := parseOptTacSeq (cl.getArg 2) } }
-        | ``fnBlindToClause => pure { acc with blinds := acc.blinds.push { ref := cl, guards, targets := ← (cl.getArg 1).getSepArgs.mapM (parseBlindTarget ·), tac? := parseOptTacSeq (cl.getArg 2) } }
-        | ``fnExampleClause =>
-            unless guards.isEmpty do throwErrorAt cl "`example` must appear at the top level of `fn` (use `where` on `example` for preconditions)"
-            let exName : Ident := ⟨cl.getArg 1⟩
-            if acc.examples.any (·.name.getId.eraseMacroScopes == exName.getId.eraseMacroScopes) then throwErrorAt exName s!"duplicate `example {exName.getId}` in `fn`"
-            let params := if (cl.getArg 2).getNumArgs == 3 then ((cl.getArg 2).getArg 1).getSepArgs else #[]
-            let wheres := if (cl.getArg 3).getNumArgs == 2 then ((cl.getArg 3).getArg 1).getSepArgs else #[]
-            pure { acc with examples := acc.examples.push { ref := cl, name := exName, params, wheres, preds := (cl.getArg 5).getSepArgs, tac? := parseOptTacSeq (cl.getArg 6) } }
-        | ``fnContractIf => collectFnContracts (guards ++ (cl.getArg 1).getSepArgs) (cl.getArg 3).getArgs.toList acc
-        | _ => throwErrorAt cl "unexpected contract clause in `fn`"
-      collectFnContracts guards rest acc'
+@[noinline] private partial def collectFnContracts (guards clauses : Array Syntax) (acc : ParsedFnContracts) : CommandElabM ParsedFnContracts :=
+  Qed.Lang.foldlCmd clauses acc fun acc cl => match cl.getKind with
+    | ``fnRequiresClause => do
+        unless guards.isEmpty do throwErrorAt cl "`requires` must appear at the top level of `fn` (combine guard conditions inside `if ...:`)"
+        pure { acc with requires := acc.requires ++ (cl.getArg 1).getSepArgs }
+    | ``fnEnsuresClause => pure { acc with ensures := acc.ensures.push { ref := cl, guards, preds := (cl.getArg 1).getSepArgs, tac? := parseOptTacSeq (cl.getArg 2) } }
+    | ``fnBlindToClause => do pure { acc with blinds := acc.blinds.push { ref := cl, guards, targets := ← Qed.Lang.mapCmd (cl.getArg 1).getSepArgs (parseBlindTarget ·), tac? := parseOptTacSeq (cl.getArg 2) } }
+    | ``fnExampleClause => do
+        unless guards.isEmpty do throwErrorAt cl "`example` must appear at the top level of `fn` (use `where` on `example` for preconditions)"
+        let exName : Ident := ⟨cl.getArg 1⟩
+        if acc.examples.any (·.name.getId.eraseMacroScopes == exName.getId.eraseMacroScopes) then throwErrorAt exName s!"duplicate `example {exName.getId}` in `fn`"
+        let params := if (cl.getArg 2).getNumArgs == 3 then ((cl.getArg 2).getArg 1).getSepArgs else #[]
+        let wheres := if (cl.getArg 3).getNumArgs == 2 then ((cl.getArg 3).getArg 1).getSepArgs else #[]
+        pure { acc with examples := acc.examples.push { ref := cl, name := exName, params, wheres, preds := (cl.getArg 5).getSepArgs, tac? := parseOptTacSeq (cl.getArg 6) } }
+    | ``fnContractIf => collectFnContracts (guards ++ (cl.getArg 1).getSepArgs) (cl.getArg 3).getArgs acc
+    | _ => throwErrorAt cl "unexpected contract clause in `fn`"
 
 private def mkTypedBinder (id : Ident) (ty : Term) : PureQuotM (TSyntax `Lean.Parser.Term.bracketedBinder) := `(bracketedBinder| ($id:ident : $ty))
 private def lowerContractProp (s : Syntax) : CommandElabM Term := liftMacroM (lowerSimpleQedExpr .propInv s (allowOptElse := true) (optElseFallback := `(True)))
-private def mkSuffixId (ref : Syntax) (base : Ident) (tag : String) (total idx : Nat) : Ident :=
-  mkIdentFrom ref (base.getId.appendAfter (if total == 1 then tag else s!"{tag}_{idx + 1}"))
+private def lowerContractConj (xs : Array Syntax) : CommandElabM Term := do mkConjBody (← Qed.Lang.mapCmd xs lowerContractProp)
+private def lowerTypeOnly (s : Syntax) : CommandElabM Term := liftMacroM (return (← lowerQedType s false).1)
 
 @[noinline] private def elabContractThm (isPrivate : Bool) (thmId : Ident) (baseBinders : Array (TSyntax `Lean.Parser.Term.bracketedBinder))
     (guardPfx : String) (guards : Array Syntax) (goal : Term) (tac? : Option (TSyntax ``Lean.Parser.Tactic.tacticSeq))
     (defaultTac : PureQuotM (TSyntax ``Lean.Parser.Tactic.tacticSeq)) : CommandElabM Unit := do
-  let gProps ← guards.toList.mapM lowerContractProp
-  let cmd ← runPureQuot do
-    let binders := baseBinders ++ (← gProps.zipIdx.mapM fun (gp, i) => mkTypedBinder (mkIdent (Name.mkSimple s!"{guardPfx}{i}")) gp).toArray
+  let gProps ← Qed.Lang.mapCmd guards lowerContractProp
+  Qed.Lang.elabCmdWithVis isPrivate <| ← Qed.Lang.runPQ do
+    let binders := baseBinders ++ (← Qed.Lang.mapIdxPQ gProps fun gp i => mkTypedBinder (mkIdent (Name.mkSimple s!"{guardPfx}{i}")) gp)
     let proofTac ← match tac? with | some ts => pure ts | none => defaultTac
     `(command| set_option linter.unusedVariables false in theorem $thmId $[$binders:bracketedBinder]* : $goal := by $proofTac)
-  Qed.Lang.elabCmdWithVis isPrivate cmd
-
-@[noinline, nospecialize] private def forListCmd {α : Type} (f : α → CommandElabM Unit) : List α → CommandElabM Unit
-  | [] => pure () | x :: xs => do f x; forListCmd f xs
 
 @[noinline] def elabPureFnContracts (thmBaseId fnConstId : Ident) (paramIds : Array Ident) (paramTys : Array Term) (retTy : Term)
     (contracts : Array Syntax) (extraPreHyps : Array (Ident × Term) := #[]) (isPrivate : Bool := false) : CommandElabM Unit := do
   if contracts.isEmpty then return
-  let parsed ← collectFnContracts #[] contracts.toList {}
-  let reqProp? ← if parsed.requires.isEmpty then pure none else some <$> mkConjBody (← parsed.requires.toList.mapM lowerContractProp).toArray
-  let prePairs := paramIds.zip paramTys ++ extraPreHyps ++ match reqProp? with | some rp => #[(mkIdent `_hReq, rp)] | none => #[]
-  let baseBinders := (← runPureQuot (prePairs.toList.mapM fun (i, t) => mkTypedBinder i t)).toArray
+  let parsed ← collectFnContracts #[] contracts {}
+  let reqProp? ← if parsed.requires.isEmpty then pure none else some <$> lowerContractConj parsed.requires
+  let baseBinders ← Qed.Lang.runPQ (Qed.Lang.mapPQ (paramIds.zip paramTys ++ extraPreHyps ++ match reqProp? with | some rp => #[(mkIdent `_hReq, rp)] | none => #[]) fun (i, t) => mkTypedBinder i t)
   let rhsCall ← mkAppTerms fnConstId (paramIds.map (⟨·.raw⟩)); let paramNames := paramIds.map (·.getId.eraseMacroScopes)
-  forListCmd (fun (ens, i) => do
-    let thmId := mkSuffixId ens.ref thmBaseId "_ensures" parsed.ensures.size i
-    let ensProp ← mkConjBody (← ens.preds.toList.mapM lowerContractProp).toArray
-    elabContractThm isPrivate thmId baseBinders "_hIf_" ens.guards (← runPureQuot `(let $(mkIdent `result):ident : $retTy := $rhsCall; $ensProp)) ens.tac? `(Lean.Parser.Tactic.tacticSeq| qedProveFnEnsures $fnConstId $thmId)) parsed.ensures.toList.zipIdx
-  forListCmd (fun (bl, i) => do
-    let thmId := mkSuffixId bl.ref thmBaseId "_blindTo" parsed.blinds.size i
-    let (freshVars, lhsArgs, _) ← buildBlindToArgs bl.targets paramNames paramIds paramTys
-    let eqProp ← mkBlindToEqProp freshVars (← mkAppTerms fnConstId lhsArgs) rhsCall
+  let mkSfx (ref : Syntax) (tag : String) (total idx : Nat) : Ident := mkIdentFrom ref (thmBaseId.getId.appendAfter (if total == 1 then tag else s!"{tag}_{idx + 1}"))
+  let forIdx {α : Type} (xs : Array α) (f : Nat → α → CommandElabM Unit) : CommandElabM Unit := discard <| Qed.Lang.foldlCmd xs 0 fun i x => do f i x; return i + 1
+  forIdx parsed.ensures fun i ens => do
+    let thmId := mkSfx ens.ref "_ensures" parsed.ensures.size i; let ensProp ← lowerContractConj ens.preds
+    elabContractThm isPrivate thmId baseBinders "_hIf_" ens.guards (← Qed.Lang.runPQ `(let $(mkIdent `result):ident : $retTy := $rhsCall; $ensProp)) ens.tac? `(Lean.Parser.Tactic.tacticSeq| qedProveFnEnsures $fnConstId $thmId)
+  forIdx parsed.blinds fun i bl => do
+    let thmId := mkSfx bl.ref "_blindTo" parsed.blinds.size i; let (freshVars, lhsArgs, _) ← buildBlindToArgs bl.targets paramNames paramIds paramTys
     let descLit := Syntax.mkStrLit (String.intercalate ", " (bl.targets.toList.map fmtBlindTarget))
-    elabContractThm isPrivate thmId baseBinders "_hIf_" bl.guards eqProp bl.tac? `(Lean.Parser.Tactic.tacticSeq| qedProveBlindTo $fnConstId $thmId $descLit)) parsed.blinds.toList.zipIdx
-  forListCmd (fun ex => do
+    elabContractThm isPrivate thmId baseBinders "_hIf_" bl.guards (← mkBlindToEqProp freshVars (← mkAppTerms fnConstId lhsArgs) rhsCall) bl.tac? `(Lean.Parser.Tactic.tacticSeq| qedProveBlindTo $fnConstId $thmId $descLit)
+  Qed.Lang.foldlCmd parsed.examples () fun _ ex => do
     let thmId := mkIdentFrom ex.name (thmBaseId.getId.appendAfter s!"_example_{ex.name.getId.eraseMacroScopes}")
-    let pBinders ← ex.params.toList.mapM fun ep => do runPureQuot (mkTypedBinder ⟨ep.getArg 0⟩ (← liftMacroM (return (← lowerQedType (ep.getArg 2) false).1)))
-    let exProp ← mkConjBody (← ex.preds.toList.mapM lowerContractProp).toArray
-    elabContractThm isPrivate thmId pBinders.toArray "_hExWhere_" ex.wheres exProp ex.tac? `(Lean.Parser.Tactic.tacticSeq| qedProveFnExample $fnConstId $thmId)) parsed.examples.toList
-
-@[noinline] private def parseFnParam (fnId : Ident) (seenDef : Bool) (paramIds : Array Ident) (rp : Syntax) :
-    CommandElabM (Bool × Ident × Term × TSyntax `Lean.Parser.Term.bracketedBinder) := do
-  let pid : Ident := ⟨rp.getArg 0⟩
-  if paramIds.any (·.getId.eraseMacroScopes == pid.getId.eraseMacroScopes) then throwErrorAt pid s!"duplicate parameter `{pid.getId}` in `fn {fnId.getId}`"
-  let pty ← liftMacroM (return (← lowerQedType (rp.getArg 2) false).1)
-  if (rp.getArg 3).getNumArgs == 2 then
-    let defT ← liftMacroM (lowerSimpleQedExpr .val ((rp.getArg 3).getArg 1))
-    return (true, pid, pty, ← runPureQuot `(bracketedBinder| ($pid:ident : $pty := $defT)))
-  if seenDef then throwErrorAt pid s!"non-default parameter `{pid.getId}` cannot follow a parameter with a default value in `fn {fnId.getId}`"
-  return (false, pid, pty, ← runPureQuot (mkTypedBinder pid pty))
+    let pBinders ← Qed.Lang.mapCmd ex.params fun ep => do Qed.Lang.runPQ (mkTypedBinder ⟨ep.getArg 0⟩ (← lowerTypeOnly (ep.getArg 2)))
+    let exTac := if ex.params.isEmpty && ex.wheres.isEmpty then `(Lean.Parser.Tactic.tacticSeq| qedProveFnExample ground $fnConstId $thmId) else `(Lean.Parser.Tactic.tacticSeq| qedProveFnExample $fnConstId $thmId)
+    elabContractThm isPrivate thmId pBinders "_hExWhere_" ex.wheres (← lowerContractConj ex.preds) ex.tac? exTac
 
 @[noinline, command_elab fnCmd] def elabFnCmd : CommandElab := fun stx => do
   let doc? := if (stx.getArg 0).getNumArgs == 1 then some (⟨(stx.getArg 0).getArg 0⟩ : TSyntax ``Lean.Parser.Command.docComment) else none
   let isPrivate := (stx.getArg 1).getNumArgs == 1; let fnId : Ident := ⟨stx.getArg 3⟩
-  let (_, paramIds, paramTys, defBinders) ← (stx.getArg 5).getSepArgs.toList.foldlM (init := (false, #[], #[], #[]))
-    fun (seenDef, ids, tys, bs) rp => do let (seen', pid, pty, b) ← parseFnParam fnId seenDef ids rp; return (seen', ids.push pid, tys.push pty, bs.push b)
-  let retTy ← liftMacroM (return (← lowerQedType (stx.getArg 8) false).1)
+  let (_, paramIds, paramTys, defBinders) ← Qed.Lang.foldlCmd (stx.getArg 5).getSepArgs (false, #[], #[], #[]) fun (seenDef, ids, tys, bs) rp => do
+    let pid : Ident := ⟨rp.getArg 0⟩
+    if ids.any (·.getId.eraseMacroScopes == pid.getId.eraseMacroScopes) then throwErrorAt pid s!"duplicate parameter `{pid.getId}` in `fn {fnId.getId}`"
+    let pty ← lowerTypeOnly (rp.getArg 2)
+    let (seen', b) ← if (rp.getArg 3).getNumArgs == 2 then
+        let defT ← liftMacroM (lowerSimpleQedExpr .val ((rp.getArg 3).getArg 1))
+        pure (true, ← Qed.Lang.runPQ `(bracketedBinder| ($pid:ident : $pty := $defT)))
+      else do
+        if seenDef then throwErrorAt pid s!"non-default parameter `{pid.getId}` cannot follow a parameter with a default value in `fn {fnId.getId}`"
+        pure (false, ← Qed.Lang.runPQ (mkTypedBinder pid pty))
+    return (seen', ids.push pid, tys.push pty, bs.push b)
+  let retTy ← lowerTypeOnly (stx.getArg 8)
   let bodyTerm ← lowerPureFnStmts s!"fn {fnId.getId}" (stx.getArg 11).getArgs.toList
-  Qed.Lang.elabCmdWithVis isPrivate (← runPureQuot `(command| $[$doc?:docComment]? def $fnId $[$defBinders:bracketedBinder]* : $retTy := $bodyTerm))
+  Qed.Lang.elabCmdWithVis isPrivate (← Qed.Lang.runPQ `(command| $[$doc?:docComment]? def $fnId $[$defBinders:bracketedBinder]* : $retTy := $bodyTerm))
   elabPureFnContracts fnId fnId paramIds paramTys retTy (stx.getArg 10).getArgs #[] isPrivate
 
 end FnElab

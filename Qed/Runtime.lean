@@ -54,25 +54,24 @@ private def isStyleConstructorFn (env : Environment) (fn : Name) : Bool :=
   let (styleMetaMap, tokMetaMap, themeMetaMap) := (Qed.StyleDsl.styleMetaRegistry.getState env, Qed.StyleDsl.tokenMetaRegistry.getState env, Qed.StyleDsl.themeMetaRegistry.getState env)
   let stRef ← IO.mkRef ((#[] : Array Expr), (#[] : Array Expr), ({} : NameSet), ← collectInlineStylesFromExpr env value #[])
   let addThemeStyle (thNm : Name) : MetaM Unit := do
-    let (styles, themeStyles, seen, inlines) ← stRef.get
-    if seen.contains thNm then return
-    let themeStyles := match themeMetaMap.find? thNm with | some thInfo => if env.contains thInfo.styleConst then themeStyles.push (Lean.mkConst thInfo.styleConst) else themeStyles | none => themeStyles
-    stRef.set (styles, themeStyles, seen.insert thNm, inlines)
+    let (s, ts, seen, i) ← stRef.get; if seen.contains thNm then return
+    let ts := match themeMetaMap.find? thNm with | some thInfo => if env.contains thInfo.styleConst then ts.push (Lean.mkConst thInfo.styleConst) else ts | none => ts
+    stRef.set (s, ts, seen.insert thNm, i)
   walkAppDefs value (fun _ => pure ()) fun n d => do
     if d.type.isConstOf ``Qed.Style then
       stRef.modify fun (s, t, sn, i) => (s.push (Lean.mkConst n), t, sn, i)
       if let some sm := styleMetaMap.find? n then sm.themes.forM addThemeStyle
       return false
-    else if d.type.isConstOf ``Qed.Theme then
+    if d.type.isConstOf ``Qed.Theme then
       if env.contains (n.getPrefix ++ `style) then addThemeStyle n.getPrefix
       else stRef.modify fun (s, t, sn, i) => (s, t.push (Lean.mkApp (Lean.mkConst ``Qed.Theme.asStyle) (Lean.mkConst n)), sn, i)
       return false
-    else if d.type.isConstOf ``Qed.Keyframes then stRef.modify fun (s, t, sn, i) => (s, t.push (Lean.mkApp (Lean.mkConst ``Qed.Keyframes.asStyle) (Lean.mkConst n)), sn, i); return false
-    else if let some tm := tokMetaMap.find? n then
+    if d.type.isConstOf ``Qed.Keyframes then stRef.modify fun (s, t, sn, i) => (s, t.push (Lean.mkApp (Lean.mkConst ``Qed.Keyframes.asStyle) (Lean.mkConst n)), sn, i); return false
+    if let some tm := tokMetaMap.find? n then
       if let some thNm := tm.themeName? then addThemeStyle thNm
       return false
-    else if !isFrameworkRoot env n then let (s, t, sn, i) ← stRef.get; stRef.set (s, t, sn, ← collectInlineStylesFromExpr env d.value i); return true
-    else return false
+    if !isFrameworkRoot env n then let (s, t, sn, i) ← stRef.get; stRef.set (s, t, sn, ← collectInlineStylesFromExpr env d.value i); return true
+    return false
   let (styles, themeStyles, _, inlines) ← stRef.get
   mkListLit (Lean.mkConst ``Qed.Style) ((styles ++ inlines).foldl (init := themeStyles) fun acc s => if acc.contains s then acc else acc.push s).toList
 

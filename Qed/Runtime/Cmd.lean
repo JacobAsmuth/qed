@@ -56,15 +56,15 @@ def Cmd.clientOnly : Cmd msg → Cmd msg | .request .. | .requestBytes .. | .wsM
 def Cmd.clientOnlyList : List (Cmd msg) → List (Cmd msg) | [] => [] | c :: cs => Cmd.clientOnly c :: Cmd.clientOnlyList cs
 end
 
-def httpDecode [FromJson α] (onOk : α → msg) (onErr : String → msg) : Except String String → msg
+@[noinline, nospecialize] def httpDecode [FromJson α] (onOk : α → msg) (onErr : String → msg) : Except String String → msg
   | .error e => onErr e | .ok body => match (Json.parse body).bind FromJson.fromJson with | .ok a => onOk a | .error e => onErr e
-def protoDecode [FromProto α] (onResult : Except String α → msg) : Except String ByteArray → msg
+@[noinline, nospecialize] def protoDecode [FromProto α] (onResult : Except String α → msg) : Except String ByteArray → msg
   | .error e => onResult (.error e) | .ok body => onResult (Proto.decode body)
 
-def Cmd.rpc [ToProto req] [FromProto resp] (url : String) (payload : req) (onResult : Except String resp → msg) : Cmd msg := .requestBytes "POST" url (Proto.encode payload) (protoDecode onResult)
-def Cmd.getJson [FromJson α] (url : String) (onOk : α → msg) (onErr : String → msg) : Cmd msg := .request "GET" url "" (httpDecode onOk onErr)
-def Cmd.postJson [FromJson α] (url body : String) (onOk : α → msg) (onErr : String → msg) : Cmd msg := .request "POST" url body (httpDecode onOk onErr)
-def Cmd.streamJson [ToJson α] (url : String) (body : α) (onChunk : String → msg) (onDone : msg) : Cmd msg := .stream url (Json.render (toJson body)) onChunk onDone
+@[noinline, nospecialize] def Cmd.rpc [ToProto req] [FromProto resp] (url : String) (payload : req) (onResult : Except String resp → msg) : Cmd msg := .requestBytes "POST" url (Proto.encode payload) (protoDecode onResult)
+@[noinline, nospecialize] def Cmd.getJson [FromJson α] (url : String) (onOk : α → msg) (onErr : String → msg) : Cmd msg := .request "GET" url "" (httpDecode onOk onErr)
+@[noinline, nospecialize] def Cmd.postJson [FromJson α] (url body : String) (onOk : α → msg) (onErr : String → msg) : Cmd msg := .request "POST" url body (httpDecode onOk onErr)
+@[noinline, nospecialize] def Cmd.streamJson [ToJson α] (url : String) (body : α) (onChunk : String → msg) (onDone : msg) : Cmd msg := .stream url (Json.render (toJson body)) onChunk onDone
 
 private abbrev fx0 (k : String) : Cmd msg := .fx k "" "" ""
 private abbrev fx1 (k a : String) : Cmd msg := .fx k a "" ""

@@ -4,19 +4,19 @@ import Qed.Lang
 
 namespace Qed
 
-private def wrapLocalView {S M O : Type} [ToJson S] [FromJson S] [ToJson O] (init : S) (view : S → Html M) (update : S → M → S × Option O) : String → Html LocalMsg :=
+@[noinline, nospecialize] private def wrapLocalView {S M O : Type} [ToJson S] [FromJson S] [ToJson O] (init : S) (view : S → Html M) (update : S → M → S × Option O) : String → Html LocalMsg :=
   let dec (s : String) : S := ((Json.parse s).bind FromJson.fromJson).toOption.getD init
   fun s => (view (dec s)).map fun m => { run := fun st => let (s', o) := update (dec st) m; (Json.render (ToJson.toJson s'), o.map (Json.render ∘ toJson)) }
 
-def LocalDef.of {S M O : Type} [ToJson S] [FromJson S] [ToJson O] (id : String) (init : S) (view : S → Html M) (update : S → M → S × Option O)
+@[noinline, nospecialize] def LocalDef.of {S M O : Type} [ToJson S] [FromJson S] [ToJson O] (id : String) (init : S) (view : S → Html M) (update : S → M → S × Option O)
     (hvalid : ∀ s, Html.valid (view s) = true := by qedProveValidHtml) : LocalDef :=
   { id, init := Json.render (ToJson.toJson init), view := wrapLocalView init view update, valid_view := ⟨fun _ => by simpa [wrapLocalView, Html.valid] using hvalid _, trivial⟩ }
 
-def LocalDef.ofSimple {S M : Type} [ToJson S] [FromJson S] (id : String) (init : S) (view : S → Html M) (update : S → M → S)
+@[noinline, nospecialize] def LocalDef.ofSimple {S M : Type} [ToJson S] [FromJson S] (id : String) (init : S) (view : S → Html M) (update : S → M → S)
     (hvalid : ∀ s, Html.valid (view s) = true := by qedProveValidHtml) : LocalDef :=
   LocalDef.of (O := String) id init view (fun s m => (update s m, none)) hvalid
 
-def LocalDef.ofProps {P S M O : Type} [FromJson P] [ToJson S] [FromJson S] [ToJson O] (id : String) (init : S) (view : P → S → Html M) (update : P → S → M → S × Option O)
+@[noinline, nospecialize] def LocalDef.ofProps {P S M O : Type} [FromJson P] [ToJson S] [FromJson S] [ToJson O] (id : String) (init : S) (view : P → S → Html M) (update : P → S → M → S × Option O)
     (hvalid : ∀ p s, Html.valid (view p s) = true := by qedProveValidHtml) : LocalDef :=
   { id, init := Json.render (toJson init), view := fun _ => .text ""
     viewProps := some fun props => match (Json.parse props).bind (FromJson.fromJson (α := P)) with
@@ -53,17 +53,17 @@ defAppProjSimps mkApp (init : Model) (u : Model → Msg → Model × Cmd Msg) (t
   [init := (init, s), update := u, template := t, dehydrate := fun _ => "", rehydrate := fun _ => none]
 defAppProjSimps mkRoutedApp {R : Type} [Router R] [Inhabited R] (init : Model) (u : Model → Msg → Model × Cmd Msg) (t : View Model Msg) (r : R → Msg) (s l st p os hv) =>
   mkRoutedApp init u t r s l st p os hv with [init := (init, s), update := u, template := t, dehydrate := fun _ => "", rehydrate := fun _ => none]
-@[reducible] def App.withDehydrate {Model Msg : Type} (d : Dehydrate Model) (app : App Model Msg)
+@[reducible, noinline, nospecialize] def App.withDehydrate {Model Msg : Type} (d : Dehydrate Model) (app : App Model Msg)
     (hview : ∀ m, View.render app.template (d.project m) = View.render app.template m := by qedProveDehydrateView) : App Model Msg := App.withDehydrateCore d app hview
 defAppProjSimps App.withDehydrate (d : Dehydrate Model) (app : App Model Msg) (hv) => App.withDehydrate d app hv with
   [init := app.init, update := app.update, template := app.template, dehydrate := d.dehydrate, rehydrate := d.rehydrate]
 @[simp] theorem App.withDehydrate_rehydrate_dehydrate (d : Dehydrate Model) (app : App Model Msg) (hv) (m : Model) :
     (App.withDehydrate d app hv).rehydrate ((App.withDehydrate d app hv).dehydrate m) = some (d.project m) := d.round_trip m
-@[reducible] def App.withFullDehydrate {Model Msg : Type} [LawfulJson Model] (app : App Model Msg) : App Model Msg := App.withDehydrate Dehydrate.full app (fun _ => rfl)
+@[reducible, noinline, nospecialize] def App.withFullDehydrate {Model Msg : Type} [LawfulJson Model] (app : App Model Msg) : App Model Msg := App.withDehydrate Dehydrate.full app (fun _ => rfl)
 end Internal
 
 set_option linter.unusedVariables false in
-def App.guardRehydrate {Model Msg : Type} (Inv : Model → Prop) [DecidablePred Inv] (app : App Model Msg)
+@[noinline, nospecialize] def App.guardRehydrate {Model Msg : Type} (Inv : Model → Prop) [DecidablePred Inv] (app : App Model Msg)
     (hpres : ∀ m m', Inv m → app.rehydrate (app.dehydrate m) = some m' → Inv m' := by qedProveDehydrateInv) : App Model Msg := App.guardRehydrateCore Inv app hpres
 defAppProjSimps App.guardRehydrate {Model Msg : Type} (Inv : Model → Prop) [DecidablePred Inv] (app : App Model Msg) (hp) =>
   App.guardRehydrate Inv app hp with [init := app.init, update := app.update, template := app.template, dehydrate := app.dehydrate]
@@ -149,7 +149,7 @@ private def withLocalInst (nm cls : Name) (ty val : Expr) (k : Expr → MetaM (O
   let mkDecls (fTys : List Expr) := ((List.range fTys.length).zip fTys).map (fun (i, fTy) => (Name.mkSimple s!"_x_{i}", fTy)) |>.toArray
   let toMinors ← ((List.range ctorEntries.length).zip ctorEntries).mapM fun (j, (_, pad, fTys, _)) =>
     withLocalDeclsDND (mkDecls fTys) fun xs => mkLambdaFVars xs (injSumVal payloadTys j (mkTupleVal pad (fTys.zip xs.toList)))
-  let toB ← mkCasesFnFor casesName ty args (fun _ => sumTy) toMinors; let fromB ← buildSumFromB ty ctorEntries
+  let (toB, fromB) := (← mkCasesFnFor casesName ty args (fun _ => sumTy) toMinors, ← buildSumFromB ty ctorEntries)
   let some invMinors ← (OptionT.run <| ctorEntries.mapM fun (cApp, _, fTys, _) => OptionT.mk <|
     withLocalDeclsDND (mkDecls fTys) fun xs => do
       let cTerm := mkAppN cApp xs
@@ -187,20 +187,19 @@ private def elabClosed (stx : Syntax) (ty? : Option Expr) : TermElabM Expr := do
 @[noinline] def elabStructFieldsSlice (ref : Syntax) (initVal modelTy : Expr) (fArr : Array Ident) : TermElabM Expr := do
   if fArr.isEmpty then return mkApp2 (Lean.mkConst ``Dehydrate.const) modelTy initVal
   let (mId, pId) := (mkIdentFrom ref `_qed_m, mkIdentFrom ref `_qed_p)
-  let (getterStx, setterStx) ← liftMacroM do
-    let getterBody ← Qed.Lang.buildTupleVal (← fArr.mapM fun f => `($mId.$f:ident))
-    let projTerms ← Qed.Lang.extractTupleProjections pId fArr.size
-    Qed.Lang.runPureQuot do return (← `(fun $mId => $getterBody), ← `(fun $mId $pId => { $mId with $[$fArr:ident := $projTerms],* }))
+  let (getterStx, setterStx) ← liftMacroM <| Qed.Lang.runPureQuot do
+    let getterBody ← Qed.Lang.buildTupleValPure (← Qed.Lang.mapPQ fArr fun f => `($mId.$f:ident))
+    let projTerms ← Qed.Lang.extractTupleProjectionsPure pId fArr.size
+    return (← `(fun $mId => $getterBody), ← `(fun $mId $pId => { $mId with $[$fArr:ident := $projTerms],* }))
   let alphaMVar ← mkFreshExprMVar (mkSort Level.one)
-  let getterVal ← elabClosed getterStx (some (← mkArrow modelTy alphaMVar))
-  let alphaTy ← instantiateMVars alphaMVar
+  let getterVal ← elabClosed getterStx (some (← mkArrow modelTy alphaMVar)); let alphaTy ← instantiateMVars alphaMVar
   let setterVal ← elabClosed setterStx (some (← mkArrow modelTy (← mkArrow alphaTy modelTy)))
   let some (instAlpha, _) ← synthLawfulJsonAux 16 alphaTy | do
-    let badFields ← fArr.filterMapM fun f => do
-      if let some (fTy, false) ← fieldJsonStatus modelTy f.getId then return some m!"`{f.getId} : {← ppExpr fTy}`" else return none
+    let badFields ← Qed.Verify.Core.foldlMeta fArr #[] fun acc f => do
+      if let some (fTy, false) ← fieldJsonStatus modelTy f.getId then return acc.push m!"`{f.getId} : {← ppExpr fTy}`" else return acc
     if !badFields.isEmpty then
       throwErrorAt ref m!"cannot serialize dehydrated state field(s) {MessageData.joinSep badFields.toList ", "} for SSR (missing `LawfulJson` instance).\nMark non-serializable fields as `ephemeral` (if not rendered by the view or constrained by an invariant), or define `LawfulJson` for their type."
-    else throwErrorAt ref m!"could not synthesize a verified JSON codec (`LawfulJson`) for dehydrated field slice `{← ppExpr alphaTy}`"
+    throwErrorAt ref m!"could not synthesize a verified JSON codec (`LawfulJson`) for dehydrated field slice `{← ppExpr alphaTy}`"
   return mkApp6 (Lean.mkConst ``Dehydrate.slice) modelTy alphaTy instAlpha initVal getterVal setterVal
 
 elab "Dehydrate.except " init:term:max " [" es:ident,* "]" : term => do
@@ -220,7 +219,8 @@ elab "qedInternalAutoDehydrate% " init:term:max app:term:max : term <= expectedT
   let (fn, _) := (← whnfR modelTy).getAppFnArgs; let env ← getEnv
   if isStructure env fn then
     let initVal ← elabClosed init (some modelTy)
-    let goodFields ← (getStructureFieldsFlattened env fn (includeSubobjectFields := false)).filterM fun f => return (← fieldJsonStatus modelTy f).any Prod.snd
+    let goodFields ← Qed.Verify.Core.foldlMeta (getStructureFieldsFlattened env fn (includeSubobjectFields := false)) #[] fun acc f => do
+      if (← fieldJsonStatus modelTy f).any Prod.snd then return acc.push f else return acc
     if !goodFields.isEmpty then
       let saved ← saveState; let preMsgs := (← Core.getMessageLog).toList.length
       let sliceAttempt? ← try
@@ -228,8 +228,7 @@ elab "qedInternalAutoDehydrate% " init:term:max app:term:max : term <= expectedT
           let fn4 := mkApp4 (Lean.mkConst ``Qed.Internal.App.withDehydrate) modelTy msgTy dSlice appVal
           let pfMVar ← mkFreshExprMVar (← inferType fn4).bindingDomain!
           let unsolved ← Tactic.run pfMVar.mvarId! (runProveDehydrate false); let pf ← instantiateMVars pfMVar
-          let ok := unsolved.isEmpty && !pf.hasExprMVar
-          if ok then if ((← Core.getMessageLog).toList.drop preMsgs).all (·.severity != .error) then pure (some (Lean.mkApp fn4 pf)) else pure none else pure none
+          if unsolved.isEmpty && !pf.hasExprMVar then if ((← Core.getMessageLog).toList.drop preMsgs).all (·.severity != .error) then pure (some (Lean.mkApp fn4 pf)) else pure none else pure none
         catch _ => pure none
       if let some wrapped := sliceAttempt? then return wrapped
       restoreState saved

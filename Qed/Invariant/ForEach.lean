@@ -46,11 +46,10 @@ private def feFallbackOps : List FeOp :=
   if !isPredIdent then match ← simpGoalOnly g2 baseCtx with | none => return true | some g3 => if ← tryCloseBasic g3 then return true
   let some g3 ← trySimpAll g2 baseCtx | return true
   if ← tryCloseBasic g3 then return true
-  setGoals [g3]; tryTac (requireClosed := true) `(tactic| qedAutoClose)
+  setGoals [g3]; tryTac (requireClosed := true) (Qed.Lang.runPQTactic `(tactic| qedAutoClose))
 
 @[noinline] private def closeWithH (hFv : FVarId) (gh : MVarId) : MetaM Bool := do
-  if ← gh.assumptionCore then return true
-  tryRestoreM false id (gh.withContext do return (← gh.apply (mkFVar hFv)).isEmpty)
+  if ← gh.assumptionCore then return true else tryRestoreM false id (gh.withContext do return (← gh.apply (mkFVar hFv)).isEmpty)
 
 @[noinline] private def applyFeOpCore (g : MVarId) (hFv : FVarId) (hcExprs : List Expr) (closeSub : MVarId → TacticM Bool) : FeOp → TacticM (Option (List MVarId))
   | .exactH => return if ← closeWithH hFv g then some [] else none
@@ -77,9 +76,6 @@ private def feFallbackOps : List FeOp :=
       let ok : Bool ← (hcExprs.anyM fun hc => tryRestoreM false id (ghc.withContext do return (← ghc.apply hc).isEmpty) : MetaM Bool)
       return if ok then some [] else none
 
-@[noinline] private def tryFeOp (g : MVarId) (hFv : FVarId) (hcExprs : List Expr) (closeSub : MVarId → TacticM Bool) (op : FeOp) : TacticM (Option (List MVarId)) :=
-  tryRestoreM none Option.isSome (applyFeOpCore g hFv hcExprs closeSub op)
-
 @[noinline] private def runForEachLift (upd childInv : Ident) (pred : Term) : TacticM Unit := withFreshHeartbeatsT do
   let predNm? ← if pred.raw.isIdent then try some <$> realizeGlobalConstNoOverload pred catch _ => pure none else pure none
   let predCtx ← mkDynamicSimpCtx (match predNm? with | some p => #[p, ``Qed.Lang.QedVal.val_id] | none => #[``Qed.Lang.QedVal.val_id]) none
@@ -89,7 +85,8 @@ private def feFallbackOps : List FeOp :=
   let hcExprs := match ← try some <$> Meta.mkAppM ``And.right #[childExpr] catch _ => pure none with | some r => [childExpr, r] | none => [childExpr]
   let (fvs, g1) ← (← getMainGoal).introN 2 [`m, `msg]
   let closeSub := tryCloseForEachSub dCtx predCtx pred.raw.isIdent
-  let rec tryOps (g : MVarId) (hFv : FVarId) : List FeOp → TacticM (List MVarId) | [] => pure [g] | op :: r => do match ← tryFeOp g hFv hcExprs closeSub op with | some rem => pure rem | none => tryOps g hFv r
+  let rec tryOps (g : MVarId) (hFv : FVarId) : List FeOp → TacticM (List MVarId)
+    | [] => pure [g] | op :: r => do match ← tryRestoreM none Option.isSome (applyFeOpCore g hFv hcExprs closeSub op) with | some rem => pure rem | none => tryOps g hFv r
   setGoals ((← g1.cases fvs[1]!).toList.map (·.mvarId))
   forEachGoal fun g => withFreshHeartbeatsT do
     let (hFv, g0) ← g.intro `h
@@ -148,14 +145,14 @@ private def attrSimpNames : Array Name := #[``Qed.attrRole, ``Qed.attrValue, ``Q
     if ← tryLiftChildElem mapCtx fullMapCtx childExpr cFv g2 then return true
     match ← simpGoalOnly g2 everyCtx with
     | none => return true
-    | some g3 => (← splitGoalAnds g3).allM fun sg => do
+    | some g3 => closeAllGoals (fun sg => do
         if ← tryLiftChildElem mapCtx fullMapCtx childExpr cFv sg then return true
         match ← simpGoalOnly sg attrCtx with
         | none => return true
-        | some sg1 => if ← tryReflGoal sg1 then return true else if (← simpGoalOnly sg1 fullAttrCtx).isNone then return true else tryReflGoal sg1
+        | some sg1 => if ← tryReflGoal sg1 then return true else if (← simpGoalOnly sg1 fullAttrCtx).isNone then return true else tryReflGoal sg1) (← splitGoalAnds g3)
   if closedEvery then return true
   let tgt ← g.withContext (instantiateMVars (← g.getType))
-  a11yForEachLiftPairs.anyM fun (ml, m, can) => g.withContext do
+  foldlMeta a11yForEachLiftPairs.toArray false fun ok (ml, m, can) => if ok then pure true else g.withContext do
     if (← applyWithMVars g tgt ``Qed.Html.liftA11yWithKey [(5, mkConst ml), (6, mkConst can), (7, mkConst m), (12, childExpr)]).isSome then return true
     return (← applyWithMVars g tgt ``Qed.Html.liftA11yPlain [(5, mkConst ml), (6, mkConst m), (10, childExpr)]).isSome
 

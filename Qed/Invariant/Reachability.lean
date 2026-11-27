@@ -79,13 +79,6 @@ private partial def extractHeadIdent? (stx : Lean.Syntax) : Option Lean.Syntax :
 section ReachabilityTactic
 open Lean Meta Elab Tactic Qed.Verify.Core
 
-@[noinline] private def splitAndDsimp (dCtx : Simp.Context) : Nat → List MVarId → MetaM (List MVarId)
-  | 0, gs => pure gs | _, [] => pure []
-  | fuel + 1, g :: rest => do
-      match ← trySplitTarget g with
-      | none => return g :: (← splitAndDsimp dCtx fuel rest)
-      | some sub => splitAndDsimp dCtx fuel ((← sub.filterMapM (simpGoalOnly · dCtx (dsimpOnly := true))) ++ rest)
-
 @[noinline] private def runReachPass (allDynNames unfoldDyn : Array Name) (projSt? : Option SimpTheorems) : TacticM Unit := do
   if let g :: rest ← getGoals then
     let closedRfl ← if projSt?.isNone then tryReflGoal g else pure false
@@ -101,33 +94,28 @@ open Lean Meta Elab Tactic Qed.Verify.Core
       setGoals (match g3? with | none => rest | some g' => g' :: rest)
   if !(← getGoals).isEmpty then
     let (bCtx, _) ← mkCachedSimpCtx "reachBool" reachBoolSimpNames; let dCtx ← mkEmptyDsimpCtx
-    let splitSimp : TacticM Unit := do setGoals (← splitAndDsimp dCtx 16 (← (← getGoals).filterMapM (simpGoalAllHyps · bCtx)))
+    let splitSimp : TacticM Unit := do setGoals (← splitTargetsRec 16 (← (← getGoals).filterMapM (simpGoalAllHyps · bCtx)) (some dCtx))
     splitSimp; if !(← getGoals).isEmpty && projSt?.isNone then runUnfoldPresent #[] allDynNames; splitSimp
     let closeLeaf (g : MVarId) : MetaM Bool := do if ← tryCloseBasic g then pure true else tryCloseGroundKernel g (check := true)
     forEachGoal fun g => do
       if ← closeLeaf g then setGoals []; return
       let some g' ← trySimpAll g (← mkSimpCtxWithBase) #[← Meta.Simp.getSimprocs] | setGoals []; return
-      if ← closeLeaf g' then setGoals [] else setGoals [g']; discard <| tryTac (requireClosed := true) `(tactic| qedAutoClose)
+      if ← closeLeaf g' then setGoals [] else setGoals [g']; discard <| tryTac (requireClosed := true) (Qed.Lang.runPQTactic `(tactic| qedAutoClose))
 
 @[noinline] private def runDischargeReachable (upd initT : Term) (nm : Ident) (labelLit : StrLit) : TacticM Unit := withFreshHeartbeatsT do
   if let g0 :: _ ← getGoals then
     if (← g0.withContext (Lean.instantiateMVars (← g0.getType))).getUsedConstants.contains ``Qed.optSat then
       if ← tryCloseGroundKernel g0 (check := true) then replaceMainGoal []; return
-  let dynNames ← [upd, initT].foldlM (init := #[]) fun acc raw =>
+  let dynNames ← foldlMeta #[upd, initT] #[] fun acc raw =>
     match extractHeadIdent? raw.raw with
     | none => pure acc
     | some idStx => return (← resolveCompUpdateUnfolds idStx).foldl (fun a n => if a.contains n then a else a.push n) acc
-  let reconNames := dynNames.filter (·.getString! == "_reconcileHoisted")
   try
-    let solvedFast ← if reconNames.isEmpty then pure false else match ← getGoals with
-      | [] => pure false
-      | g0 :: _ => do
-          let goalConsts ← collectGoalConsts g0 true
-          let projSt? ← reconNames.toList.foldlM (init := some ({} : SimpTheorems)) fun acc? rn =>
-            match acc? with | none => pure none | some st => addReconcileProjLemmas st rn goalConsts
-          match projSt? with
-          | none => pure false
+    let solvedFast ← match ← getGoals with
+      | g0 :: _ => match ← buildFastReconThms? g0 (dynNames.filter (·.getString! == "_reconcileHoisted")) with
           | some projSt => tryRestoreM false id (do runReachPass dynNames (dynNames.filter (·.getString! != "_reconcileHoisted")) (some projSt); return (← getGoals).isEmpty)
+          | none => pure false
+      | [] => pure false
     unless solvedFast do runReachPass dynNames dynNames none
   catch _ => pure ()
   let lbl := labelLit.getString

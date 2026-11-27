@@ -217,7 +217,7 @@ fn handle_sse_connection(mut stream: TcpStream, hub: &Arc<SseHub>) {
     }
     const HDR: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nCache-Control: no-cache, no-store\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\nX-Accel-Buffering: no\r\n\r\nretry: 500\n\n";
     let last = lock_unpoison(&hub.last_frame).clone();
-    let ok = stream.write_all(HDR).is_ok() && last.as_deref().is_none_or(|f| stream.write_all(f).is_ok());
+    let ok = match last { Some(f) => stream.write_all(&[HDR, &f].concat()), None => stream.write_all(HDR) }.is_ok();
     if !ok || stream.set_nonblocking(true).is_err() { return; }
     let mut clients = lock_unpoison(&hub.clients);
     if !hub.closed.load(Ordering::Acquire) && clients.len() < 64 { clients.push(stream); }

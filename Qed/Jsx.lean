@@ -51,7 +51,7 @@ syntax (name := qedCompTerm) "qedComp%" str str num "[" qedCompProp,* "]" term :
 syntax (name := qedCheckUrlValTerm) "qedCheckUrlVal%" str term:max : term
 
 open Lean Meta Elab Term in
-@[term_elab qedCheckUrlValTerm] def elabQedCheckUrlVal : TermElab := fun stx expectedType? => do
+@[noinline, term_elab qedCheckUrlValTerm] def elabQedCheckUrlVal : TermElab := fun stx expectedType? => do
   let attrName := (⟨stx.getArg 1⟩ : TSyntax `str).getString
   let e ← elabTerm (stx.getArg 2) expectedType?; synthesizeSyntheticMVars (postpone := .yes)
   let ty ← instantiateMVars (← inferType e)
@@ -129,6 +129,7 @@ private partial def isListJsxExpr (stx : Syntax) : Bool :=
   else if k == ``Qed.Lang.qedCall then (stx.getArg 0).getKind == ``Qed.Lang.qedProj && ((stx.getArg 0).getArg 2).getId.eraseMacroScopes == `map
   else k == ``Qed.Lang.qedExprFor
 
+@[noinline]
 partial def expandJsxExpr (pPath : String) (parentCtx? : Option (String × HtmlCtx)) (fallback : MacroM Term) (stx : Syntax) : MacroM (Term × Bool) := do
   let hooks : Qed.Lang.LowerHooks MacroM := { Qed.Lang.LowerHooks.mkDefault Macro.throwErrorAt with
     lowerJsx := fun j _ => do
@@ -140,6 +141,7 @@ partial def expandJsxExpr (pPath : String) (parentCtx? : Option (String × HtmlC
   let exp ← Qed.Lang.lowerQedExpr hooks .val stx
   return (exp, isListJsxExpr stx || isMapCall exp.raw)
 
+@[noinline]
 partial def expandAttrVal (valNode : Syntax) (fallback : MacroM Term) : MacroM Term := do
   let inner := valNode.getArg 1
   if inner.getKind == ``attrValStr then return ⟨inner.getArg 0⟩
@@ -147,6 +149,7 @@ partial def expandAttrVal (valNode : Syntax) (fallback : MacroM Term) : MacroM T
   else if inner.getKind == ``attrValExpr then return (← expandJsxExpr "" none fallback (inner.getArg 1)).1
   else Macro.throwUnsupported
 
+@[noinline]
 partial def attrsToTerms (rawAttrs : Array Syntax) (tag : String := "") : MacroM (Array Term) := do
   let (isCheck, textEvt) := (isCheckboxAttrs rawAttrs, if tag == "select" then ``Qed.onChange else ``Qed.onInput)
   let mut out : Array Term := #[]
@@ -191,6 +194,7 @@ partial def expandKidExpr (pPath : String) (parentCtx? : Option (String × HtmlC
   let (t, isList) ← expandJsxExpr pPath parentCtx? (`(Qed.Html.text "")) exprStx
   if isMapCall t.raw then return .many (← `(($t).toList)) else return if isList then .many t else .single t
 
+@[noinline]
 partial def collectKidParts (pPath : String) (parentCtx? : Option (String × HtmlCtx)) (opener : Syntax) (kids : Array Syntax) : MacroM (Array KidPart) := do
   let mut parts : Array KidPart := #[]; let mut prev := opener
   for k in kids do
@@ -213,6 +217,7 @@ partial def collectKidParts (pPath : String) (parentCtx? : Option (String × Htm
     prev := k
   return parts
 
+@[noinline]
 partial def childrenToTerm (pPath : String) (parentCtx? : Option (String × HtmlCtx)) (opener : Syntax) (kids : Array Syntax) : MacroM Term := do
   if kids.size == 1 && !isJsxTextKid kids[0]! && !isJsxElementKid kids[0]! then
     match ← expandKidExpr pPath parentCtx? kids[0]![0][1] with | .many t => return t | .single t => return ← `([$t])
@@ -226,6 +231,7 @@ partial def childrenToTerm (pPath : String) (parentCtx? : Option (String × Html
   if !cur.isEmpty then lists := lists.push (← `([$cur,*]))
   match lists.toList with | [] => `([]) | l :: ls => ls.foldlM (init := l) fun acc x => `($acc ++ $x)
 
+@[noinline]
 partial def expandAwaitTag (pPath : String) (parentCtx? : Option (String × HtmlCtx)) (stx opener : Syntax) (attrStxs kids : Array Syntax) : MacroM Term := withRef stx do
   let valid := ["of", "as", "err", "loading", "failed", "idle"]
   let parseVar (attrNm : String) (v : Term) : MacroM Ident :=
@@ -251,6 +257,7 @@ partial def expandAwaitTag (pPath : String) (parentCtx? : Option (String × Html
         if isEl then `((fun (_ : String) => $f)) else pure f
   `($(mkIdent `Qed.Resource.awaitView) $ofT $readyT $(← attrs["loading"]?.getDM `(Qed.Html.text "Loading…")) $failT $(← attrs["idle"]?.getDM `(Qed.Html.empty)))
 
+@[noinline]
 partial def componentToTerm (pPath : String) (parentCtx? : Option (String × HtmlCtx)) (stx opener : Syntax) (tag : String) (attrStxs kids : Array Syntax) : MacroM Term := withRef stx do
   if tag == "Await" then return ← expandAwaitTag pPath parentCtx? stx opener attrStxs kids
   let compProps ← attrStxs.mapM fun a => do
@@ -262,6 +269,7 @@ partial def componentToTerm (pPath : String) (parentCtx? : Option (String × Htm
   let kidsT ← if kids.isEmpty then `([]) else childrenToTerm "" none opener kids
   `(qedComp% $(Syntax.mkStrLit tag) $(Syntax.mkStrLit pPath) $(Syntax.mkNumLit (toString ((stx.getPos?.map (·.byteIdx)).getD 0))) [$[$compProps],*] $kidsT)
 
+@[noinline]
 partial def elementToTerm (pPath : String) (parentCtx? : Option (String × HtmlCtx)) (stx : Syntax) : MacroM Term := withRef stx do
   if stx.getKind == ``jsxFragment then childrenToTerm pPath parentCtx? (stx.getArg 1) (stx.getArg 2).getArgs
   else if stx.getKind == ``selfClosing || stx.getKind == ``withChildren then

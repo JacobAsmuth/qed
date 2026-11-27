@@ -24,6 +24,7 @@ private def forEachElemTable : Array (Name × Name) := #[
   (``Array.setIfInBounds, ``Qed.ForEach.forall_setIfInBounds),
   (``HAppend.hAppend, ``Qed.ForEach.forall_append), (``Array.append, ``Qed.ForEach.forall_append)]
 
+@[noinline]
 private def runForEachArm (childInv : Ident) (elemClose mapClose : TSyntax `tactic) : TacticM Unit := do
   let (h, y, hy, hP) := (mkIdent `h, mkIdent `y, mkIdent `hy, mkIdent `hP)
   let mkDirect (lem : Name) := `(tactic| exact $(mkIdent lem):ident $h)
@@ -49,7 +50,8 @@ private def runForEachArm (childInv : Ident) (elemClose mapClose : TSyntax `tact
   for (_, lem) in forEachElemTable.take 4 do if ← tryTac (mkElem lem) then return
   discard <| tryTac `(tactic| grind)
 
-elab "forEachLift " upd:ident childInv:ident pred:term : tactic => Core.withCurrHeartbeats do
+@[noinline]
+private def runForEachLift (upd childInv : Ident) (pred : Term) : TacticM Unit := Core.withCurrHeartbeats do
   let valId ← `(Lean.Parser.Tactic.simpLemma| Qed.Lang.QedVal.val_id)
   let predLem ← if pred.raw.isIdent then pure #[← `(Lean.Parser.Tactic.simpLemma| $(⟨pred.raw⟩):ident), valId] else pure #[valId]
   let elemFallback ← if pred.raw.isIdent then `(tactic| first | omega | decide | trivial | simp_all | qedAutoClose) else `(tactic| first | omega | decide | trivial | simp | simp_all | qedAutoClose)
@@ -64,8 +66,9 @@ elab "forEachLift " upd:ident childInv:ident pred:term : tactic => Core.withCurr
     | none => setGoals []
     | some g1 => setGoals [g1]; runForEachArm childInv elemClose mapClose
 
-elab "qedDischargeForEach" upd:ident childInv:ident nm:ident pred:term : tactic => Core.withCurrHeartbeats do
-  evalTactic (← `(tactic| forEachLift $upd $childInv $pred))
+@[noinline]
+private def runDischargeForEach (upd childInv nm : Ident) (pred : Term) : TacticM Unit := Core.withCurrHeartbeats do
+  runForEachLift upd childInv pred
   let goals ← getUnsolvedGoals
   unless goals.isEmpty do
     let predStr := (pred.raw.reprint.getD "the contract").trimmed
@@ -80,6 +83,9 @@ elab "qedDischargeForEach" upd:ident childInv:ident nm:ident pred:term : tactic 
           else "inserts an element not known to satisfy the contract."
         return some s!"  • {Qed.Diag.formatCaseTag (← g.getTag)}: {why}\n    must satisfy:  {s}")
 
+elab "forEachLift " upd:ident childInv:ident pred:term : tactic => runForEachLift upd childInv pred
+elab "qedDischargeForEach" upd:ident childInv:ident nm:ident pred:term : tactic => runDischargeForEach upd childInv nm pred
+
 private def a11yForEachLiftPairs : Array (Name × Name × Name) := #[
   (``Qed.Html.imgsHaveAltList_mapList, ``Qed.Html.imgsHaveAlt_map, ``Qed.Html.imgsHaveAlt_canonical),
   (``Qed.Html.buttonsAccessibleList_mapList, ``Qed.Html.buttonsAccessible_map, ``Qed.Html.buttonsAccessible_canonical),
@@ -87,7 +93,8 @@ private def a11yForEachLiftPairs : Array (Name × Name × Name) := #[
   (``Qed.Html.labelsAssociatedList_mapList, ``Qed.Html.labelsAssociated_map, ``Qed.Html.labelsAssociated_canonical),
   (``Qed.Html.htmlHasLangList_mapList, ``Qed.Html.htmlHasLang_map, ``Qed.Html.htmlHasLang_canonical)]
 
-elab "forEachStyleLift " view:ident childStyled:ident : tactic => do
+@[noinline]
+private def runForEachStyleLift (view childStyled : Ident) : TacticM Unit := do
   let c := mkIdent `c
   let liftChild ← `(tactic| (refine Qed.everyElement_through_map _ _ ?_ ($childStyled $c) <;> (intro t a; first | (simp only [Qed.attrRole_map, Qed.attrClasses_map, Qed.hasOneClass]; done) | (simp [Qed.attrRole_map, Qed.attrClasses_map, Qed.hasOneClass]; done))))
   let everyArm ← `(tactic| (rw [Qed.everyElementL_mapList]; intro $c _; first | $liftChild:tactic |
@@ -108,16 +115,20 @@ elab "forEachStyleLift " view:ident childStyled:ident : tactic => do
              exact $childStyled $c
            · rw [$(mkIdent can):ident, ← Qed.Html.map, $(mkIdent m):ident]; exact $childStyled $c)))
 
-elab "qedDischargeStyledForEach" view:ident field:ident childStyled:ident nm:ident pred:term : tactic => Core.withCurrHeartbeats do
-  evalTactic (← `(tactic| forEachStyleLift $view $childStyled))
+@[noinline]
+private def runDischargeStyledForEach (view field childStyled nm : Ident) (pred : Term) : TacticM Unit := Core.withCurrHeartbeats do
+  runForEachStyleLift view childStyled
   let predStr := (pred.raw.reprint.getD "the rule").trimmed
   Qed.Diag.throwUnsolvedGoals m!"Styling invariant `{nm.getId}` failed to lift `{predStr}` over `{field.getId}` in `{view.getId}`:"
     m!"\n\nHint: Finish the remaining branch with `forEachStyleLift`:\n  invariant {nm.getId} : {predStr} for_each {field.getId} using {childStyled.getId} := by\n    forEachStyleLift {view.getId} {childStyled.getId}\n    …"
     (ref? := some nm)
     (formatGoal? := some fun g => g.withContext do
       let s ← Qed.Diag.ppQedExpr (← g.getType) ["m"]
-      let why := if (s.splitOn "everyElementL").length > 1 then s!"child list didn't match `{childStyled.getId}` — check that both use the same role and styles."
-        else "an element outside the collection wasn't covered — check if the parent view also renders that role."
+      let why := if (s.splitOn "everyElementL").length > 1 then s!"child list didn't match `{childStyled.getId}`: check that both use the same role and styles."
+        else "an element outside the collection wasn't covered: check if the parent view also renders that role."
       return some s!"  • {why}\n    must satisfy:  {s}")
+
+elab "forEachStyleLift " view:ident childStyled:ident : tactic => runForEachStyleLift view childStyled
+elab "qedDischargeStyledForEach" view:ident field:ident childStyled:ident nm:ident pred:term : tactic => runDischargeStyledForEach view field childStyled nm pred
 
 end Qed

@@ -142,21 +142,33 @@ def parseCompIfCond (optCond : Syntax) : Option (Syntax × Syntax) × Array Synt
     (some (cBody.getArg 1, cBody.getArg 3), if (cBody.getArg 4).getNumArgs == 2 then ((cBody.getArg 4).getArg 1).getSepArgs else #[])
   else (none, cBody.getSepArgs)
 
-def inferAwaitBinderTy? (mInfo : ServerMethodInfo) (hasCatchNone : Bool) : CommandElabM (Option Term) := do
+@[noinline]
+def extractRpcOutcomeTys? (mInfo : ServerMethodInfo) (unwrapField unwrapOpt requireOutcome : Bool) :
+    CommandElabM (Option (Option Term × Term)) := do
   if mInfo.outcomeConst == .anonymous then return none
   let savedMsgs := (← get).messages
   try liftTermElabM do
     let some (.defnInfo dinfo) := (← getEnv).find? mInfo.outcomeConst | return none
     Meta.lambdaTelescope dinfo.value fun _ body => do
-      let mut ty ← Meta.whnf body
-      if ty.isAppOfArity ``Qed.RpcOutcome 2 || ty.isAppOfArity ``Qed.RpcSimpleOutcome 1 then ty ← Meta.whnf ty.appArg!
-      let unwrap (e : Expr) := if e.isAppOfArity ``Qed.Ensured 2 || e.isAppOfArity ``Qed.Field 2 then e.appFn!.appArg! else e
-      if mInfo.isOption && ty.isAppOfArity ``Option 1 then
-        let u := unwrap (← Meta.whnf ty.appArg!)
-        ty ← if hasCatchNone then pure u else Meta.mkAppM ``Option #[u]
-      else ty := unwrap ty
-      if ty.hasLooseBVars then return none else return some (← PrettyPrinter.delab ty)
+      let ty ← Meta.whnf body
+      let (errExpr?, payRaw) ←
+        if ty.isAppOfArity ``Qed.RpcOutcome 2 then pure (some ty.appFn!.appArg!, ty.appArg!)
+        else if ty.isAppOfArity ``Qed.RpcSimpleOutcome 1 then pure (none, ty.appArg!)
+        else if requireOutcome then return none
+        else pure (none, ty)
+      let unwrap (e : Expr) :=
+        if e.isAppOfArity ``Qed.Ensured 2 || (unwrapField && e.isAppOfArity ``Qed.Field 2) then e.appFn!.appArg! else e
+      let mut pay ← Meta.whnf payRaw
+      if pay.isAppOfArity ``Option 1 && (!unwrapField || mInfo.isOption) then
+        let u := unwrap (← Meta.whnf pay.appArg!)
+        pay ← if unwrapOpt then pure u else Meta.mkAppM ``Option #[u]
+      else pay := unwrap pay
+      if pay.hasLooseBVars || errExpr?.any (·.hasLooseBVars) then return none
+      return some (← errExpr?.mapM (fun e => liftM (PrettyPrinter.delab e)), ← PrettyPrinter.delab pay)
   catch _ => modify fun s => { s with messages := savedMsgs }; return none
+
+def inferAwaitBinderTy? (mInfo : ServerMethodInfo) (hasCatchNone : Bool) : CommandElabM (Option Term) :=
+  return (← extractRpcOutcomeTys? mInfo true (mInfo.isOption && hasCatchNone) false).map Prod.snd
 
 def resolveServerRpc (rpcId : Ident) (argCount : Nat) (ctxDesc : String) : CommandElabM (ServerInfo × ServerMethodInfo) := do
   let some (srvInfo, mInfo) := lookupServerMethod? (← getEnv) (← getCurrNamespace) (← getScope).openDecls rpcId.getId
@@ -226,8 +238,12 @@ def mkRewriteCtx (spec : ComponentSpec) (isPureComp : Bool) (allowHoist : Bool :
 private def registerKeyedSite (accum : IO.Ref RewriteAccum) (key base : String) (mkSite : Name → SetSite) : CommandElabM Name := do
   let cur := (← accum.get).sites
   if let some site := cur.find? (·.key == key) then return site.ctor
-  let mut name := Name.mkSimple base; let mut i := 2
-  while cur.any (·.ctor == name) do name := Name.mkSimple s!"{base}_{i}"; i := i + 1
+  let rec freshName (i : Nat) : Nat → Name
+    | 0 => Name.mkSimple s!"{base}_{i}"
+    | fuel + 1 =>
+        let cand := if i == 1 then Name.mkSimple base else Name.mkSimple s!"{base}_{i}"
+        if cur.any (·.ctor == cand) then freshName (i + 1) fuel else cand
+  let name := freshName 1 (cur.size + 1)
   accum.modify fun a => { a with sites := a.sites.push (mkSite name) }
   return name
 
@@ -257,6 +273,7 @@ open Lean Meta Elab Term in
   else
     elabTerm (← `(($fId).set $idxStx $valStx (by first | get_elem_tactic | (simp (config := { zetaDelta := false }) only [$fId:ident, Array.size_set, Array.size_push] <;> omega) | (simp (config := { zetaDelta := true }) only [Array.size_set, Array.size_push] <;> omega)))) expectedType?
 
+@[noinline]
 def lowerControlFlowStmt (st : Syntax) (lowerVal : Syntax → CommandElabM Term)
     (lowerBranch : Array Syntax → CommandElabM Term) : CommandElabM Term := do
   let k := st.getKind
@@ -272,6 +289,7 @@ def lowerControlFlowStmt (st : Syntax) (lowerVal : Syntax → CommandElabM Term)
       mkMatchAltFromAlts (← liftMacroM (lowerCasePatAlts (alt.getArg 1))) (← lowerBranch (suiteStmts (alt.getArg 3)))
     `(match $[$scruts:term],* with $[$alts:matchAlt]*)
 
+@[noinline]
 private def wrapEnsuredMsgTy (valTy : Term) (ensConst? : Option Name) (paramCount : Nat)
     (paramTypeConsts : Array Name) (valVar : Name) (paramPfx : String) : CommandElabM (Term × Bool) := do
   let some ensConst := ensConst? | return (valTy, false)
@@ -295,6 +313,7 @@ private def wrapMsgArity (wrap? : Option Ident) (arity : Nat) (fn : Term) : Comm
 private def expandAttrValM (valNode : Syntax) (fallback : Term) : CommandElabM Term :=
   liftMacroM <| Qed.Jsx.expandAttrVal valNode (pure fallback)
 
+@[noinline]
 def mkSetterHandler (ctx : RewriteCtx) (fname : Name) (path : Array Name := #[]) : CommandElabM Term := do
   if ctx.spec.bindNames.contains fname then
     let sf := mkIdent (bindSetName fname)
@@ -305,6 +324,7 @@ def mkSetterHandler (ctx : RewriteCtx) (fname : Name) (path : Array Name := #[])
     return ← `(fun v => $call)
   wrapMsgArity ctx.wrapMsg? 1 ⟨ctx.spec.msgCtor (← registerSite ctx.accum #[.mk fname path none] none)⟩
 
+@[noinline]
 def mkSiteExpr (ctx : RewriteCtx) (assigns : Array SiteAssign) (send? : Option Term) : CommandElabM Term := do
   let wrapVal (a : SiteAssign) (v : Term) : CommandElabM Term :=
     if a.path.isEmpty then pure v else buildRecordUpdateFrom ⟨(mkIdent a.field).raw⟩ a.path (fun _ => pure v)
@@ -351,6 +371,7 @@ def noEmitsErr (ref : Syntax) : CommandElabM Unit :=
 private def unitEvents : List String := ["onClick", "onSubmit", "onBlur", "onFocus", "onDoubleClick", "onMouseDown", "onMouseUp"]
 private def strEvents  : List String := ["onInput", "onChange", "onKeydown", "onKeyup"]
 
+@[noinline]
 private def wrapEventAttrs (pairs : Array (Bool × Syntax)) (msgTy : Ident) (wrapMsg? : Option Ident)
     (lookupArgTys : String → CommandElabM (Option (Array Term))) : CommandElabM (Array Syntax) :=
   pairs.mapM fun (wasAssign, a') => do
@@ -376,6 +397,7 @@ private def isSomePlaceholder (stx : Syntax) : Bool :=
   u.getKind == ``qedCall && (u.getArg 0).getKind == ``qedIdent && ((u.getArg 0).getArg 0).getId.eraseMacroScopes == `some &&
   (u.getArg 2).getSepArgs.size == 1 && (u.getArg 2).getSepArgs[0]!.getKind == ``qedCallArgPos && isPlaceholder (u.getArg 2).getSepArgs[0]![0]
 
+@[noinline]
 private def rewriteHoistedChild (ctx : RewriteCtx) (inLambda : Bool) (stx : Syntax) (tag : String)
     (cInfo : ComponentInfo) (attrNames : Array String) (rewrittenAttrs : Array Syntax) (kids? : Option Syntax) : CommandElabM (Option Syntax) := do
   let mustHoist := !cInfo.hasLocalDef || cInfo.hasSession || attrNames.any (·.startsWith "bind:") || cInfo.hasChildren || !cInfo.slotNames.isEmpty
@@ -391,20 +413,22 @@ private def rewriteHoistedChild (ctx : RewriteCtx) (inLambda : Bool) (stx : Synt
       if aname == "key" then
         keyExpr? := some vT
         keptAttrs := keptAttrs.push a
-      else if let some ev := cInfo.events.find? (·.name.toString == aname) then outArms := outArms.push (.mk ev.name ev.arity vT)
-      else if let some (bStr, valPart, setPart) ← liftMacroM (unpackBindProp aname vT) then
-        let bNm := Name.mkSimple bStr
-        dataProps := dataProps.push (mkIdentFrom nameRef bNm, valPart)
-        outArms := outArms.push (.mk (bindSetName bNm) 1 setPart); keptAttrs := keptAttrs.push (mkJsxAttrExpr bStr valPart)
-      else
-        let pId := mkIdentFrom nameRef (Name.mkSimple aname)
-        if cInfo.propNames.contains pId.getId then dataProps := dataProps.push (pId, vT)
-        keptAttrs := keptAttrs.push a
+      else match ← liftMacroM (classifyCompProp cInfo.events aname vT) with
+        | .eventProp arm => outArms := outArms.push arm
+        | .bindProp bNm valPart setPart =>
+            dataProps := dataProps.push (mkIdentFrom nameRef bNm, valPart)
+            outArms := outArms.push (.mk (bindSetName bNm) 1 setPart)
+            keptAttrs := keptAttrs.push (mkJsxAttrExpr bNm.toString valPart)
+        | .dataProp pNm _ =>
+            let pId := mkIdentFrom nameRef pNm
+            if cInfo.propNames.contains pId.getId then dataProps := dataProps.push (pId, vT)
+            keptAttrs := keptAttrs.push a
     else keptAttrs := keptAttrs.push a
   ctx.accum.modify fun a => { a with hoisted := a.hoisted.push (.mk subFieldId subName cInfo dataProps outArms keyExpr? ctx.guards) }
   let subRoute ← wrapMsgArity ctx.wrapMsg? 1 ⟨ctx.spec.msgCtor subName⟩
   return some (rebuildJsxEl stx (keptAttrs.push (mkJsxAttrExpr "_hoist" (← `(($subRoute, $subFieldId))))) kids?)
 
+@[noinline]
 private def rewriteSchemaFormElement (ctx : RewriteCtx) (inLambda : Bool) (stx : Syntax) (tag : String) (sInfo : SchemaFormInfo)
     (attrNames : Array String) (rewrittenPairs : Array (Bool × Syntax)) (kids? : Option Syntax) (origBindField? : Option Ident) :
     CommandElabM (Sum Syntax (Array (Bool × Syntax))) := do
@@ -440,6 +464,7 @@ private def rewriteSchemaFormElement (ctx : RewriteCtx) (inLambda : Bool) (stx :
     return .inl (rebuildJsxEl stx finalAttrs kids?)
   return .inr pairs
 
+@[noinline]
 private def rewriteUpperElement (ctx : RewriteCtx) (inLambda : Bool) (stx : Syntax) (tag : String)
     (rewrittenPairs : Array (Bool × Syntax)) (kids? : Option Syntax) (origBindField? : Option Ident := none) : CommandElabM Syntax := do
   let rewrittenAttrs := rewrittenPairs.map (·.2)
@@ -469,6 +494,7 @@ private def rewriteUpperElement (ctx : RewriteCtx) (inLambda : Bool) (stx : Synt
       return rebuildJsxEl stx attrs' kids?
   return rebuildJsxEl stx (pairs.map (·.2)) kids?
 
+@[noinline]
 partial def rewriteIn (ctx : RewriteCtx) (inLambda : Bool) (stx : Syntax) : CommandElabM Syntax := do
   let lowerEmitCall (ref : Syntax) (evId : Ident) (rawArgs : Array Syntax) : CommandElabM Term := do
     let evName := evId.getId.eraseMacroScopes
@@ -477,6 +503,13 @@ partial def rewriteIn (ctx : RewriteCtx) (inLambda : Bool) (stx : Syntax) : Comm
       throwErrorAt evId s!"unknown `event` `{evName}` in `{evName}.emit(...)`"
     let argTerms ← lowerPosCallArgs ref s!"{evName}.emit(...)" none rawArgs (fun e => do lowerCompExpr .val (← rewriteIn ctx inLambda e))
     Qed.Lang.mkAppTerms (mkIdentFrom evId (ctx.spec.t.getId ++ `Out ++ evName)) argTerms
+  let rewriteGuardedBranch (thenIdx optEIdx elseArgIdx elseLen : Nat) (mkGuard : Bool → ViewGuard) (baseStx : Syntax) : CommandElabM Syntax := do
+    let then' ← rewriteIn { ctx with guards := ctx.guards.push (mkGuard true) } inLambda (baseStx.getArg thenIdx)
+    let optE := baseStx.getArg optEIdx
+    let optE' ← if optE.getNumArgs == elseLen then
+        setStxArg optE elseArgIdx <$> rewriteIn { ctx with guards := ctx.guards.push (mkGuard false) } inLambda (optE.getArg elseArgIdx)
+      else pure optE
+    return setStxArg (setStxArg baseStx thenIdx then') optEIdx optE'
   let k := stx.getKind
   if k == ``qedRawTerm then return stx
   else if k == ``qedLam1 || k == ``qedLamN then return Syntax.node stx.getHeadInfo k (← stx.getArgs.mapM (rewriteIn ctx true))
@@ -491,31 +524,13 @@ partial def rewriteIn (ctx : RewriteCtx) (inLambda : Bool) (stx : Syntax) : Comm
     return Syntax.node stx.getHeadInfo k #[stx.getArg 0, patStx, stx.getArg 2, collRewritten, stx.getArg 4, bodyRewritten]
   else if k == ``qedExprIf then
     let cond' ← rewriteIn ctx inLambda (stx.getArg 1)
-    let then' ← rewriteIn { ctx with guards := ctx.guards.push (.ifCond cond' true) } inLambda (stx.getArg 3)
-    let optE := stx.getArg 4
-    let optE' ← if optE.getNumArgs == 3 then
-        let e' ← rewriteIn { ctx with guards := ctx.guards.push (.ifCond cond' false) } inLambda (optE.getArg 2)
-        pure (setStxArg optE 2 e')
-      else pure optE
-    return Syntax.node stx.getHeadInfo k #[stx.getArg 0, cond', stx.getArg 2, then', optE']
+    rewriteGuardedBranch 3 4 2 3 (.ifCond cond') (setStxArg stx 1 cond')
   else if k == ``qedTernary then
     let cond' ← rewriteIn ctx inLambda (stx.getArg 2)
-    let then' ← rewriteIn { ctx with guards := ctx.guards.push (.ifCond cond' true) } inLambda (stx.getArg 0)
-    let optE := stx.getArg 3
-    let optE' ← if optE.getNumArgs == 2 then
-        let e' ← rewriteIn { ctx with guards := ctx.guards.push (.ifCond cond' false) } inLambda (optE.getArg 1)
-        pure (setStxArg optE 1 e')
-      else pure optE
-    return Syntax.node stx.getHeadInfo k #[then', stx.getArg 1, cond', optE']
+    rewriteGuardedBranch 0 3 1 2 (.ifCond cond') (setStxArg stx 2 cond')
   else if k == ``qedExprIfLet then
     let pat := stx.getArg 2; let scrut' ← rewriteIn ctx inLambda (stx.getArg 4)
-    let then' ← rewriteIn { ctx with guards := ctx.guards.push (.ifLet pat scrut' true) } inLambda (stx.getArg 6)
-    let optE := stx.getArg 7
-    let optE' ← if optE.getNumArgs == 3 then
-        let e' ← rewriteIn { ctx with guards := ctx.guards.push (.ifLet pat scrut' false) } inLambda (optE.getArg 2)
-        pure (setStxArg optE 2 e')
-      else pure optE
-    return Syntax.node stx.getHeadInfo k #[stx.getArg 0, stx.getArg 1, pat, stx.getArg 3, scrut', stx.getArg 5, then', optE']
+    rewriteGuardedBranch 6 7 2 3 (.ifLet pat scrut') (setStxArg stx 4 scrut')
   else if k == ``qedExprMatch then
     let scrutsNode := stx.getArg 1
     let scrutsNode' ← rewriteIn ctx inLambda scrutsNode
@@ -544,6 +559,10 @@ partial def rewriteIn (ctx : RewriteCtx) (inLambda : Bool) (stx : Syntax) : Comm
     checkMutableField ctx (stx.getArg 1) s!"`({(stx.getArg 1).getId.eraseMacroScopes} = _)`" fname
     return mkRawExpr (← mkSetterHandler ctx fname path)
   else if k == ``qedCall then
+    let regQueryCtrl (key base : String) : CommandElabM Syntax := do
+      let ctor ← registerKeyedSite ctx.accum key base fun ctor =>
+        { key, ctor, stmts? := some #[Syntax.node stx.getHeadInfo ``qedStmtExpr #[stx]] }
+      return mkRawExpr (← wrapMsgArity ctx.wrapMsg? 0 ⟨ctx.spec.msgCtor ctor⟩)
     match matchIdentMethodCall? stx with
     | some (poId, "send", rawArgs) =>
         if ctx.inPerform && ctx.hasPortOut poId.getId.eraseMacroScopes then
@@ -554,10 +573,7 @@ partial def rewriteIn (ctx : RewriteCtx) (inLambda : Bool) (stx : Syntax) : Comm
     | some (qId, qMeth, rawArgs) =>
         if ctx.allowHoist && (qMeth == "refetch" || qMeth == "invalidate") && rawArgs.isEmpty && ctx.hasQuery qId.getId.eraseMacroScopes then
           let qNm := qId.getId.eraseMacroScopes
-          let key := s!"qctrl:{qNm}.{qMeth}"
-          let ctor ← registerKeyedSite ctx.accum key s!"q_{qNm}_{qMeth}" fun ctor =>
-            { key, ctor, stmts? := some #[Syntax.node stx.getHeadInfo ``qedStmtExpr #[stx]] }
-          return mkRawExpr (← wrapMsgArity ctx.wrapMsg? 0 ⟨ctx.spec.msgCtor ctor⟩)
+          return ← regQueryCtrl s!"qctrl:{qNm}.{qMeth}" s!"q_{qNm}_{qMeth}"
     | _ =>
         if ctx.allowHoist && !ctx.spec.queries.isEmpty then
           if let some rawArgs := matchInvalidateCall? stx then
@@ -568,10 +584,7 @@ partial def rewriteIn (ctx : RewriteCtx) (inLambda : Bool) (stx : Syntax) : Comm
               else none
             if !qNames.isEmpty && qNames.size == rawArgs.size then
               let joined := String.intercalate "_" (qNames.toList.map toString)
-              let key := s!"qctrl:inv:{joined}"
-              let ctor ← registerKeyedSite ctx.accum key s!"q_inv_{joined}" fun ctor =>
-                { key, ctor, stmts? := some #[Syntax.node stx.getHeadInfo ``qedStmtExpr #[stx]] }
-              return mkRawExpr (← wrapMsgArity ctx.wrapMsg? 0 ⟨ctx.spec.msgCtor ctor⟩)
+              return ← regQueryCtrl s!"qctrl:inv:{joined}" s!"q_inv_{joined}"
     if (stx.getArg 0).getKind == ``qedIdent then
       let calleeId : Ident := ⟨(stx.getArg 0).getArg 0⟩
       let cn := calleeId.getId.eraseMacroScopes
@@ -640,6 +653,7 @@ private def parseCallArgsAndCond (argsStx condStx : Syntax) : CommandElabM (Arra
   let whenPat? ← rawPat?.mapM fun (p, s) => return (← liftMacroM (lowerQedPat p), ← lowerCompExpr .val s, collectQedPatIds p)
   return (rawArgs, whenPat?, ← rawGuards.mapM (lowerCompExpr .propGuard))
 
+@[noinline]
 private def parseRpcQueryClause (acc : ComponentSpec) (cl : Syntax) : CommandElabM ComponentSpec := do
   let (qId, explicitTy?, rpcId) := ((⟨cl.getArg 1⟩ : Ident), ← lowerOptType (cl.getArg 2), (⟨cl.getArg 4⟩ : Ident))
   let (rawArgs, whenPat?, whenGuards) ← parseCallArgsAndCond (cl.getArg 6) (cl.getArg 8)
@@ -653,6 +667,7 @@ private def parseRpcQueryClause (acc : ComponentSpec) (cl : Syntax) : CommandEla
     states  := acc.states.push { id := qId, ty? := some (← `(Cached $qTy)), def? := some (← `({})) }
     queries := acc.queries.push (.mk qId qTy msgTy (.mk rpcId srvInfo mInfo rawArgs whenPat? whenGuards hasMsgEnsured)) }
 
+@[noinline]
 private def parseSubscribeClause (acc : ComponentSpec) (cl : Syntax) : CommandElabM ComponentSpec := do
   let (subId, chanId) : Ident × Ident := (⟨cl.getArg 1⟩, ⟨cl.getArg 3⟩)
   let (rawArgs, whenPat?, whenGuards) ← parseCallArgsAndCond (cl.getArg 5) (cl.getArg 7)
@@ -678,6 +693,7 @@ private def parseSubscribeClause (acc : ComponentSpec) (cl : Syntax) : CommandEl
     states := acc.states.push { id := subId, ty? := some (← `(Qed.SocketStatus)), def? := some (← `(Qed.SocketStatus.disconnected)) }
     subscriptions := acc.subscriptions.push (.mk subId chanId chInfo rawArgs whenPat? whenGuards recPolicy onJoin? onMsg? onStatus? msgEvTy hasMsgEnsured) }
 
+@[noinline]
 private def parseCompClause (acc : ComponentSpec) (cl : Syntax) : CommandElabM ComponentSpec := do
   match cl.getKind with
   | `Qed.compSessionClause =>
@@ -750,6 +766,7 @@ def checkTopLevelMountable (spec : ComponentSpec) (ref : Syntax) (featureDesc : 
   if !blockers.isEmpty then
     throwErrorAt ref s!"{featureDesc} is only supported on top-level mountable components, but `{spec.t.getId}` declares {String.intercalate ", " blockers.toList}"
 
+@[noinline]
 def parseComponentSpec (stx : Syntax) : CommandElabM ComponentSpec := do
   let doc? := if (stx.getArg 0).getNumArgs == 1 then some ⟨(stx.getArg 0).getArg 0⟩ else none
   let (t, bodyStx) := ((⟨stx.getArg 2⟩ : Ident), stx.getArg 7)
@@ -795,6 +812,7 @@ def parseComponentSpec (stx : Syntax) : CommandElabM ComponentSpec := do
       throwErrorAt s0.id s!"reactive `subscribe {s0.id.getId}` requires all `state` fields on `{spec.t.getId}` to have default values"
   return spec
 
+@[noinline]
 def bindMentionedFields (spec : ComponentSpec) (shouldBind : Name → Bool) (body : Term) : CommandElabM Term := do
   let mut out := body
   for po in spec.portOuts.reverse do if shouldBind po.id.getId then out ← `(let $(mkIdent po.id.getId):ident := $(spec.id po.id.getId); $out)
@@ -804,6 +822,7 @@ def bindMentionedFields (spec : ComponentSpec) (shouldBind : Name → Bool) (bod
     out ← if spec.fieldNames.contains g then `(let $gId:ident := (s.$gId:ident); $out) else `(let $gId:ident := (p.$gId:ident); $out)
   return out
 
+@[noinline]
 def lowerMutStmt? (spec : ComponentSpec) (s : Syntax) (strict : Bool) : CommandElabM (Option (Name × (Term → CommandElabM Term))) := do
   let checkField (ref : Syntax) (fname : Name) : CommandElabM Name := do
     if strict && !spec.fieldNames.contains fname then throwNotMutableStateField ref s!"`{fname}`" fname spec.fieldNames spec.propNames

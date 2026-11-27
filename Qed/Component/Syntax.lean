@@ -214,6 +214,17 @@ def rebuildJsxEl (stx : Syntax) (attrs : Array Syntax) (kids? : Option Syntax) :
   | none    => Syntax.node info stx.getKind #[stx.getArg 0, stx.getArg 1, aNode, stx.getArg 3]
   | some kn => Syntax.node info stx.getKind #[stx.getArg 0, stx.getArg 1, aNode, stx.getArg 3, kn, stx.getArg 5, stx.getArg 6]
 
+inductive ClassifiedCompProp where
+  | bindProp (name : Name) (valTerm setTerm : Term)
+  | eventProp (arm : OutArm)
+  | dataProp (name : Name) (valTerm : Term)
+
+def classifyCompProp (evSigs : Array CompEventSig) (nm : String) (v : Term) : MacroM ClassifiedCompProp := do
+  if let some (bStr, v1, v2) ← unpackBindProp nm v then return .bindProp (Name.mkSimple bStr) v1 v2
+  else if let some sig := evSigs.find? (·.name.toString == nm) then return .eventProp (.mk sig.name sig.arity v)
+  else return .dataProp (Name.mkSimple nm) v
+
+@[noinline]
 def mkOutMatchTerm (baseName : Name) (totalCtors : Nat) (arms : Array OutArm) (outVar : Ident) : MacroM Term := do
   let mut alts ← arms.mapM fun arm => do
     let patTerms : Array Term := (Array.range arm.arity).map fun i => ⟨(mkIdent (Name.mkSimple s!"_a{i}")).raw⟩

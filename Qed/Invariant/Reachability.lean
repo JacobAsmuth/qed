@@ -105,8 +105,11 @@ private partial def extractHeadIdent? (stx : Lean.Syntax) : Option Lean.Syntax :
   else if stx.getKind == ``Lean.Parser.Term.app then extractHeadIdent? (stx.getArg 0)
   else none
 
-open Lean Elab Tactic Qed.Verify.Core in
-elab "qedDischargeReachable" upd:term:max initT:term:max nm:ident labelLit:str : tactic => Core.withCurrHeartbeats do
+section ReachabilityTactic
+open Lean Elab Tactic Qed.Verify.Core
+
+@[noinline]
+private def runDischargeReachable (upd initT : Term) (nm : Ident) (labelLit : StrLit) : TacticM Unit := Core.withCurrHeartbeats do
   -- Fast path for closed async traces (Proto encode/decode & Qed.Str.*): kernel decide
   if let g0 :: _ ← getGoals then
     let tgt0 ← g0.withContext (Lean.instantiateMVars (← g0.getType))
@@ -142,5 +145,10 @@ elab "qedDischargeReachable" upd:term:max initT:term:max nm:ident labelLit:str :
   let lbl := labelLit.getString
   Qed.Diag.throwUnsolvedGoals m!"Example `{nm.getId}` failed to prove `{lbl}`:"
     m!"\n\nHint: Verify the action sequence reaches a state satisfying `{lbl}` (or strengthen the `where` preconditions for parametric examples)." (ref? := some nm)
+
+elab "qedDischargeReachable" upd:term:max initT:term:max nm:ident labelLit:str : tactic =>
+  runDischargeReachable upd initT nm labelLit
+
+end ReachabilityTactic
 
 end Qed

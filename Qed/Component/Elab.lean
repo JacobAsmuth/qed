@@ -2,9 +2,8 @@ import Qed.Component.Codegen
 import Qed.Component.AwaitLift
 import Qed.Component.Speculative
 import Qed.Component.Invariants
-import Qed.Component.RpcChecks
 import Qed.Speculative
-import Qed.View.Lift
+import Qed.View
 import Qed.Runtime
 import Qed.Resource
 import Qed.Socket
@@ -13,6 +12,7 @@ namespace Qed
 section CompElab
 open Lean Elab Command Qed.Lang
 
+@[noinline]
 private def elabPureComponent (spec : ComponentSpec) (body' : Term) : CommandElabM Unit := do
   for f in spec.mutFns do
     throwErrorAt f.id s!"`fn {f.id.getId}` has no `-> ReturnType` and mutates component state, but `{spec.t.getId}` has no `state`/`event`/`bind`; add `-> Type` for a pure helper or declare `state`"
@@ -71,6 +71,7 @@ private def canSynthJson (fromCls : Name) (tyTerm : Term) : CommandElabM Bool :=
 private def mkCompStructJsonCmds (sName : Name) (decls : Array FieldDecl) : CommandElabM (Array CmdStx) :=
   Qed.mkStructJsonCmds (mkIdent sName) (decls.map fun d => { ident := d.id, wireKey := d.id.getId.toString, valTy := d.ty }) { emitNamedDefs := false }
 
+@[noinline]
 private def mkOutJsonCmds (tId : Name) (outCtorSpecs : Array (Name × Array (Ident × Term))) : CommandElabM (Array CmdStx) := do
   let outId := mkIdent (tId ++ `Out)
   let encAlts ← outCtorSpecs.mapM fun (cName, ps) => do
@@ -88,6 +89,7 @@ private def mkOutJsonCmds (tId : Name) (outCtorSpecs : Array (Name × Array (Ide
     ← `(command| instance $(mkIdent (tId ++ `Out ++ `instToJson)):ident : ToJson $outId := ⟨fun o => match o with $[$encAlts:matchAlt]*⟩),
     ← `(command| instance $(mkIdent (tId ++ `Out ++ `instFromJson)):ident : FromJson $outId := ⟨fun j => do let tag ← (FromJsonField.fromField j "t" : Except String String); $decBody:term⟩) ]
 
+@[noinline]
 private def mkCompLocalDefCmds (spec : ComponentSpec) (idLit : StrLit) : CommandElabM (Array CmdStx) := do
   let regRhs ← match spec.hasProps, spec.outTy?.isNone with
     | true,  true  => `(LocalDef.ofProps $idLit $(spec.initId) $(spec.viewId) (fun p s m => ($(spec.updateId) p s m, (none : Option Bool))))
@@ -120,7 +122,8 @@ private def mkHoistedKeyAndPropsFns (spec : ComponentSpec) (h : HoistedSub) : Co
         if spec.hasProps then `(fun pm => (_getProps pm).bind fun p => $pId p (_getState pm))
         else `(fun pm => $pId (_getState pm))
       else
-        let recT ← bindMentionedFields spec (mentionsIdent (← mkHoistedPropsTerm h).raw) (← mkHoistedPropsTerm h)
+        let propsT ← mkHoistedPropsTerm h
+        let recT ← bindMentionedFields spec (mentionsIdent propsT.raw) propsT
         if spec.hasProps then `(fun pm => (_getProps pm).map fun p => let s := _getState pm; $recT)
         else `(fun pm => let s := _getState pm; Option.some $recT)
     else `(fun _ => Option.some ({} : $(mkIdent (h.info.fullName ++ `Props))))
@@ -133,6 +136,38 @@ private def mkAppendListExpr (ownTerms hoistedParts : Array Term) : CommandElabM
   | p :: ps => ps.foldlM (init := p) fun acc x => `($acc ++ $x)
 
 @[noinline]
+private def mkCompLifecycleCmds (spec : ComponentSpec) (isTopMount : Bool) (liftName topName : Name)
+    (itemTy : Term) (hasSlotPfx : Bool) (hasChild : ComponentInfo → Bool) (ownTerms : Array Term) : CommandElabM (Array CmdStx) := do
+  let mut hoistedParts : Array Term := #[]
+  for h in spec.hoisted do
+    if hasChild h.info then
+      let (hkFn, hpFn) ← mkHoistedKeyAndPropsFns spec h; let subF := h.fieldId
+      let baseArgs : Array Term := #[hkFn, hpFn,
+        ← `(fun pm => (_getState pm).$subF:ident),
+        ← `(fun cs pm => _setState { _getState pm with $subF:ident := cs } pm),
+        ← `(_wrapMsg ∘ $(spec.msgCtor h.ctorName))]
+      let callArgs : Array Term ← if hasSlotPfx then do
+          pure (#[← `(_slotPfx ++ $(Syntax.mkStrLit s!"{subF.getId}."))] ++ baseArgs)
+        else pure baseArgs
+      hoistedParts := hoistedParts.push (← Qed.Lang.mkAppTerms (mkIdent (h.info.fullName ++ liftName)) callArgs)
+  let listExpr ← mkAppendListExpr ownTerms hoistedParts
+  let slotBinders : Array BinderStx ← if hasSlotPfx then do
+      pure #[← `(bracketedBinder| (_slotPfx : String))]
+    else pure #[]
+  let mut cmds : Array CmdStx := #[← `(command|
+    set_option linter.unusedVariables false in
+    def $(spec.id liftName) {PModel PMsg : Type} $[$slotBinders:bracketedBinder]* (_getKey : PModel → String) (_getProps : PModel → Option $(spec.propsId))
+        (_getState : PModel → $(spec.stateId)) (_setState : $(spec.stateId) → PModel → PModel) (_wrapMsg : $(spec.msgId) → PMsg) : List ($itemTy PModel PMsg) :=
+      $listExpr)]
+  if isTopMount then
+    let topPfx : Array Term ← if hasSlotPfx then do pure #[← `("")] else pure #[]
+    let topArgs : Array Term := topPfx ++
+      #[← `(fun _ => "1"), ← `(fun _ => Option.some ({} : $(spec.propsId))), ← `(id), ← `(fun s _ => s), ← `(id)]
+    let topCall ← Qed.Lang.mkAppTerms (spec.id liftName) topArgs
+    cmds := cmds.push (← `(command| def $(spec.id topName) : List ($itemTy $(spec.stateId) $(spec.msgId)) := $topCall))
+  return cmds
+
+@[noinline]
 private def mkCompQueriesCmds (spec : ComponentSpec) (isTopMount : Bool) : CommandElabM (Array CmdStx) := do
   if !spec.hasAnyQueries then return #[]
   let ownTerms ← spec.queries.mapM fun q => do
@@ -143,23 +178,7 @@ private def mkCompQueriesCmds (spec : ComponentSpec) (isTopMount : Bool) : Comma
         (fetch := fun (s : $(spec.stateId)) _ _qk => $fCall) (got := $(spec.msgCtor q.ctorName))
         (get := fun (s : $(spec.stateId)) => s.$(q.id):ident) (set := fun c (s : $(spec.stateId)) => { s with $(q.id):ident := c }))
     `(Qed.Query.liftWithProps _getKey _getProps _getState _setState _wrapMsg (fun (p : $(spec.propsId)) => $qCore))
-  let mut hoistedParts : Array Term := #[]
-  for h in spec.hoisted do
-    if h.info.hasQueries then
-      let (hkFn, hpFn) ← mkHoistedKeyAndPropsFns spec h; let subF := h.fieldId
-      hoistedParts := hoistedParts.push (← `($(mkIdent (h.info.fullName ++ `liftQueries)) $hkFn $hpFn
-        (fun pm => (_getState pm).$subF:ident) (fun cs pm => _setState { _getState pm with $subF:ident := cs } pm) (_wrapMsg ∘ $(spec.msgCtor h.ctorName))))
-  let listExpr ← mkAppendListExpr ownTerms hoistedParts
-  let mut cmds : Array CmdStx := #[← `(command|
-    set_option linter.unusedVariables false in
-    def $(spec.id `liftQueries) {PModel PMsg : Type} (_getKey : PModel → String) (_getProps : PModel → Option $(spec.propsId))
-        (_getState : PModel → $(spec.stateId)) (_setState : $(spec.stateId) → PModel → PModel) (_wrapMsg : $(spec.msgId) → PMsg) : List (Query PModel PMsg) :=
-      $listExpr)]
-  if isTopMount then
-    cmds := cmds.push (← `(command|
-      def $(spec.id `queries) : List (Query $(spec.stateId) $(spec.msgId)) :=
-        $(spec.id `liftQueries) (fun _ => "1") (fun _ => Option.some ({} : $(spec.propsId))) id (fun s _ => s) id))
-  return cmds
+  mkCompLifecycleCmds spec isTopMount `liftQueries `queries (← `(Query)) false (·.hasQueries) ownTerms
 
 @[noinline]
 private def mkCompSubscriptionsCmds (spec : ComponentSpec) (isTopMount : Bool) : CommandElabM (Array CmdStx) := do
@@ -181,23 +200,7 @@ private def mkCompSubscriptionsCmds (spec : ComponentSpec) (isTopMount : Bool) :
         (fun ($slotId:ident : String) (p : $(spec.propsId)) _wk (s : $(spec.stateId)) => $openBody)
         (fun ($slotId:ident : String) => $(mkIdentFrom sub.chanRef sub.chInfo.unsubHelperConst) $slotId)
         (fun (s : $(spec.stateId)) => { s with $(sub.id):ident := Qed.SocketStatus.disconnected }))
-  let mut hoistedParts : Array Term := #[]
-  for h in spec.hoisted do
-    if h.info.hasSubscriptions then
-      let (hkFn, hpFn) ← mkHoistedKeyAndPropsFns spec h; let subF := h.fieldId; let pfxSeg := Syntax.mkStrLit s!"{subF.getId}."
-      hoistedParts := hoistedParts.push (← `($(mkIdent (h.info.fullName ++ `liftSubscriptions)) (_slotPfx ++ $pfxSeg) $hkFn $hpFn
-        (fun pm => (_getState pm).$subF:ident) (fun cs pm => _setState { _getState pm with $subF:ident := cs } pm) (_wrapMsg ∘ $(spec.msgCtor h.ctorName))))
-  let listExpr ← mkAppendListExpr ownTerms hoistedParts
-  let mut cmds : Array CmdStx := #[← `(command|
-    set_option linter.unusedVariables false in
-    def $(spec.id `liftSubscriptions) {PModel PMsg : Type} (_slotPfx : String) (_getKey : PModel → String) (_getProps : PModel → Option $(spec.propsId))
-        (_getState : PModel → $(spec.stateId)) (_setState : $(spec.stateId) → PModel → PModel) (_wrapMsg : $(spec.msgId) → PMsg) : List (Qed.Subscription PModel PMsg) :=
-      $listExpr)]
-  if isTopMount then
-    cmds := cmds.push (← `(command|
-      def $(spec.id `subscriptions) : List (Qed.Subscription $(spec.stateId) $(spec.msgId)) :=
-        $(spec.id `liftSubscriptions) "" (fun _ => "1") (fun _ => Option.some ({} : $(spec.propsId))) id (fun s _ => s) id))
-  return cmds
+  mkCompLifecycleCmds spec isTopMount `liftSubscriptions `subscriptions (← `(Qed.Subscription)) true (·.hasSubscriptions) ownTerms
 
 private def mkSpecStepPf (sVar mVar : Ident) : List Ident → Term → CommandElabM Term
   | [], _ => `(trivial) | [id0], hTerm => `(($id0:ident).2 $sVar $mVar $hTerm)
@@ -209,6 +212,7 @@ private def mkSpecPropPair (spec : ComponentSpec) (suffix : String) (prop initPf
     ← `(command| theorem $(spec.id (Name.mkSimple s!"specApp_init_{suffix}")) : $prop ($appIdent).init.1 := $initPf),
     ← `(command| theorem $(spec.id (Name.mkSimple s!"specApp_preserves_{suffix}")) (st : Qed.SpecState $(spec.stateId) $(spec.msgId)) (msg : $(spec.msgId)) (h : $prop st) : $prop (($appIdent).update st msg).1 := $stepFn st msg h) ]
 
+@[noinline]
 private def mkRehydrateInvCmds (spec : ComponentSpec) (specBaseApp? : Option Ident) (compInv? : Option Term) (hasDecInv : Bool) : CommandElabM (Array CmdStx) := do
   let some inv := compInv? | return #[]
   let appId := spec.id `app
@@ -223,6 +227,7 @@ private def mkRehydrateInvCmds (spec : ComponentSpec) (specBaseApp? : Option Ide
 private def mkViewEqThm (thmId appId viewId stateId : Ident) : CommandElabM CmdStx :=
   `(command| theorem $thmId (s : $stateId) : Qed.Html.canonical (Qed.App.view $appId s) = Qed.Html.canonical ($viewId s) := by qedProveViewEquiv $appId $viewId)
 
+@[noinline]
 private def mkSpecAppCmds (spec : ComponentSpec) (finalApp : Term) (compInv? : Option Term)
     (hasDecInv : Bool) (stateInvEntries : Array (Term × Option Ident)) (initCmds : Array CmdStx) : CommandElabM (Array CmdStx × CmdStx) := do
   let (appId, baseId, clsId) := (spec.id `app, spec.id `_baseApp, spec.id `_specClassify)
@@ -247,6 +252,7 @@ private def mkSpecAppCmds (spec : ComponentSpec) (finalApp : Term) (compInv? : O
       Qed.Html.canonical (Qed.App.view $appId st) = Qed.Html.canonical ($(spec.viewId) st.visible) := by
     simpa [Qed.Internal.App.withSpeculative_view, $appId:ident] using $baseViewEqId st.visible))
 
+@[noinline]
 private def applyHeadDirectives (hmId stId : Ident) (dirs : Array Syntax) (tail : Term) : CommandElabM Term :=
   dirs.foldrM (init := tail) fun d acc => do match d.getKind with
     | `Qed.compHeadTitle | `Qed.compHeadDescription =>
@@ -261,6 +267,7 @@ private def applyHeadDirectives (hmId stId : Ident) (dirs : Array Syntax) (tail 
         `(let $hmId:ident := { $hmId with redirect := Option.some (($(← lowerCompExpr .val (d.getArg 1)) : Qed.HrefTarget).raw) }; let $stId:ident : Nat := $stT; $acc)
     | _ => throwErrorAt d "unexpected directive in `head:`"
 
+@[noinline]
 private def mkCompHeadCmd? (spec : ComponentSpec) : CommandElabM (Option CmdStx) := do
   let some headStx := spec.headClause? | return none
   let (hmId, stId) := (mkIdent `_qed_hm, mkIdent `_qed_st)
@@ -279,6 +286,7 @@ private def mkCompHeadCmd? (spec : ComponentSpec) : CommandElabM (Option CmdStx)
   let fullBody ← `(let $hmId:ident : Qed.HeadMeta := {}; let $stId:ident : Nat := 200; $(← applyHeadDirectives hmId stId sharedDirs coreTail))
   return some (← `(command| set_option linter.unusedVariables false in def $(spec.id `headInfo) (s : $(spec.stateId)) : Qed.HeadMeta × Nat := $(← bindMentionedFields spec (mentionsIdent fullBody.raw) fullBody)))
 
+@[noinline]
 private def mkCompAppCmds (spec : ComponentSpec) (body' : Term) (hasStart : Bool) (stateInvEntries : Array (Term × Option Ident)) : CommandElabM (Array CmdStx × CmdStx) := do
   let mut cmds : Array CmdStx := #[]
   let startArg ← if hasStart then `($(spec.id `startCmd)) else `(Qed.Cmd.none)
@@ -323,6 +331,7 @@ private def mkCompAppCmds (spec : ComponentSpec) (body' : Term) (hasStart : Bool
   return (cmds.push (← `(command| $[$(spec.doc?):docComment]? def $appId : App $(spec.stateId) $(spec.msgId) := $appT)) ++
           (← mkRehydrateInvCmds spec none compInv? hasDecInv), ← mkViewEqThm (spec.id `app_view_eq) appId spec.viewId spec.stateId)
 
+@[noinline]
 private def mkCodecAndMountCmds (spec : ComponentSpec) (starts' : Array Term) (idLit : StrLit) : CommandElabM (Array CmdStx × Bool × Bool) := do
   let (tId, fs) := (spec.t.getId, spec.states.map (·.id)); let mut cmds : Array CmdStx := #[]
   if spec.mountable then let dsT := spec.states.filterMap (·.def?); cmds := cmds.push (← `(command| def $(spec.initId) : $(spec.stateId) := { $[$fs:ident := $dsT],* }))
@@ -330,20 +339,7 @@ private def mkCodecAndMountCmds (spec : ComponentSpec) (starts' : Array Term) (i
   if hasStart then
     let pBinders ← mkPropsBinders spec
     let subStarts ← hoistedStarts.mapM fun h => do
-      let cStart := mkIdent (h.info.fullName ++ `startCmd)
-      let pfxLit := Syntax.mkStrLit s!"{h.fieldId.getId}."
-      let subCtor := spec.msgCtor h.ctorName
-      if h.hasLifecycle then
-        let kId := mkIdent (subKeyDefName spec.t.getId h)
-        let kCall ← if spec.hasProps then `($kId p s) else `($kId s)
-        if h.info.hasProps then
-          let pId := mkIdent (subPropsDefName spec.t.getId h)
-          let pCall ← if spec.hasProps then `($pId p s) else `($pId s)
-          `(if ($kCall).isEmpty then Qed.Cmd.none else match $pCall:term with | Option.none => Qed.Cmd.none | Option.some _cp => Cmd.mapScoped $pfxLit $subCtor ($cStart _cp))
-        else `(if ($kCall).isEmpty then Qed.Cmd.none else Cmd.mapScoped $pfxLit $subCtor $cStart)
-      else
-        let call ← if h.info.hasProps then `($cStart $(← mkHoistedPropsTerm h)) else `($cStart)
-        `(Cmd.mapScoped $pfxLit $subCtor $call)
+      mkHoistedStartCmdExpr spec h (← `(s)) none (← `(Qed.Cmd.none)) pure
     let mut startBody ← mkCmdBatch (starts' ++ subStarts)
     if spec.mountable then
       startBody ← bindMentionedFields spec (mentionsIdent startBody.raw) startBody
@@ -362,6 +358,7 @@ private def mkCodecAndMountCmds (spec : ComponentSpec) (starts' : Array Term) (i
 private def withOpenNs {α : Type} (ns : Name) (k : CommandElabM α) : CommandElabM α := do
   if (← getEnv).isNamespace ns then withScope (fun sc => { sc with openDecls := .simple ns [] :: sc.openDecls }) k else k
 
+@[noinline]
 private def elabStatefulComponentBody (compNs : Name) (rawSpec : ComponentSpec) : CommandElabM Unit := do
   if rawSpec.states.isEmpty && rawSpec.actions.isEmpty && rawSpec.keyF?.isNone && rawSpec.starts.isEmpty &&
       rawSpec.sessionField?.isNone && rawSpec.portOuts.isEmpty && rawSpec.portIns.isEmpty &&
@@ -422,7 +419,7 @@ private def elabStatefulComponentBody (compNs : Name) (rawSpec : ComponentSpec) 
     hasLocalDef, hasQueries := spec.hasAnyQueries, hasSubscriptions := spec.hasAnySubscriptions,
     hasSession := spec.hasAnySession, usedRpcs := allUsedRpcs, usedChannels := allUsedChannels }
 
-@[command_elab componentCmd] def elabComponentCmd : CommandElab := fun stx => do
+@[noinline, command_elab componentCmd] def elabComponentCmd : CommandElab := fun stx => do
   let (savedEnv, errsInit, priorTasks) := (← getEnv, ← getErrorCount, (← get).snapshotTasks.size)
   let compNs := (← getCurrNamespace) ++ (stx.getArg 2).getId
   pendingRpcChecks.set #[]; pendingPredictChecks.set #[]; currentCompSessionRef.set none

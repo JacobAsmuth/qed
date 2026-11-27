@@ -121,6 +121,16 @@ def comp {A B C : Type} {pA : A → Prop} {pB pB' : B → Prop} {pC : C → Prop
     have h2 := m2.roundtrip (m1.toTarget a) (hCompat _ (m1.encode_ok a ha))
     simp only [h2, Except.bind, m1.roundtrip a ha]
 
+theorem decode_ok_of_guard {A : Type} {pA : A → Prop} {dec : ∀ x, Decidable (pA x)} {e : Except String A} {err : String} {a : A}
+    (h : (e.bind fun x => @dite _ (pA x) (dec x) (fun _ => Except.ok x) (fun _ => Except.error err)) = Except.ok a) : pA a := by
+  cases e with
+  | error _ => nomatch h
+  | ok a0 =>
+      dsimp only [Except.bind] at h
+      split at h
+      · exact Except.ok.inj h ▸ ‹_›
+      · nomatch h
+
 end Mapping
 
 end Qed

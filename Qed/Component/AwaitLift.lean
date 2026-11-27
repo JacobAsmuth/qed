@@ -31,6 +31,24 @@ private def mkMatchStx (st : Syntax) (scrutId : Ident) (cases : Array Syntax) : 
 
 private inductive CatchPatKind | wildcard | dotTag (tag : String) (binder? : Option Syntax)
 
+private structure ParsedLetClauses where mk ::
+  (predict? : Option (Syntax × PredictBody) := none) (onConfirm? : Option (Syntax × Array Syntax) := none)
+  (rollback? : Option (Syntax × Option Syntax × Array Syntax) := none) (catch? : Option (Syntax × Syntax) := none)
+
+private structure AwaitCallCtx where mk ::
+  (st : Syntax) (xId : Ident) (optTy? : Option Term) (rpcId : Ident) (rawArgs : Array Term)
+  (srvInfo : ServerInfo) (mInfo : ServerMethodInfo) (parsedCatch : Array (CatchPatKind × Array Syntax))
+  (outerParams : Array (Ident × Term)) (localNames : Array Name)
+
+private structure PreparedAwait where mk ::
+  (kIdx : Nat) (catchHasNone : Bool) (capturedParams : Array (Ident × Term)) (callArgs : Array Term)
+  (preLetStmts : Array Syntax) (rpcCallArgs : Array Term) (hoistDefs : Array (Ident × Term × Term))
+  (outTyTerm : Term) (xBinderTy? : Option Term)
+
+structure RewriteResult where mk ::
+  (accum : RewriteAccum) (route? : Option RouteDecl) (starts : Array Term) (body : Term)
+  (fns : Array CompFnDecl) (subscriptions : Array SubDecl)
+
 private def classifyCatchCase (validTags : Array String) (isOption : Bool) (cStx : Syntax) : CommandElabM (Array (CatchPatKind × Array Syntax)) := do
   let body := suiteStmts (cStx.getArg 3)
   let checkTag (tagRef : Syntax) (tag : String) (binder? : Option Syntax) : CommandElabM (CatchPatKind × Array Syntax) := do
@@ -71,10 +89,6 @@ private def unpackAwaitCall (ref awaitExpr : Syntax) : CommandElabM (Ident × Ar
     let sn := stxSnippet inner; throwErrorAt ref s!"`await` expects a server RPC call `Server.method(args...)`{if sn.isEmpty then "" else s!", got `{sn}`"}"
   return (⟨(inner.getArg 0).getArg 0⟩, ← lowerPosCallArgs ref "await ..." none (inner.getArg 2).getSepArgs)
 
-private structure ParsedLetClauses where mk ::
-  (predict? : Option (Syntax × PredictBody) := none) (onConfirm? : Option (Syntax × Array Syntax) := none)
-  (rollback? : Option (Syntax × Option Syntax × Array Syntax) := none) (catch? : Option (Syntax × Syntax) := none)
-
 private def parsePredictClauseNode (cl : Syntax) : CommandElabM (Syntax × PredictBody) := match cl.getKind with
   | `Qed.Lang.letPredictBlock => pure (cl, .block (suiteStmts (cl.getArg 2)))
   | `Qed.Lang.letPredictExpr  => pure (cl, .expr (cl.getArg 1))
@@ -94,13 +108,40 @@ private def parseLetClauses (clausesNode : Syntax) : CommandElabM ParsedLetClaus
     if let some ref := ref? then unless acc.predict?.isSome do throwErrorAt ref s!"`{lbl}` requires a `predict` clause on the same `await`"
   return acc
 
-private def forEachControlSubSuite (st : Syntax) (f : Array Syntax → CommandElabM Unit) : CommandElabM Unit := do
-  let k := st.getKind
+@[noinline]
+private def mapControlSubSuites (st : Syntax) (synthEmptyElse : Bool := false)
+    (f : Array Name → Array Syntax → CommandElabM (Array Syntax × Option (Array Syntax))) :
+    CommandElabM (Option (Syntax × Option Syntax)) := do
+  let k := st.getKind; let info := SourceInfo.fromRef st
+  let packOptElse : Option (Array Syntax) → Syntax
+    | some cs => Syntax.node info nullKind #[Syntax.atom info "else", Syntax.atom info ":", packSuite st cs]
+    | none => Syntax.node info nullKind #[]
+  let mapNode (node : Syntax) (bodyIdx : Nat) (extra : Array Name := #[]) := do
+    let (bL, bC?) ← f extra (suiteStmts (node.getArg bodyIdx))
+    pure (setStxArg node bodyIdx (packSuite st bL), setStxArg node bodyIdx (packSuite st (bC?.getD #[])), bC?.isSome)
+  let mapOptElse (eNode : Syntax) : CommandElabM (Syntax × Option (Array Syntax)) := do
+    if eNode.getNumArgs == 3 then let (eL, eC?) ← f #[] (suiteStmts (eNode.getArg 2)); pure (setStxArg eNode 2 (packSuite st eL), eC?)
+    else if synthEmptyElse then let (eL, eC?) ← f #[] #[]; pure (packOptElse (some eL), eC?)
+    else pure (eNode, none)
   if k == ``qedStmtIf then
-    f (suiteStmts (st.getArg 3)); for el in (st.getArg 4).getArgs do f (suiteStmts (el.getArg 3))
-    if let some es := extractElseSuite (st.getArg 5) then f es
-  else if k == ``qedStmtIfLet then f (suiteStmts (st.getArg 6)); if let some es := extractElseSuite (st.getArg 7) then f es
-  else if k == ``qedStmtMatch then for c in (st.getArg 3).getArgs do f (suiteStmts (c.getArg 3))
+    let (tL, tC?) ← f #[] (suiteStmts (st.getArg 3))
+    let elRes ← (st.getArg 4).getArgs.mapM (mapNode · 3)
+    let (eOpt, eC?) ← mapOptElse (st.getArg 5)
+    let mkIf (t els : Array Syntax) (e : Syntax) := setStxArg (setStxArg (setStxArg st 3 (packSuite st t)) 4 (Syntax.node info nullKind els)) 5 e
+    return some (mkIf tL (elRes.map (·.1)) eOpt, if tC?.isNone && !elRes.any (·.2.2) && eC?.isNone then none else some (mkIf (tC?.getD #[]) (elRes.map (·.2.1)) (packOptElse eC?)))
+  else if k == ``qedStmtIfLet then
+    let (tL, tC?) ← f (collectQedPatIds (st.getArg 2)) (suiteStmts (st.getArg 6))
+    let (eOpt, eC?) ← mapOptElse (st.getArg 7)
+    let mkIfL (t : Array Syntax) (e : Syntax) := setStxArg (setStxArg st 6 (packSuite st t)) 7 e
+    return some (mkIfL tL eOpt, if tC?.isNone && eC?.isNone then none else some (mkIfL (tC?.getD #[]) (packOptElse eC?)))
+  else if k == ``qedStmtMatch then
+    let cRes ← (st.getArg 3).getArgs.mapM fun c => mapNode c 3 (collectCasePatIds (extractCasePatAlts (c.getArg 1)))
+    let mkM (cs : Array Syntax) := setStxArg st 3 (Syntax.node (st.getArg 3).getHeadInfo (st.getArg 3).getKind cs)
+    return some (mkM (cRes.map (·.1)), if !cRes.any (·.2.2) then none else some (mkM (cRes.map (·.2.1))))
+  else return none
+
+private def forEachControlSubSuite (st : Syntax) (f : Array Syntax → CommandElabM Unit) : CommandElabM Unit :=
+  discard <| mapControlSubSuites st false fun _ ss => do f ss; pure (ss, none)
 
 private partial def checkPureSpecCont (ctx : RewriteCtx) (stmts : Array Syntax) : CommandElabM Unit := do
   let pureMut := ctx.spec.pureMutFnNames
@@ -134,16 +175,7 @@ private def shadowOuter (outer : Array (Ident × Term)) (id : Ident) (ty? : Opti
   let f := outer.filter (·.1.getId.eraseMacroScopes != id.getId.eraseMacroScopes)
   match ty? with | some ty => f.push (id, ty) | none => f
 
-private structure AwaitCallCtx where mk ::
-  (st : Syntax) (xId : Ident) (optTy? : Option Term) (rpcId : Ident) (rawArgs : Array Term)
-  (srvInfo : ServerInfo) (mInfo : ServerMethodInfo) (parsedCatch : Array (CatchPatKind × Array Syntax))
-  (outerParams : Array (Ident × Term)) (localNames : Array Name)
-
-private structure PreparedAwait where mk ::
-  (kIdx : Nat) (catchHasNone : Bool) (capturedParams : Array (Ident × Term)) (callArgs : Array Term)
-  (preLetStmts : Array Syntax) (rpcCallArgs : Array Term) (hoistDefs : Array (Ident × Term × Term))
-  (outTyTerm : Term) (xBinderTy? : Option Term)
-
+@[noinline]
 private def prepareAwaitCall (ctx : RewriteCtx) (ac : AwaitCallCtx) (captureStmts : Array Syntax) : CommandElabM PreparedAwait := do
   let info := SourceInfo.fromRef ac.st
   let hasTag (t : String) := ac.parsedCatch.any fun (pk, _) => match pk with | .dotTag t' _ => t' == t | _ => false
@@ -173,6 +205,7 @@ private def prepareAwaitCall (ctx : RewriteCtx) (ac : AwaitCallCtx) (captureStmt
 private def prependOptTy (info : SourceInfo) (xId : Ident) (optTy? : Option Term) (body : Array Syntax) : CommandElabM (Array Syntax) := do
   match optTy? with | some oTy => pure (#[mkLetRawSt info xId none (mkRawExpr (← `(($xId:ident : $oTy))))] ++ body) | none => pure body
 
+@[noinline]
 private def mkOkPatAndBody (ac : AwaitCallCtx) (prep : PreparedAwait) (bodyIn : Array Syntax) : CommandElabM (Syntax × Array Syntax) := do
   let info := SourceInfo.fromRef ac.st; let okCtor := outcomePrefix ac.mInfo ++ `ok
   let okBody ← prependOptTy info ac.xId ac.optTy? bodyIn
@@ -184,6 +217,7 @@ private def mkOkPatAndBody (ac : AwaitCallCtx) (prep : PreparedAwait) (bodyIn : 
       let inner := if wrap == .ensured then mkPatIdent info `Qed.Ensured.mk #[mkPatIdent info ac.xId.getId, mkPatIdent info `_qed_ens] else mkPatIdent info ac.xId.getId
       return (mkPatIdent info okCtor #[if ac.mInfo.isOption && prep.catchHasNone then mkPatIdent info `some #[inner] else inner], okBody)
 
+@[noinline]
 private def mkRpcPerformStmt (ctx : RewriteCtx) (st : Syntax) (rpcId : Ident) (srvInfo : ServerInfo)
     (mInfo : ServerMethodInfo) (contCtor : Name) (callArgs rpcCallArgs : Array Term) : CommandElabM Syntax := do
   let cbTerm ← Qed.Lang.mkAppTerms (mkIdentFrom st (ctx.spec.t.getId ++ `Msg ++ contCtor)) callArgs
@@ -192,6 +226,7 @@ private def mkRpcPerformStmt (ctx : RewriteCtx) (st : Syntax) (rpcId : Ident) (s
 
 private abbrev LiftRecFn := Array (Ident × Term) → Array (Ident × Term) → Array Name → Array Syntax → CommandElabM (Array Syntax × Option (Array Syntax))
 
+@[noinline]
 private def buildCatchArms (liftRec : LiftRecFn) (ac : AwaitCallCtx) (forCtorParams : Array (Ident × Term)) :
     CommandElabM (Array Syntax × Array Syntax × Bool × Bool) := do
   let info := SourceInfo.fromRef ac.st; let pfx := outcomePrefix ac.mInfo
@@ -220,6 +255,7 @@ private def pushSite (ctx : RewriteCtx) (keyPfx : String) (ctor : Name) (params 
 private def pushSpecDisp (ctx : RewriteCtx) (ctor : Name) (params : Array (Ident × Term)) (stmts : Array Syntax) : IO Unit :=
   ctx.accum.modify fun a => { a with specDispatches := a.specDispatches.push (.mk ctor params stmts) }
 
+@[noinline]
 private def registerAwaitContSite (ctx : RewriteCtx) (liftRec : LiftRecFn) (ac : AwaitCallCtx) (prep : PreparedAwait)
     (mkOkStmts : Array (Ident × Term) → CommandElabM (Array Syntax × Option (Array Syntax))) : CommandElabM Syntax := do
   let contCtor := Name.mkSimple s!"_cont_{prep.kIdx}"; let outVarId := mkIdentFrom ac.st (Name.mkSimple s!"_qedOut_{prep.kIdx}")
@@ -232,6 +268,7 @@ private def registerAwaitContSite (ctx : RewriteCtx) (liftRec : LiftRecFn) (ac :
   if let some restCls := restCls? then pushSpecDisp ctx contCtor contParams #[mkMatchStx ac.st outVarId #[mkCaseStx ac.st okPat restCls, mkWildPassCase ac.st]]
   mkRpcPerformStmt ctx ac.st ac.rpcId ac.srvInfo ac.mInfo contCtor prep.callArgs prep.rpcCallArgs
 
+@[noinline]
 private def liftPredictedAwait (ctx : RewriteCtx) (actionParams : Array (Ident × Term)) (liftRec : LiftRecFn) (ac : AwaitCallCtx)
     (predBody : PredictBody) (onConfirm? : Option (Syntax × Array Syntax)) (rollback? : Option (Syntax × Option Syntax × Array Syntax))
     (catchCasesForCapture preStmts unpredPreStmts : Array Syntax) (rest : List Syntax) : CommandElabM (Array Syntax × Option (Array Syntax)) := do
@@ -289,6 +326,7 @@ private def liftPredictedAwait (ctx : RewriteCtx) (actionParams : Array (Ident �
   ctx.accum.modify fun a => { a with specNodes := a.specNodes.push (.mk ac.st preCtor? (actionParams.map (⟨·.1.raw⟩)) prep.callArgs prep.rpcCallArgs prep.hoistDefs ac.srvInfo ac.mInfo prep.catchHasNone rawValTy innerEnsTy? predBody specContCtor specResCtor) }
   return (unpredPreStmts ++ prep.preLetStmts.push fbPerfSt, some #[mkSpecDispatchMarker info nodeIdx])
 
+@[noinline]
 private partial def liftAwaitStmts (ctx : RewriteCtx) (actionParams outerParams : Array (Ident × Term))
     (localLetNames : Array Name) (stmts : Array Syntax) (initPreStmts : Array Syntax := #[]) : CommandElabM (Array Syntax × Option (Array Syntax)) := do
   let liftRec : LiftRecFn := liftAwaitStmts ctx
@@ -359,29 +397,10 @@ private partial def liftAwaitStmts (ctx : RewriteCtx) (actionParams outerParams 
         unless rest.isEmpty || hasReturnStmt st do
           throwErrorAt st "statements after an `if`/`match` containing `await` are not supported unless the branch `return`s; move trailing statements inside the branches"
         let tailIfReturn := if hasReturnStmt st then rest else []
-        let packOptElse : Option (Array Syntax) → Syntax | some cs => Syntax.node info nullKind #[Syntax.atom info "else", Syntax.atom info ":", packSuite st cs] | none => Syntax.node info nullKind #[]
         let liftBranch (extraLocals : Array Name) (bodyStmts : Array Syntax) :=
           go outerParams (localNames ++ extraLocals.filter fun n => !outerParams.any (·.1.getId.eraseMacroScopes == n)) preStmts (bodyStmts.toList ++ tailIfReturn)
-        let liftNode (node : Syntax) (bodyIdx : Nat) (extraLocals : Array Name := #[]) := do
-          let (bL, bC?) ← liftBranch extraLocals (suiteStmts (node.getArg bodyIdx))
-          pure (setStxArg node bodyIdx (packSuite st bL), setStxArg node bodyIdx (packSuite st (bC?.getD #[])), bC?.isSome)
-        let liftOptElse (eNode : Syntax) : CommandElabM (Syntax × Option (Array Syntax)) := do
-          if eNode.getNumArgs == 3 then let (eL, eC?) ← liftBranch #[] (suiteStmts (eNode.getArg 2)); pure (setStxArg eNode 2 (packSuite st eL), eC?)
-          else if !tailIfReturn.isEmpty then let (eL, eC?) ← liftBranch #[] #[]; pure (packOptElse (some eL), eC?)
-          else pure (eNode, none)
-        if k == ``qedStmtIf then
-          let (tL, tC?) ← liftBranch #[] (suiteStmts (st.getArg 3)); let elRes ← (st.getArg 4).getArgs.mapM (liftNode · 3); let (eOpt, eC?) ← liftOptElse (st.getArg 5)
-          let mkIf (t els : Array Syntax) (e : Syntax) := setStxArg (setStxArg (setStxArg st 3 (packSuite st t)) 4 (Syntax.node info nullKind els)) 5 e
-          return (#[mkIf tL (elRes.map (·.1)) eOpt], if tC?.isNone && !elRes.any (·.2.2) && eC?.isNone then none else some #[mkIf (tC?.getD #[]) (elRes.map (·.2.1)) (packOptElse eC?)])
-        else if k == ``qedStmtIfLet then
-          let (tL, tC?) ← liftBranch (collectQedPatIds (st.getArg 2)) (suiteStmts (st.getArg 6)); let (eOpt, eC?) ← liftOptElse (st.getArg 7)
-          let mkIfL (t : Array Syntax) (e : Syntax) := setStxArg (setStxArg st 6 (packSuite st t)) 7 e
-          return (#[mkIfL tL eOpt], if tC?.isNone && eC?.isNone then none else some #[mkIfL (tC?.getD #[]) (packOptElse eC?)])
-        else
-          let cRes ← (st.getArg 3).getArgs.mapM fun c =>
-            liftNode c 3 (collectCasePatIds (extractCasePatAlts (c.getArg 1)))
-          let mkM (cs : Array Syntax) := setStxArg st 3 (Syntax.node (st.getArg 3).getHeadInfo (st.getArg 3).getKind cs)
-          return (#[mkM (cRes.map (·.1))], if !cRes.any (·.2.2) then none else some #[mkM (cRes.map (·.2.1))])
+        if let some (stL, stC?) ← mapControlSubSuites st (!tailIfReturn.isEmpty) liftBranch then
+          return (#[stL], stC?.map (#[·]))
       let (tail, tailCls?) ← go outerParams localNames (preStmts.push st) rest
       return (#[st] ++ tail, tailCls?.map (#[st] ++ ·))
   go outerParams localLetNames initPreStmts stmts.toList
@@ -408,12 +427,10 @@ private partial def checkAsyncFnCycles (fnMap : Std.HashMap Name CompFnDecl) (ed
     vis ← checkAsyncFnCycles fnMap edges v1 vis nxt
   return vis.insert cur
 
+@[noinline]
 private partial def inlineAsyncMutFns (asyncMap : Std.HashMap Name CompFnDecl) (cntRef : IO.Ref Nat)
     (fuel : Nat) (stmts : Array Syntax) : CommandElabM (Array Syntax) := do
   if asyncMap.isEmpty then return stmts
-  let mapSuite (ref : Syntax) (s : Syntax) := packSuite ref <$> inlineAsyncMutFns asyncMap cntRef fuel (suiteStmts s)
-  let mapOptElse (eNode : Syntax) :=
-    if eNode.getNumArgs == 3 then setStxArg eNode 2 <$> mapSuite eNode (eNode.getArg 2) else pure eNode
   let mut out : Array Syntax := #[]
   for i in [0:stmts.size] do
     let st := stmts[i]!; let k := st.getKind; let info := SourceInfo.fromRef st
@@ -441,17 +458,12 @@ private partial def inlineAsyncMutFns (asyncMap : Std.HashMap Name CompFnDecl) (
           out := out ++ (← inlineAsyncMutFns asyncMap cntRef (fuel - 1) mfn.stmts)
           continue
       out := out.push st
-    else if k == ``qedStmtIf then
-      let els' ← (st.getArg 4).getArgs.mapM fun el => setStxArg el 3 <$> mapSuite el (el.getArg 3)
-      out := out.push (setStxArg (setStxArg (setStxArg st 3 (← mapSuite st (st.getArg 3))) 4 (Syntax.node info nullKind els')) 5 (← mapOptElse (st.getArg 5)))
-    else if k == ``qedStmtIfLet then
-      out := out.push (setStxArg (setStxArg st 6 (← mapSuite st (st.getArg 6))) 7 (← mapOptElse (st.getArg 7)))
-    else if k == ``qedStmtMatch then
-      let cs' ← (st.getArg 3).getArgs.mapM fun c => setStxArg c 3 <$> mapSuite c (c.getArg 3)
-      out := out.push (setStxArg st 3 (Syntax.node (st.getArg 3).getHeadInfo (st.getArg 3).getKind cs'))
+    else if let some (st', _) ← mapControlSubSuites st false (fun _ ss => return (← inlineAsyncMutFns asyncMap cntRef fuel ss, none)) then
+      out := out.push st'
     else out := out.push st
   return out
 
+@[noinline]
 private def registerActionOrPort (spec : ComponentSpec) (baseCtx : RewriteCtx) (asyncMap : Std.HashMap Name CompFnDecl) (cntRef : IO.Ref Nat)
     (kindPrefix dupLabel conflictLabel : String) (nameRef errRef : Syntax) (name : Name)
     (params : Array (Ident × Term)) (bodyStx : Syntax) (checkPlaceholders : Bool) : CommandElabM Unit := do
@@ -469,10 +481,6 @@ private def registerActionOrPort (spec : ComponentSpec) (baseCtx : RewriteCtx) (
       throwErrorAt errRef s!"action `{name}` declares explicit parameter(s) and cannot use the `_` placeholder; assign explicitly (e.g. `{dummyAssigns[0]!.field} = {params[0]!.1.getId}`)"
   pushSite baseCtx kindPrefix name params stmts dummyAssigns
 
-structure RewriteResult where mk ::
-  (accum : RewriteAccum) (route? : Option RouteDecl) (starts : Array Term) (body : Term)
-  (fns : Array CompFnDecl) (subscriptions : Array SubDecl)
-
 private def checkCompParams (spec : ComponentSpec) (kindLabel : String) (ownerName : Name) (params : Array (Ident × Term)) : CommandElabM Unit := do
   discard <| params.foldlM (init := (#[] : Array Name)) fun seen (pId, _) => do
     let pn := pId.getId
@@ -480,6 +488,7 @@ private def checkCompParams (spec : ComponentSpec) (kindLabel : String) (ownerNa
     if spec.allNames.contains pn then throwErrorAt pId s!"parameter `{pn}` in {kindLabel} `{ownerName}` shadows a component field; rename the parameter"
     pure (seen.push pn)
 
+@[noinline]
 def collectSitesAndRewriteStateful (spec : ComponentSpec) : CommandElabM RewriteResult := do
   let baseCtx ← mkRewriteCtx spec false
   let mut allRwFns : Array CompFnDecl := #[]
@@ -492,20 +501,23 @@ def collectSitesAndRewriteStateful (spec : ComponentSpec) : CommandElabM Rewrite
   let mutFnNames := (allRwFns.filter CompFnDecl.isMut).map (·.id.getId.eraseMacroScopes)
   let mut fnMap : Std.HashMap Name CompFnDecl := {}
   let mut edges : Std.HashMap Name (Array Name) := {}
-  let mut asyncMap : Std.HashMap Name CompFnDecl := {}
+  let mut asyncMap0 : Std.HashMap Name CompFnDecl := {}
   for f in allRwFns do
     if f.isMut then
       let nm := f.id.getId.eraseMacroScopes
       fnMap := fnMap.insert nm f
       let callees := f.stmts.foldl (init := #[]) fun acc s => (collectDirectMutFnCalls mutFnNames s).foldl pushUnique acc
       edges := edges.insert nm callees
-      if f.stmts.any stmtContainsAwait then asyncMap := asyncMap.insert nm f
-  let mut changed := true
-  while changed do
-    changed := false
-    for nm in mutFnNames do
-      if !asyncMap.contains nm && (edges[nm]?.getD #[]).any asyncMap.contains then
-        if let some f := fnMap[nm]? then asyncMap := asyncMap.insert nm f; changed := true
+      if f.stmts.any stmtContainsAwait then asyncMap0 := asyncMap0.insert nm f
+  let rec closeAsync (am : Std.HashMap Name CompFnDecl) : Nat → Std.HashMap Name CompFnDecl
+    | 0 => am
+    | fuel + 1 =>
+        let (am', changed) := mutFnNames.foldl (init := (am, false)) fun (acc, ch) nm =>
+          if !acc.contains nm && (edges[nm]?.getD #[]).any acc.contains then
+            match fnMap[nm]? with | some f => (acc.insert nm f, true) | none => (acc, ch)
+          else (acc, ch)
+        if changed then closeAsync am' fuel else am'
+  let asyncMap := closeAsync asyncMap0 (mutFnNames.size + 1)
   let mut visited : Std.HashSet Name := {}
   for nm in mutFnNames do
     if asyncMap.contains nm then visited ← checkAsyncFnCycles fnMap edges {} visited nm

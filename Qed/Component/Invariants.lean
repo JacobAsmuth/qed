@@ -36,6 +36,7 @@ private def isForEachStyled (invStx : Syntax) : CommandElabM Bool := do
   let some pid := using?.or (if pred.raw.isIdent then some ⟨pred.raw⟩ else none) | return false
   liftTermElabM do try Meta.forallTelescope (← getConstInfo (← realizeGlobalConstNoOverload pid)).type fun _ body => return body.eq?.isSome catch _ => return false
 
+@[noinline]
 private def elabForEachInlineInv (spec : ComponentSpec) (invStx : Syntax) (isStyled : Bool) : CommandElabM (Option Term) := do
   let (invId, pred, colField) := (resolveInvIdent invStx spec.t.getId, ← lowerCompExpr .val (invStx.getArg 2), (⟨invStx.getArg 4⟩ : Ident))
   let using? : Option Ident := if (invStx.getArg 6).getNumArgs == 2 then some ⟨(invStx.getArg 6).getArg 1⟩ else none
@@ -54,6 +55,7 @@ private def elabForEachInlineInv (spec : ComponentSpec) (invStx : Syntax) (isSty
   elabIsolatedTheorem (← `(command| theorem $invId:ident : ∀ m msg, (∀ c ∈ m.$colField, ($predToEmit) c) → (∀ c ∈ (InvTarget.proj ($(spec.updateId) m msg)).$colField, ($predToEmit) c) := $rhs))
   try return some (← liftTermElabM (extractInvPred invId)) catch _ => return none
 
+@[noinline]
 private def elabViewInlineInv (spec : ComponentSpec) (invStx : Syntax) (invId : Ident)
     (rawClauses : Array Syntax) (clauses : Array Term) (assume? pf? : Option Term) : CommandElabM Unit := do
   let (vPred, predStr) ← mkViewPredAndStr invStx rawClauses clauses "empty view styling invariant"
@@ -89,6 +91,7 @@ private def parseProveCases (optNode : Syntax) : CommandElabM (Option (Array (TS
     `(Qed.qedProveCase| $[$cIds:ident],* => $tacSeq)
   return some cases
 
+@[noinline]
 private def elabStateInlineInv (spec : ComponentSpec) (invId : Ident) (clauses : Array Term) (using? : Option (Array Term))
     (prove? : Option (Array (TSyntax ``Qed.qedProveCase))) (pf? : Option Term) : CommandElabM Term := do
   let conj ← mkConjBody clauses; let pred ← `(fun (s : $(spec.stateId)) => $(← bindMentionedFields spec (mentionsIdent conj.raw) conj))
@@ -114,6 +117,7 @@ private def elabStateInlineInv (spec : ComponentSpec) (invId : Ident) (clauses :
     elabIsolatedTheorem (← `(command| theorem $invId:ident : $prop := $rhs))
   return pred
 
+@[noinline]
 def elabInlineInvariantsPhase (spec : ComponentSpec) (wantView : Bool) : CommandElabM (Array (Term × Option Ident)) := do
   let mut statePreds : Array (Term × Option Ident) := #[]
   let rwCtx ← mkRewriteCtx spec false (allowHoist := false)
@@ -158,27 +162,9 @@ private def parseCompExRecord (recStx : Syntax) (validFields : Array Name) (kind
     return (mkIdentFrom fid fn, ← lowerCompExpr .val (item.getArg 2))
 
 private def extractRpcWireTys (mInfo : ServerMethodInfo) : CommandElabM (Option Term × Term) := do
-  liftTermElabM do
-    let some (.defnInfo dinfo) := (← getEnv).find? mInfo.outcomeConst
-      | throwError s!"internal: missing outcome declaration `{mInfo.outcomeConst}`"
-    Meta.lambdaTelescope dinfo.value fun _ body => do
-      let ty ← Meta.whnf body
-      let unwrapEns (e : Expr) : MetaM Expr := do
-        let e' ← Meta.whnf e
-        if e'.isAppOfArity ``Qed.Ensured 2 then return e'.appFn!.appArg!
-        if e'.isAppOfArity ``Option 1 then
-          let inner ← Meta.whnf e'.appArg!
-          if inner.isAppOfArity ``Qed.Ensured 2 then return ← Meta.mkAppM ``Option #[inner.appFn!.appArg!]
-        return e'
-      if ty.isAppOfArity ``Qed.RpcOutcome 2 then
-        let errT ← PrettyPrinter.delab ty.appFn!.appArg!
-        let payT ← PrettyPrinter.delab (← unwrapEns ty.appArg!)
-        return (some errT, payT)
-      else if ty.isAppOfArity ``Qed.RpcSimpleOutcome 1 then
-        let payT ← PrettyPrinter.delab (← unwrapEns ty.appArg!)
-        return (none, payT)
-      else
-        throwError s!"internal: unexpected RPC outcome type for `{mInfo.name}`"
+  let some tys ← extractRpcOutcomeTys? mInfo false false true
+    | throwError s!"internal: unexpected RPC outcome type for `{mInfo.name}`"
+  return tys
 
 @[noinline]
 def elabCompReachableAndWitnesses (spec : ComponentSpec) : CommandElabM Unit := do

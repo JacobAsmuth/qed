@@ -248,6 +248,7 @@ def splitCallArgsPure (callName : String) (rawArgs : Array Syntax) (validKeys : 
     else throw (a, s!"unexpected argument in `{callName}(...)`")
   return (posArgs, namedArgs)
 
+@[noinline, nospecialize]
 def splitCallArgs {m : Type → Type} [Monad m] [MonadError m] (callName : String) (rawArgs : Array Syntax)
     (validKeys : Option (List String) := none) (allowWhere : Bool := false) (errRef : Syntax := Syntax.missing) : m (Array Syntax × Array (String × Syntax)) :=
   match splitCallArgsPure callName rawArgs validKeys allowWhere errRef with | .ok r => pure r | .error (r, mg) => throwErrorAt r mg
@@ -258,6 +259,7 @@ def splitCallArgsMacro (callName : String) (rawArgs : Array Syntax) (validKeys :
 
 structure ParsedEnvRef where mk :: (isSecret : Bool) (envKey : String) (default? : Option String) deriving Inhabited, Repr
 
+@[noinline, nospecialize]
 def parseQedEnvRef {m : Type → Type} [Monad m] [MonadError m] (ctxDesc : String) (stx : Syntax) : m ParsedEnvRef := do
   let envKey := (⟨stx.getArg 2⟩ : TSyntax `str).getString
   if envKey.isEmpty then throwErrorAt stx s!"environment variable name in {ctxDesc} must not be empty"
@@ -386,9 +388,12 @@ def resolveBaseTypeTerm (baseId : Ident) : Term := match baseId.getId with
 private def foldRight1M {m : Type → Type} [Monad m] (empty : m Term) (combine : Term → Term → m Term) (xs : Array Term) : m Term :=
   if xs.isEmpty then empty else if xs.size == 1 then pure xs[0]! else xs.foldrM (init := xs.back!) (start := xs.size - 1) combine
 
+@[noinline, nospecialize]
 def buildProdType {m : Type → Type} [Monad m] [MonadQuotation m] : Array Term → m Term := foldRight1M `(Unit) fun a b => `($a × $b)
+@[noinline, nospecialize]
 def buildTupleVal {m : Type → Type} [Monad m] [MonadQuotation m] : Array Term → m Term := foldRight1M `(()) fun a b => `(($a, $b))
 
+@[noinline, nospecialize]
 partial def lowerLetBinderPat {m : Type → Type} [Monad m] [MonadQuotation m] (stx : Syntax) : m Term := do
   if stx.isIdent then return ⟨stx⟩
   let k := stx.getKind
@@ -413,9 +418,11 @@ def mkLetBindTerm {m : Type → Type} [Monad m] [MonadQuotation m]
     match ty? with
     | some ty => `(let _ : $ty := $val; $body)
     | none    => `(let _ := $val; $body)
+@[noinline, nospecialize]
 def mkAppTerms {m : Type → Type} [Monad m] [MonadQuotation m] (fn : Term) (args : Array Term) : m Term :=
   if args.isEmpty then pure fn else `($fn $args*)
 
+@[noinline, nospecialize]
 def extractTupleProjections {m : Type → Type} [Monad m] [MonadQuotation m] (tupleVar : Ident) (n : Nat) : m (Array Term) := do
   if n == 0 then return #[]
   let mut out : Array Term := #[]; let mut cur : Term := ⟨tupleVar.raw⟩
@@ -426,6 +433,7 @@ structure LoweredQedType where mk ::
   (term : Term) (isFallible isProto isForm isOption : Bool := false) (innerOpt? : Option Term := none) (baseName : Name := .anonymous) (mods : Array TypeMod := #[])
 deriving Inhabited
 
+@[noinline]
 private def applyTypeModsInfo (base : Term) (mods : Array TypeMod) (allowFallible : Bool)
     (ref : Syntax) (ctxDesc? : Option String := none) (nestedErr? : Option String := none) : MacroM (Term × Bool × Option Term) := do
   let mut acc := base; let mut isFallible := false; let mut innerOpt? : Option Term := none
@@ -440,6 +448,7 @@ private def applyTypeModsInfo (base : Term) (mods : Array TypeMod) (allowFallibl
         isFallible := true
   return (acc, isFallible, innerOpt?)
 
+@[noinline]
 partial def lowerQedTypeInfo (stx : Syntax) (allowFallible := false) (allowHigherOrder := true) (ctxDesc? : Option String := none) : MacroM LoweredQedType := do
   let rec go (s : Syntax) (allowFall : Bool) (nestedErr? : Option String) : MacroM LoweredQedType := do
     let mkInvalidErr (node : Syntax) : MacroM LoweredQedType := do
@@ -480,6 +489,7 @@ partial def lowerQedTypeInfo (stx : Syntax) (allowFallible := false) (allowHighe
 
 def lowerQedType (stx : Syntax) (allowFallible := false) : MacroM (Term × Bool) := do let info ← lowerQedTypeInfo stx allowFallible; return (info.term, info.isFallible)
 
+@[noinline]
 partial def inferQedTypeDefault? (stx : Syntax) : MacroM (Option Term) := do
   let modDef (n : Syntax) (init : Array TypeMod := #[]) : MacroM (Option Term) := do
     match (init ++ (← n.getArgs.mapM parseTypeModNode)).back? with | some .array => some <$> `(#[]) | some .option => some <$> `(none) | _ => pure none
@@ -493,6 +503,7 @@ partial def inferQedTypeDefault? (stx : Syntax) : MacroM (Option Term) := do
     match ((stx.getArg 0).getArg 0).getId.eraseMacroScopes with | `Resource => some <$> `(.idle) | `Cached => some <$> `({}) | _ => pure none
   else return none
 
+@[noinline]
 partial def lowerQedPat (stx : Syntax) : MacroM Term := do
   let k := stx.getKind
   if k == ``qedPatWild then `(_)
@@ -544,9 +555,22 @@ structure LowerHooks (m : Type → Type) where mk ::
   (optElseFallback : Syntax → Term → m Term) (wrapForMap : Syntax → Term → Term → m Term)
   (freshIdent : String → m Ident) (throwErr : Syntax → String → m Term)
 
+inductive LocalMutAction where
+  | assign (id : Ident) (op : String) (rhsStx : Syntax)
+  | push   (id : Ident) (elemStx : Syntax)
+  | remove (id : Ident) (keyStx : Syntax)
+
+def LocalMutAction.targetIdent : LocalMutAction → Ident
+  | .assign id _ _ | .push id _ | .remove id _ => id
+
+def LocalMutAction.rhsSyntax : LocalMutAction → Syntax
+  | .assign _ _ s | .push _ s | .remove _ s => s
+
+@[noinline, nospecialize]
 def finishTermMode {m : Type → Type} [Monad m] [MonadQuotation m] (mode : ExprMode) (t : Term) : m Term :=
   if mode.isProp then `(qedAsProp($t)) else return t
 
+@[noinline, nospecialize]
 def LowerHooks.mkDefault {m : Type → Type} [Monad m] [MonadQuotation m] (throwErr : Syntax → String → m Term) : LowerHooks m := {
   lowerIdent := fun _ id mode => finishTermMode mode ⟨id.raw⟩
   lowerProj  := fun _ obj fld mode => do finishTermMode mode (← `(($obj).$fld:ident))
@@ -565,6 +589,7 @@ def LowerHooks.mkDefault {m : Type → Type} [Monad m] [MonadQuotation m] (throw
   wrapForMap := fun _ _ t => pure t, freshIdent := fun pfx => pure (mkIdent (Name.mkSimple pfx)), throwErr
 }
 
+@[noinline, nospecialize]
 private def lowerCallExpr {m : Type → Type} [Monad m] [MonadQuotation m]
     (hooks : LowerHooks m) (go : ExprMode → Syntax → m Term) (finish : Term → m Term) (mode : ExprMode) (stx : Syntax) : m Term := do
   let (calleeStx, rawArgs) := (stx.getArg 0, (stx.getArg 2).getSepArgs)
@@ -592,6 +617,7 @@ private def lowerCallExpr {m : Type → Type} [Monad m] [MonadQuotation m]
   let argTerms ← rawArgs.mapM fun a => let u := unwrapParens1 (a.getArg 0); go (if isPropAll && (u.getKind == ``qedLam1 || u.getKind == ``qedLamN) then .propInv else .val) (a.getArg 0)
   finish (← if argTerms.isEmpty then pure calleeTerm else `($calleeTerm $argTerms*))
 
+@[noinline, nospecialize]
 private def lowerCmpExpr {m : Type → Type} [Monad m] [MonadQuotation m]
     (hooks : LowerHooks m) (lowerValOp : Syntax → m Term) (mode : ExprMode) (stx : Syntax) : m Term := do
   let lowerSingle (lhsStx : Syntax) (opStr : String) (rhsStx : Syntax) : m Term := do
@@ -610,6 +636,7 @@ private def lowerCmpExpr {m : Type → Type} [Monad m] [MonadQuotation m]
   for lk in (stx.getArg 1).getArgs do terms := terms.push (← lowerSingle prev (cmpOpKind (lk.getArg 0)) (lk.getArg 1)); prev := lk.getArg 1
   match terms.toList with | [] => hooks.throwErr stx "empty comparison" | t :: ts => ts.foldlM (init := t) fun acc x => if mode.isProp then `($acc ∧ $x) else `($acc && $x)
 
+@[noinline, nospecialize]
 private def lowerAndOrExpr {m : Type → Type} [Monad m] [MonadQuotation m]
     (hooks : LowerHooks m) (go : ExprMode → Syntax → m Term) (isAnd : Bool) (mode : ExprMode) (stx : Syntax) : m Term := do
   let subMode := if mode.isProp then mode else .boolCond; let (a, b) := (← go subMode (stx.getArg 0), ← go subMode (stx.getArg 2))
@@ -619,6 +646,7 @@ private def lowerAndOrExpr {m : Type → Type} [Monad m] [MonadQuotation m]
   else if !mode.isProp && isAnd && exprHasIndex (stx.getArg 2) then let h ← hooks.freshIdent "_qedAnd"; `(if $h:ident : ($a) = true then $b else false)
   else if mode.isProp then (if isAnd then `($a ∧ $b) else `($a ∨ $b)) else (if isAnd then `($a && $b) else `($a || $b))
 
+@[noinline, nospecialize]
 private def lowerLamExpr {m : Type → Type} [Monad m] [MonadQuotation m]
     (hooks : LowerHooks m) (go : ExprMode → Syntax → m Term) (isLam1 : Bool) (mode : ExprMode) (stx : Syntax) : m Term := do
   let pEntries : Array (Syntax × Option Syntax) := if isLam1 then #[(stx.getArg 0, none)]
@@ -744,6 +772,7 @@ partial def lowerQedExpr {m : Type → Type} [Monad m] [MonadQuotation m] (hooks
     | _ => hooks.lowerJsx stx mode
   go mode stx
 
+@[noinline]
 def lowerSimpleQedExpr (mode : ExprMode) (stx : Syntax) (allowOptElse := false) (optElseFallback : MacroM Term := `(()))
     (lowerJsx? : Option (Syntax → ExprMode → MacroM Term) := none) (wrapNamedField : Term → MacroM Term := pure)
     (lowerIndex? : Option (Syntax → Term → Term → ExprMode → MacroM Term) := none) : MacroM Term :=
@@ -779,17 +808,6 @@ def isRangeCallExpr (stx : Syntax) : Bool :=
   let u := unwrapParens1 stx
   u.getKind == ``qedCall && (u.getArg 0).getKind == ``qedIdent &&
     ((u.getArg 0).getArg 0).getId.eraseMacroScopes == `range
-
-inductive LocalMutAction where
-  | assign (id : Ident) (op : String) (rhsStx : Syntax)
-  | push   (id : Ident) (elemStx : Syntax)
-  | remove (id : Ident) (keyStx : Syntax)
-
-def LocalMutAction.targetIdent : LocalMutAction → Ident
-  | .assign id _ _ | .push id _ | .remove id _ => id
-
-def LocalMutAction.rhsSyntax : LocalMutAction → Syntax
-  | .assign _ _ s | .push _ s | .remove _ s => s
 
 def tryMatchLocalMut? (muts : Array Ident) (stmt : Syntax) : Option LocalMutAction :=
   let hasMut (n : Name) : Bool := muts.any (·.getId.eraseMacroScopes == n)
@@ -905,6 +923,7 @@ def qedIsHelper (env : Environment) (n : Name) : Bool :=
   !Qed.Diag.isToolchainRoot (Qed.Diag.modRootOf env n n) (includeQed := true) &&
   (match env.find? n with | some (.defnInfo d) => !d.type.isConstOf `Qed.Style | _ => false) && !qedLooksGenerated n
 
+@[noinline]
 def qedUnfoldHelperLoop (maxIters : Nat) (keep : Environment → Name → MetaM Bool)
     (extraLemmas : Array (TSyntax `Lean.Parser.Tactic.simpLemma) := #[]) (includeLCtx useSimpAll tryRfl : Bool := false) : TacticM Unit := do
   for _ in [0:maxIters] do
@@ -925,15 +944,255 @@ def qedUnfoldHelperLoop (maxIters : Nat) (keep : Environment → Name → MetaM 
       | false, false, true => `(tactic| (simp only [$[$combined],*]; try rfl)) | false, false, false => `(tactic| simp only [$[$combined],*])
     unless (← try evalTactic tac; pure true catch _ => pure false) do break
 
+@[noinline, nospecialize]
 def mkConjBody {m : Type → Type} [Monad m] [MonadQuotation m] (clauses : Array Term) (ascribeProp : Bool := true) : m Term := do
   let props ← if ascribeProp then clauses.mapM fun c => `(($c : Prop)) else pure clauses
   match props.toList with | [] => `(True) | p :: ps => ps.foldlM (init := p) fun acc x => `($acc ∧ $x)
 
+@[noinline]
 def extractInvPred (id : Ident) : TermElabM (TSyntax `term) := do
   let cTy := (← getConstInfo (← realizeGlobalConstNoOverload id)).type
   forallTelescope (if cTy.isAppOfArity ``And 2 then cTy.appArg! else cTy) fun args _ => do
     let some hIdx ← (List.range args.size).findM? fun i => do if i ≥ 2 then isProp (← inferType args[i]!) else pure false
       | throwErrorAt id "`{id}` doesn't look like a state invariant, so its predicate can't be inferred; write it explicitly (`<pred> for_each … using {id}`)."
     delab (← mkLambdaFVars #[args[hIdx - 2]!] (← inferType args[hIdx]!)).eta
+
+/-- If `ty` is a non-recursive zero-param/zero-index inductive with all nullary constructors, return its constructor count. -/
+def nullaryEnumCtorCount? (env : Environment) (ty : Expr) : Option Nat :=
+  match ty.getAppFn with
+  | .const nm _ =>
+      match env.find? nm with
+      | some (.inductInfo iv) =>
+          if iv.numParams == 0 && iv.numIndices == 0 && !iv.isRec &&
+             iv.ctors.all (fun c => match env.find? c with | some (.ctorInfo ci) => ci.numFields == 0 | _ => false)
+          then some iv.ctors.length else none
+      | _ => none
+  | _ => none
+
+/-! ## Pure `fn` Surface Syntax (`qedFnContract`, `fnCmd`, `fnOptProof`, `fnBlindTarget`) -/
+
+declare_syntax_cat qedFnContract
+
+section FnParsers
+open Lean Parser Qed.Lang
+
+private abbrev fExpr : Parser := categoryParser `qedExpr 0
+private abbrev fType : Parser := withPosition (categoryParser `qedType 0)
+private abbrev fContract : Parser := categoryParser `qedFnContract 0
+
+def fnParam : Parser := node `Qed.fnParam (ident >> ":" >> fType >> optional ("=" >> fExpr))
+def fnExParam : Parser := node `Qed.fnExParam (ident >> ":" >> fType)
+def fnBlindTarget : Parser := node `Qed.fnBlindTarget (ident >> optional (checkNoWsBefore "" >> ".{" >> sepBy1 ident "," >> "}"))
+def fnProofBy : Parser := node `Qed.fnProofBy (":=" >> kw "by" >> Parser.Tactic.tacticSeq)
+def fnProofProve : Parser := node `Qed.fnProofProve (atomic (checkColGt "expected indented `prove:` block" >> identEq `prove >> ":") >> checkColGt "expected indented proof tactics" >> Parser.Tactic.tacticSeq)
+def fnOptProof : Parser := optional (fnProofBy <|> fnProofProve)
+
+@[qedFnContract_parser] def fnRequiresClause : Parser := leading_parser
+  withPosition (atomic (identEq `requires) >> sepBy1 fExpr ",")
+@[qedFnContract_parser] def fnEnsuresClause : Parser := leading_parser
+  withPosition (atomic (identEq `ensures) >> sepBy1 fExpr "," >> fnOptProof)
+@[qedFnContract_parser] def fnBlindToClause : Parser := leading_parser
+  withPosition (atomic (identEq `blindTo) >> sepBy1 fnBlindTarget "," >> fnOptProof)
+@[qedFnContract_parser] def fnExampleClause : Parser := leading_parser
+  withPosition (atomic (symbol "example" >> ident) >>
+    optional (checkNoWsBefore "" >> "(" >> sepBy1 fnExParam "," >> ")") >>
+    optional (symbol "where" >> sepBy1 fExpr ",") >> ":" >> sepBy1 fExpr "," >> fnOptProof)
+@[qedFnContract_parser] def fnContractIf : Parser := leading_parser
+  withPosition (atomic (symbol "if" >> notFollowedBy (symbol "let") "let" >> sepBy1 fExpr "," >> ":" >>
+    checkColGt "expected indented contract clauses" >> many1Indent fContract))
+
+@[command_parser] def fnCmd : Parser := leading_parser
+  optional Command.docComment >>
+  withPosition (atomic (optional (symbol "private") >> identEq `fn >> ident >> "(") >> sepBy fnParam "," >> ")" >> " -> " >> fType >> ":" >>
+    checkColGt "expected indented `fn` body" >>
+    withPosition (many (atomic (checkColEq "contract" >> fContract)) >>
+                  many1 (checkColEq "statement" >> categoryParser `qedStmt 0)))
+
+end FnParsers
+
+/-! ## Shared Pure Statement Lowering (`lowerPureStmtsM`, `lowerPureFnStmts`) -/
+
+section PureStmtLower
+open Qed.Lang
+
+structure PureStmtHooks (m : Type → Type) (σ : Type) where
+  withVal         : σ → Syntax → (Term → m Term) → m Term
+  withGuard       : σ → Syntax → (Term → m Term) → m Term
+  extendLocals    : σ → Array Name → σ
+  onEmpty         : σ → m Term
+  onReturn        : σ → Syntax → List Syntax → m Term
+  onExpr          : σ → Syntax → List Syntax → m Term
+  onCustom?       : Option (σ → Syntax → List Syntax → (σ → List Syntax → m Term) → m (Option Term)) := none
+  onMissingElse   : Syntax → String → m Term
+  onUnsupported   : Syntax → m Term
+  freshIfId?      : Option (m Ident) := none
+  depIfLet        : Bool := true
+  appendRest      : Bool := true
+  letClauseErr    : String := "`predict`/`catch` clauses are not supported here"
+
+@[noinline, nospecialize]
+partial def lowerPureStmtsM {m : Type → Type} {σ : Type} [Monad m] [MonadQuotation m] [MonadError m]
+    [MonadLiftT CommandElabM m] (h : PureStmtHooks m σ) (env : σ) (stmts : List Syntax) : m Term := do
+  let liftMac {α : Type} (x : MacroM α) : m α := liftM (liftMacroM (m := CommandElabM) x)
+  let rec go (env : σ) (stmts : List Syntax) : m Term := do
+    let lowerBranchElse (st : Syntax) (kindName : String) (elseSuite? : Option (Array Syntax)) (rest : List Syntax) : m Term :=
+      match elseSuite?, h.appendRest with
+      | some es, true  => go env (es.toList ++ rest)
+      | some es, false => go env es.toList
+      | none,    true  => go env rest
+      | none,    false => if rest.isEmpty then h.onMissingElse st kindName else go env rest
+    match stmts with
+    | [] => h.onEmpty env
+    | s :: rest =>
+        let sk := s.getKind
+        if sk == ``qedStmtPass then go env rest
+        else if sk == ``qedStmtReturn then h.onReturn env s rest
+        else if sk == ``qedStmtLet then
+          if (s.getArg 5).getNumArgs > 0 then throwErrorAt ((s.getArg 5).getArg 0) h.letClauseErr
+          let bStx := s.getArg 1
+          let ty? ← if (s.getArg 2).getNumArgs == 2 then
+              some <$> liftMac (return (← lowerQedType ((s.getArg 2).getArg 1) false).1)
+            else pure none
+          h.withVal env (s.getArg 4) fun rhsT => do
+            let cont ← go (h.extendLocals env (collectLetBinderIds bStx)) rest
+            mkLetBindTerm bStx ty? rhsT cont
+        else if sk == ``qedStmtIf then
+          h.withGuard env (s.getArg 1) fun condT => do
+            let thenT ← go env ((suiteStmts (s.getArg 3)).toList ++ if h.appendRest then rest else [])
+            let elseT ← lowerBranchElse s "if" (desugarElifs (s.getArg 4).getArgs (s.getArg 5)) rest
+            let hIf ← match h.freshIfId? with | some mk => mk | none => pure (mkIdent `_qedIf)
+            `(if $hIf:ident : $condT then $thenT else $elseT)
+        else if sk == ``qedStmtIfLet then
+          let pat ← liftMac (lowerQedPat (s.getArg 2))
+          h.withVal env (s.getArg 4) fun scrT => do
+            let env' := h.extendLocals env (collectQedPatIds (s.getArg 2))
+            let thenT ← go env' ((suiteStmts (s.getArg 6)).toList ++ if h.appendRest then rest else [])
+            let elseT ← lowerBranchElse s "if let" (extractElseSuite (s.getArg 7)) rest
+            if h.depIfLet then `(match $(mkIdent `_qedIfLet):ident : $scrT:term with | $pat:term => $thenT | _ => $elseT)
+            else `(match $scrT:term with | $pat:term => $thenT | _ => $elseT)
+        else if sk == ``qedStmtMatch then
+          let scrStxs := (s.getArg 1).getSepArgs
+          let rec lowerScrs (i : Nat) (acc : Array Term) : m Term := do
+            if hi : i < scrStxs.size then
+              h.withVal env scrStxs[i] fun t => lowerScrs (i + 1) (acc.push t)
+            else
+              let alts ← (s.getArg 3).getArgs.mapM fun alt => do
+                let altTerms ← liftMac (lowerCasePatAlts (alt.getArg 1))
+                let env' := h.extendLocals env (collectCasePatIds (extractCasePatAlts (alt.getArg 1)))
+                let body ← go env' ((suiteStmts (alt.getArg 3)).toList ++ if h.appendRest then rest else [])
+                mkMatchAltFromAlts altTerms body
+              `(match $[$acc:term],* with $[$alts:matchAlt]*)
+          lowerScrs 0 #[]
+        else
+          if let some customFn := h.onCustom? then
+            if let some custom ← customFn env s rest go then return custom
+          if sk == ``qedStmtExpr then h.onExpr env s rest
+          else h.onUnsupported s
+  go env stmts
+
+private structure PureFnEnv where
+  locals    : Array String := #[]
+  muts      : Array Ident := #[]
+  loopMuts? : Option (Array Ident) := none
+  depth     : Nat := 0
+
+@[noinline]
+private def lowerPureFnStmtsAux (fnDesc : String)
+    (lowerVal : Array String → Syntax → CommandElabM Term) (lowerGuard : Array String → Syntax → CommandElabM Term)
+    (stmts : List Syntax) : CommandElabM Term := do
+  let extendEnv (e : PureFnEnv) (names : Array Name) : PureFnEnv :=
+    { e with locals := e.locals ++ names.map (·.toString), muts := e.muts.filter fun m => !names.contains m.getId.eraseMacroScopes }
+  let hooks : PureStmtHooks CommandElabM PureFnEnv := {
+    withVal   := fun e s k => do k (← lowerVal e.locals s)
+    withGuard := fun e s k => do k (← lowerGuard e.locals s)
+    extendLocals := extendEnv
+    onEmpty := fun e => match e.loopMuts? with
+      | none => throwError s!"missing `return` on fallthrough path of `{fnDesc}`"
+      | some lm => do `(Qed.QedLoopStep.next $(← liftMacroM (mkMutPack lm.toList)))
+    onReturn := fun e s _ => do
+      unless (s.getArg 1).getNumArgs == 1 do throwErrorAt s s!"`return` inside `{fnDesc}` must return a value"
+      let v ← lowerVal e.locals ((s.getArg 1).getArg 0)
+      match e.loopMuts? with
+      | none => pure v
+      | some lm => `(Qed.QedLoopStep.ret $(← liftMacroM (mkMutPack lm.toList)) $v)
+    onExpr := fun e s rest => do
+      if rest.isEmpty && e.loopMuts?.isNone then lowerVal e.locals (s.getArg 0)
+      else throwErrorAt s s!"unexpected bare expression statement in pure `{fnDesc}`; bind it with `let _ = ...` or return it"
+    onMissingElse := fun _ _ => throwError s!"missing `return` on fallthrough path of `{fnDesc}`"
+    onUnsupported := fun s => do
+      let sn := stxSnippet s
+      throwErrorAt s s!"unsupported statement{if sn.isEmpty then "" else s!" `{sn}`"} in pure `{fnDesc}`"
+    letClauseErr := s!"`predict`/`catch` clauses are not supported in pure `{fnDesc}`"
+    onCustom? := some fun e s rest go => do
+      let sk := s.getKind
+      if sk == ``qedStmtBreak then
+        let some lm := e.loopMuts? | throwErrorAt s "`break` can only be used inside a `for` loop"
+        some <$> `(Qed.QedLoopStep.breakLoop $(← liftMacroM (mkMutPack lm.toList)))
+      else if sk == ``qedStmtContinue then
+        let some lm := e.loopMuts? | throwErrorAt s "`continue` can only be used inside a `for` loop"
+        some <$> `(Qed.QedLoopStep.next $(← liftMacroM (mkMutPack lm.toList)))
+      else if sk == ``qedStmtLetMut then
+        let lId : Ident := ⟨s.getArg 2⟩; let nm := lId.getId.eraseMacroScopes
+        if e.muts.any (·.getId.eraseMacroScopes == nm) then
+          throwErrorAt lId s!"mutable variable `{nm}` is already declared in this scope; update it with `{nm} = ...`"
+        let rhsT ← lowerVal e.locals (s.getArg 5)
+        let cont ← go { e with locals := e.locals.push nm.toString, muts := e.muts.push lId } rest
+        let ty? ← if (s.getArg 3).getNumArgs == 2 then some <$> liftMacroM (return (← lowerQedType ((s.getArg 3).getArg 1) false).1) else pure none
+        some <$> mkLetBindTerm lId.raw ty? rhsT cont
+      else if let some act := tryMatchLocalMut? e.muts s then
+        if sk == ``qedStmtAssign && s.getNumArgs > 3 && (s.getArg 3).getNumArgs > 0 then
+          throwErrorAt ((s.getArg 3).getArg 0) s!"`predict` is not supported in pure `{fnDesc}`"
+        let rhsT ← lowerVal e.locals act.rhsSyntax
+        let newVal ← liftMacroM (applyLocalMutRhs act rhsT)
+        let lId := act.targetIdent
+        some <$> `(let $lId:ident := $newVal; $(← go e rest))
+      else if sk == ``qedStmtFor then
+        let bStx := s.getArg 1; let iterStx := s.getArg 3; let bodyStmts := suiteStmts (s.getArg 5)
+        if bStx.isIdent then
+          let bNm := bStx.getId.eraseMacroScopes
+          if e.muts.any (·.getId.eraseMacroScopes == bNm) then
+            throwErrorAt bStx s!"`for` loop variable `{bNm}` shadows mutable variable `{bNm}`; use a different loop variable name"
+        let iterTerm ← lowerVal e.locals iterStx
+        let mutated := collectMutatedIds bodyStmts
+        let usedMuts := e.muts.filter fun m => mutated.contains m.getId.eraseMacroScopes
+        let initSt ← liftMacroM (mkMutPack usedMuts.toList)
+        let stParam := mkIdent (Name.mkSimple s!"_qedSt{e.depth}")
+        let resSt := mkIdent (Name.mkSimple s!"_qedLoopSt{e.depth}")
+        let resRet := mkIdent (Name.mkSimple s!"_qedLoopRet{e.depth}")
+        let retValId := mkIdent (Name.mkSimple s!"_qedRet{e.depth}")
+        let bodyLocs := if bStx.isIdent then e.locals.push bStx.getId.eraseMacroScopes.toString else e.locals
+        let bodyInner ← go { e with locals := bodyLocs, loopMuts? := some usedMuts, depth := e.depth + 1 } bodyStmts.toList
+        let bodyWithUnpack ← liftMacroM (wrapMutUnpack stParam usedMuts.toList bodyInner)
+        let lam ← if bStx.isIdent then `(fun $stParam:ident $(⟨bStx⟩):ident => $bodyWithUnpack) else `(fun $stParam:ident _ => $bodyWithUnpack)
+        let loopCall ← if isRangeCallExpr iterStx then `(Qed.qedForRange $iterTerm $initSt $lam) else `(Qed.qedForFold $iterTerm $initSt $lam)
+        let restTerm ← go { e with depth := e.depth + 1 } rest
+        let someArm ← match e.loopMuts? with
+          | none => pure (⟨retValId.raw⟩ : Term)
+          | some outerMuts => `(Qed.QedLoopStep.ret $(← liftMacroM (mkMutPack outerMuts.toList)) $retValId)
+        let afterLoop ← liftMacroM (wrapMutUnpack resSt usedMuts.toList (← `(match $resRet:ident with | Option.some $retValId:ident => $someArm | Option.none => $restTerm)))
+        some <$> `(let ($resSt:ident, $resRet:ident) := $loopCall; $afterLoop)
+      else if sk == ``qedStmtLetElse then
+        let pat ← liftMacroM (lowerQedPat (s.getArg 1))
+        let scrut ← lowerVal e.locals (s.getArg 3)
+        let elseT ← go e (extractLetElseStmts s).toList
+        let thenT ← go (extendEnv e (collectQedPatIds (s.getArg 1))) rest
+        some <$> `(match $(mkIdent `_qedLetElse):ident : $scrut:term with | $pat:term => $thenT | _ => $elseT)
+      else if sk == ``qedStmtAssign then
+        let lhsStr := stxSnippet (s.getArg 0)
+        throwErrorAt s s!"cannot assign to `{lhsStr}` in pure `{fnDesc}`; declare local variables with `let mut {lhsStr} = ...` to mutate them"
+      else pure none
+  }
+  lowerPureStmtsM hooks {} stmts
+
+@[noinline]
+def lowerPureFnStmts (fnDesc : String) (stmts : List Syntax)
+    (lowerVal : Syntax → CommandElabM Term := fun s => liftMacroM (lowerSimpleQedExpr .val s))
+    (lowerGuard : Syntax → CommandElabM Term := fun s => liftMacroM (lowerSimpleQedExpr .propGuard s))
+    (lowerWithLocals? : Option (Array String → ExprMode → Syntax → CommandElabM Term) := none) : CommandElabM Term :=
+  match lowerWithLocals? with
+  | some f => lowerPureFnStmtsAux fnDesc (fun ls s => f ls .val s) (fun ls s => f ls .propGuard s) stmts
+  | none   => lowerPureFnStmtsAux fnDesc (fun _ s => lowerVal s) (fun _ s => lowerGuard s) stmts
+
+end PureStmtLower
 
 end Qed

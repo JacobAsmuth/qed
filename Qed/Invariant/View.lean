@@ -5,11 +5,13 @@ namespace Qed
 
 open Lean Elab Tactic Qed.Verify.Core
 
+@[noinline]
 private def runUnfoldViewHelpers : TacticM Unit :=
   qedUnfoldHelperLoop 6 fun env n =>
     if !qedIsHelper env n || (n.getString! == "view" && env.contains (n.getPrefix ++ `keyOf)) then return false
     else return (← getProjectionFnInfo? n).isNone
 
+@[noinline]
 private def runCloseExhaustiveEnum : TacticM Unit := withMainContext do
   for d in (← getLCtx) do
     if d.isImplementationDetail then continue
@@ -19,16 +21,15 @@ private def runCloseExhaustiveEnum : TacticM Unit := withMainContext do
       | .app (.app (.app (.const ``Eq _) _) lhs) _ => some lhs
       | _ => none
     if let some lhs := lhs? then
-      if ← tryTac (requireClosed := true) (do `(tactic| (generalize $(← PrettyPrinter.delab lhs):term = _qed_enum_x at *; cases _qed_enum_x <;> (simp_all; try decide)))) then return
+      if ← tryTac (requireClosed := true) (do `(tactic| (generalize $(← PrettyPrinter.delab lhs):term = _qed_enum_x at *; cases _qed_enum_x <;> first | contradiction | decide | (simp_all; try decide)))) then return
 
 private def isSmallNullaryEnum (env : Environment) (ty : Expr) (allowBool : Bool := false) : Bool :=
   match ty.getAppFn with
   | .const nm _ =>
       if nm == ``Unit || nm == ``PUnit || (!allowBool && nm == ``Bool) then false
-      else match env.find? nm with
-        | some (.inductInfo iv) => iv.numParams == 0 && iv.numIndices == 0 && 2 ≤ iv.ctors.length && iv.ctors.length ≤ 8 &&
-            iv.ctors.all fun c => match env.find? c with | some (.ctorInfo ci) => ci.numFields == 0 | _ => false
-        | _ => false
+      else match nullaryEnumCtorCount? env ty with
+        | some k => 2 ≤ k && k ≤ 8
+        | none => false
   | _ => false
 
 private partial def findFiniteEnumExpr (env : Environment) (e : Expr) : MetaM (Option Expr) := do
@@ -52,6 +53,7 @@ private def evalGroundBoolGoal (g : MVarId) (tgt : Expr) : TacticM (Option (List
   if ← tryReflGoal g then return some []
   return none
 
+@[noinline]
 private def runSplitFiniteEnums : TacticM Unit := do
   let mut checked : Std.HashSet MVarId := {}
   let evalGroundPass (gs : List MVarId) (chk : Std.HashSet MVarId) : TacticM (List MVarId × Std.HashSet MVarId × Bool) := do
@@ -114,6 +116,7 @@ private def isUnprovableFalseGoal (g : MVarId) : MetaM Bool := g.withContext do
   for d in (← getLCtx) do if !d.isImplementationDetail then if ← Meta.isProp d.type then return false
   return true
 
+@[noinline]
 private def runStyleLeafClose (g : MVarId) : TacticM (List MVarId) := do
   if ← tryReflGoal g then return []
   let some g1 ← trySimpAll g (← mkCachedSimpCtx "styleLeafFast" styleLeafFastNames).1 | return []
@@ -125,6 +128,7 @@ private def runStyleLeafClose (g : MVarId) : TacticM (List MVarId) := do
   setGoals [g2]; try runCloseExhaustiveEnum catch _ => pure ()
   (← getGoals).filterM fun g3 => return !(← tryDirectDecide g3)
 
+@[noinline]
 private def runStyleReduce (view : Ident) : TacticM Unit := do
   runSplitFiniteEnums
   forEachGoal fun g0 => do
@@ -163,6 +167,7 @@ private def diagnoseStyling (predStr : String) (vName : Name) : String × String
       else if (predStr.contains "hasRole" || predStr.contains "hasTag") && !(predStr.contains "roleHas" || predStr.contains "tagHas") then s!"No element with the required `role`/tag is rendered in some branch of `{vName}`. Check every conditional branch of `{vName}`."
       else s!"Check that the matching `role`/tag is rendered and receives exactly one allowed style in every branch of `{vName}`.")
 
+@[noinline]
 private def runDischargeStyling (view nm : Ident) (predLit : StrLit) : TacticM Unit := do
   evalTactic (← `(tactic| (intro m; try intro _qed_h_assume)))
   withMainContext do
@@ -186,22 +191,30 @@ elab "qedDischargeStyling" view:ident nm:ident predLit:str : tactic => Core.with
 
 syntax (name := invariantView) "invariant " ident " : " qedExpr,+ " holds_in " ident (" assuming " qedExpr)? (" := " term)? : command
 
-open Lean Elab Command in
+section InvariantViewElab
+open Lean Elab Command
+
+@[noinline]
+private def elabInvariantViewCmd (name view : Ident) (rawPreds : Array (TSyntax `qedExpr))
+    (assumeE : Option (TSyntax `qedExpr)) (pf : Option Term) : CommandElabM Unit := do
+  let p :: ps := (← rawPreds.mapM fun p => liftMacroM (Qed.Lang.lowerSimpleQedExpr .val p)).toList | throwErrorAt name "empty view invariant"
+  let pred ← ps.foldlM (init := p) fun acc q => `(Qed.both $acc $q)
+  let predStr := String.intercalate ", " (rawPreds.toList.map fun p => (p.raw.reprint.getD "this rule").trimmed)
+  let prop ← match assumeE with
+    | some a =>
+        let uA := Qed.Lang.unwrapParens1 a.raw
+        let aT ← liftMacroM (Qed.Lang.lowerSimpleQedExpr (if uA.getKind == ``Qed.Lang.qedLam1 || uA.getKind == ``Qed.Lang.qedLamN then .propInv else .val) a)
+        let P ← if aT.raw.isIdent then try liftTermElabM (extractInvPred ⟨aT.raw⟩) catch _ => pure aT else pure aT
+        `(∀ m, ($P) m → ($pred) ($view m) = true)
+    | none => `(∀ m, ($pred) ($view m) = true)
+  match pf with
+  | some p => elabCommand (← `(theorem $name:ident : $prop := $p))
+  | none   => elabCommand (← `(set_option linter.unusedSimpArgs false in theorem $name:ident : $prop := by qedDischargeStyling $view $name $(Syntax.mkStrLit predStr)))
+
 elab_rules : command
-  | `(invariant $name:ident : $preds:qedExpr,* holds_in $view:ident $[assuming $assumeE:qedExpr]? $[ := $pf:term]?) => do
-    let rawPreds := preds.getElems
-    let p :: ps := (← rawPreds.mapM fun p => liftMacroM (Qed.Lang.lowerSimpleQedExpr .val p)).toList | throwErrorAt name "empty view invariant"
-    let pred ← ps.foldlM (init := p) fun acc q => `(Qed.both $acc $q)
-    let predStr := String.intercalate ", " (rawPreds.toList.map fun p => (p.raw.reprint.getD "this rule").trimmed)
-    let prop ← match assumeE with
-      | some a =>
-          let uA := Qed.Lang.unwrapParens1 a.raw
-          let aT ← liftMacroM (Qed.Lang.lowerSimpleQedExpr (if uA.getKind == ``Qed.Lang.qedLam1 || uA.getKind == ``Qed.Lang.qedLamN then .propInv else .val) a)
-          let P ← if aT.raw.isIdent then try liftTermElabM (extractInvPred ⟨aT.raw⟩) catch _ => pure aT else pure aT
-          `(∀ m, ($P) m → ($pred) ($view m) = true)
-      | none => `(∀ m, ($pred) ($view m) = true)
-    match pf with
-    | some p => elabCommand (← `(theorem $name:ident : $prop := $p))
-    | none   => elabCommand (← `(set_option linter.unusedSimpArgs false in theorem $name:ident : $prop := by qedDischargeStyling $view $name $(Syntax.mkStrLit predStr)))
+  | `(invariant $name:ident : $preds:qedExpr,* holds_in $view:ident $[assuming $assumeE:qedExpr]? $[ := $pf:term]?) =>
+    elabInvariantViewCmd name view preds.getElems assumeE pf
+
+end InvariantViewElab
 
 end Qed

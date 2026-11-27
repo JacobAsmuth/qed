@@ -48,10 +48,7 @@ def put (c : Cached α) (issuedKey : String) (r : Resource α) (currentKey : Str
 def lifecycleKey (dataKey : String) (rev : Nat) : String :=
   if dataKey.isEmpty then "" else if rev == 0 then dataKey else dataKey ++ "#" ++ toString rev
 def putRev (c : Cached α) (issuedKey : String) (r : Resource α) (currentDataKey : String) : Cached α :=
-  let isCur := issuedKey == lifecycleKey currentDataKey c.rev
-  { state := if isCur then r else c.state
-    seen  := match r with | .ok a => if isCur then ((currentDataKey, a) :: c.seen.filter (·.1 != currentDataKey)).take 32 else c.seen | _ => c.seen
-    rev   := c.rev }
+  if issuedKey == lifecycleKey currentDataKey c.rev then c.put currentDataKey r currentDataKey else c
 def activate (c : Cached α) (k : String) : Cached α := { c with state := (c.lookup k).elim .loading .ok }
 def map (f : α → β) (c : Cached α) : Cached β :=
   { state := c.state.map f, seen := c.seen.map fun (k, v) => (k, f v), rev := c.rev }
@@ -113,12 +110,7 @@ def Query.liftWithProps {PModel PMsg CModel CMsg Props : Type}
     (getKey : PModel → String) (getProps : PModel → Option Props)
     (getState : PModel → CModel) (setState : CModel → PModel → PModel) (wrapMsg : CMsg → PMsg)
     (childQuery : Props → Query CModel CMsg) : Query PModel PMsg :=
-  { key := fun pm =>
-      let pk := getKey pm
-      if pk.isEmpty then ""
-      else match getProps pm with
-        | none => ""
-        | some p => let ck := (childQuery p).key (getState pm); if ck.isEmpty then "" else pk ++ "|" ++ ck,
+  { key := KeyedLifecycle.composeKey getKey getProps getState (fun p => (childQuery p).key),
     load := fun _ pm =>
       match getProps pm with
       | none => (pm, .none)
@@ -250,17 +242,8 @@ theorem Cached.all_invalidateKey {P : α → Prop} {c : Cached α} {k : String} 
 @[simp] theorem Cached.all_invalidateAll {P : α → Prop} {c : Cached α} :
     (c.invalidateAll).all P := ⟨trivial, fun _ h => nomatch h⟩
 theorem Cached.all_putRev {P : α → Prop} {c : Cached α} {k currentDataKey : String} {r : Resource α} (hall : c.all P) (hr : r.all P) :
-    (c.putRev k r currentDataKey).all P :=
-  ⟨by dsimp only [Cached.putRev]; split <;> first | exact hr | exact hall.1, fun kv hkv => by
-    cases r with
-    | ok _ =>
-        dsimp only [Cached.putRev] at hkv
-        split at hkv
-        · rcases List.mem_cons.1 (List.mem_of_mem_take hkv) with rfl | hflt
-          · exact hr
-          · exact hall.2 kv (List.mem_filter.1 hflt).1
-        · exact hall.2 kv hkv
-    | _ => exact hall.2 kv hkv⟩
+    (c.putRev k r currentDataKey).all P := by
+  unfold Cached.putRev; split <;> first | exact Cached.all_put hall hr | exact hall
 end CachedProofs
 
 section QueryProofs

@@ -26,7 +26,10 @@ instance : Inhabited Url := ⟨root⟩
 instance : ToString Url := ⟨Url.raw⟩
 @[simp] theorem isSafe (u : Url) : isSafeUrl u.raw = true := u.safe
 def parse? (s : String) : Option Url := if h : isSafeUrl s = true then some ⟨s, h⟩ else none
-@[simp] theorem parse?_isSome (s : String) : (parse? s).isSome = isSafeUrl s := by unfold parse?; split <;> simp [*]
+@[simp] theorem parse?_isSome (s : String) : (parse? s).isSome = isSafeUrl s := by
+  unfold parse?; split <;> rename_i h
+  · rw [h]; rfl
+  · rw [Bool.eq_false_iff.2 h]; rfl
 end Url
 
 /-! ## Hex Digit Helpers -/
@@ -181,13 +184,27 @@ def Html.prefixSignalsList (pfx : String) : List (Html msg) → List (Html msg) 
 def asciiLowerChar (c : Char) : Char := if 'A' ≤ c && c ≤ 'Z' then Char.ofNat (c.toNat + 32) else c
 def asciiLower (s : String) : String := String.ofList (s.toList.map asciiLowerChar)
 def hasOnPrefix : List Char → Bool | 'o' :: 'n' :: _ => true | _ => false
-def isSafeRenderedKey (k : String) : Bool := !k.isEmpty && !hasOnPrefix (k.toList.map asciiLowerChar) && asciiLower k != "srcdoc"
+def isSrcdocChars : List Char → Bool | ['s', 'r', 'c', 'd', 'o', 'c'] => true | _ => false
+@[simp] theorem isSrcdocChars_of_asciiLower {k : String} (h : asciiLower k = "srcdoc") :
+    isSrcdocChars (k.toList.map asciiLowerChar) = true := by
+  have := congrArg String.toList h; rw [asciiLower, String.toList_ofList] at this; rw [this]; rfl
+def isSafeRenderedKey (k : String) : Bool :=
+  let low := k.toList.map asciiLowerChar
+  !low.isEmpty && !hasOnPrefix low && !isSrcdocChars low
 def isSafeAttrName (k : String) : Bool := k.toList.all isKeyChar && isSafeRenderedKey k
 
+@[inline] private def asciiLowerByte (b : UInt8) : UInt8 := if 65 ≤ b && b ≤ 90 then b ||| 32 else b
+private def isUrlAttrBytes : List UInt8 → Bool
+  | [115, 114, 99] => true
+  | [104, 114, 101, 102] | [100, 97, 116, 97] | [99, 105, 116, 101] => true
+  | [97, 99, 116, 105, 111, 110] | [112, 111, 115, 116, 101, 114] | [115, 114, 99, 115, 101, 116] => true
+  | [102, 111, 114, 109, 97, 99, 116, 105, 111, 110] | [120, 108, 105, 110, 107, 58, 104, 114, 101, 102] => true
+  | _ => false
+
 def isUrlAttrName (k : String) : Bool :=
-  let kl := asciiLower k
-  kl == "href" || kl == "src" || kl == "action" || kl == "formaction" || kl == "xlink:href" ||
-  kl == "poster" || kl == "data" || kl == "cite" || kl == "srcset"
+  match k.utf8ByteSize with
+  | 3 | 4 | 6 | 10 => isUrlAttrBytes (k.toByteArray.data.toList.map asciiLowerByte)
+  | _ => false
 
 def Attr.validKeyValue (k v : String) : Bool := isSafeAttrName k && (!isUrlAttrName k || isSafeUrl v)
 
@@ -225,18 +242,29 @@ def isVoidTagFast (tag : String) : Bool :=
   | 5 => tag == "embed" || tag == "input" || tag == "track" | 6 => tag == "source" | _ => false
 
 def isSafeTagName (tag : String) : Bool := let cs := tag.toList; !cs.isEmpty && cs.all (fun c => c.isAlphanum || c == '-')
-def isForbiddenTag (tag : String) : Bool := tag == "script" || tag == "base" || tag == "applet" || tag == "object" || tag == "embed"
-def isHeadingTag (tag : String) : Bool := tag == "h1" || tag == "h2" || tag == "h3" || tag == "h4" || tag == "h5" || tag == "h6"
+def isForbiddenTag (tag : String) : Bool :=
+  match tag.utf8ByteSize with
+  | 4 => tag == "base" | 5 => tag == "embed"
+  | 6 => tag == "script" || tag == "applet" || tag == "object" | _ => false
+def isHeadingTag (tag : String) : Bool :=
+  tag.utf8ByteSize == 2 && match tag.toByteArray.data.toList with | [104, b] => 49 ≤ b && b ≤ 54 | _ => false
 def closesPTag (tag : String) : Bool :=
-  tag == "address" || tag == "article" || tag == "aside" || tag == "blockquote" || tag == "details" || tag == "div" ||
-  tag == "dl" || tag == "fieldset" || tag == "figcaption" || tag == "figure" || tag == "footer" || tag == "form" ||
-  isHeadingTag tag || tag == "header" || tag == "hgroup" || tag == "hr" || tag == "main" || tag == "menu" ||
-  tag == "nav" || tag == "ol" || tag == "p" || tag == "pre" || tag == "search" || tag == "section" || tag == "table" || tag == "ul"
+  match tag.utf8ByteSize with
+  | 1 => tag == "p" | 2 => tag == "dl" || tag == "hr" || tag == "ol" || tag == "ul" || isHeadingTag tag
+  | 3 => tag == "div" || tag == "nav" || tag == "pre" | 4 => tag == "form" || tag == "main" || tag == "menu"
+  | 5 => tag == "aside" || tag == "table" | 8 => tag == "fieldset" | 10 => tag == "blockquote" || tag == "figcaption"
+  | 6 => tag == "figure" || tag == "footer" || tag == "header" || tag == "hgroup" || tag == "search"
+  | 7 => tag == "address" || tag == "article" || tag == "details" || tag == "section" | _ => false
 def isInteractiveTag (tag : String) : Bool :=
-  tag == "a" || tag == "button" || tag == "input" || tag == "select" || tag == "textarea" || tag == "details" || tag == "summary"
+  match tag.utf8ByteSize with
+  | 1 => tag == "a" | 5 => tag == "input"
+  | 6 => tag == "button" || tag == "select" | 7 => tag == "details" || tag == "summary"
+  | 8 => tag == "textarea" | _ => false
 def isContextOnlyTag (tag : String) : Bool :=
-  tag == "li" || tag == "dt" || tag == "dd" || tag == "caption" || tag == "colgroup" || tag == "col" ||
-  tag == "thead" || tag == "tbody" || tag == "tfoot" || tag == "tr" || tag == "td" || tag == "th" || tag == "option" || tag == "optgroup"
+  match tag.utf8ByteSize with
+  | 2 => tag == "li" || tag == "dt" || tag == "dd" || tag == "tr" || tag == "td" || tag == "th"
+  | 3 => tag == "col" | 5 => tag == "thead" || tag == "tbody" || tag == "tfoot"
+  | 6 => tag == "option" | 7 => tag == "caption" | 8 => tag == "colgroup" || tag == "optgroup" | _ => false
 
 inductive TagMode where
   | normal | ulOl | dl | table | colgroup | tableSection | tableRow
@@ -310,9 +338,12 @@ end
 
 def Html.valid (h : Html msg) : Bool := Html.validIn {} h
 
-private theorem Attr.validList_eq_all (as : List (Attr msg)) : Attr.validList as = as.all Attr.valid := by induction as <;> simp [Attr.validList, *]
-private theorem Attr.hasLocalCell_eq_any (as : List (Attr msg)) : Attr.hasLocalCell as = as.any Attr.isLocalCell := by induction as <;> simp [Attr.hasLocalCell, *]
-private theorem Html.validListIn_eq_all (ctx : HtmlCtx) (cs : List (Html msg)) : Html.validListIn ctx cs = cs.all (Html.validIn ctx) := by induction cs <;> simp [Html.validListIn, *]
+private theorem Attr.validList_eq_all (as : List (Attr msg)) : Attr.validList as = as.all Attr.valid := by
+  induction as with | nil => rfl | cons _ _ ih => simp only [Attr.validList, List.all_cons, ih]
+private theorem Attr.hasLocalCell_eq_any (as : List (Attr msg)) : Attr.hasLocalCell as = as.any Attr.isLocalCell := by
+  induction as with | nil => rfl | cons _ _ ih => simp only [Attr.hasLocalCell, List.any_cons, ih]
+private theorem Html.validListIn_eq_all (ctx : HtmlCtx) (cs : List (Html msg)) : Html.validListIn ctx cs = cs.all (Html.validIn ctx) := by
+  induction cs with | nil => rfl | cons _ _ ih => simp only [Html.validListIn, List.all_cons, ih]
 
 @[simp] theorem Attr.valid_empty : (Attr.empty : Attr msg).valid = true := rfl
 @[simp] theorem Attr.isLocalCell_empty : (Attr.empty : Attr msg).isLocalCell = false := rfl
@@ -379,7 +410,8 @@ ite_simp Html.validListIn_ite (ctx : HtmlCtx) | Html.validListIn ctx : List (Htm
 @[simp] theorem Html.validIn_ofOption (ctx : HtmlCtx) (o : Option (Html msg)) : Html.validIn ctx (Html.ofOption o) = match o with | some h => Html.validIn ctx h | none => validTextIn ctx "" := by cases o <;> rfl
 @[simp] theorem Html.validListIn_map {α msg : Type} (ctx : HtmlCtx) (xs : List α) (f : α → Html msg) : Html.validListIn ctx (xs.map f) = xs.all (fun a => Html.validIn ctx (f a)) := by simp [Html.validListIn_eq_all, Function.comp_def]
 @[simp] theorem Html.validListIn_toList_map {α msg : Type} (ctx : HtmlCtx) (xs : Array α) (f : α → Html msg) : Html.validListIn ctx (xs.map f).toList = xs.toList.all (fun a => Html.validIn ctx (f a)) := by simp [Array.toList_map]
-@[simp] theorem List.all_const_true {α : Type} (xs : List α) : xs.all (fun _ => true) = true := by induction xs <;> simp [*]
+@[simp] theorem List.all_const_true {α : Type} (xs : List α) : xs.all (fun _ => true) = true := by
+  induction xs with | nil => rfl | cons _ _ ih => simp only [List.all_cons, Bool.true_and, ih]
 
 @[simp] theorem validTextIn_normal   (inP inter inForm : Bool) (s : String) : validTextIn ⟨.normal, inP, inter, inForm⟩ s = true := rfl
 @[simp] theorem validTextIn_option   (inP inter inForm : Bool) (s : String) : validTextIn ⟨.option, inP, inter, inForm⟩ s = true := rfl
@@ -431,7 +463,8 @@ ite_simp Html.canonical_ite | Html.canonical : Html msg
     Html.canonical (Html.ofOption o) = match o with | some h => Html.canonical h | none => .text "" := by cases o <;> rfl
 @[simp] theorem Html.canonicalList_nil : Html.canonicalList ([] : List (Html msg)) = [] := rfl
 @[simp] theorem Html.canonicalList_cons (c : Html msg) (cs : List (Html msg)) : Html.canonicalList (c :: cs) = Html.canonical c :: Html.canonicalList cs := rfl
-theorem Html.canonicalList_eq_map (cs : List (Html msg)) : Html.canonicalList cs = cs.map Html.canonical := by induction cs <;> simp [*]
+theorem Html.canonicalList_eq_map (cs : List (Html msg)) : Html.canonicalList cs = cs.map Html.canonical := by
+  induction cs with | nil => rfl | cons _ _ ih => simp only [Html.canonicalList, List.map_cons, ih]
 @[simp] theorem Html.canonicalList_append (xs ys : List (Html msg)) : Html.canonicalList (xs ++ ys) = Html.canonicalList xs ++ Html.canonicalList ys := by simp [Html.canonicalList_eq_map]
 @[simp] theorem Html.canonicalList_map {α : Type _} (xs : List α) (f : α → Html msg) :
     Html.canonicalList (xs.map f) = xs.map (fun x => Html.canonical (f x)) := by simp [Html.canonicalList_eq_map, Function.comp_def]
@@ -472,6 +505,68 @@ theorem hasAsciiByte_eq_any (s : String) (p : UInt8 → Bool) (q : Char → Bool
   · rw [utf8EncodeChar_le_127 c hc, List.any_cons, List.any_nil, Bool.or_false]; exact hlo c hc
   · have hgt : c.toNat > 127 := by omega
     rw [hqhi c hgt, List.any_eq_false]; exact fun b hb => by simp [hhi b (utf8EncodeChar_gt_127 c hgt b hb)]
+
+private theorem flatMap_utf8_ascii : ∀ cs : List Char, (∀ c ∈ cs, c.toNat ≤ 127) →
+    cs.flatMap String.utf8EncodeChar = cs.map (fun c => UInt8.ofNat c.toNat)
+  | [], _ => rfl
+  | c :: rest, hc => by
+      rw [List.flatMap_cons, utf8EncodeChar_le_127 c (hc c List.mem_cons_self), List.singleton_append,
+          List.map_cons, flatMap_utf8_ascii rest fun x hx => hc x (List.mem_cons_of_mem _ hx)]
+
+private theorem bytes_all_toList {s : String} {p : UInt8 → Bool}
+    (hhi : ∀ b : UInt8, b.toNat ≥ 128 → p b = false) (h : s.toByteArray.data.toList.all p = true) :
+    (∀ c ∈ s.toList, c.toNat ≤ 127 ∧ p (UInt8.ofNat c.toNat) = true) ∧
+      s.toByteArray.data.toList = s.toList.map (fun c => UInt8.ofNat c.toNat) := by
+  rw [string_toByteArray_data] at h ⊢
+  have h1 : ∀ c ∈ s.toList, c.toNat ≤ 127 ∧ p (UInt8.ofNat c.toNat) = true := fun c hc => by
+    have hce := List.all_eq_true.1 (List.all_flatMap.symm ▸ h) c hc
+    by_cases hle : c.toNat ≤ 127
+    · rw [utf8EncodeChar_le_127 c hle] at hce; exact ⟨hle, List.all_eq_true.1 hce _ List.mem_cons_self⟩
+    · cases hne : String.utf8EncodeChar c with
+      | nil => exact absurd hne (utf8EncodeChar_ne_nil c)
+      | cons b _ =>
+          exact absurd (List.all_eq_true.1 hce b (hne ▸ List.mem_cons_self))
+            (by rw [hhi b (utf8EncodeChar_gt_127 c (by omega) b (hne ▸ List.mem_cons_self))]; decide)
+  exact ⟨h1, flatMap_utf8_ascii s.toList fun c hc => (h1 c hc).1⟩
+
+@[inline] def isAsciiLowerTagByte (b : UInt8) : Bool := (97 ≤ b && b ≤ 122) || (48 ≤ b && b ≤ 57) || b == 45
+@[inline] def isAsciiLowerAttrByte (b : UInt8) : Bool := isAsciiLowerTagByte b || b == 95 || b == 58 || b == 46
+def isSafeTagBytes (tag : String) : Bool := let bs := tag.toByteArray.data.toList; !bs.isEmpty && bs.all isAsciiLowerTagByte
+def isSafeLowerAttrBytes (k : String) : Bool :=
+  let bs := k.toByteArray.data.toList
+  !bs.isEmpty && bs.all isAsciiLowerAttrByte && (match bs with | 111 :: 110 :: _ => false | _ => true) && bs != [115, 114, 99, 100, 111, 99]
+
+theorem isSafeTagName_of_bytes (tag : String) (h : isSafeTagBytes tag = true) : isSafeTagName tag = true := by
+  simp only [isSafeTagBytes, Bool.and_eq_true, Bool.not_eq_true'] at h
+  have ⟨hc, hmap⟩ := bytes_all_toList (by decide) h.2
+  have hfin : ∀ x : Fin 128, isAsciiLowerTagByte (UInt8.ofNat x.val) = true → ((Char.ofNat x.val).isAlphanum || Char.ofNat x.val == '-') = true := by decide
+  simp only [isSafeTagName, Bool.and_eq_true, Bool.not_eq_true']
+  refine ⟨by cases htl : tag.toList with | nil => rw [htl] at hmap; simp [hmap] at h | cons _ _ => rfl, List.all_eq_true.2 fun c hm => ?_⟩
+  have ⟨hle, hp⟩ := hc c hm; have hok := hfin ⟨c.toNat, by omega⟩ hp; rwa [Char.ofNat_toNat] at hok
+
+theorem isSafeAttrName_of_bytes (k : String) (h : isSafeLowerAttrBytes k = true) : isSafeAttrName k = true := by
+  simp only [isSafeLowerAttrBytes, Bool.and_eq_true, Bool.not_eq_true'] at h
+  rcases h with ⟨⟨⟨hne, hall⟩, hnoOn⟩, hnoSrc⟩
+  have ⟨hc, hmap⟩ := bytes_all_toList (by decide) hall
+  have hfin : ∀ x : Fin 128, isAsciiLowerAttrByte (UInt8.ofNat x.val) = true →
+      isKeyChar (Char.ofNat x.val) = true ∧ asciiLowerChar (Char.ofNat x.val) = Char.ofNat x.val := by decide
+  have hchars : ∀ c ∈ k.toList, isKeyChar c = true ∧ asciiLowerChar c = c := fun c hm => by
+    have ⟨hle, hp⟩ := hc c hm; have hok := hfin ⟨c.toNat, by omega⟩ hp; rwa [Char.ofNat_toNat] at hok
+  have hlow : k.toList.map asciiLowerChar = k.toList := by rw [List.map_congr_left fun c hm => (hchars c hm).2, List.map_id']
+  simp only [isSafeAttrName, isSafeRenderedKey, hlow, Bool.and_eq_true, Bool.not_eq_true']
+  refine ⟨List.all_eq_true.2 fun c hm => (hchars c hm).1, ⟨by cases htl : k.toList with | nil => rw [htl] at hmap; simp [hmap] at hne | cons _ _ => rfl, ?_⟩, ?_⟩
+  · cases hon : hasOnPrefix k.toList with
+    | false => rfl
+    | true =>
+        unfold hasOnPrefix at hon; split at hon
+        · next _ _ heq => rw [heq] at hmap; simp only [List.map_cons] at hmap; rw [hmap] at hnoOn; cases hnoOn
+        · cases hon
+  · cases hsd : isSrcdocChars k.toList with
+    | false => rfl
+    | true =>
+        unfold isSrcdocChars at hsd; split at hsd
+        · next _ heq => rw [heq] at hmap; rw [hmap] at hnoSrc; exact absurd hnoSrc (by decide)
+        · cases hsd
 
 theorem asciiByte_beq_char (c : Char) (hc : c.toNat ≤ 127) (target : Char) (ht : target.toNat ≤ 127) :
     (UInt8.ofNat c.toNat == UInt8.ofNat target.toNat) = (c == target) := by
@@ -822,6 +917,34 @@ def splitCharAux (sep : Char) (cur : List Char) (acc : List String) : List Char 
 def splitChar (s : String) (sep : Char) : List String :=
   splitCharAux sep [] [] s.toList
 
+theorem splitCharAux_acc (sep : Char) : ∀ (xs cur : List Char) (acc : List String),
+    splitCharAux sep cur acc xs = acc.reverse ++ splitCharAux sep cur [] xs
+  | [], cur, acc => by simp only [splitCharAux, List.reverse_cons, List.reverse_nil, List.nil_append]
+  | c :: cs, cur, acc => by
+      simp only [splitCharAux]; split
+      · rw [splitCharAux_acc sep cs [] (_ :: acc), splitCharAux_acc sep cs [] [_],
+            List.reverse_cons, List.reverse_singleton, List.append_assoc]
+      · exact splitCharAux_acc sep cs (c :: cur) acc
+
+theorem splitCharAux_append_not_mem (sep : Char) : ∀ (xs ys cur : List Char) (acc : List String), sep ∉ xs →
+    splitCharAux sep cur acc (xs ++ sep :: ys) = splitCharAux sep [] (String.ofList (cur.reverse ++ xs) :: acc) ys
+  | [], ys, cur, acc, _ => by simp only [List.nil_append, splitCharAux, beq_self_eq_true, ↓reduceIte, List.append_nil]
+  | c :: xs, ys, cur, acc, hnd => by
+      have hc : (c == sep) = false := beq_false_of_ne fun h => hnd (h ▸ .head _)
+      have hxs : sep ∉ xs := fun hm => hnd (.tail _ hm)
+      simp only [List.cons_append, splitCharAux, hc, Bool.false_eq_true, ↓reduceIte]
+      rw [splitCharAux_append_not_mem sep xs ys (c :: cur) acc hxs, List.reverse_cons, List.append_assoc, List.singleton_append]
+
+theorem splitCharAux_not_mem (sep : Char) : ∀ (xs cur : List Char) (acc : List String), sep ∉ xs →
+    splitCharAux sep cur acc xs = (String.ofList (cur.reverse ++ xs) :: acc).reverse
+  | [], cur, acc, _ => by simp only [splitCharAux, List.append_nil]
+  | c :: xs, cur, acc, hnd => by
+      have hc : (c == sep) = false := beq_false_of_ne fun h => hnd (h ▸ .head _)
+      have hxs : sep ∉ xs := fun hm => hnd (.tail _ hm)
+      simp only [splitCharAux, hc, Bool.false_eq_true, ↓reduceIte]
+      rw [splitCharAux_not_mem sep xs (c :: cur) acc hxs]
+      simp only [List.reverse_cons, List.append_assoc, List.singleton_append]
+
 def parseNatAux (acc : Nat) : List Char → Option Nat
   | [] => some acc
   | c :: cs =>
@@ -943,11 +1066,10 @@ theorem nat_toString_not_mem {d : Char} (hd : d < '0' ∨ '9' < d) (n : Nat) : d
   · have : 57 < d.toNat := hgt; omega
 
 private theorem digit_mem_digits {c : Char} (h1 : '0' ≤ c) (h2 : c ≤ '9') : c ∈ "0123456789".toList := by
+  have hfin : ∀ d : Fin 10, Char.ofNat (48 + d.val) ∈ "0123456789".toList := by decide
   have h1' : 48 ≤ c.toNat := h1; have h2' : c.toNat ≤ 57 := h2
-  have hcases : c.toNat = 48 ∨ c.toNat = 49 ∨ c.toNat = 50 ∨ c.toNat = 51 ∨ c.toNat = 52 ∨
-      c.toNat = 53 ∨ c.toNat = 54 ∨ c.toNat = 55 ∨ c.toNat = 56 ∨ c.toNat = 57 := by omega
-  rcases hcases with h | h | h | h | h | h | h | h | h | h <;>
-    (have hc : c = Char.ofNat c.toNat := (Char.ofNat_toNat c).symm; rw [hc, h]; decide)
+  have hc : c = Char.ofNat (48 + (c.toNat - 48)) := by rw [Nat.add_sub_cancel' h1', Char.ofNat_toNat]
+  exact hc ▸ hfin ⟨c.toNat - 48, by omega⟩
 
 theorem nat_toString_all {p : Char → Bool} (hp : "0123456789".toList.all p = true) (n : Nat) :
     (toString n).toList.all p = true :=
@@ -1137,6 +1259,11 @@ def containsBytes (haystack needle : String) : Bool :=
 def containsAllBytes (haystack : String) (needles : List String) : Bool :=
   let hbs := haystack.toByteArray.data.toList
   needles.all fun n => if n.utf8ByteSize == 0 then true else bytesContains n.toByteArray.data.toList hbs
+
+/-- Kernel-fast check that `haystack` contains none of the substrings in `needles` (converts `haystack` once). -/
+def containsNoneBytes (haystack : String) (needles : List String) : Bool :=
+  let hbs := haystack.toByteArray.data.toList
+  needles.all fun n => if n.utf8ByteSize == 0 then false else !bytesContains n.toByteArray.data.toList hbs
 
 end Str
 

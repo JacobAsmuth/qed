@@ -62,80 +62,6 @@ class MonadDom (msg : outParam Type) (m : Type → Type) extends Monad m where
   patchTmplRow     : Dom.Node → UInt32 → Array String → Array String → m Unit
   hydrateTmplRow   : Dom.Node → UInt32 → m Unit
 
-private def buildStaticProtoDom {msg : Type} (ns : String) : Html msg → IO Dom.Node
-  | .text s => Dom.createText s
-  | .element tag attrs children => do
-      let node ← Dom.createElement ns tag
-      (normalizeAttrs attrs).forM fun
-        | .cls c => Dom.setAttribute node "class" c | .attr "value" v => Dom.setValue node v
-        | .attr k v => Dom.setAttribute node k v | .flag "checked" p => Dom.setChecked node p
-        | .flag k p => if p then Dom.setAttribute node k k else Dom.removeAttribute node k
-        | _ => pure ()
-      for c in children do Dom.appendChild node (← buildStaticProtoDom (Dom.childNsOf ns tag) c)
-      return node
-
-def registerHandler {α : Type} (tbl : IO.Ref (Array α)) (node : Dom.Node) (key : String) (v : α) (reuse : Bool := true) : IO Unit := do
-  let ts ← tbl.get; let next := toString ts.size -- capture `ts.size` before `push` (JS mutates in place)
-  if reuse then
-    if let some i := (← Dom.getAttribute node key).toNat? then
-      if i < ts.size then tbl.set (ts.set! i v); return
-  tbl.set (ts.push v); Dom.setAttribute node key next
-
-@[inline] private def listenEv (e : String) : IO Unit := Dom.effect "event.listen" e "" ""
-private def allocSigSlot (h : Handlers msg) (name : String) (m : msg) : IO Nat := do
-  let ts ← h.click.get; let i := ts.size; h.click.set (ts.push m); Dom.setSigSlot name (UInt32.ofNat (i + 1)); pure i
-
-abbrev DomM (msg : Type) := ReaderT (Handlers msg) IO
-
-instance : MonadDom msg (DomM msg) where
-  createElement a b := Dom.createElement a b
-  createText a := Dom.createText a
-  createFragment := Dom.createFragment
-  childNamespace a := Dom.childNamespace a
-  setAttribute a b c := Dom.setAttribute a b c
-  removeAttribute a b := Dom.removeAttribute a b
-  retainAttributes a b := Dom.retainAttributes a b
-  clearHandlers a := Dom.clearHandlers a
-  setValue a b := Dom.setValue a b
-  setChecked a b := Dom.setChecked a b
-  setText a b := Dom.setText a b
-  appendChild a b := Dom.appendChild a b
-  childAt a b := Dom.childAt a b
-  childCount a := Dom.childCount a
-  removeChild a b := Dom.removeChild a b
-  replaceChild a b c := Dom.replaceChild a b c
-  insertBeforeNode a b c := Dom.insertBefore a b c
-  insertBeforeRef p r c := Dom.insertBeforeRef p (r.getD 0) c
-  removeNode a b := Dom.removeNode a b
-  clearChildren a := Dom.clearChildren a
-  bindSignal a b := Dom.bindSignal a b
-  bindSignalAttr a b c := Dom.bindSignalAttr a b c
-  setSignal name val := Dom.effect "signal.set" name val ""
-  bindSignalOn n name ev m := fun h => do
-    listenEv ev; let slot ← Dom.getSigSlot name
-    Dom.setAttribute n s!"data-qed-on-{ev}" (toString (← if slot > 0 then pure (slot.toNat - 1) else allocSigSlot h name m))
-  setSignalOn name m := fun h => do
-    let slot ← Dom.getSigSlot name
-    if slot > 0 then let i := slot.toNat - 1; let ts ← h.click.get; if i < ts.size then h.click.set (ts.set! i m)
-    else discard <| allocSigSlot h name m
-  onEvent n ev m := fun h => do listenEv ev; registerHandler h.click n s!"data-qed-on-{ev}" m h.reuseSlots
-  onValueEvent n ev f := fun h => do listenEv ev; registerHandler h.input n s!"data-qed-onv-{ev}" f h.reuseSlots
-  mountLocalCell n key comp init props bubble := fun h => do
-    let fk := localKey comp key
-    if (← Dom.getAttribute n "data-qed-local") != fk then
-      if (← Dom.childCount n) > 0 then Dom.clearChildren n
-      Dom.setAttribute n "data-qed-local" fk
-    h.mountLocal key comp init props bubble n
-  compileRowTmpl ns proto slotPaths slotAttrs evPaths evNames := fun _ => do evNames.forM listenEv; Dom.compileRowTmpl (← buildStaticProtoDom ns proto) slotPaths slotAttrs evPaths evNames
-  allocRowEvSlot node fn := fun h => do
-    let ts ← h.rowEv.get; let slot := ts.size; h.rowEv.set (ts.push fn)
-    Dom.setAttribute node "data-qed-list" (toString (rowEvBase.toNat + slot)); return UInt32.ofNat slot
-  setRowEvSlot slot fn := fun h => do let ts ← h.rowEv.get; if slot.toNat < ts.size then h.rowEv.set (ts.set! slot.toNat fn)
-  mountTmplRow a b := Dom.mountTmplRow a b
-  mountTmplRows a b c := Dom.mountTmplRows a b c
-  patchTmplRow a b c d := Dom.patchTmplRow a b c d
-  hydrateTmplRow a b := Dom.hydrateTmplRow a b
-
 def applyAttrM [MonadDom msg m] (node : Dom.Node) : Attr msg → m Unit
   | .cls c => MonadDom.setAttribute node "class" c | .attr "value" v => MonadDom.setValue node v
   | .attr k v => MonadDom.setAttribute node k v | .flag "checked" p => MonadDom.setChecked node p
@@ -174,6 +100,74 @@ def buildDomM [MonadDom msg m] (ns : String) : Html msg → m Dom.Node
 def buildDomListM [MonadDom msg m] (ns : String) (parent : Dom.Node) : List (Html msg) → m Unit
   | [] => pure () | c :: cs => do MonadDom.appendChild parent (← buildDomM ns c); buildDomListM ns parent cs
 end
+
+def registerHandler {α : Type} (tbl : IO.Ref (Array α)) (node : Dom.Node) (key : String) (v : α) (reuse : Bool := true) : IO Unit := do
+  let ts ← tbl.get; let next := toString ts.size -- capture `ts.size` before `push` (JS mutates in place)
+  if reuse then
+    if let some i := (← Dom.getAttribute node key).toNat? then
+      if i < ts.size then tbl.set (ts.set! i v); return
+  tbl.set (ts.push v); Dom.setAttribute node key next
+
+@[inline] private def listenEv (e : String) : IO Unit := Dom.effect "event.listen" e "" ""
+private def allocSigSlot (h : Handlers msg) (name : String) (m : msg) : IO Nat := do
+  let ts ← h.click.get; let i := ts.size; h.click.set (ts.push m); Dom.setSigSlot name (UInt32.ofNat (i + 1)); pure i
+
+abbrev DomM (msg : Type) := ReaderT (Handlers msg) IO
+
+@[instance_reducible] private def domMBase : MonadDom msg (DomM msg) where
+  createElement a b := Dom.createElement a b
+  createText a := Dom.createText a
+  createFragment := Dom.createFragment
+  childNamespace a := Dom.childNamespace a
+  setAttribute a b c := Dom.setAttribute a b c
+  removeAttribute a b := Dom.removeAttribute a b
+  retainAttributes a b := Dom.retainAttributes a b
+  clearHandlers a := Dom.clearHandlers a
+  setValue a b := Dom.setValue a b
+  setChecked a b := Dom.setChecked a b
+  setText a b := Dom.setText a b
+  appendChild a b := Dom.appendChild a b
+  childAt a b := Dom.childAt a b
+  childCount a := Dom.childCount a
+  removeChild a b := Dom.removeChild a b
+  replaceChild a b c := Dom.replaceChild a b c
+  insertBeforeNode a b c := Dom.insertBefore a b c
+  insertBeforeRef p r c := Dom.insertBeforeRef p (r.getD 0) c
+  removeNode a b := Dom.removeNode a b
+  clearChildren a := Dom.clearChildren a
+  bindSignal a b := Dom.bindSignal a b
+  bindSignalAttr a b c := Dom.bindSignalAttr a b c
+  setSignal name val := Dom.effect "signal.set" name val ""
+  bindSignalOn n name ev m := fun h => do
+    listenEv ev; let slot ← Dom.getSigSlot name
+    Dom.setAttribute n s!"data-qed-on-{ev}" (toString (← if slot > 0 then pure (slot.toNat - 1) else allocSigSlot h name m))
+  setSignalOn name m := fun h => do
+    let slot ← Dom.getSigSlot name
+    if slot > 0 then let i := slot.toNat - 1; let ts ← h.click.get; if i < ts.size then h.click.set (ts.set! i m)
+    else discard <| allocSigSlot h name m
+  onEvent n ev m := fun h => do listenEv ev; registerHandler h.click n s!"data-qed-on-{ev}" m h.reuseSlots
+  onValueEvent n ev f := fun h => do listenEv ev; registerHandler h.input n s!"data-qed-onv-{ev}" f h.reuseSlots
+  mountLocalCell n key comp init props bubble := fun h => do
+    let fk := localKey comp key
+    if (← Dom.getAttribute n "data-qed-local") != fk then
+      if (← Dom.childCount n) > 0 then Dom.clearChildren n
+      Dom.setAttribute n "data-qed-local" fk
+    h.mountLocal key comp init props bubble n
+  compileRowTmpl _ _ _ _ _ _ := pure 0
+  allocRowEvSlot node fn := fun h => do
+    let ts ← h.rowEv.get; let slot := ts.size; h.rowEv.set (ts.push fn)
+    Dom.setAttribute node "data-qed-list" (toString (rowEvBase.toNat + slot)); return UInt32.ofNat slot
+  setRowEvSlot slot fn := fun h => do let ts ← h.rowEv.get; if slot.toNat < ts.size then h.rowEv.set (ts.set! slot.toNat fn)
+  mountTmplRow a b := Dom.mountTmplRow a b
+  mountTmplRows a b c := Dom.mountTmplRows a b c
+  patchTmplRow a b c d := Dom.patchTmplRow a b c d
+  hydrateTmplRow a b := Dom.hydrateTmplRow a b
+
+instance : MonadDom msg (DomM msg) :=
+  { domMBase with
+    compileRowTmpl := fun ns proto slotPaths slotAttrs evPaths evNames h => do
+      evNames.forM listenEv
+      Dom.compileRowTmpl (← @buildDomM msg (DomM msg) domMBase ns proto h) slotPaths slotAttrs evPaths evNames }
 
 def hydrateTextSlotM [MonadDom msg m] (parent : Dom.Node) (index : UInt32) (inTextRun : Bool)
     (s : String) (moreInRun : Unit → Bool) : m (Dom.Node × Bool) := do

@@ -36,17 +36,27 @@ private theorem mk_nv (t : String) (h : isVoidTagFast t = false) : isVoidTag t =
 private theorem bool_guard_false : ∀ {x req bad : Bool}, (x && !req) = false → (!req || !bad) = true → (x && bad) = false
   | false, _, _, _, _ | true, _, false, _, _ => rfl | true, true, true, _, h | true, false, true, h, _ => nomatch h
 
+private theorem eq_false_of_sz_ne {t s : String} (h : (t.utf8ByteSize == s.utf8ByteSize) = false) : (t == s) = false :=
+  beq_eq_false_iff_ne.2 fun heq => by subst heq; simp at h
+
+private def tagEqSz (n : Nat) (s t : String) : Bool := t.utf8ByteSize == n && t == s
+private theorem tagEqSz_eq (n : Nat) (s : String) (hn : s.utf8ByteSize = n) (t : String) : tagEqSz n s t = (t == s) := by
+  unfold tagEqSz; cases hsz : (t.utf8ByteSize == n)
+  · rw [Bool.false_and, eq_false_of_sz_ne (hn ▸ hsz)]
+  · rfl
+
 private def normalStepTagOk (t : String) (m2 : TagMode) (reqNoCloseP reqNonInter wantHead wantInter : Bool) : Bool :=
-  isSafeTagName t && !isForbiddenTag t && !isContextOnlyTag t &&
-  !(t == "svg" || t == "style" || t == "dl" || t == "form") &&
-  (!reqNoCloseP || !closesPTag t) && (!reqNonInter || !(isInteractiveTag t || t == "label")) &&
+  isSafeTagBytes t && !isForbiddenTag t && !isContextOnlyTag t &&
+  !(tagEqSz 3 "svg" t || tagEqSz 5 "style" t || tagEqSz 2 "dl" t || tagEqSz 4 "form" t) &&
+  (!reqNoCloseP || !closesPTag t) && (!reqNonInter || !(isInteractiveTag t || tagEqSz 5 "label" t)) &&
   if m2 == .normal then
-    !(t == "textarea" || t == "select" || t == "ul" || t == "ol" || t == "table") &&
-    ((t == "p" || isHeadingTag t) == wantHead) && ((t == "a" || t == "button" || t == "details" || t == "summary") == wantInter)
+    !(tagEqSz 8 "textarea" t || tagEqSz 6 "select" t || tagEqSz 2 "ul" t || tagEqSz 2 "ol" t || tagEqSz 5 "table" t) &&
+    ((tagEqSz 1 "p" t || isHeadingTag t) == wantHead) &&
+    ((tagEqSz 1 "a" t || tagEqSz 6 "button" t || tagEqSz 7 "details" t || tagEqSz 7 "summary" t) == wantInter)
   else
-    !wantHead && ((t == "textarea" || t == "select") == wantInter) &&
-    (if t == "textarea" then m2 == .textarea else if t == "select" then m2 == .select
-     else if t == "ul" || t == "ol" then m2 == .ulOl else if t == "table" then m2 == .table else false)
+    !wantHead && ((tagEqSz 8 "textarea" t || tagEqSz 6 "select" t) == wantInter) &&
+    (if tagEqSz 8 "textarea" t then m2 == .textarea else if tagEqSz 6 "select" t then m2 == .select
+     else if tagEqSz 2 "ul" t || tagEqSz 2 "ol" t then m2 == .ulOl else if tagEqSz 5 "table" t then m2 == .table else false)
 
 private theorem mk_normalStep (t : String) (m2 : TagMode) (reqNoCloseP reqNonInter wantHead wantInter : Bool)
     (h : normalStepTagOk t m2 reqNoCloseP reqNonInter wantHead wantInter = true)
@@ -54,8 +64,15 @@ private theorem mk_normalStep (t : String) (m2 : TagMode) (reqNoCloseP reqNonInt
     (hp' : (p || wantHead) = p') (hi' : (i || wantInter) = i') :
     stepHtmlCtx { mode := .normal, inP := p, interactive := i, inForm := f } t =
       some { mode := m2, inP := p', interactive := i', inForm := f } := by
-  simp only [normalStepTagOk, Bool.and_eq_true] at h
-  rcases h with ⟨⟨⟨⟨⟨⟨hs, hfb⟩, hc⟩, hsp⟩, hcp⟩, hni⟩, hm⟩
+  simp only [normalStepTagOk,
+    tagEqSz_eq 3 "svg" rfl, tagEqSz_eq 5 "style" rfl, tagEqSz_eq 2 "dl" rfl, tagEqSz_eq 4 "form" rfl,
+    tagEqSz_eq 5 "label" rfl, tagEqSz_eq 8 "textarea" rfl, tagEqSz_eq 6 "select" rfl,
+    tagEqSz_eq 2 "ul" rfl, tagEqSz_eq 2 "ol" rfl, tagEqSz_eq 5 "table" rfl,
+    tagEqSz_eq 1 "p" rfl, tagEqSz_eq 1 "a" rfl, tagEqSz_eq 6 "button" rfl,
+    tagEqSz_eq 7 "details" rfl, tagEqSz_eq 7 "summary" rfl,
+    Bool.and_eq_true] at h
+  rcases h with ⟨⟨⟨⟨⟨⟨hsB, hfb⟩, hc⟩, hsp⟩, hcp⟩, hni⟩, hm⟩
+  have hs := isSafeTagName_of_bytes t hsB
   simp only [Bool.not_eq_true', Bool.or_eq_false_iff] at hfb hc hsp
   rcases hsp with ⟨⟨⟨hsvg, hsty⟩, hdl⟩, hfrm⟩
   have hp0 : (p && closesPTag t) = false := bool_guard_false hp hcp
@@ -81,7 +98,7 @@ private theorem mk_normalStep (t : String) (m2 : TagMode) (reqNoCloseP reqNonInt
     · cases beq_iff_eq.1 hstep; simp only [ht1, Bool.true_or, beq_iff_eq] at hwI; subst hwI; simp only [Bool.or_true] at hi'; subst hi'; rfl
 
 private theorem mk_modeStep (m1 m2 : TagMode) (tag : String) (resetP : Bool)
-    (hs : isSafeTagName tag = true) (hf : isForbiddenTag tag = false)
+    (hsB : isSafeTagBytes tag = true) (hf : isForbiddenTag tag = false)
     (hstep : (match m1 with
       | .ulOl => if tag == "li" then some (TagMode.normal, true) else none
       | .table => if tag == "caption" then some (TagMode.normal, true) else if tag == "colgroup" then some (TagMode.colgroup, true)
@@ -92,8 +109,17 @@ private theorem mk_modeStep (m1 m2 : TagMode) (tag : String) (resetP : Bool)
       | _ => none) = some (m2, resetP)) (p i f : Bool) :
     stepHtmlCtx { mode := m1, inP := p, interactive := i, inForm := f } tag =
       some { mode := m2, inP := if resetP then false else p, interactive := i, inForm := f } := by
-  cases m1 <;> simp only [stepHtmlCtx, hs, hf, Bool.not_true, Bool.or_false, Bool.false_eq_true, ↓reduceIte] at hstep ⊢ <;>
-    repeat (first | (cases hstep; done) | (split at hstep <;> simp only [*, ↓reduceIte] <;> try (cases hstep; rfl)))
+  have hs := isSafeTagName_of_bytes tag hsB
+  cases m1 with
+  | ulOl | tableSection | tableRow | select =>
+      simp only [stepHtmlCtx, hs, hf, Bool.not_true, Bool.or_false, Bool.false_eq_true, ↓reduceIte] at hstep ⊢
+      split at hstep <;> simp only [*, ↓reduceIte] <;> cases hstep <;> rfl
+  | table =>
+      simp only [stepHtmlCtx, hs, hf, Bool.not_true, Bool.or_false, Bool.false_eq_true, ↓reduceIte] at hstep ⊢
+      split at hstep; · simp only [*, ↓reduceIte]; cases hstep; rfl
+      · split at hstep; · simp only [*, ↓reduceIte]; cases hstep; rfl
+        · split at hstep <;> simp only [*, ↓reduceIte] <;> cases hstep <;> rfl
+  | _ => cases hstep
 
 private def camelValidName (pfx s : String) : String :=
   match s.splitOn "-" with
@@ -103,7 +129,7 @@ private def modeStepInfo : String → Lean.Name × Lean.Name × Bool
   | "li" => (`ulOl, `normal, true) | "thead" | "tbody" => (`table, `tableSection, true)
   | "tr" => (`tableSection, `tableRow, true) | "option" => (`select, `option, false) | _ => (`tableRow, `normal, true)
 
-private def genStepItem (k : String) (ref thm : Lean.Ident) (sLit : Lean.StrLit) : Lean.MacroM (Lean.TSyntax `command) := do
+@[noinline] private def genStepItem (k : String) (ref thm : Lean.Ident) (sLit : Lean.StrLit) : Lean.MacroM (Lean.TSyntax `command) := do
   let mk (n : String) := Lean.mkIdentFrom ref (Lean.Name.mkSimple n)
   let mkM (m : Lean.Name) := Lean.mkIdentFrom ref (``TagMode ++ m)
   let (p, i, f) := (mk "p", mk "i", mk "f")
@@ -124,11 +150,11 @@ private def genStepItem (k : String) (ref thm : Lean.Ident) (sLit : Lean.StrLit)
   let bs := (if pVar then #[p] else #[]) ++ (if iVar then #[i] else #[]) ++ #[f]
   `(command| theorem $thm ($bs* : Bool) : stepHtmlCtx { mode := $(mkM m1), inP := $(if pVar then p else bT false), interactive := $(if iVar then i else bT false), inForm := $f } $sLit = some { mode := $(mkM m2), inP := $pOut, interactive := $iOut, inForm := $f } := $prf)
 
-local macro "genValidTable " kind:ident mapDef:ident " [" keys:str,* "]" : command => do
+@[noinline] private def genValidTableAux (kind mapDef : Lean.Ident) (keys : Array Lean.StrLit) : Lean.MacroM (Lean.TSyntax `command) := do
   let mut cmds := #[]; let mut entries : Array (Lean.TSyntax `term) := #[]
   let k := kind.getId.eraseMacroScopes.toString
   let pfx := match k with | "snu" => "snu_" | "sa" => "sa_" | "nv" => "nv_" | _ => "step_"
-  for sLit in keys.getElems do
+  for sLit in keys do
     let thmStr := camelValidName pfx sLit.getString
     let thm := Lean.mkIdentFrom sLit (Lean.Name.mkSimple thmStr)
     let fullName := Lean.Name.mkStr (Lean.Name.mkStr (Lean.Name.mkSimple "Qed") "ValidLemmas") thmStr
@@ -136,8 +162,8 @@ local macro "genValidTable " kind:ident mapDef:ident " [" keys:str,* "]" : comma
         `(((($(Lean.mkIdentFrom kind (``TagMode ++ (modeStepInfo sLit.getString).1))).ctorIdx, $sLit), $(Lean.quote fullName)))
       else `(($sLit, $(Lean.quote fullName)))
     cmds := cmds.push <| ← match k with
-      | "snu" => `(command| theorem $thm : isSafeAttrName $sLit = true ∧ isUrlAttrName $sLit = false := ⟨rfl, rfl⟩)
-      | "sa"  => `(command| theorem $thm : isSafeAttrName $sLit = true := rfl)
+      | "snu" => `(command| theorem $thm : isSafeAttrName $sLit = true ∧ isUrlAttrName $sLit = false := ⟨isSafeAttrName_of_bytes $sLit rfl, rfl⟩)
+      | "sa"  => `(command| theorem $thm : isSafeAttrName $sLit = true := isSafeAttrName_of_bytes $sLit rfl)
       | "nv"  => `(command| theorem $thm : isVoidTag $sLit = false := $(Lean.mkIdentFrom kind `mk_nv) $sLit rfl)
       | _     => genStepItem k kind thm sLit
   let defCmd ←
@@ -145,6 +171,9 @@ local macro "genValidTable " kind:ident mapDef:ident " [" keys:str,* "]" : comma
     else if k == "modeStep" then `(command| private def $mapDef : Std.HashMap (Nat × String) Lean.Name := mkMap #[$entries,*])
     else `(command| private def $mapDef : Array (String × Lean.Name) := #[$entries,*])
   return ⟨Lean.mkNullNode (cmds.push defCmd)⟩
+
+local macro "genValidTable " kind:ident mapDef:ident " [" keys:str,* "]" : command =>
+  genValidTableAux kind mapDef keys.getElems
 
 genValidTable snu safeNonUrlAttrMap [
   "data-role", "data-qed-link", "value", "placeholder", "name", "alt", "title", "style", "type",

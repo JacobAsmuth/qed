@@ -1,6 +1,5 @@
 namespace Qed
 
-def _root_.Array.findIndex {α : Type} (xs : Array α) (p : α → Bool) : Option (Fin xs.size) := Array.findFinIdx? p xs
 @[simp] theorem _root_.Array.forall_push {α : Type} {P : α → Prop} {xs : Array α} {v : α} : (∀ x ∈ xs.push v, P x) ↔ (∀ x ∈ xs, P x) ∧ P v :=
   ⟨fun h => ⟨fun x hx => h x (Array.mem_push.2 (.inl hx)), h v (Array.mem_push.2 (.inr rfl))⟩, fun ⟨hxs, hv⟩ x hx => (Array.mem_push.1 hx).elim (hxs x) (· ▸ hv)⟩
 theorem _root_.Array.forall_set {α : Type u} {P : α → Prop} {xs : Array α} {i : Nat} {v : α} (h : i < xs.size) (hxs : ∀ x ∈ xs, P x) (hv : P v) : ∀ x ∈ xs.set i v h, P x := fun x hx =>

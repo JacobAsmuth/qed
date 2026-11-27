@@ -77,17 +77,13 @@ def decodeSeg (s : String) : String := (String.fromUTF8? (decodeBytes s.toList .
 def urlDecodeComponent (s : String) : String :=
   (String.fromUTF8? (decodeBytes (s.toList.map fun c => if c == '+' then ' ' else c) .empty)).getD s
 
-private def splitAmp : List Char → List Char → List String
-  | [], acc => [String.ofList acc.reverse]
-  | c :: cs, acc => if c == '&' then String.ofList acc.reverse :: splitAmp cs [] else splitAmp cs (c :: acc)
-
 private def splitFirstEq : List Char → List Char → String × String
   | [], acc => (String.ofList acc.reverse, "")
   | c :: cs, acc => if c == '=' then (String.ofList acc.reverse, String.ofList cs) else splitFirstEq cs (c :: acc)
 
 def parseQueryParams (q : String) : List (String × String) :=
   let cs := match q.toList with | '?' :: rest => rest | rest => rest
-  if cs.isEmpty then [] else (splitAmp cs []).filterMap fun pair =>
+  if cs.isEmpty then [] else (Str.splitCharAux '&' [] [] cs).filterMap fun pair =>
     if pair.isEmpty then none
     else let (k, v) := splitFirstEq pair.toList []; some (urlDecodeComponent k, urlDecodeComponent v)
 
@@ -126,10 +122,7 @@ def Router.toURL {α} [Router α] (a : α) : String :=
     rcases List.mem_map.1 hs with ⟨raw, _, rfl⟩; exact encodeSeg_safe raw
 def Router.toUrl {α : Type} [Router α] (a : α) : Url := ⟨Router.toURL a, Router.isSafeUrl_toURL a⟩
 def stripQueryAndHash (path : String) : String := String.ofList (path.toList.takeWhile fun c => c != '#' && c != '?')
-def splitSlashChars : List Char → List Char → List String
-  | [], acc => [String.ofList acc.reverse]
-  | c :: cs, acc => if c == '/' then String.ofList acc.reverse :: splitSlashChars cs [] else splitSlashChars cs (c :: acc)
-def splitSlash (s : String) : List String := splitSlashChars s.toList []
+def splitSlash (s : String) : List String := Str.splitChar s '/'
 def Router.fromURL {α} [Router α] (path : String) : Option α :=
   Router.parse (((splitSlash (stripQueryAndHash path)).filter (· ≠ "")).map decodeSeg)
 

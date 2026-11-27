@@ -210,7 +210,7 @@ private structure CtrlFlowSpec where
   allowSplit : Bool := true
   allowUnfold : Bool := true
 
-private def proveCtrlFlow? (env : Environment) (spec : CtrlFlowSpec) (e : Expr)
+@[noinline] private def proveCtrlFlow? (env : Environment) (spec : CtrlFlowSpec) (e : Expr)
     (proveRec : Expr → ProveValidM Expr) (onSplit : ProveValidM Expr) : ProveValidM (Option Expr) := do
   let a := e.getAppArgs
   let branch := fun (lem : Name) (isDite : Bool) => do
@@ -234,7 +234,7 @@ private structure ListCombinatorSpec where
   prefixArgs : Array Expr
   postArgs : Array Expr := #[]
 
-private def proveListCombinator? (spec : ListCombinatorSpec) (xs : Expr) (proveElem proveRec : Expr → ProveValidM Expr) : ProveValidM (Option Expr) := do
+@[noinline] private def proveListCombinator? (spec : ListCombinatorSpec) (xs : Expr) (proveElem proveRec : Expr → ProveValidM Expr) : ProveValidM (Option Expr) := do
   let a := xs.getAppArgs
   if let some nilPf := spec.nilExpr? then if xs.isAppOfArity ``List.nil 1 then return some nilPf
   if xs.isAppOfArity ``List.cons 3 then
@@ -251,7 +251,7 @@ private def proveListCombinator? (spec : ListCombinatorSpec) (xs : Expr) (proveE
       if inner.isAppOfArity ``Array.map 4 then return ← proveMap tlmLem inner.getAppArgs
   return none
 
-private def proveAttrValid (env : Environment) (msgTy a : Expr) : Nat → ProveValidM Expr
+@[noinline] private def proveAttrValid (env : Environment) (msgTy a : Expr) : Nat → ProveValidM Expr
   | 0 => emitValidMVar (mkBoolEqTrue (mkApp2 (mkConst ``Attr.valid) msgTy a))
   | fuel + 1 => do
       let a := stripLetE stripLetFuel a; let kind := classifyAttr a
@@ -352,7 +352,7 @@ private def tryFormViewValidIn (env : Environment) (ctxV : HtmlCtx) (fn : Name) 
 
 private inductive TargetKind where | html | view (sigmaTy sExpr : Expr)
 
-private def proveElementCore (env : Environment) (kind : TargetKind) (ctxV : HtmlCtx) (msgTy tagE attrs kids : Expr) (tagS : String) :
+@[noinline] private def proveElementCore (env : Environment) (kind : TargetKind) (ctxV : HtmlCtx) (msgTy tagE attrs kids : Expr) (tagS : String) :
     ProveValidM (Option (HtmlCtx × Expr × Expr × Expr × Expr × Expr)) := do
   let some childCtx := Qed.stepHtmlCtx ctxV tagS | return none
   let childCtxE := htmlCtxExpr childCtx
@@ -362,7 +362,7 @@ private def proveElementCore (env : Environment) (kind : TargetKind) (ctxV : Htm
   return some (childCtx, childCtxE, ValidLemmas.proveStepHtmlCtx ctxV tagS childCtxE,
     ← proveAttrValidList env msgTy evalAttrs 128, ← proveVoidObligation elemTy tagE kids tagS, ← proveCellObligation elemTy msgTy evalAttrs kids)
 
-private def finishForEachProof (env : Environment) (ctxV : HtmlCtx)
+@[noinline] private def finishForEachProof (env : Environment) (ctxV : HtmlCtx)
     (sigmaTy msgTy ctxE childCtxE tagE alpha items key child attrs sigPrefix sExpr pfChild : Expr) (tagS : String) : ProveValidM Expr := do
   let evalAttrs := expandVAttrMap sigmaTy msgTy sExpr 128 attrs
   let hcell ← if allAttrList AttrKind.isNonCell 128 evalAttrs then pure rflBoolTrue
@@ -376,7 +376,7 @@ private def finishForEachProof (env : Environment) (ctxV : HtmlCtx)
   return mkAppNode ``V.validIn_render_forEach (partialArgs.push hsig)
 
 mutual
-  private partial def proveSplitSubgoal (fuel : Nat) (env : Environment) (goalTy : Expr) : ProveValidM Expr := do
+  @[noinline] private partial def proveSplitSubgoal (fuel : Nat) (env : Environment) (goalTy : Expr) : ProveValidM Expr := do
     match fuel with
     | 0 => emitValidMVar goalTy
     | fuel + 1 =>
@@ -386,7 +386,7 @@ mutual
                       instantiateMVars m
         | none => modify (·.push m.mvarId!); return m
 
-  private partial def proveNode (fuel : Nat) (env : Environment) (kind : TargetKind) (ctxV : HtmlCtx) (ctxE msgTy node : Expr) : ProveValidM Expr := do
+  @[noinline] private partial def proveNode (fuel : Nat) (env : Environment) (kind : TargetKind) (ctxV : HtmlCtx) (ctxE msgTy node : Expr) : ProveValidM Expr := do
     let goalTy := mkBoolEqTrue <| mkApp3 (mkConst ``Html.validIn) msgTy ctxE <| match kind with
       | .html => node | .view σ s => mkApp4 (mkConst ``View.render) σ msgTy node s
     match fuel with
@@ -453,7 +453,7 @@ mutual
             if let some pf ← proveCtrlFlow? env { iteLem? := some ``Qed.View.validIn_render_ite_intro, prefixArgs := #[sigmaTy, msgTy, ctxE], postBranchArgs := #[sExpr] } node (proveNode fuel env kind ctxV ctxE msgTy) (proveSplitSubgoal fuel env goalTy) then return pf
             emitValidMVar goalTy
 
-  private partial def proveNodeList (fuel : Nat) (env : Environment) (kind : TargetKind) (ctxV : HtmlCtx) (ctxE msgTy cs : Expr) : ProveValidM Expr := do
+  @[noinline] private partial def proveNodeList (fuel : Nat) (env : Environment) (kind : TargetKind) (ctxV : HtmlCtx) (ctxE msgTy cs : Expr) : ProveValidM Expr := do
     let goalTy := mkBoolEqTrue <| mkApp3 (mkConst ``Html.validListIn) msgTy ctxE <| match kind with
       | .html => cs | .view σ s => mkApp4 (mkConst ``View.renderEach) σ msgTy cs s
     match fuel with
@@ -487,7 +487,7 @@ mutual
             if let some fn := fn? then if ← isMatcherOrCases fn then return ← proveSplitSubgoal fuel env goalTy
             proveNodeList fuel env .html ctxV ctxE msgTy (mkApp4 (mkConst ``View.renderEach) sigmaTy msgTy cs sExpr)
 
-  private partial def proveGoalMVar (fuel : Nat) (env : Environment) (g : MVarId) : ProveValidM Unit := do
+  @[noinline] private partial def proveGoalMVar (fuel : Nat) (env : Environment) (g : MVarId) : ProveValidM Unit := do
     if ← g.isAssigned then return
     match fuel with
     | 0 => modify (·.push g)
@@ -531,7 +531,7 @@ private def diagnoseHtmlStepFailure (ctx : HtmlCtx) (tag : String) : Option Stri
         else none
     | .svg => none
 
-private def diagnoseValidGoal (g : MVarId) : MetaM (Option String) := g.withContext do
+@[noinline] private def diagnoseValidGoal (g : MVarId) : MetaM (Option String) := g.withContext do
   let some (_, lhsRaw, rhs) := (← instantiateMVars (← g.getType)).consumeMData.headBeta.eq? | return none
   unless rhs.consumeMData.isConstOf ``Bool.true do return none
   let lhs := lhsRaw.consumeMData.headBeta
@@ -563,13 +563,13 @@ private def diagnoseValidGoal (g : MVarId) : MetaM (Option String) := g.withCont
     if o0.isAppOfArity ``Bool.not 1 then
       let inner := o0.getAppArgs[0]!.consumeMData.headBeta
       if inner.isAppOfArity ``Qed.isVoidTag 1 then
-        if let some tagS := strLitVal? inner.getAppArgs[0]! then return some s!"`<{tagS}>` is an HTML5 void element and cannot have children — write it self-closing (`<{tagS} .../>`)"
+        if let some tagS := strLitVal? inner.getAppArgs[0]! then return some s!"`<{tagS}>` is an HTML5 void element and cannot have children; write it self-closing (`<{tagS} .../>`)"
       if inner.isAppOfArity ``Attr.hasLocalCell 2 then return some "a mounted local component cannot have extra children directly on its mount element"
   if lhs.getUsedConstants.contains ``Qed.containsCloseSeq then return some styleRawTextMsg
   if lhs.getUsedConstants.contains ``Qed.Url.isSafe then return some "dynamic URL attribute must use a typed `Router` route or `Url` (raw strings are disallowed)"
   return none
 
-private def runProveValidHtml : TacticM Unit := do
+@[noinline] private def runProveValidHtml : TacticM Unit := do
   evalTactic (← `(tactic| intros))
   let env ← getEnv
   let residuals ← (← getGoals).foldlM (init := #[]) fun acc g => return acc ++ (← (proveGoalMVar 2048 env g).run #[]).2
@@ -615,7 +615,7 @@ private def dehydrateProjLemmas (env0 : Environment) : Array Name :=
 private def closeGoalsByRfl : TacticM Unit := do
   setGoals <| ← (← getGoals).filterM fun g => return !(← tryReflGoal g)
 
-private def runProveDehydrateView : TacticM Unit := do
+@[noinline] private def runProveDehydrateView : TacticM Unit := do
   evalTactic (← `(tactic| intro _qed_m)); closeGoalsByRfl; if (← getGoals).isEmpty then return
   let env0 ← getEnv; let viewSimpNames := dehydrateProjLemmas env0 ++ viewCoreUnfolds.filter env0.contains
   simpAllGoalsWith (← mkCachedSimpCtx "dehydrateViewProj" viewSimpNames).1; closeGoalsByRfl; if (← getGoals).isEmpty then return
@@ -646,7 +646,7 @@ private def tryFastFullDehydrateInv (tgt : Expr) : MetaM (Option Expr) := do
   let pf := mkAppNode `Qed.Internal.App.dehydrate_preserves_of_project #[modelTy, msgTy, invLam, appE, mkApp (mkConst ``id [Level.one]) modelTy, rt, hprojLam]
   return if ← Meta.isDefEq (← Meta.inferType pf) tgt then some pf else none
 
-private def runProveDehydrateInv : TacticM Unit := do
+@[noinline] private def runProveDehydrateInv : TacticM Unit := do
   let env0 ← getEnv
   if env0.contains `Qed.Internal.App.dehydrate_preserves_of_project && env0.contains `Qed.Dehydrate.full then
     if ← tryRestoreM false id <| withMainContext do
@@ -682,7 +682,7 @@ private def viewEquivBaseNames : Array Name :=
     ``Function.comp_def, ``Array.toList_map, ``id_eq, ``Bool.false_eq_true, ``Option.map_some, ``Option.map_none,
     ``mkCanonicalElem, ``onlySignalBind, ``Attr.canonical, `Qed.toString_field, ``toString_string] ++ boolConstSimpNames
 
-private def runProveViewEquiv (appId viewId : Ident) : TacticM Unit := do
+@[noinline] private def runProveViewEquiv (appId viewId : Ident) : TacticM Unit := do
   let appName ← realizeGlobalConstNoOverloadWithInfo appId; let viewName ← realizeGlobalConstNoOverloadWithInfo viewId
   let env0 ← getEnv
   let stage1 := #[appName, viewName] ++ (#[`Qed.App.view, `Qed.Internal.App.withFullDehydrate, `Qed.App.guardRehydrate_template].filter env0.contains) ++ appProjSimpNames env0 #["template"]

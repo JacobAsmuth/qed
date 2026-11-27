@@ -140,4 +140,14 @@ def App.withSsrStatus (f : Model → Nat) (app : App Model Msg) : App Model Msg 
 defAppProjSimps App.withHead (f : Model → HeadMeta) (app : App Model Msg) => App.withHead f app preserves app
 defAppProjSimps App.withSsrStatus (f : Model → Nat) (app : App Model Msg) => App.withSsrStatus f app preserves app
 
+namespace KeyedLifecycle
+def composeKey {PModel CModel Props : Type} (getKey : PModel → String) (getProps : PModel → Option Props)
+    (getState : PModel → CModel) (childKey : Props → CModel → String) (pm : PModel) : String :=
+  let pk := getKey pm
+  if pk.isEmpty then ""
+  else match getProps pm with
+    | none => ""
+    | some p => let ck := childKey p (getState pm); if ck.isEmpty then "" else pk ++ "|" ++ ck
+end KeyedLifecycle
+
 end Qed

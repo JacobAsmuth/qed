@@ -73,12 +73,18 @@ mutual
   def Item.mergeOne (base : List Item) : Item → List Item
     | .decl p v      => (base.filter fun | .decl p' _ => p' != p | _ => true) ++ [.decl p v]
     | .nest sel body => Item.mergeNest sel body base
+  termination_by i => (sizeOf i, 0)
+  decreasing_by simp_wf; omega
   def Item.mergeNest (sel : String) (body : List Item) : List Item → List Item
     | []              => [.nest sel body]
     | .nest s b :: rs => if s == sel then .nest s (Item.mergeItems b body) :: rs else .nest s b :: Item.mergeNest sel body rs
     | o :: rs         => o :: Item.mergeNest sel body rs
+  termination_by rs => (sizeOf body, rs.length)
+  decreasing_by all_goals (simp_wf; omega)
   def Item.mergeItems : List Item → List Item → List Item
     | base, [] => base | base, i :: is => Item.mergeItems (Item.mergeOne base i) is
+  termination_by _ xs => (sizeOf xs, 0)
+  decreasing_by all_goals (simp_wf; omega)
 end
 
 /-! ## Typed CSS Values: Numbers, Lengths, Time, Colors & Design Tokens -/

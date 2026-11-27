@@ -81,26 +81,41 @@ theorem wcagAA_implies_wcagAALarge (fg bg : Color) (h : wcagAA fg bg = true) : w
 
 /-! ## Style & Stylesheet Contrast Verification (Fast Kernel-Reducible) -/
 
-private def parseRgbChannels? (argsStr : String) : Option (Nat × Nat × Nat) :=
-  let rawParts :=
-    if argsStr.contains ',' then (argsStr.splitOn ",").map String.trimmed
-    else ((argsStr.replace "/" " ").splitOn " ").map String.trimmed |>.filter (!·.isEmpty)
-  match rawParts with
-  | [rS, gS, bS] => do
-      let r ← rS.toNat?; let g ← gS.toNat?; let b ← bS.toNat?
-      guard (r ≤ 255 && g ≤ 255 && b ≤ 255); pure (r, g, b)
-  | [rS, gS, bS, aS] => do
-      let r ← rS.toNat?; let g ← gS.toNat?; let b ← bS.toNat?
-      guard (r ≤ 255 && g ≤ 255 && b ≤ 255 && (aS == "1" || aS == "1.0" || aS == "100%")); pure (r, g, b)
-  | _ => none
+private def isSimpleNumericStr (s : String) : Bool :=
+  let cs := match s.toList with | '-' :: r | '+' :: r => r | r => r
+  let (d1, r1) := cs.span Char.isDigit
+  !d1.isEmpty && match r1 with | [] => true | '.' :: r2 => !r2.isEmpty && r2.all Char.isDigit | _ => false
+
+def parseRgbArgs (fnName argsStr : String) (parts : List String) : Except String (Option (Nat × Nat × Nat)) := do
+  let parseCh (p : String) : Except String (Option Nat) := do
+    if p.startsWith "var(" then return none
+    let some n := p.toNat? | throw s!"`{fnName}({argsStr})`: expected integer channel 0..255, got `{p}`"
+    if n > 255 then throw s!"`{fnName}({argsStr})`: channel value `{n}` is out of range (must be 0..255)"
+    return some n
+  let (rS, gS, bS, a?) ← match parts with
+    | [r, g, b] => pure (r, g, b, none) | [r, g, b, a] => pure (r, g, b, some a)
+    | _ => throw s!"`{fnName}({argsStr})` expects {if fnName == "rgba" then 4 else 3} arguments"
+  let some r ← parseCh rS | return none
+  let some g ← parseCh gS | return none
+  let some b ← parseCh bS | return none
+  if let some aS := a? then
+    if aS.startsWith "var(" then return none
+    if !isSimpleNumericStr aS && !(aS.endsWith "%" && isSimpleNumericStr (String.ofList aS.toList.dropLast)) then
+      throw s!"`{fnName}({argsStr})`: invalid alpha value `{aS}`"
+    if aS != "1" && aS != "1.0" && aS != "100%" then return none
+  return some (r, g, b)
 
 def parseCssColorRgb? (raw : String) : Option (Nat × Nat × Nat) :=
   let t := raw.trimmed
   if t.startsWith "#" then parseHexRgb? t
   else if t == "white" then some (255, 255, 255)
   else if t == "black" then some (0, 0, 0)
-  else if t.startsWith "rgb(" && t.endsWith ")" then parseRgbChannels? (String.ofList ((t.toList.drop 4).dropLast))
-  else if t.startsWith "rgba(" && t.endsWith ")" then parseRgbChannels? (String.ofList ((t.toList.drop 5).dropLast))
+  else if (t.startsWith "rgb(" || t.startsWith "rgba(") && t.endsWith ")" then
+    let argsStr := String.ofList ((t.toList.drop (if t.startsWith "rgba(" then 5 else 4)).dropLast)
+    let parts :=
+      if argsStr.contains ',' then (argsStr.splitOn ",").map String.trimmed
+      else ((argsStr.replace "/" " ").splitOn " ").map String.trimmed |>.filter (!·.isEmpty)
+    match parseRgbArgs "rgb" argsStr parts with | .ok res => res | .error _ => none
   else none
 
 def unwrapCssVarName? (raw : String) : Option String :=
@@ -138,6 +153,8 @@ mutual
         | none => []
       else []
     here ++ collectNestedColorChecks fg? bg? dark scope items
+  termination_by (sizeOf items, 1)
+  decreasing_by exact Prod.Lex.right _ (Nat.zero_lt_one)
 
   def collectNestedColorChecks (fg? bg? : Option String) (dark : Bool) (scope : String) :
       List Item → List StyleColorCheck
@@ -147,6 +164,8 @@ mutual
         let nextScope := if scope.isEmpty then sel else scope ++ " " ++ sel
         collectStyleColorChecks fg? bg? (dark || isDarkSelector sel) nextScope sub ++
           collectNestedColorChecks fg? bg? dark scope rest
+  termination_by xs => (sizeOf xs, 0)
+  decreasing_by all_goals (apply Prod.Lex.left; simp_wf; omega)
 end
 
 structure ContrastFallbackBg where mk ::

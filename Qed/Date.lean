@@ -194,33 +194,14 @@ private theorem parseNat?_padNat (w n : Nat) : Str.parseNat? (padNat w n) = some
     | nil => exact absurd hEq hne
     | cons c cs => dsimp only; rw [← hEq, hcore]; rfl
 
-private theorem splitCharAux_append_noDash : ∀ xs ys cur acc, '-' ∉ xs →
-    Str.splitCharAux '-' cur acc (xs ++ '-' :: ys) = Str.splitCharAux '-' [] (String.ofList (cur.reverse ++ xs) :: acc) ys
-  | [], ys, cur, acc, _ => by simp [Str.splitCharAux]
-  | c :: xs, ys, cur, acc, hnd => by
-      have hc : (c == '-') = false := beq_false_of_ne fun h => hnd (h ▸ .head _)
-      have hxs : '-' ∉ xs := fun hm => hnd (.tail _ hm)
-      simp only [List.cons_append, Str.splitCharAux, hc, Bool.false_eq_true, ↓reduceIte]
-      rw [splitCharAux_append_noDash xs ys (c :: cur) acc hxs, List.reverse_cons, List.append_assoc, List.singleton_append]
-
-private theorem splitCharAux_noDash : ∀ xs cur acc, '-' ∉ xs →
-    Str.splitCharAux '-' cur acc xs = (String.ofList (cur.reverse ++ xs) :: acc).reverse
-  | [], cur, acc, _ => by simp [Str.splitCharAux]
-  | c :: xs, cur, acc, hnd => by
-      have hc : (c == '-') = false := beq_false_of_ne fun h => hnd (h ▸ .head _)
-      have hxs : '-' ∉ xs := fun hm => hnd (.tail _ hm)
-      simp only [Str.splitCharAux, hc, Bool.false_eq_true, ↓reduceIte]
-      rw [splitCharAux_noDash xs (c :: cur) acc hxs]
-      simp [List.reverse_cons, List.append_assoc]
-
 private theorem splitChar_ymd (a b c : String) (ha : '-' ∉ a.toList) (hb : '-' ∉ b.toList) (hc : '-' ∉ c.toList) :
     Str.splitChar (a ++ "-" ++ b ++ "-" ++ c) '-' = [a, b, c] := by
   unfold Str.splitChar
   have hlist : (a ++ "-" ++ b ++ "-" ++ c).toList = a.toList ++ '-' :: (b.toList ++ '-' :: c.toList) := by
     simp [String.toList_append, List.append_assoc]
-  rw [hlist, splitCharAux_append_noDash a.toList _ [] [] ha,
-      splitCharAux_append_noDash b.toList _ [] _ hb,
-      splitCharAux_noDash c.toList [] _ hc]
+  rw [hlist, Str.splitCharAux_append_not_mem '-' a.toList _ [] [] ha,
+      Str.splitCharAux_append_not_mem '-' b.toList _ [] _ hb,
+      Str.splitCharAux_not_mem '-' c.toList [] _ hc]
   simp [String.ofList_toList]
 
 theorem parse?_toString (d : Date) : Date.parse? (Date.toString d) = some d := by
@@ -246,7 +227,7 @@ theorem parse?_toString (d : Date) : Date.parse? (Date.toString d) = some d := b
             '-' :: ((padNat 4 (Int.negSucc k).natAbs).toList ++ '-' :: ((padNat 2 mo).toList ++ '-' :: (padNat 2 dy).toList)) := by
           simp [String.toList_append, List.append_assoc]
         rw [hlist]; simp only [Str.splitCharAux, beq_self_eq_true, ↓reduceIte]
-        rw [splitCharAux_append_noDash _ _ [] _ hyr, splitCharAux_append_noDash _ _ [] _ hmo, splitCharAux_noDash _ [] _ hdy]
+        rw [Str.splitCharAux_append_not_mem '-' _ _ [] _ hyr, Str.splitCharAux_append_not_mem '-' _ _ [] _ hmo, Str.splitCharAux_not_mem '-' _ [] _ hdy]
         simp [String.ofList_toList]
       rw [hsplit]
       have hna : (Int.negSucc k).natAbs = k + 1 := rfl
@@ -264,7 +245,7 @@ instance : BEq Date := ⟨fun a b => a.year == b.year && a.month == b.month && a
 instance : LawfulBEq Date where
   eq_of_beq {a b} h := by cases a; cases b; simp only [BEq.beq, Bool.and_eq_true, decide_eq_true_eq] at h; rcases h with ⟨⟨rfl, rfl⟩, rfl⟩; rfl
   rfl := by simp [BEq.beq]
-instance : DecidableEq Date := fun a b => if h : a == b then isTrue (eq_of_beq h) else isFalse fun heq => h (heq ▸ beq_self_eq_true a)
+instance : DecidableEq Date := fun a b => decidable_of_iff ((a == b) = true) beq_iff_eq
 instance : Repr Date := ⟨fun d _ => repr (Date.toString d)⟩
 instance : LT Date := ⟨fun a b => a.before b = true⟩
 instance : LE Date := ⟨fun a b => b.before a = false⟩

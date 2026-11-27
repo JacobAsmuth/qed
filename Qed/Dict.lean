@@ -25,7 +25,6 @@ def isEmpty (d : Dict K V) : Bool := d.entriesList.isEmpty
 def keys (d : Dict K V) : Array K := (d.entriesList.map Prod.fst).toArray
 def values (d : Dict K V) : Array V := (d.entriesList.map Prod.snd).toArray
 def entries (d : Dict K V) : Array (K × V) := d.entriesList.toArray
-def mapValues {W : Type} (d : Dict K V) (f : V → W) : Dict K W := ⟨d.entriesList.map fun (k, v) => (k, f v)⟩
 def filter (d : Dict K V) (p : K → V → Bool) : Dict K V := ⟨d.entriesList.filter fun (k, v) => p k v⟩
 
 instance : EmptyCollection (Dict K V) := ⟨Dict.empty⟩

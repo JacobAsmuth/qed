@@ -74,12 +74,7 @@ def liftWithProps {PModel PMsg CModel CMsg Props : Type}
     (childOpen : String → Props → String → CModel → Option (Cmd CMsg))
     (childClose : String → Cmd CMsg) (childOnClose : CModel → CModel) : Subscription PModel PMsg :=
   { slot,
-    key := fun pm =>
-      let pk := getKey pm
-      if pk.isEmpty then ""
-      else match getProps pm with
-        | none => ""
-        | some p => let ck := childKey p (getState pm); if ck.isEmpty then "" else pk ++ "|" ++ ck,
+    key := KeyedLifecycle.composeKey getKey getProps getState childKey,
     openCmd := fun _ pm =>
       match getProps pm with
       | none => none

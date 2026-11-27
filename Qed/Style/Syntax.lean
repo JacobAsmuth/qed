@@ -146,28 +146,17 @@ private def parseFuncCall? (tok : String) : Option (String × String) :=
   | _ :: _, '(' :: inner => match inner.reverse with | ')' :: revArgs => some (String.ofList fnCs, (String.ofList revArgs.reverse).trimmed) | _ => none
   | _, _ => none
 
-private def validateRgbArgs (fnName argsStr : String) : Except String (Option (Nat × Nat × Nat)) := do
+private def validateRgbArgs (fnName argsStr : String) : Except String (Option (Nat × Nat × Nat)) :=
   let byComma := splitTopLevel ',' argsStr
   let parts := if byComma.length > 1 then byComma else splitTopLevel ' ' (argsStr.replace "/" " ")
-  if parts.length < 3 || parts.length > 4 then throw s!"`{fnName}({argsStr})` expects {if fnName == "rgba" then 4 else 3} arguments"
-  let mut chs : Array Nat := #[]
-  for i in [0:3] do
-    let p := parts[i]!; if p.startsWith "var(" then return none
-    let some n := p.toNat? | throw s!"`{fnName}({argsStr})`: expected integer channel 0..255, got `{p}`"
-    if n > 255 then throw s!"`{fnName}({argsStr})`: channel value `{n}` is out of range (must be 0..255)"
-    chs := chs.push n
-  if parts.length == 4 then
-    let aStr := parts[3]!; if aStr.startsWith "var(" then return none
-    if !isNumericString aStr && !(aStr.endsWith "%" && isNumericString (String.ofList aStr.toList.dropLast)) then throw s!"`{fnName}({argsStr})`: invalid alpha value `{aStr}`"
-    if aStr != "1" && aStr != "1.0" && aStr != "100%" then return none
-  return some (chs[0]!, chs[1]!, chs[2]!)
+  Qed.parseRgbArgs fnName argsStr parts
 
 private def validateColorLiteral (tok : String) : Except String (Option (Nat × Nat × Nat)) := do
   if tok.startsWith "#" then
     if !Qed.isValidHexColor tok then throw s!"invalid hex color `{tok}` (expected 3, 4, 6, or 8 hex digits, e.g. `#06c` or `#2563eb`)"
     return Qed.parseHexRgb? tok
   else if namedCssColors.contains tok || commonGlobalKw.contains tok then
-    return if tok == "white" then some (255, 255, 255) else if tok == "black" then some (0, 0, 0) else none
+    return Qed.parseCssColorRgb? tok
   else if tok.startsWith "var(" then return none
   else if let some (fn, args) := parseFuncCall? tok then match fn with
     | "rgb" | "rgba" => validateRgbArgs fn args
@@ -271,31 +260,31 @@ private partial def compileCssBlockItems (env : Environment) (currNs : Name) (op
     items := items ++ [item]; toks := toks ++ t; rules := rules ++ r; thms := (thms ++ th).eraseDups
   return .mk items toks.eraseDups rules.eraseDups thms
 
-private partial def quoteItem : Qed.Item → MacroM Term
+@[noinline] private partial def quoteItem : Qed.Item → MacroM Term
   | .decl p v => `(Qed.Item.decl $(quote p) $(quote v))
   | .nest sel body => do `(Qed.Item.nest $(quote sel) [$(← body.toArray.mapM quoteItem),*])
-private def quoteItems (items : List Qed.Item) : MacroM Term := do `([$(← items.toArray.mapM quoteItem),*])
-private def quoteRgbOpt : Option (Nat × Nat × Nat) → MacroM Term
+@[noinline] private def quoteItems (items : List Qed.Item) : MacroM Term := do `([$(← items.toArray.mapM quoteItem),*])
+@[noinline] private def quoteRgbOpt : Option (Nat × Nat × Nat) → MacroM Term
   | none => `(none)
   | some (r, g, b) => `(some ($(quote r), $(quote g), $(quote b)))
 
-private def quoteThemeColorEntry (e : Qed.ThemeColorEntry) : MacroM Term := do
+@[noinline] private def quoteThemeColorEntry (e : Qed.ThemeColorEntry) : MacroM Term := do
   `({ cssName := $(quote e.cssName), lightRgb := ($(quote e.lightRgb.1), $(quote e.lightRgb.2.1), $(quote e.lightRgb.2.2)),
       darkRgb? := $(← quoteRgbOpt e.darkRgb?) : Qed.ThemeColorEntry })
 
-private def quoteThemePalette (ps : List Qed.ThemeColorEntry) : MacroM Term := do
+@[noinline] private def quoteThemePalette (ps : List Qed.ThemeColorEntry) : MacroM Term := do
   `([$(← ps.toArray.mapM quoteThemeColorEntry),*])
 
-private def quoteStyleColorCheck (c : Qed.StyleColorCheck) : MacroM Term := do
+@[noinline] private def quoteStyleColorCheck (c : Qed.StyleColorCheck) : MacroM Term := do
   `({ scope := $(quote c.scope), fgCss := $(quote c.fgCss), bgCss := $(quote c.bgCss),
       fgRgb? := $(← quoteRgbOpt c.fgRgb?), bgRgb? := $(← quoteRgbOpt c.bgRgb?),
       fgTok? := $(quote c.fgTok?), bgTok? := $(quote c.bgTok?), forcedDark := $(quote c.forcedDark) : Qed.StyleColorCheck })
 
-private def quoteFallbackBgOpt : Option Qed.ContrastFallbackBg → MacroM Term
+@[noinline] private def quoteFallbackBgOpt : Option Qed.ContrastFallbackBg → MacroM Term
   | none => `(none)
   | some fb => do `(some ({ css := $(quote fb.css), rgb? := $(← quoteRgbOpt fb.rgb?), tok? := $(quote fb.tok?) : Qed.ContrastFallbackBg }))
 
-private def quoteStyleLiteral (s : Qed.Style) : MacroM Term := do
+@[noinline] private def quoteStyleLiteral (s : Qed.Style) : MacroM Term := do
   `({ className := $(quote s.className), raw := $(quote s.raw), items := $(← quoteItems s.items),
       usedTokens := $(quote s.usedTokens), extraRules := $(quote s.extraRules), isGlobal := $(quote s.isGlobal),
       colorChecks := [$(← s.colorChecks.toArray.mapM quoteStyleColorCheck),*],
@@ -328,24 +317,57 @@ private def resolveContrastBgStx (env : Environment) (currNs : Name) (openDecls 
       throwErrorAt bgStx s!"token `{tInfo.fullName}` has kind `{tInfo.kind}`, expected `color` in `on {idStr}`"
     return ({ css := s!"var(--{tInfo.cssName})", rgb? := none, tok? := some tInfo.cssName }, tInfo.themeName?)
 
-private def mkThemePaletteTerm (env : Environment) (themeNames : List Name) : MacroM Term := do
+@[noinline] private def mkThemePaletteTerm (env : Environment) (themeNames : List Name) : MacroM Term := do
   let thReg := themeMetaRegistry.getState env
   let thConsts := themeNames.eraseDups.filterMap fun nm => (thReg.find? nm).map (·.themeConst)
   match thConsts with
   | [] => `(([] : List Qed.ThemeColorEntry))
   | c :: rest => rest.foldlM (init := ← `($(mkIdent c).colorPalette)) fun acc n => do `($acc ++ $(mkIdent n).colorPalette)
 
-private def resolveStylesTargetTerm (target : Term) : CommandElabM Term := liftTermElabM do
+@[noinline] private def resolveStylesTargetTerm (target : Term) : CommandElabM Term := liftTermElabM do
   let e ← elabTerm target none; synthesizeSyntheticMVarsNoPostponing
   if (← whnf (← instantiateMVars (← inferType e))).isAppOf `Qed.App then `(($target).styles) else pure target
 
-private def checkContrastEval (ref : Syntax) (minX100 : Nat) (violsTerm : Term) : CommandElabM Unit := do
+@[noinline] private partial def reduceEvalStr (e : Expr) : MetaM String := do
+  let w ← whnf e
+  match w with
+  | .lit (.strVal s) => return s
+  | _ =>
+      if w.isAppOfArity ``String.ofByteArray 2 then
+        let rec evalBytes (b : Expr) : MetaM ByteArray := do
+          let b := b.consumeMData
+          if b.isAppOfArity ``HAppend.hAppend 6 then
+            let a := b.getAppArgs; return (← evalBytes a[4]!) ++ (← evalBytes a[5]!)
+          if b.isAppOfArity ``ByteArray.append 2 then
+            let a := b.getAppArgs; return (← evalBytes a[0]!) ++ (← evalBytes a[1]!)
+          if b.isAppOfArity ``String.toByteArray 1 || b.isAppOfArity ``String.toUTF8 1 then
+            return (← reduceEvalStr b.appArg!).toUTF8
+          throwError "failed to evaluate ByteArray"
+        return String.fromUTF8! (← evalBytes (w.getAppArgs[0]!))
+      Lean.Meta.reduceEval w
+
+@[noinline] private partial def reduceEvalViolations (e : Expr) : MetaM (List Qed.ContrastViolation) := do
+  let w ← whnf e
+  if w.isAppOfArity ``List.nil 1 then return []
+  if w.isAppOfArity ``List.cons 3 then
+    let a := w.getAppArgs
+    let v ← whnf a[1]!
+    unless v.isAppOfArity ``Qed.ContrastViolation.mk 5 do throwError "expected ContrastViolation.mk"
+    let f := v.getAppArgs
+    return { styleName := ← reduceEvalStr f[0]!, scope := ← reduceEvalStr f[1]!,
+             fgCss := ← reduceEvalStr f[2]!, bgCss := ← reduceEvalStr f[3]!,
+             ratioX100 := ← Lean.Meta.reduceEval f[4]! } :: (← reduceEvalViolations a[2]!)
+  throwError "expected List ContrastViolation"
+
+@[noinline] private def checkContrastEval (ref : Syntax) (minX100 : Nat) (violsTerm : Term) : CommandElabM Unit := do
   let errStr : String ← liftTermElabM do
-    try Lean.Meta.reduceEval (← elabTerm (← `(Qed.formatContrastViolations $(quote minX100) $violsTerm)) none)
+    try
+      let vs ← reduceEvalViolations (← elabTerm violsTerm none)
+      return Qed.formatContrastViolations minX100 vs
     catch _ => pure ""
   unless errStr.isEmpty do throwErrorAt ref errStr
 
-def elabStyleDef (doc? : Option (TSyntax ``Lean.Parser.Command.docComment)) (nameId : Ident) (extendsIds : Array Ident)
+@[noinline] def elabStyleDef (doc? : Option (TSyntax ``Lean.Parser.Command.docComment)) (nameId : Ident) (extendsIds : Array Ident)
     (strictTokens : Bool) (bodyStxs : Array Syntax) (contrastOpt? : Option Syntax := none) : CommandElabM Unit := do
   let (env, currNs, openDecls) ← getCssScope; let compiled ← liftCoreM <| compileCssBlockItems env currNs openDecls strictTokens bodyStxs
   let styleReg := styleMetaRegistry.getState env
@@ -380,10 +402,10 @@ def elabStyleDef (doc? : Option (TSyntax ``Lean.Parser.Command.docComment)) (nam
 def extractStyleExtends (optStx : Syntax) : Array Ident := if optStx.getNumArgs == 1 then ((optStx.getArg 0).getArg 1).getSepArgs.map (⟨·⟩) else #[]
 def extractOptChild (optStx : Syntax) : Option Syntax := if optStx.getNumArgs == 1 then some (optStx.getArg 0) else none
 
-@[command_elab styleCmd] def elabStyleCmd : CommandElab := fun stx =>
+@[noinline, command_elab styleCmd] def elabStyleCmd : CommandElab := fun stx =>
   elabStyleDef (optDocComment stx) ⟨stx.getArg 2⟩ (extractStyleExtends (stx.getArg 3)) ((stx.getArg 4).getNumArgs == 1) (stx.getArg 7).getArgs (extractOptChild (stx.getArg 5))
 
-@[command_elab keyframesCmd] def elabKeyframesCmd : CommandElab := fun stx => do
+@[noinline, command_elab keyframesCmd] def elabKeyframesCmd : CommandElab := fun stx => do
   let nameId : Ident := ⟨stx.getArg 2⟩; let kfName := Qed.sanitizeCssIdent nameId.getId.getString!; let (env, currNs, openDecls) ← getCssScope
   let steps ← (stx.getArg 4).getArgs.toList.mapM fun stepStx => do
     unless stepStx.getKind == ``cssNestedBlock do throwErrorAt stepStx "expected keyframe stop (`from:`, `to:`, or `50%:`)"
@@ -427,7 +449,7 @@ private def toKebabCase (s : String) : String :=
   let cs := s.toList.flatMap fun c => if c.isUpper then ['-', c.toLower] else if c == '_' then ['-'] else [c]
   String.ofList (match cs with | '-' :: r => r | _ => cs)
 
-private def emitThemeTokens (themeNm fullThemeName : Name) (entries : Array ThemeTokEntry) : CommandElabM Unit := do
+@[noinline] private def emitThemeTokens (themeNm fullThemeName : Name) (entries : Array ThemeTokEntry) : CommandElabM Unit := do
   let quoteOpt (ty? : Option Term) (css? : Option String) (rgb? : Option (Nat × Nat × Nat) := none) : MacroM Term := match css?, ty? with
     | none, _ => `(none) | some s, some ty => `(some ({ raw := $(quote s) } : $ty))
     | some s, none => do let rT ← match rgb? with | some (r, g, b) => `(some ($(quote r), $(quote g), $(quote b))) | none => `(none)
@@ -443,7 +465,7 @@ private def emitThemeTokens (themeNm fullThemeName : Name) (entries : Array Them
     elabCommand (← `(command| def $tokId : Qed.TypedToken $tyTerm := { name := $(quote e.cssName), lightVal := $lTerm, darkVal := $dTerm }))
     modifyEnv fun env' => tokenMetaRegistry.addEntry env' (.mk (fullThemeName ++ Name.mkSimple e.ident) e.cssName e.kind (some fullThemeName))
 
-private def emitThemeContrastInvs (themeNm : Name) (entries : Array ThemeTokEntry) (invs : Array ThemeContrastInv) : CommandElabM Unit := do
+@[noinline] private def emitThemeContrastInvs (themeNm : Name) (entries : Array ThemeTokEntry) (invs : Array ThemeContrastInv) : CommandElabM Unit := do
   for inv in invs do
     let findTok (nm : String) : CommandElabM ThemeTokEntry :=
       match entries.find? (·.ident == nm) with
@@ -460,7 +482,7 @@ private def emitThemeContrastInvs (themeNm : Name) (entries : Array ThemeTokEntr
     let mkId (nm : String) := mkIdentFrom inv.ref (themeNm ++ Name.mkSimple nm)
     elabCommand (← `(command| theorem $(mkId inv.invName) : Qed.TypedToken.wcagCheck $(mkId inv.fgName) $(mkId inv.bgName) $(quote inv.minX100) = true := by decide))
 
-@[command_elab themeCmd] def elabThemeCmd : CommandElab := fun stx => do
+@[noinline, command_elab themeCmd] def elabThemeCmd : CommandElab := fun stx => do
   let themeId : Ident := ⟨stx.getArg 2⟩; let themeNm := themeId.getId; let (env, currNs, openDecls) ← getCssScope
   let mut entries : Array ThemeTokEntry := #[]; let mut resets : List Qed.Item := []; let mut invs : Array ThemeContrastInv := #[]
   for itemStx in (stx.getArg 4).getArgs do
@@ -498,7 +520,7 @@ private def emitThemeContrastInvs (themeNm : Name) (entries : Array ThemeTokEntr
   emitThemeContrastInvs themeNm entries invs
   modifyEnv fun env' => themeMetaRegistry.addEntry env' (.mk fullThemeName (fullThemeName ++ `style) (fullThemeName ++ `theme))
 
-@[command_elab verifyThemeCmd] def elabVerifyThemeCmd : CommandElab := fun stx => do
+@[noinline, command_elab verifyThemeCmd] def elabVerifyThemeCmd : CommandElab := fun stx => do
   let (thId, target) : Ident × Term := (⟨stx.getArg 1⟩, ⟨stx.getArg 3⟩); let (env, currNs, openDecls) ← getCssScope
   let some thInfo := resolveInRegistry (themeMetaRegistry.getState env) env currNs openDecls thId.getId.toString | throwErrorAt thId s!"unknown `theme` `{thId.getId}`"
   let thConst := mkIdentFrom thId thInfo.themeConst
@@ -511,7 +533,7 @@ private def emitThemeContrastInvs (themeNm : Name) (entries : Array ThemeTokEntr
       try let xs : List String ← Lean.Meta.reduceEval (← elabTerm (← `(($thConst).missingTokens ($stylesTerm))) none)
           return "[" ++ String.intercalate ", " (xs.map fun s => s!"\"{s}\"") ++ "]"
       catch _ => return "(unknown)"
-    throwErrorAt stx s!"theme `{thId.getId}` does not define all CSS tokens used by `{(target.raw.reprint.getD "target").trimmed}`.\n  Missing tokens: {missingStr}\nAdd them to `theme {thId.getId}:`."
+    throwErrorAt stx s!"theme `{thId.getId}` does not define all CSS tokens used by `{(target.raw.unsetTrailing.reprint.getD "target").trimmed}`.\n  Missing tokens: {missingStr}\nAdd them to `theme {thId.getId}:`."
 
 @[noinline, command_elab verifyContrastCmd] def elabVerifyContrastCmd : CommandElab := fun stx => do
   let minX100 ← liftCoreM <| parseContrastRatioStx (stx.getArg 2)

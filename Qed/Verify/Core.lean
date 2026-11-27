@@ -43,7 +43,7 @@ private def addSimpNamesWithEqns (st : SimpTheorems) (names : Array Name) (dsimp
             if let some eqns ← getEqnsFor? n then for eq in eqns do st ← st.addConst eq; eqnsAdded := eqnsAdded.push eq
   return (st, eqnsAdded)
 
-initialize simpThmsCache : IO.Ref (Std.HashMap (String × Name × Bool × Bool) (SimpTheorems × Array Name)) ← IO.mkRef {}
+initialize simpThmsCache : IO.Ref (Std.HashMap (String × Name × Bool × Bool × Bool) (SimpTheorems × Array Name)) ← IO.mkRef {}
 initialize simprocsCache : IO.Ref (Std.HashMap (Array Name × Bool) Simp.SimprocsArray) ← IO.mkRef {}
 
 def getCachedSimprocs (names : Array Name) (post : Bool := true) : MetaM Simp.SimprocsArray := do
@@ -58,10 +58,23 @@ def getCachedSimprocs (names : Array Name) (post : Bool := true) : MetaM Simp.Si
 
 def getCachedSimpThms (key : String) (names : Array Name) (dsimpOnly : Bool := false) (withEqns : Bool := true) : MetaM SimpTheorems := do
   let env ← getEnv
-  let cacheKey := (key, env.header.mainModule, dsimpOnly, env.contains `Qed.Codec.valid)
+  let cacheKey := (key, env.header.mainModule, dsimpOnly, withEqns, env.contains `Qed.Codec.valid)
   if let some (st, needed) := (← simpThmsCache.get).get? cacheKey then if needed.all env.contains then return st
   let (st, eqns) ← addSimpNamesWithEqns {} names dsimpOnly withEqns
   simpThmsCache.modify (·.insert cacheKey (st, eqns)); return st
+
+/-- Resolve a component `update`/`app` ident and include its generated hoisted helpers (`stepOwn`, `_reconcileHoisted`) when present. -/
+def resolveCompUpdateUnfolds (idStx : Syntax) : CoreM (Array Name) := do
+  let some cn ← try some <$> resolveGlobalConstNoOverload idStx catch _ => pure none | return #[]
+  let env ← getEnv; let pfx := cn.getPrefix; let base := #[cn]
+  if pfx.isAnonymous then return base
+  let extras := if cn.getString! == "app" then #[pfx ++ `update, pfx ++ `stepOwn, pfx ++ `_reconcileHoisted]
+                else #[pfx ++ `stepOwn, pfx ++ `_reconcileHoisted]
+  return extras.foldl (init := base) fun acc aux =>
+    if env.contains aux && !acc.contains aux then acc.push aux else acc
+
+elab "qedWithFreshHeartbeats" tac:tacticSeq : tactic =>
+  Core.withCurrHeartbeats (evalTactic tac)
 
 private def mkSimpCtx (cfg : Simp.Config) (thms : Array SimpTheorems) : MetaM Simp.Context := do
   Simp.mkContext { cfg with failIfUnchanged := false } thms (← getSimpCongrTheorems)

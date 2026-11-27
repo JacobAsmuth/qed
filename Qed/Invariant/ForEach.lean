@@ -49,17 +49,22 @@ private def runForEachArm (childInv : Ident) (elemClose mapClose : TSyntax `tact
   for (_, lem) in forEachElemTable.take 4 do if ← tryTac (mkElem lem) then return
   discard <| tryTac `(tactic| grind)
 
-elab "forEachLift " upd:ident childInv:ident pred:term : tactic => do
+elab "forEachLift " upd:ident childInv:ident pred:term : tactic => Core.withCurrHeartbeats do
   let valId ← `(Lean.Parser.Tactic.simpLemma| Qed.Lang.QedVal.val_id)
   let predLem ← if pred.raw.isIdent then pure #[← `(Lean.Parser.Tactic.simpLemma| $(⟨pred.raw⟩):ident), valId] else pure #[valId]
   let elemFallback ← if pred.raw.isIdent then `(tactic| first | omega | decide | trivial | simp_all | qedAutoClose) else `(tactic| first | omega | decide | trivial | simp | simp_all | qedAutoClose)
   let elemClose ← `(tactic| (try dsimp only) <;> (try simp only [$[$predLem],*]) <;> (try ($elemFallback:tactic)))
   let (m, msg, h, hP) := (mkIdent `m, mkIdent `msg, mkIdent `h, mkIdent `hP)
   let mapClose ← `(tactic| ((try dsimp only at $hP:ident ⊢) <;> (try simp only [$[$predLem],*] at $hP:ident ⊢) <;> (try (first | omega | decide | trivial | (simp_all <;> omega) | (simp_all <;> done) | qedAutoClose))))
-  evalTactic (← `(tactic| (intro $m $msg $h; cases $msg:ident <;> simp only [$upd:ident, InvTarget.proj_id, InvTarget.proj_fst])))
-  forEachGoal fun _ => runForEachArm childInv elemClose mapClose
+  let updNames := (← resolveCompUpdateUnfolds upd.raw) ++ #[``InvTarget.proj_id, ``InvTarget.proj_fst]
+  let updCtx ← mkDynamicSimpCtx updNames none (withEqns := false)
+  evalTactic (← `(tactic| (intro $m $msg $h; cases $msg:ident)))
+  forEachGoal fun g => Core.withCurrHeartbeats do
+    match ← simpGoalOnly g updCtx with
+    | none => setGoals []
+    | some g1 => setGoals [g1]; runForEachArm childInv elemClose mapClose
 
-elab "qedDischargeForEach" upd:ident childInv:ident nm:ident pred:term : tactic => do
+elab "qedDischargeForEach" upd:ident childInv:ident nm:ident pred:term : tactic => Core.withCurrHeartbeats do
   evalTactic (← `(tactic| forEachLift $upd $childInv $pred))
   let goals ← getUnsolvedGoals
   unless goals.isEmpty do
@@ -103,7 +108,7 @@ elab "forEachStyleLift " view:ident childStyled:ident : tactic => do
              exact $childStyled $c
            · rw [$(mkIdent can):ident, ← Qed.Html.map, $(mkIdent m):ident]; exact $childStyled $c)))
 
-elab "qedDischargeStyledForEach" view:ident field:ident childStyled:ident nm:ident pred:term : tactic => do
+elab "qedDischargeStyledForEach" view:ident field:ident childStyled:ident nm:ident pred:term : tactic => Core.withCurrHeartbeats do
   evalTactic (← `(tactic| forEachStyleLift $view $childStyled))
   let predStr := (pred.raw.reprint.getD "the rule").trimmed
   Qed.Diag.throwUnsolvedGoals m!"Styling invariant `{nm.getId}` failed to lift `{predStr}` over `{field.getId}` in `{view.getId}`:"

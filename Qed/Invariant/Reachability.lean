@@ -24,28 +24,39 @@ theorem inv_nonvacuous_of_reachable {update : State → Msg → Out} {init : Sta
     ∃ s, Inv s ∧ target s := let ⟨tr, ht⟩ := hreach; ⟨runTrace update init tr, inv_holds_on_runTrace hinit hstep tr, ht⟩
 end
 
-private def reachBaseSimpNames : Array Lean.Name := #[``Qed.runTrace, ``Qed.InvTarget.proj_id, ``Qed.InvTarget.proj_fst, ``Qed.Lang.QedVal.val_id] ++ Qed.Verify.Core.dictSimpNames
+private def reachBaseSimpNames : Array Lean.Name :=
+  #[``Qed.runTrace, ``Qed.runTrace_nil, ``Qed.runTrace_cons, ``Qed.InvTarget.proj_id, ``Qed.InvTarget.proj_fst, ``Qed.Lang.QedVal.val_id] ++ Qed.Verify.Core.dictSimpNames
 private def reachBoolSimpNames : Array Lean.Name := Qed.Verify.Core.boolSimpNames ++ #[``decide_eq_false_iff_not]
 
 open Lean Elab Tactic Qed.Verify.Core in
-elab "qedDischargeReachable" upd:term:max initT:term:max nm:ident labelLit:str : tactic => do
+elab "qedDischargeReachable" upd:term:max initT:term:max nm:ident labelLit:str : tactic => Core.withCurrHeartbeats do
   let mut dynNames : Array Name := #[]
   for raw in #[upd, initT] do
     let inner := match raw with | `(($u)) => u | u => u
-    if inner.raw.isIdent then if let some cn ← try some <$> resolveGlobalConstNoOverload inner.raw catch _ => pure none then dynNames := dynNames.push cn
+    if inner.raw.isIdent then
+      for n in ← resolveCompUpdateUnfolds inner.raw do
+        if !dynNames.contains n then dynNames := dynNames.push n
   try
     if let g :: rest ← getGoals then
-      let ctx ← mkDynamicSimpCtx dynNames (some ("reachBase", reachBaseSimpNames))
-      let g1? ← simpGoalOnly g ctx (dsimpOnly := true)
-      let g2? ← match g1? with | none => pure none | some g1 => simpGoalOnly g1 ctx
-      setGoals (match g2? with | none => rest | some g' => g' :: rest)
-    evalTactic (← `(tactic| qedUnfoldPresent []))
-    let (bCtx, _) ← mkCachedSimpCtx "reachBool" reachBoolSimpNames
-    setGoals <| ← (← getGoals).filterMapM (simpGoalAllHyps · bCtx)
-    evalTactic (← `(tactic| try (repeat' split)))
-    forEachGoal fun g => do
-      if ← tryCloseBasic g then setGoals []
-      else (try evalTactic (← `(tactic| first | (simp_all; first | decide | omega | rfl | qedAutoClose) | qedAutoClose)) catch _ => pure ())
+      if ← tryReflGoal g then setGoals rest
+      else
+        let ctx ← mkDynamicSimpCtx dynNames (some ("reachBase", reachBaseSimpNames)) (withEqns := false)
+        let g1? ← simpGoalOnly g ctx (dsimpOnly := true)
+        let g2? ← match g1? with | none => pure none | some g1 => simpGoalOnly g1 ctx
+        let g3? ← match g2? with | none => pure none | some g2 => trySimpAll g2 (← mkSimpCtxWithBase)
+        setGoals (match g3? with | none => rest | some g' => g' :: rest)
+    if !(← getGoals).isEmpty then
+      let (bCtx, _) ← mkCachedSimpCtx "reachBool" reachBoolSimpNames
+      let splitSimp : TacticM Unit := do
+        setGoals <| ← (← getGoals).filterMapM (simpGoalAllHyps · bCtx)
+        evalTactic (← `(tactic| try (repeat' (split <;> try dsimp only))))
+      splitSimp
+      if !(← getGoals).isEmpty then
+        runUnfoldPresent #[] dynNames
+        splitSimp
+      forEachGoal fun g => do
+        if ← tryCloseBasic g then setGoals []
+        else (try evalTactic (← `(tactic| first | (simp_all; first | decide | omega | rfl | qedAutoClose) | qedAutoClose)) catch _ => pure ())
   catch _ => pure ()
   let lbl := labelLit.getString
   Qed.Diag.throwUnsolvedGoals m!"Example `{nm.getId}` failed to prove `{lbl}`:"

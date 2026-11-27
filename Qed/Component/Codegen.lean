@@ -421,35 +421,51 @@ private def mkHoistedSubArm (spec : ComponentSpec) (stepOwnId : Ident) (unchange
 @[noinline]
 private def mkReconcileHoistedCmd (spec : ComponentSpec) (pBinders : Array BinderStx) (retTy : Term) : CommandElabM CmdStx := do
   let lifecycleSubs := spec.hoisted.filter HoistedSub.hasLifecycle
-  let (sOldV, resV) := (mkIdent `_sOld, mkIdent `_res)
+  let (sOldV, resV, sNextId) := (mkIdent `_sOld, mkIdent `_res, mkIdent `_sNext)
   let (sCur0, outCur?, cmdCur?) ← unpackRetTuple spec.outTy?.isSome spec.hasEffects resV
-  let sId := mkIdent `_rs; let cId := mkIdent `_rc
-  let mut stepBody ← mkUpdateRet spec ⟨sId.raw⟩ outCur? (if spec.hasEffects then #[⟨cId.raw⟩] else #[])
-  for h in lifecycleSubs.reverse do
+  let mut subFieldIds : Array Ident := #[]
+  let mut subFieldVals : Array Term := #[]
+  let mut startSpecs : Array (Ident × Term × Ident × Term × HoistedSub) := #[]
+  for h in lifecycleSubs do
     let keyCallOld ← appWithProps spec (mkIdent (subKeyDefName spec.t.getId h)) #[⟨sOldV.raw⟩]
-    let keyCallNew ← appWithProps spec (mkIdent (subKeyDefName spec.t.getId h)) #[⟨sId.raw⟩]
+    let keyCallNew ← appWithProps spec (mkIdent (subKeyDefName spec.t.getId h)) #[⟨sNextId.raw⟩]
     let childInit := mkIdent (h.info.fullName ++ `init)
     let childResetVal : Term ← match h.info.hasSession, spec.effectiveSessionField? with
-      | true, some sfId => `($(mkIdent (h.info.fullName ++ `setSession)) $childInit ($sId:ident).$sfId:ident)
+      | true, some sfId => `($(mkIdent (h.info.fullName ++ `setSession)) $childInit ($sNextId:ident).$sfId:ident)
       | _, _ => pure childInit
-    let resetState ← `({ $sId:ident with $(h.fieldId):ident := $childResetVal })
-    let nextCmd : Term ← if !spec.hasEffects then pure ⟨cId.raw⟩
-      else if !h.info.hasStart then pure ⟨cId.raw⟩
-      else do
-        let cStart := mkIdent (h.info.fullName ++ `startCmd)
-        let subCtor := spec.msgCtor h.ctorName
-        let pfxLit := Syntax.mkStrLit s!"{h.fieldId.getId}."
-        let startCmdExpr ← if h.info.hasProps then
-            let propsCall ← appWithProps spec (mkIdent (subPropsDefName spec.t.getId h)) #[resetState]
-            `(match $propsCall:term with | Option.none => $cId:ident | Option.some _cp => Qed.Cmd.batch [$cId:ident, Cmd.mapScoped $pfxLit $subCtor ($cStart _cp)])
-          else `(Qed.Cmd.batch [$cId:ident, Cmd.mapScoped $pfxLit $subCtor $cStart])
-        `(if (_kNew).isEmpty then $cId:ident else $startCmdExpr)
-    let updatePair ← if spec.hasEffects then
-        `(let $cId:ident := if _kOld == _kNew then $cId:ident else $nextCmd; let $sId:ident := if _kOld == _kNew then $sId:ident else $resetState; $stepBody)
+    let subF := h.fieldId
+    let subVal : Term ← if spec.hasEffects && h.info.hasStart then
+        let kOldId := mkIdent (Name.mkSimple s!"_kOld_{subF.getId}")
+        let kNewId := mkIdent (Name.mkSimple s!"_kNew_{subF.getId}")
+        startSpecs := startSpecs.push (kOldId, keyCallOld, kNewId, keyCallNew, h)
+        `(if $kOldId == $kNewId then ($sNextId:ident).$subF:ident else $childResetVal)
       else
-        `(let $sId:ident := if _kOld == _kNew then $sId:ident else $resetState; $stepBody)
-    stepBody ← `(let _kOld := $keyCallOld; let _kNew := $keyCallNew; $updatePair)
-  let fullBody ← if spec.hasEffects then `(let $sId:ident := $sCur0; let $cId:ident := $(cmdCur?.get!); $stepBody) else `(let $sId:ident := $sCur0; $stepBody)
+        `(if $keyCallOld == $keyCallNew then ($sNextId:ident).$subF:ident else $childResetVal)
+    subFieldIds := subFieldIds.push subF
+    subFieldVals := subFieldVals.push subVal
+  let sOutExpr : Term ← `({ $sNextId:ident with $[$subFieldIds:ident := $subFieldVals:term],* })
+  let cId := mkIdent `_rc
+  let rcExpr? : Option Term := if spec.hasEffects then some (if startSpecs.isEmpty then cmdCur?.get! else ⟨cId.raw⟩) else none
+  let mut body ← match outCur?, rcExpr? with
+    | none,   none   => pure sOutExpr
+    | some o, none   => `(($sOutExpr, $o))
+    | none,   some c => `(($sOutExpr, $c))
+    | some o, some c => `(($sOutExpr, $o, $c))
+  if !startSpecs.isEmpty then
+    for (kOldId, _, kNewId, _, h) in startSpecs.reverse do
+      let cStart := mkIdent (h.info.fullName ++ `startCmd)
+      let subCtor := spec.msgCtor h.ctorName
+      let pfxLit := Syntax.mkStrLit s!"{h.fieldId.getId}."
+      let startCmdExpr ← if h.info.hasProps then
+          let propsCall ← appWithProps spec (mkIdent (subPropsDefName spec.t.getId h)) #[⟨sNextId.raw⟩]
+          `(match $propsCall:term with | Option.none => $cId:ident | Option.some _cp => Qed.Cmd.batch [$cId:ident, Cmd.mapScoped $pfxLit $subCtor ($cStart _cp)])
+        else `(Qed.Cmd.batch [$cId:ident, Cmd.mapScoped $pfxLit $subCtor $cStart])
+      let nextCmd ← `(if ($kNewId:ident).isEmpty then $cId:ident else $startCmdExpr)
+      body ← `(let $cId:ident := if $kOldId == $kNewId then $cId:ident else $nextCmd; $body)
+    body ← `(let $cId:ident := $(cmdCur?.get!); $body)
+    for (kOldId, keyCallOld, kNewId, keyCallNew, _) in startSpecs.reverse do
+      body ← `(let $kOldId:ident := $keyCallOld; let $kNewId:ident := $keyCallNew; $body)
+  let fullBody ← `(let $sNextId:ident := $sCur0; $body)
   `(command| set_option linter.unusedVariables false in def $(spec.id `_reconcileHoisted) $[$pBinders:bracketedBinder]* ($sOldV:ident : $(spec.stateId)) ($resV:ident : $retTy) : $retTy := $fullBody)
 
 def mkMsgAndUpdateCmds (spec : ComponentSpec) (sites : Array SetSite) : CommandElabM (Array CmdStx) := do

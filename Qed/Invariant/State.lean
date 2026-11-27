@@ -48,11 +48,11 @@ private def stripStepPrefix : Name → Name
   | .str p s     => let p' := stripStepPrefix p; if p' == .anonymous then Name.mkSimple s else .str p' s
   | n => n
 
-private def runUnfoldPresent (extra : Array Term) : TacticM Unit := do
+def runUnfoldPresent (extra : Array Term) (skip : Array Name := #[]) : TacticM Unit := do
   let g :: _ ← getGoals | return
   let cs ← collectGoalConsts g true
   let fixedL := (← namesToSimpLemmas (relevantAppLemmas (← getEnv) cs ++ relevantBoundaryLemmas cs)) ++ (← termsToSimpLemmas extra)
-  qedUnfoldHelperLoop 12 (fun env n => if !qedIsHelper env n then return false else return (← getProjectionFnInfo? n).isNone)
+  qedUnfoldHelperLoop 12 (fun env n => if skip.contains n || !qedIsHelper env n then return false else return (← getProjectionFnInfo? n).isNone)
     fixedL (includeLCtx := true) (useSimpAll := true)
 
 private def runAddFieldFacts : TacticM Unit := do
@@ -206,16 +206,16 @@ private def throwUnsolvedInvGoals (nm : Ident) (hdr footer : MessageData) : Tact
 
 private def closeSplitBranch (usingL : Array Term) (reducibleOnly : Bool)
     (extraSimpL? : Option (Array (TSyntax `Lean.Parser.Tactic.simpLemma)) := none)
-    (hypSplitFuel : Nat := 0) (g : MVarId) : TacticM Unit := do
+    (hypSplitFuel : Nat := 0) (skipUnfold : Array Name := #[]) (g : MVarId) : TacticM Unit := do
   if ← tryCloseContradiction g then setGoals []; return
   if ← tryCloseTrivial g (reducibleOnly := reducibleOnly) then setGoals []; return
   if ← tryDirectOmega g then setGoals []; return
-  evalTactic (← `(tactic| (intros; try repeat' split; try dsimp only at *)))
+  evalTactic (← `(tactic| (intros; try repeat' (split <;> try dsimp only); try dsimp only at *)))
   forEachGoal fun gSub => do
     if ← tryCloseContradiction gSub then setGoals []; return
     runAddFieldFacts
     if let g1 :: r1 ← getGoals then setGoals ((← splitAndHypsGoal g1 true 16).1 :: r1)
-    runUnfoldPresent usingL
+    runUnfoldPresent usingL skipUnfold
     if let some simpL := extraSimpL? then
       discard <| tryTac `(tactic| simp_all only [$[$simpL],*])
       if (← getGoals).isEmpty then return
@@ -233,7 +233,7 @@ private def closeSplitBranch (usingL : Array Term) (reducibleOnly : Bool)
         if let some fv := splitFVar? then
           if let some subgoals ← trySplitLocalDecl gRem fv then
             setGoals subgoals
-            forEachGoal (closeSplitBranch usingL reducibleOnly extraSimpL? (hypSplitFuel - 1))
+            forEachGoal (closeSplitBranch usingL reducibleOnly extraSimpL? (hypSplitFuel - 1) skipUnfold)
 termination_by hypSplitFuel
 
 syntax qedProveCase := ident,+ " => " Lean.Parser.Tactic.tacticSeq
@@ -241,17 +241,19 @@ syntax "qedDischargeInit " "[" term,* "]" term:max ident term:max : tactic
 syntax "qedDischargePreserved " "[" term,* "]" term:max ident term:max (" from " term)? (" _qedProve " "[" qedProveCase,* "]")? : tactic
 
 elab_rules : tactic
-  | `(tactic| qedDischargeInit [$[$usingL],*] $initT $nm $pred) => do
+  | `(tactic| qedDischargeInit [$[$usingL],*] $initT $nm $pred) => Core.withCurrHeartbeats do
     (← getMainGoal).setTag `init; runInitPass usingL pred initT
     throwUnsolvedInvGoals nm m!"Invariant `{nm.getId}` failed on initial state `{formatTargetName initT}`:"
       m!"Hint: Update the initial `state` values so `{nm.getId}` holds, add `using [lemma]`, or supply a `:= by` proof."
 
-  | `(tactic| qedDischargePreserved [$[$usingL],*] $upd $nm $pred $[from $init]? $[_qedProve [$[$proveCases],*]]?) => do
+  | `(tactic| qedDischargePreserved [$[$usingL],*] $upd $nm $pred $[from $init]? $[_qedProve [$[$proveCases],*]]?) => Core.withCurrHeartbeats do
     let unfoldPred ← unfoldIdentTac pred
-    let appL ← namesToSimpLemmas (relevantAppLemmas (← getEnv) (← collectGoalConsts (← getMainGoal) true))
-    let updL ← match upd with
-      | `($a:ident) | `(($a:ident).update) | `((($a:ident).update)) | `(($a:ident $_:term*)) => pure (#[← `(Lean.Parser.Tactic.simpLemma| $a:term)] ++ appL)
-      | _ => pure appL
+    let appNames := relevantAppLemmas (← getEnv) (← collectGoalConsts (← getMainGoal) true)
+    let updUnfolds ← match upd with
+      | `($a:ident) | `(($a:ident).update) | `((($a:ident).update)) | `(($a:ident $_:term*)) => resolveCompUpdateUnfolds a.raw
+      | _ => pure #[]
+    let updNames := updUnfolds ++ appNames
+    let updCtx ← mkDynamicSimpCtx updNames none (withEqns := false)
     let mut caseMap : Std.HashMap Name (Ident × TSyntax ``Lean.Parser.Tactic.tacticSeq) := {}
     let mut orderedCaseIds : Array Ident := #[]
     if let some pcs := proveCases then
@@ -268,24 +270,31 @@ elab_rules : tactic
     let allCtorsRef ← IO.mkRef (#[] : Array Name)
     let runStep : TacticM Unit := do
       evalTactic (← `(tactic| (intro m msg h; $unfoldPred:tactic; try dsimp only at *; cases msg)))
-      forEachGoal fun g => do
+      forEachGoal fun g => Core.withCurrHeartbeats do
         let ctorTag := stripStepPrefix (← g.getTag)
         allCtorsRef.modify (Qed.Lang.pushUnique · ctorTag)
         if let some (_, tacSeq) := caseMap[ctorTag]? then
           seenCasesRef.modify (·.insert ctorTag)
-          discard <| tryTac `(tactic| simp only [$[$updL],*])
-          discard <| tryTac `(tactic| dsimp only at *)
-          evalTactic tacSeq
-          return
-        discard <| tryTac `(tactic| simp_all only [$[$updL],*])
-        runUnfoldPresent usingL; try runCloseCachedPut usingL catch _ => pure ()
-        discard <| tryTac `(tactic| repeat' split)
-        forEachGoal (closeSplitBranch usingL true none 3)
+          match ← simpGoalOnly g updCtx with
+          | none => setGoals []; return
+          | some g1 =>
+              setGoals [g1]
+              discard <| tryTac `(tactic| dsimp only at *)
+              evalTactic tacSeq
+              return
+        match ← trySimpAll g updCtx with
+        | none => setGoals []; return
+        | some g1 =>
+            setGoals [g1]
+            if ← tryCloseBasic g1 (reducibleOnly := true) then setGoals []; return
+        runUnfoldPresent usingL updNames; try runCloseCachedPut usingL catch _ => pure ()
+        discard <| tryTac `(tactic| repeat' (split <;> try dsimp only))
+        forEachGoal (closeSplitBranch usingL true none 3 updNames)
     match init with
     | some initT =>
         let [gInit, gStep] ← (← getMainGoal).apply (mkConst ``And.intro) | throwError "internal error splitting invariant init/step goals"
         gInit.setTag `init; gStep.setTag `step
-        setGoals [gInit]; runInitPass usingL pred initT; let remInit ← getUnsolvedGoals
+        setGoals [gInit]; Core.withCurrHeartbeats (runInitPass usingL pred initT); let remInit ← getUnsolvedGoals
         setGoals [gStep]; runStep; setGoals (remInit ++ (← getUnsolvedGoals))
     | none => runStep
     let seenCases ← seenCasesRef.get

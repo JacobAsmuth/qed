@@ -6,36 +6,29 @@ import Qed.Date
 namespace Qed
 open Qed.Proto
 
-/-! ## JSON Codec for `Bytes` (`ByteArray`) via Verified Hex Bijection -/
+/-! ## JSON Codec for `Bytes` (`ByteArray`) & Binary Protobuf Typeclasses -/
 
-instance : ToJson ByteArray where toJson b := .str (encodeHex b)
-instance : FromJson ByteArray where fromJson | .str s => decodeHex s | _ => .error "expected hex-encoded byte string"
-instance : LawfulJson ByteArray where fromJson_toJson := decodeHex_encodeHex
+instance : ToJson ByteArray := .ofEquiv encodeHex
+instance : FromJson ByteArray := .ofRetract decodeHex
+instance : LawfulJson ByteArray := .ofRetract encodeHex decodeHex decodeHex_encodeHex
 instance : NonNullJson ByteArray := ⟨nofun⟩
-
-/-! ## Binary Protocol Buffers Typeclasses (`ToProto`, `FromProto`, `LawfulProto`) -/
 
 class ToProto (α : Type) where
   toProtoVal : α → WireVal
   toProtoMsg : α → List (Nat × WireVal) := fun a => [(1, toProtoVal a)]
-
 class FromProto (α : Type) where
   fromProtoVal : WireVal → Except String α
   fromProtoMsg : List (Nat × WireVal) → Except String α := fun fs =>
     match lookupField 1 fs with | some w => fromProtoVal w | none => .error "protobuf: missing value field 1"
-
 class LawfulProto (α : Type) extends ToProto α, FromProto α where
   msg_tags_pos : ∀ (a : α) (kw : Nat × WireVal), kw ∈ toProtoMsg a → 0 < kw.1
   fromProtoVal_toProtoVal : ∀ a : α, fromProtoVal (toProtoVal a) = .ok a
   fromProtoMsg_toProtoMsg : ∀ a : α, fromProtoMsg (toProtoMsg a) = .ok a
 
-@[simp] theorem fromProtoVal_toProtoVal_simp {α : Type} [LawfulProto α] (a : α) :
-    FromProto.fromProtoVal (ToProto.toProtoVal a) = .ok a := LawfulProto.fromProtoVal_toProtoVal a
-@[simp] theorem fromProtoMsg_toProtoMsg_simp {α : Type} [LawfulProto α] (a : α) :
-    FromProto.fromProtoMsg (ToProto.toProtoMsg a) = .ok a := LawfulProto.fromProtoMsg_toProtoMsg a
+@[simp] theorem fromProtoVal_toProtoVal_simp {α : Type} [LawfulProto α] (a : α) : FromProto.fromProtoVal (ToProto.toProtoVal a) = .ok a := LawfulProto.fromProtoVal_toProtoVal a
+@[simp] theorem fromProtoMsg_toProtoMsg_simp {α : Type} [LawfulProto α] (a : α) : FromProto.fromProtoMsg (ToProto.toProtoMsg a) = .ok a := LawfulProto.fromProtoMsg_toProtoMsg a
 
-@[reducible] def LawfulProto.ofScalar {α : Type} [t : ToProto α] [f : FromProto α]
-    (hval : ∀ a : α, f.fromProtoVal (t.toProtoVal a) = .ok a)
+@[reducible] def LawfulProto.ofScalar {α : Type} [t : ToProto α] [f : FromProto α] (hval : ∀ a : α, f.fromProtoVal (t.toProtoVal a) = .ok a)
     (hmsg : ∀ a : α, t.toProtoMsg a = [(1, t.toProtoVal a)] := by intro _; rfl)
     (hfmsg : ∀ fs, f.fromProtoMsg fs = (match lookupField 1 fs with | some w => f.fromProtoVal w | none => .error "protobuf: missing value field 1") := by intro _; rfl) : LawfulProto α where
   msg_tags_pos a kw h := by rw [hmsg] at h; rw [List.mem_singleton.1 h]; simp
@@ -66,17 +59,10 @@ defScalarProto Nat WireVal.varint id, Except.ok, "protobuf: expected varint for 
 defScalarProto UInt32 WireVal.fixed32 id, Except.ok, "protobuf: expected fixed32 for UInt32", (fun _ => rfl)
 defScalarProto UInt64 WireVal.fixed64 id, Except.ok, "protobuf: expected fixed64 for UInt64", (fun _ => rfl)
 defScalarProto ByteArray WireVal.bytes id, Except.ok, "protobuf: expected length-delimited bytes", (fun _ => rfl)
-defScalarProto Bool WireVal.varint (fun b => if b then 1 else 0),
-  (fun | 0 => .ok false | 1 => .ok true | n => .error s!"protobuf: invalid bool varint {n}"),
-  "protobuf: expected varint for Bool", (by intro b; cases b <;> rfl)
-defScalarProto Int WireVal.varint zigzagEncode, (fun n => .ok (zigzagDecode n)),
-  "protobuf: expected ZigZag varint for Int", (fun i => by simp [ToProto.toProtoVal, FromProto.fromProtoVal, zigzagDecode_zigzagEncode])
-defScalarProto UInt8 WireVal.varint UInt8.toNat,
-  (fun n => if n < 256 then .ok (UInt8.ofNat n) else .error s!"protobuf: UInt8 out of range ({n})"),
-  "protobuf: expected varint for UInt8", (fun b => by simp [ToProto.toProtoVal, FromProto.fromProtoVal, b.toNat_lt, UInt8.ofNat_toNat])
-defScalarProto String WireVal.bytes String.toUTF8,
-  (fun b => (String.fromUTF8? b).elim (.error "protobuf: invalid UTF-8 string") .ok),
-  "protobuf: expected length-delimited UTF-8 string", (fun ⟨_, h⟩ => by simp [ToProto.toProtoVal, FromProto.fromProtoVal, String.fromUTF8?, String.toUTF8, h, String.fromUTF8])
+defScalarProto Bool WireVal.varint (fun b => if b then 1 else 0), (fun | 0 => .ok false | 1 => .ok true | n => .error s!"protobuf: invalid bool varint {n}"), "protobuf: expected varint for Bool", (by intro b; cases b <;> rfl)
+defScalarProto Int WireVal.varint zigzagEncode, (fun n => .ok (zigzagDecode n)), "protobuf: expected ZigZag varint for Int", (fun i => by simp [ToProto.toProtoVal, FromProto.fromProtoVal, zigzagDecode_zigzagEncode])
+defScalarProto UInt8 WireVal.varint UInt8.toNat, (fun n => if n < 256 then .ok (UInt8.ofNat n) else .error s!"protobuf: UInt8 out of range ({n})"), "protobuf: expected varint for UInt8", (fun b => by simp [ToProto.toProtoVal, FromProto.fromProtoVal, b.toNat_lt, UInt8.ofNat_toNat])
+defScalarProto String WireVal.bytes String.toUTF8, (fun b => (String.fromUTF8? b).elim (.error "protobuf: invalid UTF-8 string") .ok), "protobuf: expected length-delimited UTF-8 string", (fun ⟨_, h⟩ => by simp [ToProto.toProtoVal, FromProto.fromProtoVal, String.fromUTF8?, String.toUTF8, h, String.fromUTF8])
 
 instance : ToProto Float where toProtoVal f := .fixed64 f.toBits
 instance : FromProto Float where fromProtoVal | .fixed64 bits => .ok (Float.ofBits bits) | _ => .error "protobuf: expected fixed64 for Float"
@@ -91,16 +77,14 @@ class LawfulProtoField (α : Type) extends ToProtoField α, FromProtoField α wh
   decodeProtoField_hit_raw : ∀ (k : Nat) (a : α) (rest : List (Nat × WireVal)), (∀ kw ∈ rest, kw.1 ≠ k) → decodeProtoField k (encodeProtoField k a ++ rest) = .ok a
 
 instance (priority := low) {α : Type} [ToProto α] : ToProtoField α where encodeProtoField k a := [(k, ToProto.toProtoVal a)]
-instance (priority := low) {α : Type} [FromProto α] : FromProtoField α where
-  decodeProtoField k fs := (lookupField k fs).elim (.error s!"protobuf: missing field {k}") FromProto.fromProtoVal
+instance (priority := low) {α : Type} [FromProto α] : FromProtoField α where decodeProtoField k fs := (lookupField k fs).elim (.error s!"protobuf: missing field {k}") FromProto.fromProtoVal
 instance (priority := low) {α : Type} [LawfulProto α] : LawfulProtoField α where
   encodeProtoField_tag _ _ _ h := by rw [List.mem_singleton.1 h]
   decodeProtoField_skip_prefix k pre rest hne := by simp [FromProtoField.decodeProtoField, skipUnknown_preserves_lookup_prefix k pre rest hne]
   decodeProtoField_hit_raw _ _ _ _ := by simp [ToProtoField.encodeProtoField, FromProtoField.decodeProtoField, lookupField]
 
 instance {α : Type} [ToProto α] : ToProtoField (Option α) where encodeProtoField k | none => [] | some a => [(k, ToProto.toProtoVal a)]
-instance {α : Type} [FromProto α] : FromProtoField (Option α) where
-  decodeProtoField k fs := (lookupField k fs).elim (.ok none) fun w => (FromProto.fromProtoVal w).map some
+instance {α : Type} [FromProto α] : FromProtoField (Option α) where decodeProtoField k fs := (lookupField k fs).elim (.ok none) fun w => (FromProto.fromProtoVal w).map some
 instance {α : Type} [LawfulProto α] : LawfulProtoField (Option α) where
   encodeProtoField_tag _ opt _ h := by cases opt with | none => cases h | some _ => rw [List.mem_singleton.1 h]
   decodeProtoField_skip_prefix k pre rest hne := by simp [FromProtoField.decodeProtoField, skipUnknown_preserves_lookup_prefix k pre rest hne]
@@ -113,68 +97,43 @@ namespace Proto
 def AllTagsGt (k : Nat) (fs : List (Nat × WireVal)) : Prop := ∀ kw ∈ fs, k < kw.1
 def AllTagsLe (k : Nat) (fs : List (Nat × WireVal)) : Prop := ∀ kw ∈ fs, kw.1 ≤ k
 @[simp] theorem allTagsGt_nil (k : Nat) : AllTagsGt k [] := fun _ h => nomatch h
-theorem allTagsGt_of_le {k m : Nat} {fs : List (Nat × WireVal)} (h : k ≤ m) (hgt : AllTagsGt m fs) : AllTagsGt k fs :=
-  fun kw hm => Nat.lt_of_le_of_lt h (hgt kw hm)
-theorem allTagsGt_step {α : Type} [LawfulProtoField α] {k : Nat} (a : α) {rest : List (Nat × WireVal)}
-    (hr : AllTagsGt (k + 1) rest) : AllTagsGt k (ToProtoField.encodeProtoField (k + 1) a ++ rest) := fun kw hm =>
-  (List.mem_append.1 hm).elim
-    (fun h1 => by rw [LawfulProtoField.encodeProtoField_tag (k + 1) a kw h1]; exact Nat.lt_succ_self k)
-    (fun h2 => Nat.lt_trans (Nat.lt_succ_self k) (hr kw h2))
-theorem allTagsLe_single {α : Type} [LawfulProtoField α] (k : Nat) (a : α) :
-    AllTagsLe k (ToProtoField.encodeProtoField k a) := fun kw hm => by
-  rw [LawfulProtoField.encodeProtoField_tag k a kw hm]; exact Nat.le_refl k
-theorem allTagsLe_append_step {α : Type} [LawfulProtoField α] {k : Nat} {pre : List (Nat × WireVal)}
-    (hp : AllTagsLe k pre) (a : α) : AllTagsLe (k + 1) (pre ++ ToProtoField.encodeProtoField (k + 1) a) := fun kw hm =>
-  (List.mem_append.1 hm).elim (fun h1 => Nat.le_succ_of_le (hp kw h1))
-    (fun h2 => by rw [LawfulProtoField.encodeProtoField_tag (k + 1) a kw h2]; exact Nat.le_refl _)
+theorem allTagsGt_step {α : Type} [LawfulProtoField α] {k : Nat} (a : α) {rest : List (Nat × WireVal)} (hr : AllTagsGt (k + 1) rest) :
+    AllTagsGt k (ToProtoField.encodeProtoField (k + 1) a ++ rest) := fun kw hm => (List.mem_append.1 hm).elim (fun h1 => by rw [LawfulProtoField.encodeProtoField_tag (k + 1) a kw h1]; exact Nat.lt_succ_self k) (fun h2 => Nat.lt_trans (Nat.lt_succ_self k) (hr kw h2))
+theorem allTagsLe_single {α : Type} [LawfulProtoField α] (k : Nat) (a : α) : AllTagsLe k (ToProtoField.encodeProtoField k a) := fun kw hm => by rw [LawfulProtoField.encodeProtoField_tag k a kw hm]; exact Nat.le_refl k
+theorem allTagsLe_append_step {α : Type} [LawfulProtoField α] {k : Nat} {pre : List (Nat × WireVal)} (hp : AllTagsLe k pre) (a : α) :
+    AllTagsLe (k + 1) (pre ++ ToProtoField.encodeProtoField (k + 1) a) := fun kw hm => (List.mem_append.1 hm).elim (fun h1 => Nat.le_succ_of_le (hp kw h1)) (fun h2 => by rw [LawfulProtoField.encodeProtoField_tag (k + 1) a kw h2]; exact Nat.le_refl _)
 theorem split_step {α : Type} [ToProtoField α] {all pre tail : List (Nat × WireVal)} (k : Nat) (a : α)
-    (h : all = pre ++ (ToProtoField.encodeProtoField k a ++ tail)) :
-    all = (pre ++ ToProtoField.encodeProtoField k a) ++ tail :=
-  h.trans (List.append_assoc pre _ tail).symm
+    (h : all = pre ++ (ToProtoField.encodeProtoField k a ++ tail)) : all = (pre ++ ToProtoField.encodeProtoField k a) ++ tail := h.trans (List.append_assoc pre _ tail).symm
 theorem msg_tags_pos_encodeAppend {α : Type} [LawfulProtoField α] {k : Nat} (hk : 0 < k) (a : α) {rest : List (Nat × WireVal)} (hr : ∀ kw ∈ rest, 0 < kw.1) :
-    ∀ kw ∈ ToProtoField.encodeProtoField k a ++ rest, 0 < kw.1 := fun kw hm =>
-  (List.mem_append.1 hm).elim (fun h1 => by rw [LawfulProtoField.encodeProtoField_tag k a kw h1]; exact hk) (hr kw)
+    ∀ kw ∈ ToProtoField.encodeProtoField k a ++ rest, 0 < kw.1 := fun kw hm => (List.mem_append.1 hm).elim (fun h1 => by rw [LawfulProtoField.encodeProtoField_tag k a kw h1]; exact hk) (hr kw)
 theorem decodeProtoField_hit {α : Type} [LawfulProtoField α] (k : Nat) (a : α) (rest : List (Nat × WireVal)) (hgt : AllTagsGt k rest) :
-    FromProtoField.decodeProtoField k (ToProtoField.encodeProtoField k a ++ rest) = .ok a :=
-  LawfulProtoField.decodeProtoField_hit_raw k a rest fun kw hm => Nat.ne_of_gt (hgt kw hm)
-theorem decodeProtoField_mid {α : Type} [LawfulProtoField α] {k : Nat}
-    {all pre rest : List (Nat × WireVal)} (a : α)
-    (hsplit : all = pre ++ (ToProtoField.encodeProtoField (k + 1) a ++ rest))
-    (hle : AllTagsLe k pre) (hgt : AllTagsGt (k + 1) rest) :
-    FromProtoField.decodeProtoField (k + 1) all = .ok a := by
-  rw [hsplit, LawfulProtoField.decodeProtoField_skip_prefix (k + 1) pre _ fun kw hm => Nat.ne_of_lt (Nat.lt_succ_of_le (hle kw hm))]
-  exact decodeProtoField_hit (k + 1) a rest hgt
+    FromProtoField.decodeProtoField k (ToProtoField.encodeProtoField k a ++ rest) = .ok a := LawfulProtoField.decodeProtoField_hit_raw k a rest fun kw hm => Nat.ne_of_gt (hgt kw hm)
+theorem decodeProtoField_mid {α : Type} [LawfulProtoField α] {k : Nat} {all pre rest : List (Nat × WireVal)} (a : α)
+    (hsplit : all = pre ++ (ToProtoField.encodeProtoField (k + 1) a ++ rest)) (hle : AllTagsLe k pre) (hgt : AllTagsGt (k + 1) rest) : FromProtoField.decodeProtoField (k + 1) all = .ok a := by
+  rw [hsplit, LawfulProtoField.decodeProtoField_skip_prefix (k + 1) pre _ fun kw hm => Nat.ne_of_lt (Nat.lt_succ_of_le (hle kw hm))]; exact decodeProtoField_hit (k + 1) a rest hgt
 end Proto
 
-@[reducible] def ToProto.ofFields {α : Type} (enc : α → List (Nat × WireVal)) : ToProto α :=
-  ⟨fun a => .bytes (encodeFieldsSpec (enc a)), enc⟩
+@[reducible] def ToProto.ofFields {α : Type} (enc : α → List (Nat × WireVal)) : ToProto α := ⟨fun a => .bytes (encodeFieldsSpec (enc a)), enc⟩
 @[reducible] def FromProto.ofFields {α : Type} (dec : List (Nat × WireVal) → Except String α) : FromProto α :=
   ⟨fun | .bytes b => (decodeFieldsSpec b).bind dec | _ => .error "protobuf: expected embedded message bytes", dec⟩
 @[reducible] def LawfulProto.ofFields {α : Type} (enc : α → List (Nat × WireVal)) (dec : List (Nat × WireVal) → Except String α)
     (htags : ∀ (a : α) (kw : Nat × WireVal), kw ∈ enc a → 0 < kw.1) (hrt : ∀ a : α, dec (enc a) = .ok a) : LawfulProto α where
   toToProto := .ofFields enc; toFromProto := .ofFields dec; msg_tags_pos := htags; fromProtoMsg_toProtoMsg := hrt
-  fromProtoVal_toProtoVal a := by
-    change (decodeFieldsSpec (encodeFieldsSpec (enc a))).bind dec = .ok a
-    rw [decodeFieldsSpec_encodeFieldsSpec _ (htags a)]; exact hrt a
+  fromProtoVal_toProtoVal a := by change (decodeFieldsSpec (encodeFieldsSpec (enc a))).bind dec = .ok a; rw [decodeFieldsSpec_encodeFieldsSpec _ (htags a)]; exact hrt a
 
-@[reducible] def ToProto.ofEquiv {α β : Type} [ToProto β] (toB : α → β) : ToProto α :=
-  ⟨fun a => ToProto.toProtoVal (toB a), fun a => ToProto.toProtoMsg (toB a)⟩
-@[reducible] def FromProto.ofEquiv {α β : Type} [FromProto β] (ofB : β → α) : FromProto α :=
-  ⟨fun w => (FromProto.fromProtoVal (α := β) w).map ofB, fun fs => (FromProto.fromProtoMsg (α := β) fs).map ofB⟩
-@[reducible] def FromProto.ofRetract {α β : Type} [FromProto β] (ofB : β → Except String α) : FromProto α :=
-  ⟨fun w => (FromProto.fromProtoVal (α := β) w).bind ofB, fun fs => (FromProto.fromProtoMsg (α := β) fs).bind ofB⟩
-
+@[reducible] def ToProto.ofEquiv {α β : Type} [ToProto β] (toB : α → β) : ToProto α := ⟨fun a => ToProto.toProtoVal (toB a), fun a => ToProto.toProtoMsg (toB a)⟩
+@[reducible] def FromProto.ofEquiv {α β : Type} [FromProto β] (ofB : β → α) : FromProto α := ⟨fun w => (FromProto.fromProtoVal (α := β) w).map ofB, fun fs => (FromProto.fromProtoMsg (α := β) fs).map ofB⟩
+@[reducible] def FromProto.ofRetract {α β : Type} [FromProto β] (ofB : β → Except String α) : FromProto α := ⟨fun w => (FromProto.fromProtoVal (α := β) w).bind ofB, fun fs => (FromProto.fromProtoMsg (α := β) fs).bind ofB⟩
 @[reducible] def LawfulProto.ofEquiv {α β : Type} [LawfulProto β] (toB : α → β) (ofB : β → α) (hinv : ∀ a : α, ofB (toB a) = a) : LawfulProto α where
   toToProto := .ofEquiv toB; toFromProto := .ofEquiv ofB; msg_tags_pos a := LawfulProto.msg_tags_pos (toB a)
   fromProtoMsg_toProtoMsg a := (congrArg (Except.map ofB) (LawfulProto.fromProtoMsg_toProtoMsg (toB a))).trans (congrArg Except.ok (hinv a))
   fromProtoVal_toProtoVal a := (congrArg (Except.map ofB) (LawfulProto.fromProtoVal_toProtoVal (toB a))).trans (congrArg Except.ok (hinv a))
-
 @[reducible] def LawfulProto.ofRetract {α β : Type} [LawfulProto β] (toB : α → β) (ofB : β → Except String α) (hinv : ∀ a : α, ofB (toB a) = .ok a) : LawfulProto α where
   toToProto := .ofEquiv toB; toFromProto := .ofRetract ofB; msg_tags_pos a := LawfulProto.msg_tags_pos (toB a)
   fromProtoMsg_toProtoMsg a := (congrArg (·.bind ofB) (LawfulProto.fromProtoMsg_toProtoMsg (toB a))).trans (hinv a)
   fromProtoVal_toProtoVal a := (congrArg (·.bind ofB) (LawfulProto.fromProtoVal_toProtoVal (toB a))).trans (hinv a)
 
-/-! ## Composite & Container `LawfulProto` Instances (`Date`, `Option`, `Except`, `Prod`, `List`, `Array`) -/
+/-! ## Composite & Container `LawfulProto` Instances (`Date`, `Option`, `Except`, `Prod`, `List`, `Array`, `Url`) -/
 
 macro "qed_proto_fields% " "[" vs:ident,* "]" "(" ty:term "," enc:term "," dec:term "," htags:term "," hinv:term ")" : command => do
   let ids := vs.getElems
@@ -206,11 +165,9 @@ qed_proto_fields% [α] (Option α, ToProtoField.encodeProtoField 1, FromProtoFie
   fun opt kw h => by rw [LawfulProtoField.encodeProtoField_tag 1 opt kw h]; exact Nat.zero_lt_succ _,
   fun opt => by simpa using LawfulProtoField.decodeProtoField_hit_raw 1 opt [] (by simp))
 
-private def encodeExceptFields [ToProto ε] [ToProto α] : Except ε α → List (Nat × WireVal)
-  | .ok a => [(1, ToProto.toProtoVal a)] | .error e => [(2, ToProto.toProtoVal e)]
+private def encodeExceptFields [ToProto ε] [ToProto α] : Except ε α → List (Nat × WireVal) | .ok a => [(1, ToProto.toProtoVal a)] | .error e => [(2, ToProto.toProtoVal e)]
 private def decodeExceptFields [FromProto ε] [FromProto α] (fs : List (Nat × WireVal)) : Except String (Except ε α) :=
-  match lookupField 1 fs, lookupField 2 fs with
-  | some w, _ => (FromProto.fromProtoVal (α := α) w).map .ok | none, some w => (FromProto.fromProtoVal (α := ε) w).map .error | none, none => .error "protobuf: missing Except branch"
+  match lookupField 1 fs, lookupField 2 fs with | some w, _ => (FromProto.fromProtoVal (α := α) w).map .ok | none, some w => (FromProto.fromProtoVal (α := ε) w).map .error | none, none => .error "protobuf: missing Except branch"
 qed_proto_fields% [ε, α] (Except ε α, encodeExceptFields, decodeExceptFields,
   by intro r _ h; cases r <;> (rw [List.mem_singleton.1 h]; exact Nat.zero_lt_succ _),
   by intro r; cases r <;> simp [encodeExceptFields, decodeExceptFields, lookupField, Except.map])
@@ -232,22 +189,14 @@ qed_proto_fields% [α] (List α, encodeRepeatedField1, decodeRepeatedField1,
 
 qed_equiv_codec% proto [α] (Array α, Array.toList, List.toArray, fun ⟨_⟩ => rfl)
 
-/-! ## Verified JSON & Protobuf Codecs for `Qed.Url` (Re-verifies `isSafeUrl` on Untrusted Wire Bytes) -/
-
-instance : ToJson Url where toJson u := .str u.raw
-instance : FromJson Url where
-  fromJson
-    | .str s => (Url.parse? s).elim (.error s!"unsafe URL `{s}`") .ok
-    | _ => .error "expected URL string"
-instance : LawfulJson Url where
-  fromJson_toJson u := by simp [ToJson.toJson, FromJson.fromJson, Url.parse?, u.safe]
+private def parseUrlWire (pfx s : String) : Except String Url := (Url.parse? s).elim (.error s!"{pfx}unsafe URL `{s}`") .ok
+private theorem parseUrlWire_raw (pfx : String) (u : Url) : parseUrlWire pfx u.raw = .ok u := by simp [parseUrlWire, Url.parse?, u.safe]
+instance : ToJson Url := .ofEquiv Url.raw
+instance : FromJson Url := .ofRetract (parseUrlWire "")
+instance : LawfulJson Url := .ofRetract Url.raw (parseUrlWire "") (parseUrlWire_raw "")
 instance : NonNullJson Url := ⟨nofun⟩
-
-instance : ToProto Url where toProtoVal u := ToProto.toProtoVal u.raw
-instance : FromProto Url where
-  fromProtoVal w := (FromProto.fromProtoVal (α := String) w).bind fun s =>
-    (Url.parse? s).elim (.error s!"protobuf: unsafe URL `{s}`") .ok
-instance : LawfulProto Url := .ofScalar fun ⟨⟨_, hs⟩, hsafe⟩ => by
-  simp [ToProto.toProtoVal, FromProto.fromProtoVal, String.fromUTF8?, String.toUTF8, hs, String.fromUTF8, Except.bind, Url.parse?, hsafe]
+instance : ToProto Url := .ofEquiv Url.raw
+instance : FromProto Url := .ofRetract (parseUrlWire "protobuf: ")
+instance : LawfulProto Url := .ofRetract Url.raw (parseUrlWire "protobuf: ") (parseUrlWire_raw "protobuf: ")
 
 end Qed

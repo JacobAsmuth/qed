@@ -89,11 +89,10 @@ def parseLit : List Char → Except String (Json × List Char)
 
 @[inline] def parseMember (pVal : List Char → Except String (Json × List Char)) (cs : List Char) : Except String ((String × Json) × List Char) :=
   match skipWs cs with
-  | c :: r => if c == '"' then (parseStr r).bind fun (k, r1) => match skipWs r1 with
-      | c1 :: r2 => if c1 == ':' then (pVal (skipWs r2)).map fun (v, r3) => ((k, v), r3) else .error "expected ':'"
-      | [] => .error "expected ':'"
-    else .error "expected string key"
-  | [] => .error "expected string key"
+  | '"' :: r => (parseStr r).bind fun (k, r1) => match skipWs r1 with
+      | ':' :: r2 => (pVal (skipWs r2)).map fun (v, r3) => ((k, v), r3)
+      | _ => .error "expected ':'"
+  | _ => .error "expected string key"
 
 mutual
   def parseVal : Nat → Nat → List Char → Except String (Json × List Char)
@@ -175,63 +174,47 @@ def renderFast (j : Json) : String := renderAcc "" j
 local macro "str_ext_simp" : tactic =>
   `(tactic| (ext; simp only [String.toList_push, String.toList_append, String.toList_ofList, List.append_assoc, List.cons_append, List.nil_append, List.append_nil]))
 
-private theorem foldl_push_eq : ∀ (cs : List Char) (acc : String), cs.foldl String.push acc = acc ++ String.ofList cs
-  | [], _ => by simp only [List.foldl_nil, String.ofList_nil, String.append_empty]
-  | c :: cs, acc => by simp only [List.foldl_cons, foldl_push_eq cs]; str_ext_simp
-
 private theorem foldl_appendEscaped_eq : ∀ (cs : List Char) (acc : String), cs.foldl appendEscaped acc = acc ++ String.ofList (cs.flatMap escapeCharL)
   | [], _ => by simp only [List.foldl_nil, List.flatMap_nil, String.ofList_nil, String.append_empty]
   | c :: cs, acc => by
-      have ha : appendEscaped acc c = acc ++ String.ofList (escapeCharL c) := by
-        unfold appendEscaped escapeCharL
-        split <;> first | rfl | (split <;> first | rfl | str_ext_simp)
+      have ha : appendEscaped acc c = acc ++ String.ofList (escapeCharL c) := by unfold appendEscaped escapeCharL; split <;> first | rfl | (split <;> first | rfl | str_ext_simp)
       simp only [List.foldl_cons, List.flatMap_cons, foldl_appendEscaped_eq cs, ha]; str_ext_simp
 
 private theorem flatMap_escapeCharL_of_none : ∀ cs : List Char, cs.any needsJsonEscape = false → cs.flatMap escapeCharL = cs
   | [], _ => rfl
   | c :: cs, h => by
       simp only [List.any_cons, Bool.or_eq_false_iff, needsJsonEscape, beq_eq_false_iff_ne, decide_eq_false_iff_not] at h
-      have he : escapeCharL c = [c] := by
-        unfold escapeCharL
-        split <;> first | exact absurd rfl h.1.1.1 | exact absurd rfl h.1.1.2 | (exfalso; apply h.1.2; decide) | exact ite_eq_right h.1.2
+      have he : escapeCharL c = [c] := by unfold escapeCharL; split <;> first | exact absurd rfl h.1.1.1 | exact absurd rfl h.1.1.2 | (exfalso; apply h.1.2; decide) | exact ite_eq_right h.1.2
       simp only [List.flatMap_cons, he, flatMap_escapeCharL_of_none cs h.2, List.singleton_append]
 
 private theorem hasJsonEscapeByte_eq (s : String) : hasAsciiByte s needsJsonEscapeByte = s.toList.any needsJsonEscape :=
   hasAsciiByte_eq_any s needsJsonEscapeByte needsJsonEscape
-    (fun b hb => by
-      simp only [needsJsonEscapeByte, Bool.or_eq_false_iff, decide_eq_false_iff_not, beq_eq_false_iff_ne]
-      refine ⟨⟨fun h => ?_, fun h => ?_⟩, fun h => absurd (UInt8.lt_iff_toNat_lt.1 h) (by change ¬ b.toNat < 32; omega)⟩ <;> (subst h; exact absurd hb (by decide)))
-    (fun c hc => by
-      have hlt : (UInt8.ofNat c.toNat < 32) ↔ c.toNat < 0x20 := by rw [UInt8.lt_iff_toNat_lt]; change c.toNat % 256 < 32 ↔ c.toNat < 32; omega
-      simp only [needsJsonEscapeByte, needsJsonEscape, show (34 : UInt8) = UInt8.ofNat '"'.toNat from rfl, show (92 : UInt8) = UInt8.ofNat '\\'.toNat from rfl,
-        asciiByte_beq_char c hc '"' (by decide), asciiByte_beq_char c hc '\\' (by decide), decide_eq_decide.2 hlt])
-    (fun c hgt => by
-      simp only [needsJsonEscape, Bool.or_eq_false_iff, beq_eq_false_iff_ne, decide_eq_false_iff_not]
-      refine ⟨⟨?_, ?_⟩, by omega⟩ <;> (rintro rfl; exact absurd hgt (by decide)))
+    (fun b hb => by simp only [needsJsonEscapeByte, Bool.or_eq_false_iff, decide_eq_false_iff_not, beq_eq_false_iff_ne]; refine ⟨⟨?_, ?_⟩, fun h => absurd (UInt8.lt_iff_toNat_lt.1 h) (by change ¬ b.toNat < 32; omega)⟩ <;> (rintro rfl; exact absurd hb (by decide)))
+    (fun c hc => by simp only [needsJsonEscapeByte, needsJsonEscape, show (34 : UInt8) = UInt8.ofNat '"'.toNat from rfl, show (92 : UInt8) = UInt8.ofNat '\\'.toNat from rfl,
+      asciiByte_beq_char c hc '"' (by decide), asciiByte_beq_char c hc '\\' (by decide), decide_eq_decide.2 (show (UInt8.ofNat c.toNat < 32) ↔ c.toNat < 0x20 by rw [UInt8.lt_iff_toNat_lt]; change c.toNat % 256 < 32 ↔ c.toNat < 32; omega)])
+    (fun c hgt => by simp only [needsJsonEscape, Bool.or_eq_false_iff, beq_eq_false_iff_ne, decide_eq_false_iff_not]; refine ⟨⟨?_, ?_⟩, by omega⟩ <;> (rintro rfl; exact absurd hgt (by decide)))
 
 private theorem renderStrAcc_eq (s acc : String) : renderStrAcc s acc = acc ++ String.ofList (renderStrL s) := by
   unfold renderStrAcc renderStrL; dsimp only
   rw [show s.foldl appendEscaped (acc.push '"') = s.toList.foldl appendEscaped (acc.push '"') by rw [String.foldl_eq_foldl_toList], hasJsonEscapeByte_eq]
-  cases ha : s.toList.any needsJsonEscape <;>
-    (simp only [Bool.not_false, Bool.not_true, Bool.false_eq_true, ↓reduceIte, flatMap_escapeCharL_of_none s.toList, ha, foldl_appendEscaped_eq]; str_ext_simp)
-
-private theorem pushNatAcc_eq (n : Nat) (acc : String) : pushNatAcc n acc = acc ++ String.ofList (natDigitsAux n []) := by
-  unfold pushNatAcc; split
-  · rename_i h10; rw [natDigitsAux, ite_eq_left h10, Nat.mod_eq_of_lt h10]; str_ext_simp
-  · rename_i hge10; split
-    · rename_i h100; have hd : n / 10 < 10 := by omega
-      rw [natDigitsAux, ite_eq_right hge10, natDigitsAux, ite_eq_left hd, Nat.mod_eq_of_lt hd]; str_ext_simp
-    · exact foldl_push_eq _ acc
+  cases ha : s.toList.any needsJsonEscape <;> (simp only [Bool.not_false, Bool.not_true, Bool.false_eq_true, ↓reduceIte, flatMap_escapeCharL_of_none s.toList, ha, foldl_appendEscaped_eq]; str_ext_simp)
 
 private theorem renderNumAcc_eq (n : JsonNumber) (acc : String) : renderNumAcc n acc = acc ++ String.ofList (renderNumL n) := by
-  have hint (i : Int) (a : String) : pushIntAcc i a = a ++ String.ofList (intCharsL i) := by
-    unfold pushIntAcc intCharsL; split <;> (rw [pushNatAcc_eq]; str_ext_simp)
+  let rec hfold : ∀ (cs : List Char) (a : String), cs.foldl String.push a = a ++ String.ofList cs
+    | [], _ => by simp only [List.foldl_nil, String.ofList_nil, String.append_empty] | c :: cs, a => by simp only [List.foldl_cons, hfold cs]; str_ext_simp
+  have hnat (m : Nat) (a : String) : pushNatAcc m a = a ++ String.ofList (natDigitsAux m []) := by
+    unfold pushNatAcc; split
+    · rename_i h10; rw [natDigitsAux, ite_eq_left h10, Nat.mod_eq_of_lt h10]; str_ext_simp
+    · rename_i hge10; split
+      · rename_i h100; have hd : m / 10 < 10 := by omega
+        rw [natDigitsAux, ite_eq_right hge10, natDigitsAux, ite_eq_left hd, Nat.mod_eq_of_lt hd]; str_ext_simp
+      · exact hfold _ a
+  have hint (i : Int) (a : String) : pushIntAcc i a = a ++ String.ofList (intCharsL i) := by unfold pushIntAcc intCharsL; split <;> (rw [hnat]; str_ext_simp)
   unfold renderNumAcc renderNumL; split <;> (simp only [hint]; str_ext_simp)
 
 mutual
   private theorem renderAcc_eq (acc : String) : ∀ j, renderAcc acc j = acc ++ String.ofList (renderL j)
-    | .null => rfl | .bool b => by cases b <;> rfl
-    | .num n => renderNumAcc_eq n acc | .str s => renderStrAcc_eq s acc
+    | .null => rfl | .bool b => by cases b <;> rfl | .num n => renderNumAcc_eq n acc | .str s => renderStrAcc_eq s acc
     | .arr es => by unfold renderAcc renderL; rw [renderElemsAcc_eq]; str_ext_simp
     | .obj ms => by unfold renderAcc renderL; rw [renderMembersAcc_eq]; str_ext_simp
   private theorem renderElemsAcc_eq (acc : String) : ∀ es, renderElemsAcc acc es = acc ++ String.ofList (renderElemsL es)
@@ -308,17 +291,14 @@ syntax "json_obj_codec% " (&"private ")? ident " [" jsonObjField,* "]" (" valida
 
 macro_rules
   | `(json_obj_codec% $[private%$p?]? $ty:ident [$fs:jsonObjField,*] $[validate $val?:term]?) => do
-      let mut encItems : Array (Lean.TSyntax `term) := #[]
-      let mut decFields : Array (Lean.TSyntax `ident) := #[]
-      let mut decVals : Array (Lean.TSyntax `term) := #[]
-      for f in fs.getElems do
+      let items ← fs.getElems.mapM fun f => do
         let `(jsonObjField| $id:ident $[:= $d?:term]?) := f | Lean.Macro.throwUnsupported
         let k := Lean.Syntax.mkStrLit id.getId.eraseMacroScopes.toString
-        encItems := encItems.push (← `(($k, Qed.toJson v.$id)))
-        decFields := decFields.push id
-        decVals := decVals.push (← match d? with
+        let decVal ← match d? with
           | some d => `((← Qed.fromField (α := Option _) j $k).getD $d)
-          | none   => `(← Qed.fromField j $k))
+          | none   => `(← Qed.fromField j $k)
+        return (← `(($k, Qed.toJson v.$id)), id, decVal)
+      let encItems := items.map (·.1); let decFields := items.map (·.2.1); let decVals := items.map (·.2.2)
       let toBody ← `(fun (v : $ty) => Qed.Json.obj [$[$encItems:term],*])
       let fromBody ← match val? with
         | some vfn => `(fun j => do let r : $ty := { $[$decFields:ident := $decVals:term],* }; let () ← ($vfn:term) r; return r)

@@ -34,12 +34,12 @@ initialize currentCompSessionRef : IO.Ref (Option Ident)              ← IO.mkR
     withVal := fun _ s k => do k (← lowerPredictExpr s)
     withGuard := fun _ s k => do k (← lowerCompExpr .propGuard s)
     extendLocals := fun _ _ => ()
-    onEmpty := fun _ => runPureQuot `(Option.none)
+    onEmpty := fun _ => Lang.runPQ `(Option.none)
     onReturn := fun _ st _ => do
-      if (st.getArg 1).getNumArgs == 0 then runPureQuot `(Option.none)
-      else let v ← wrapVal (← lowerPredictExpr ((st.getArg 1).getArg 0)); runPureQuot `(Option.some ($v))
+      if (st.getArg 1).getNumArgs == 0 then Lang.runPQ `(Option.none)
+      else let v ← wrapVal (← lowerPredictExpr ((st.getArg 1).getArg 0)); Lang.runPQ `(Option.some ($v))
     onExpr := fun _ st _ => badStmt st
-    onMissingElse := fun _ _ => runPureQuot `(Option.none)
+    onMissingElse := fun _ _ => Lang.runPQ `(Option.none)
     onUnsupported := badStmt
     letClauseErr := "`predict`/`catch` clauses are not supported inside `predict:`"
   } () stmts
@@ -48,40 +48,40 @@ initialize currentCompSessionRef : IO.Ref (Option Ident)              ← IO.mkR
   let (tId, srvId, methId, rpcArgs) := (spec.t.getId, mkIdentFrom node.ref node.srvInfo.serverName, mkIdentFrom node.ref (Name.mkSimple node.mInfo.name), node.rpcArgs)
   let preMsgOpt : Term ← match node.preCtor? with
     | none => `(Option.none)
-    | some preCtor => `(Option.some ($(← mkAppTerms (mkIdentFrom node.ref (tId ++ `Msg ++ preCtor)) node.preArgs)))
-  let contBase ← mkAppTerms (mkIdentFrom node.ref (tId ++ `Msg ++ node.contCtor)) node.capturedArgs
+    | some preCtor => `(Option.some ($(← mkAppTermsPure (mkIdentFrom node.ref (tId ++ `Msg ++ preCtor)) node.preArgs)))
+  let contBase ← mkAppTermsPure (mkIdentFrom node.ref (tId ++ `Msg ++ node.contCtor)) node.capturedArgs
   let (txVar, predVar) := (mkIdent `_specTxId, mkIdent `_specPredVal)
-  let resCb ← mkAppTerms (← `($(mkIdentFrom node.ref (tId ++ `Msg ++ node.resCtor)) $txVar)) (node.capturedArgs.push predVar)
+  let resCb ← mkAppTermsPure (← `($(mkIdentFrom node.ref (tId ++ `Msg ++ node.resCtor)) $txVar)) (node.capturedArgs.push predVar)
   let rpcCall ← withRef node.ref `(qedCheckRpcCall% $srvId:ident $methId:ident [$[$rpcArgs:term],*] $resCb)
   let mkDisp (arg : Term) := `(Qed.SpecAction.dispatch $preMsgOpt Qed.Cmd.none ($contBase $arg) (fun $txVar:ident => $rpcCall))
   let dispatchBody ← match ensuredWrapKind node.mInfo node.catchHasNone, node.mInfo.ensPredConst with
     | .optEnsured, some ensConst =>
-        let ensApp ← mkAppTerms (mkIdent ensConst) rpcArgs
+        let ensApp ← mkAppTermsPure (mkIdent ensConst) rpcArgs
         let dNone ← mkDisp (← `((Option.none : Option (Qed.Ensured $(node.innerEnsTy?.getD node.predValTy) ($ensApp)))))
         let dSome ← mkDisp (← `(Option.some (Qed.Ensured.mk _pv _hSpecEns)))
         `(match $predVar:ident with | Option.none => $dNone | Option.some _pv => if _hSpecEns : ($ensApp) _pv then $dSome else Qed.SpecAction.normal)
     | .ensured, some ensConst =>
-        let ensApp ← mkAppTerms (mkIdent ensConst) rpcArgs
+        let ensApp ← mkAppTermsPure (mkIdent ensConst) rpcArgs
         let disp ← mkDisp (← `(Qed.Ensured.mk $predVar:ident _hSpecEns))
         `(if _hSpecEns : ($ensApp) $predVar:ident then $disp else Qed.SpecAction.normal)
     | _, _ => mkDisp predVar
   let matched ← `(match ($predOptTerm : Option $(node.predValTy)) with | Option.none => Qed.SpecAction.normal | Option.some $predVar:ident => $dispatchBody)
-  node.hoistDefs.foldrM (init := matched) fun (tmpId, pTy, argT) acc => `(let $tmpId:ident : $pTy := $argT; $acc)
+  Lang.foldrPQ node.hoistDefs matched fun (tmpId, pTy, argT) acc => `(let $tmpId:ident : $pTy := $argT; $acc)
 
 @[noinline] private def compileSpecDispatchNode (spec : ComponentSpec) (node : SpecDispatchNode) : CommandElabM Term := do
   if ensuredWrapKind node.mInfo node.catchHasNone != .plain && node.mInfo.ensPredConst.isNone then
     throwErrorAt node.ref "internal: missing server `ensures` predicate in `predict`"
   let (srvId, methId, rpcArgs) := (mkIdentFrom node.ref node.srvInfo.serverName, mkIdentFrom node.ref (Name.mkSimple node.mInfo.name), node.rpcArgs)
   let wrapVal (valT : Term) : CommandElabM Term :=
-    if node.mInfo.hasEnsures then withRef node.ref <| runPureQuot `(qedCheckPredict% $srvId:ident $methId:ident [$[$rpcArgs:term],*] ($valT : $(node.predValTy)))
-    else runPureQuot `(($valT : $(node.predValTy)))
+    if node.mInfo.hasEnsures then withRef node.ref <| Lang.runPQ `(qedCheckPredict% $srvId:ident $methId:ident [$[$rpcArgs:term],*] ($valT : $(node.predValTy)))
+    else Lang.runPQ `(($valT : $(node.predValTy)))
   let predOptTerm ← match node.predBody with
-    | .expr eStx    => let v ← wrapVal (← lowerPredictExpr eStx); runPureQuot `(Option.some ($v))
+    | .expr eStx    => let v ← wrapVal (← lowerPredictExpr eStx); Lang.runPQ `(Option.some ($v))
     | .block pStmts => lowerPredictStmts wrapVal pStmts.toList
-  runPureQuot (mkSpecDispatchNodePure spec node predOptTerm)
+  Lang.runPQ (mkSpecDispatchNodePure spec node predOptTerm)
 
 @[noinline] private partial def compileClassifyStmts (spec : ComponentSpec) : List Syntax → CommandElabM Term
-  | [] => runPureQuot `(Qed.SpecAction.normal)
+  | [] => Lang.runPQ `(Qed.SpecAction.normal)
   | st :: rest => do
       if let some idx := matchSpecDispatchMarker? st then return ← compileSpecDispatchNode spec spec.specNodes[idx]!
       match st.getKind with
@@ -95,7 +95,7 @@ initialize currentCompSessionRef : IO.Ref (Option Ident)              ← IO.mkR
   let capIds : Array Term := rs.capturedParams.map (⟨·.1.raw⟩)
   let allPatIds : Array Term := #[⟨txId.raw⟩] ++ capIds ++ #[⟨predId.raw⟩, ⟨outId.raw⟩]
   let okCtorId := mkIdent ((if rs.mInfo.domainErrTags.isEmpty then `Qed.RpcSimpleOutcome else `Qed.RpcOutcome) ++ `ok)
-  let mkCtorApp (ctorNm : Name) (arg : Term) := mkAppTerms (spec.msgCtor ctorNm) (capIds.push arg)
+  let mkCtorApp (ctorNm : Name) (arg : Term) := mkAppTermsPure (spec.msgCtor ctorNm) (capIds.push arg)
   let (contMsg, confirmMsg?, rollbackMsg?, catchMsg?) := (← mkCtorApp rs.contCtor vId, ← rs.confirmCtor?.mapM (mkCtorApp · vId), ← rs.rollbackCtor?.mapM (mkCtorApp · vId), ← rs.catchCtor?.mapM (mkCtorApp · outId))
   let optList : Option Term → PureQuotM Term | some m => `([$m]) | none => `(([] : List $(spec.msgId)))
   let okReplList ← match confirmMsg? with | some cm => `([$contMsg, $cm]) | none => `([$contMsg])
@@ -109,16 +109,16 @@ initialize currentCompSessionRef : IO.Ref (Option Ident)              ← IO.mkR
 
 @[noinline] def mkSpecClassifyCmds (spec : ComponentSpec) : CommandElabM (Array CmdStx) := do
   if !spec.hasSpeculative then return #[]
-  let dispBodies ← spec.specDispatches.mapM fun da => return (da, ← compileClassifyStmts spec da.stmts.toList)
-  runPureQuot do
-    let clsId := spec.id `_specClassify; let mut arms : Array MatchAltStx := #[]
-    for (da, rhs0) in dispBodies do
+  let dispBodies ← Lang.mapCmd spec.specDispatches fun da => return (da, ← compileClassifyStmts spec da.stmts.toList)
+  Lang.runPQ do
+    let clsId := spec.id `_specClassify
+    let dispArms ← Lang.mapPQ dispBodies fun (da, rhs0) => do
       let (paramNames, ids) := (da.params.map (·.1.getId.eraseMacroScopes), (da.params.map (⟨·.1.raw⟩) : Array Term))
       let rhs ← bindMentionedFieldsPure spec (fun g => !paramNames.contains g && mentionsIdent rhs0.raw g) rhs0
-      arms := arms.push (← if ids.isEmpty then `(Lean.Parser.Term.matchAltExpr| | $(spec.msgCtor da.ctor):ident => $rhs)
-                           else `(Lean.Parser.Term.matchAltExpr| | $(spec.msgCtor da.ctor):ident $ids* => $rhs))
-    for rs in spec.specResolves do arms := arms.push (← mkSpecResolveArmPure spec rs)
-    arms := arms.push (← `(Lean.Parser.Term.matchAltExpr| | _ => Qed.SpecAction.normal))
+      if ids.isEmpty then `(Lean.Parser.Term.matchAltExpr| | $(spec.msgCtor da.ctor):ident => $rhs)
+      else `(Lean.Parser.Term.matchAltExpr| | $(spec.msgCtor da.ctor):ident $ids* => $rhs)
+    let resArms ← Lang.mapPQ spec.specResolves (mkSpecResolveArmPure spec)
+    let arms := dispArms ++ resArms |>.push (← `(Lean.Parser.Term.matchAltExpr| | _ => Qed.SpecAction.normal))
     return #[
       ← `(command| set_option linter.unusedVariables false in def $clsId (s : $(spec.stateId)) : $(spec.msgId) → Qed.SpecAction $(spec.msgId) := fun m => match m with $[$arms:matchAlt]*),
       ← `(command| set_option linter.unusedVariables false in
@@ -156,7 +156,7 @@ private def lookupCheckedMethod (stx : Syntax) (srvId methId : Ident) (label : S
 @[noinline, term_elab qedCheckRpcCallTerm] def elabQedCheckRpcCall : TermElab := fun stx expectedType? => do
   let argTerms : Array Term := (stx.getArg 4).getSepArgs.map (⟨·⟩)
   let (srvInfo, mInfo) ← lookupCheckedMethod stx ⟨stx.getArg 1⟩ ⟨stx.getArg 2⟩ "RPC check"
-  let fullCall ← runPureQuot (mkAppTerms (mkIdentFrom stx mInfo.rawRpcConst) (argTerms.push ⟨stx.getArg 6⟩))
+  let fullCall ← runPureQuot (mkAppTermsPure (mkIdentFrom stx mInfo.rawRpcConst) (argTerms.push ⟨stx.getArg 6⟩))
   elabAndRecordRpcLikeCheck stx expectedType? fullCall mInfo.rawRpcConst argTerms mInfo.paramCount mInfo.paramTypeConsts
     srvInfo.shortName mInfo.name mInfo.clientReqConst mInfo.clientReqLabel mInfo.requiresAuth (mInfo.hasClientReq || mInfo.requiresAuth)
 
@@ -210,7 +210,7 @@ private def fmtObl (obl : String) : String := if obl.isEmpty then "" else s!"\n 
 
 @[noinline] private def verifyOneRpcCheck (spec : ComponentSpec) (stateConstName : Name) (invPreds : Array Term) (chk : PendingRpcCheck) : CommandElabM Unit :=
   withCheckOrigin stateConstName invPreds chk.toCheckOrigin fun _ invProps stateFVar? => do
-    let tryDischarge (g : Expr) := tryDischargeOriginGoal invProps g (do Tactic.evalTactic (← `(tactic| intros; qedProveRpcReq))) (fun e => return (← Meta.unfoldDefinition? e).getD e)
+    let tryDischarge (g : Expr) := tryDischargeOriginGoal invProps g (do Tactic.evalTactic (← runPQTactic `(tactic| intros; qedProveRpcReq))) (fun e => return (← Meta.unfoldDefinition? e).getD e)
     if chk.requiresAuth then
       let some sfName := chk.sessionVar?
         | throwErrorAt chk.callRef m!"RPC `{chk.srvShort}.{chk.methodName}` requires an authenticated session (`ctx.userId != none`), but `{spec.t.getId}` has no `session` field.\n\nHint: Add `session user` to `{spec.t.getId}` and guard the call with `if user.isSome:`."
@@ -235,7 +235,7 @@ private def fmtObl (obl : String) : String := if obl.isEmpty then "" else s!"\n 
         Meta.mkForallFVars #[vFVar] (Expr.forallE `_hPredSome eqHyp (mkAppN (Lean.mkConst chk.ensConst) (chk.argExprs.push vFVar)) .default)
     else pure (mkAppN (Lean.mkConst chk.ensConst) (chk.argExprs.push chk.predExpr))
     let ensId := mkIdent (`_root_ ++ chk.ensConst)
-    match ← tryDischargeOriginGoal invProps ensGoal (do Tactic.evalTactic (← `(tactic| intros; try simp only [$ensId:ident]; try qedProveRpcReq))) (fun e => return (← Meta.unfold e chk.ensConst).expr) with
+    match ← tryDischargeOriginGoal invProps ensGoal (do Tactic.evalTactic (← runPQTactic `(tactic| intros; try simp only [$ensId:ident]; try qedProveRpcReq))) (fun e => return (← Meta.unfold e chk.ensConst).expr) with
     | .ok (fullGoal, mv) =>
         let fvars := proofLctx.foldl (init := #[]) fun acc d => if d.isAuxDecl then acc else acc.push d.toExpr
         let closedType ← instantiateMVars (← Meta.mkForallFVars (usedOnly := false) (usedLetOnly := false) fvars fullGoal)
@@ -249,9 +249,9 @@ private def fmtObl (obl : String) : String := if obl.isEmpty then "" else s!"\n 
   let (checks, predChecks) := (← pendingRpcChecks.get, ← pendingPredictChecks.get)
   if checks.isEmpty && predChecks.isEmpty then return
   let stateConstName ← liftCoreM <| realizeGlobalConstNoOverload spec.stateId
-  for chk in checks do verifyOneRpcCheck spec stateConstName invPreds chk
+  Lang.foldlCmd checks () fun _ chk => verifyOneRpcCheck spec stateConstName invPreds chk
   let currNs ← getCurrNamespace
-  for (chk, idx) in predChecks.zipIdx do verifyOnePredictCheck spec stateConstName currNs invPreds chk idx
+  Lang.foldlCmd predChecks.zipIdx () fun _ (chk, idx) => verifyOnePredictCheck spec stateConstName currNs invPreds chk idx
 
 @[noinline] private def elabAndRecordChanCheck (stx : Syntax) (expectedType? : Option Expr) (label : String)
     (argTerms : Array Term) (slotTerm : Term) (trailingArgs : Array Term) (isSub : Bool) : TermElabM Expr := do
@@ -260,7 +260,7 @@ private def fmtObl (obl : String) : String := if obl.isEmpty then "" else s!"\n 
   let (helperConst, paramCount, paramTypeConsts, methodName, reqConst?, reqLabel, requiresAuth) :=
     if isSub then (chInfo.subHelperConst, chInfo.paramCount, chInfo.paramTypeConsts, chInfo.channelName, chInfo.clientReqConst, chInfo.clientReqLabel, chInfo.requiresAuth)
     else (chInfo.sendHelperConst, chInfo.sendParamCount, chInfo.sendParamTypeConsts, s!"{chInfo.channelName}.send", chInfo.sendReqConst, chInfo.sendReqLabel, false)
-  let fullCall ← runPureQuot <| (argTerms ++ trailingArgs).foldlM (init := ← `($(mkIdentFrom stx helperConst) $slotTerm)) fun acc a => `($acc ($a))
+  let fullCall ← runPureQuot do Lang.foldlPQ (argTerms ++ trailingArgs) (← `($(mkIdentFrom stx helperConst) $slotTerm)) fun acc a => `($acc ($a))
   elabAndRecordRpcLikeCheck stx expectedType? fullCall helperConst argTerms paramCount paramTypeConsts chInfo.ownerShort methodName reqConst? reqLabel requiresAuth (reqConst?.isSome || requiresAuth)
 
 @[noinline, term_elab qedCheckChanSubTerm] def elabCheckChanSub : TermElab := fun stx expectedType? =>

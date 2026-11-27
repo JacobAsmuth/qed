@@ -16,18 +16,20 @@ def elabIsolatedTheorem (cmd : CmdStx) : CommandElabM Unit := do
   let saved ← IO.getNumHeartbeats; IO.setNumHeartbeats 0
   try elabCommand cmd finally IO.setNumHeartbeats saved
 
+@[noinline] private def lowerCompExprs (mode : ExprMode) (xs : Array Syntax) : CommandElabM (Array Term) :=
+  Lang.mapCmd xs (lowerCompExpr mode)
+
 /-! ## Inline Invariant Elaboration -/
 
 def mkViewPredAndStr (invStx : Syntax) (rawClauses : Array Syntax) (clauses : Array Term) (emptyMsg : String) : CommandElabM (Term × String) := do
-  let vPred ← match clauses.toList with
-    | [p] => pure p
-    | p :: ps => runPureQuot (ps.foldlM (init := p) fun acc q => `(Qed.both $acc $q))
-    | [] => throwErrorAt invStx emptyMsg
+  if clauses.isEmpty then throwErrorAt invStx emptyMsg
+  let vPred ← if clauses.size == 1 then pure clauses[0]!
+    else Lang.runPQ (Lang.foldlPQ (clauses.extract 1 clauses.size) clauses[0]! fun acc q => `(Qed.both $acc $q))
   return (vPred, String.intercalate ", " (rawClauses.toList.map fun c => (c.reprint.getD "this rule").trimmed))
 
 private def isViewPred (msgId : Ident) (pred : Term) : CommandElabM Bool :=
   Qed.Diag.probeTermElabOk do
-    discard <| Term.elabTermEnsuringType pred (← Term.elabType (← `(Html $msgId → Bool)))
+    discard <| Term.elabTermEnsuringType pred (← Term.elabType (← runPureQuot `(Html $msgId → Bool)))
     Term.synthesizeSyntheticMVarsNoPostponing; return true
 
 private def isForEachStyled (invStx : Syntax) : CommandElabM Bool := do
@@ -47,14 +49,13 @@ private def isForEachStyled (invStx : Syntax) : CommandElabM Bool := do
         unless pred.raw.isIdent do throwErrorAt invStx (if pf?.isSome then "specify `using <ChildInvariant>` when proving a custom predicate" else "specify `using <ChildInvariant>` for an inline `for_each` predicate")
         let cid : Ident := ⟨pred.raw⟩
         pure (← liftTermElabM (if isStyled then extractViewInvPred cid else extractInvPred cid), cid)
-  let cmd ← runPureQuot do
+  elabIsolatedTheorem (← Lang.runPQ do
     if isStyled then
       let rhs ← pf?.getDM `(by qedDischargeStyledForEach $(spec.viewId) $colField $childInv $invId $predToEmit)
       `(command| set_option linter.unusedSimpArgs false in theorem $invId:ident : ∀ m, ($predToEmit) ($(spec.viewId) m) = true := $rhs)
     else
       let rhs ← pf?.getDM `(by qedDischargeForEach $(spec.updateId) $childInv $invId $predToEmit)
-      `(command| theorem $invId:ident : ∀ m msg, (∀ c ∈ m.$colField, ($predToEmit) c) → (∀ c ∈ (InvTarget.proj ($(spec.updateId) m msg)).$colField, ($predToEmit) c) := $rhs)
-  elabIsolatedTheorem cmd
+      `(command| theorem $invId:ident : ∀ m msg, (∀ c ∈ m.$colField, ($predToEmit) c) → (∀ c ∈ (InvTarget.proj ($(spec.updateId) m msg)).$colField, ($predToEmit) c) := $rhs))
   if isStyled then return none
   try return some (← liftTermElabM (extractInvPred invId)) catch _ => return none
 
@@ -72,23 +73,23 @@ private def isForEachStyled (invStx : Syntax) : CommandElabM Bool := do
     (rawClauses : Array Syntax) (clauses : Array Term) (assume? pf? : Option Term) : CommandElabM Unit := do
   let (vPred, predStr) ← mkViewPredAndStr invStx rawClauses clauses "empty view styling invariant"
   if spec.hasProps then
-    elabIsolatedTheorem (← runPureQuot do
+    elabIsolatedTheorem (← Lang.runPQ do
       let rhs ← pf?.getDM `(by let _qed_hv := $(spec.viewId) p; change ∀ m, ($vPred) (_qed_hv m) = true; qedDischargeStyling _qed_hv $invId $(Syntax.mkStrLit predStr))
       `(command| set_option linter.unusedSimpArgs false in theorem $invId:ident (p : $(spec.propsId)) : ∀ m, ($vPred) ($(spec.viewId) p m) = true := $rhs))
   else
     let assumePred? ← assume?.mapM fun a => if a.raw.isIdent then try liftTermElabM (extractInvPred ⟨a.raw⟩) catch _ => pure a else pure a
-    elabIsolatedTheorem (← runPureQuot do
+    elabIsolatedTheorem (← Lang.runPQ do
       let prop ← match assumePred? with | some P => `(∀ m, ($P) m → ($vPred) ($(spec.viewId) m) = true) | none => `(∀ m, ($vPred) ($(spec.viewId) m) = true)
       let rhs ← pf?.getDM `(by qedDischargeStyling $(spec.viewId) $invId $(Syntax.mkStrLit predStr))
       `(command| set_option linter.unusedSimpArgs false in theorem $invId:ident : $prop := $rhs))
     let compFull := (← liftCoreM (resolveGlobalConstNoOverload spec.viewId)).getPrefix
     if (← getEnv).contains (compFull ++ `app_view_eq) then
       let saved ← get
-      try elabIsolatedTheorem (← runPureQuot (mkViewAppInvCmdPure spec invId compFull vPred assumePred?)) catch _ => set saved
+      try elabIsolatedTheorem (← Lang.runPQ (mkViewAppInvCmdPure spec invId compFull vPred assumePred?)) catch _ => set saved
 
 private def parseProveCases (optNode : Syntax) : CommandElabM (Option (Array (TSyntax ``Qed.qedProveCase))) := do
   if optNode.getNumArgs != 1 then return none
-  some <$> runPureQuot do ((optNode.getArg 0).getArg 2).getArgs.mapM fun c => do
+  some <$> Lang.runPQ do Lang.mapPQ ((optNode.getArg 0).getArg 2).getArgs fun c => do
     let caseIds : Array Ident := (c.getArg 1).getSepArgs.map (⟨·⟩)
     let tacSeq : TSyntax ``Lean.Parser.Tactic.tacticSeq := ⟨c.getArg 3⟩
     `(Qed.qedProveCase| $[$caseIds:ident],* => $tacSeq)
@@ -103,11 +104,11 @@ private def parseProveCases (optNode : Syntax) : CommandElabM (Option (Array (TS
     | none,    some pcs => `(by qedDischargePreserved [$[$usingL],*] $updT $invId ($pred) _qedProve [$[$pcs],*])
     | none,    none     => `(by qedDischargePreserved [$[$usingL],*] $updT $invId ($pred))
   if spec.hasProps then
-    let mut cmds : Array CmdStx := #[]
-    if spec.mountable then
-      cmds := cmds.push (← `(command| set_option linter.unusedVariables false in theorem $(mkIdentFrom invId (invId.getId.appendAfter "_init")):ident (p : $(spec.propsId)) : ($pred) $(spec.initId) := by qedDischargeInit [$[$usingL],*] $(spec.initId) $invId ($pred)))
+    let c0 : Array CmdStx ← if spec.mountable then
+        do pure #[← `(command| set_option linter.unusedVariables false in theorem $(mkIdentFrom invId (invId.getId.appendAfter "_init")):ident (p : $(spec.propsId)) : ($pred) $(spec.initId) := by qedDischargeInit [$[$usingL],*] $(spec.initId) $invId ($pred))]
+      else pure #[]
     let rhs ← pf?.getDM (mkPresTac (← `(($(spec.updateId) p))))
-    return (pred, cmds.push (← `(command| set_option linter.unusedVariables false in theorem $invId:ident (p : $(spec.propsId)) : ∀ m msg, ($pred) m → ($pred) (InvTarget.proj ($(spec.updateId) p m msg)) := $rhs)))
+    return (pred, c0.push (← `(command| set_option linter.unusedVariables false in theorem $invId:ident (p : $(spec.propsId)) : ∀ m msg, ($pred) m → ($pred) (InvTarget.proj ($(spec.updateId) p m msg)) := $rhs)))
   let presProp ← `(∀ m msg, ($pred) m → ($pred) (InvTarget.proj ($(spec.updateId) m msg)))
   let (prop, rhs) ← if spec.mountable then
       let r ← match pf? with
@@ -118,81 +119,87 @@ private def parseProveCases (optNode : Syntax) : CommandElabM (Option (Array (TS
   return (pred, #[← `(command| theorem $invId:ident : $prop := $rhs)])
 
 @[noinline] def elabInlineInvariantsPhase (spec : ComponentSpec) (wantView : Bool) : CommandElabM (Array (Term × Option Ident)) := do
-  let mut statePreds : Array (Term × Option Ident) := #[]
   let rwCtx ← mkRewriteCtx spec false (allowHoist := false)
   let rwRawClause (c : Syntax) : CommandElabM Syntax := if spec.pureFns.isEmpty then pure c else rewriteIn rwCtx false c
-  for invStx in spec.invariants do
-    if invStx.getKind == ``compExampleClause then continue
+  Lang.foldlCmd spec.invariants #[] fun statePreds invStx => do
+    if invStx.getKind == ``compExampleClause then return statePreds
     if invStx.getKind == ``compForEachInvClause then
       let isStyled ← isForEachStyled invStx
-      if isStyled == wantView then if let some pred ← withRef invStx (elabForEachInlineInv spec invStx isStyled) then statePreds := statePreds.push (pred, none)
-      continue
-    let rawClauses ← (invStx.getArg 2).getSepArgs.mapM rwRawClause
+      if isStyled == wantView then
+        if let some pred ← withRef invStx (elabForEachInlineInv spec invStx isStyled) then return statePreds.push (pred, none)
+      return statePreds
+    let rawClauses ← Lang.mapCmd (invStx.getArg 2).getSepArgs rwRawClause
     let hasHoldsIn := (invStx.getArg 3).getNumArgs > 0
-    let assume? ← if hasHoldsIn && ((invStx.getArg 3).getArg 2).getNumArgs == 2 then some <$> lowerCompExpr .val (← rwRawClause (((invStx.getArg 3).getArg 2).getArg 1)) else pure none
+    let assume? ← if hasHoldsIn && ((invStx.getArg 3).getArg 2).getNumArgs == 2 then do some <$> lowerCompExpr .val (← rwRawClause (((invStx.getArg 3).getArg 2).getArg 1)) else pure none
     let using? : Option (Array Term) := if (invStx.getArg 4).getNumArgs == 4 then some (((invStx.getArg 4).getArg 2).getSepArgs.map (⟨·⟩)) else none
     let prove? ← parseProveCases (invStx.getArg 5)
     let pf? : Option Term := if (invStx.getArg 6).getNumArgs == 2 then some ⟨(invStx.getArg 6).getArg 1⟩ else none
     if prove?.isSome && pf?.isSome then throwErrorAt (invStx.getArg 5) "cannot combine per-action `prove:` with a manual `:= by` proof; use one or the other"
-    let valClauses? ← if hasHoldsIn then some <$> rawClauses.mapM (lowerCompExpr .val)
-      else if using?.isSome || prove?.isSome || rawClauses.isEmpty then pure none else try some <$> rawClauses.mapM (lowerCompExpr .val) catch _ => pure none
+    let valClauses? ← if hasHoldsIn then some <$> lowerCompExprs .val rawClauses
+      else if using?.isSome || prove?.isSome || rawClauses.isEmpty then pure none else try some <$> lowerCompExprs .val rawClauses catch _ => pure none
     let autoView ← match valClauses? with
       | some vc => if !hasHoldsIn && !vc.any (fun c => spec.allNames.any (mentionsIdent c.raw)) then vc.allM (isViewPred spec.msgId) else pure false
       | none => pure false
-    if (hasHoldsIn || autoView) == wantView then
-      let invId := resolveInvIdent invStx spec.t.getId
-      if hasHoldsIn || autoView then
-        if prove?.isSome then throwErrorAt (invStx.getArg 5) "per-action `prove:` applies to state invariants, not `view` styling invariants"
-        withRef invStx <| elabViewInlineInv spec invStx invId rawClauses (← valClauses?.getDM (rawClauses.mapM (lowerCompExpr .val))) assume? pf?
-      else
-        let clauses ← rawClauses.mapM (lowerCompExpr .propInv)
-        let (pred, cmds) ← withRef invStx <| runPureQuot (mkStateInlineInvCmdsPure spec invId clauses using? prove? pf?)
-        withRef invStx <| cmds.forM elabIsolatedTheorem
-        statePreds := statePreds.push (pred, if !spec.hasProps && spec.mountable then some invId else none)
-  return statePreds
+    if (hasHoldsIn || autoView) != wantView then return statePreds
+    let invId := resolveInvIdent invStx spec.t.getId
+    if hasHoldsIn || autoView then
+      if prove?.isSome then throwErrorAt (invStx.getArg 5) "per-action `prove:` applies to state invariants, not `view` styling invariants"
+      withRef invStx <| elabViewInlineInv spec invStx invId rawClauses (← valClauses?.getDM (lowerCompExprs .val rawClauses)) assume? pf?
+      return statePreds
+    let clauses ← lowerCompExprs .propInv rawClauses
+    let (pred, cmds) ← withRef invStx <| Lang.runPQ (mkStateInlineInvCmdsPure spec invId clauses using? prove? pf?)
+    withRef invStx <| Lang.foldlCmd cmds () fun _ c => elabIsolatedTheorem c
+    return statePreds.push (pred, if !spec.hasProps && spec.mountable then some invId else none)
 
-private def parseCompExRecord (recStx : Syntax) (validFields : Array Name) (kindLabel : String) (compId : Name) : CommandElabM (Array (Ident × Term)) :=
-  (recStx.getArg 1).getSepArgs.mapM fun item => do
+private def lowerCompExRecOrExpr (node : Syntax) (validFields : Array Name) (kindLabel : String)
+    (compId : Name) (tyId : Ident) (base? : Option Ident := none) : CommandElabM Term := do
+  if node.getKind != `Qed.compExRecord then
+    let v ← lowerCompExpr .val node; return ← Lang.runPQ `(($v : $tyId))
+  let pairs ← Lang.mapCmd (node.getArg 1).getSepArgs fun item => do
     let fid : Ident := ⟨item.getArg 0⟩; let fn := fid.getId.eraseMacroScopes
     unless validFields.contains fn do
       throwErrorAt fid s!"unknown {kindLabel} `{fn}` on component `{compId}` (valid: {String.intercalate ", " (validFields.toList.map toString)})"
     return (mkIdentFrom fid fn, ← lowerCompExpr .val (item.getArg 2))
+  let (fIds, fVals) := (pairs.map (·.1), pairs.map (·.2))
+  Lang.runPQ <| match base? with
+    | some b => `(({ $b with $[$fIds:ident := $fVals:term],* } : $tyId))
+    | none   => `(({ $[$fIds:ident := $fVals:term],* } : $tyId))
 
 @[noinline] private def lowerExampleRpcStep (spec : ComponentSpec) (st : Syntax) : CommandElabM Term := do
   if st.getKind != `Qed.compExOnReply then
-    let v ← lowerCompExpr .val st; return ← runPureQuot `(Qed.TraceStep.msg ($v : $(spec.msgId)))
+    let v ← lowerCompExpr .val st; return ← Lang.runPQ `(Qed.TraceStep.msg ($v : $(spec.msgId)))
   let rpcId : Ident := ⟨st.getArg 1⟩
   let some (srvInfo, mInfo) := lookupServerMethod? (← getEnv) (← getCurrNamespace) (← getScope).openDecls rpcId.getId
     | throwErrorAt rpcId s!"unknown server RPC `{rpcId.getId}` in `on {rpcId.getId} => ...`"
   let urlLit := Syntax.mkStrLit s!"/_qed/rpc/{srvInfo.shortName}/{mInfo.name}"
   let rNode := st.getArg 3; let rk := rNode.getKind
   if rk == `Qed.compExReplyErr then
-    let msgT ← lowerCompExpr .val (rNode.getArg 2); return ← runPureQuot `(Qed.TraceStep.rpcReply $urlLit (Except.error $msgT))
+    let msgT ← lowerCompExpr .val (rNode.getArg 2); return ← Lang.runPQ `(Qed.TraceStep.rpcReply $urlLit (Except.error $msgT))
   let some (errTy?, payTy) ← extractRpcOutcomeTys? mInfo false false true | throwError s!"internal: unexpected RPC outcome type for `{mInfo.name}`"
   if rk == `Qed.compExReplyOk then
     let valT ← lowerCompExpr .val (rNode.getArg 2)
-    return ← runPureQuot do match errTy? with
+    return ← Lang.runPQ do match errTy? with
       | none     => `(Qed.TraceStep.rpcReply $urlLit (Except.ok (Qed.Proto.encode ($valT : $payTy))))
       | some eTy => `(Qed.TraceStep.rpcReply $urlLit (Except.ok (Qed.Proto.encode (Except.ok ($valT : $payTy) : Except (Qed.RpcDomainError $eTy) $payTy))))
   let some eTy := errTy? | throwErrorAt rNode s!"RPC `{rpcId.getId}` has no domain error tags; use `error(\"...\")` for transport errors"
   let tagId : Ident := ⟨rNode.getArg 3⟩
-  let msgT ← if (rNode.getArg 4).getNumArgs == 2 then lowerCompExpr .val ((rNode.getArg 4).getArg 1) else runPureQuot `("")
+  let msgT ← if (rNode.getArg 4).getNumArgs == 2 then lowerCompExpr .val ((rNode.getArg 4).getArg 1) else Lang.runPQ `("")
   let tagDot := Syntax.node (.fromRef tagId) ``Lean.Parser.Term.dotIdent #[Syntax.atom (.fromRef tagId) ".", tagId.raw]
-  runPureQuot `(Qed.TraceStep.rpcReply $urlLit (Except.ok (Qed.Proto.encode (Except.error ({ tag := $(⟨tagDot⟩), message := $msgT } : Qed.RpcDomainError $eTy) : Except (Qed.RpcDomainError $eTy) $payTy))))
+  Lang.runPQ `(Qed.TraceStep.rpcReply $urlLit (Except.ok (Qed.Proto.encode (Except.error ({ tag := $(⟨tagDot⟩), message := $msgT } : Qed.RpcDomainError $eTy) : Except (Qed.RpcDomainError $eTy) $payTy))))
 
 @[noinline] private def mkCompExampleCmdPure (spec : ComponentSpec) (thmId : Ident) (parsedParams : Array (Ident × Term))
     (whereTerms : Array (Syntax × Term)) (propsTerm? : Option Term) (initTerm goalTerm : Term) (emitsRaw? : Option Term)
     (hasRpcReplies : Bool) (stepTerms : Array Term) (lbl : StrLit) (manualTac? : Option (TSyntax `Lean.Parser.Tactic.tacticSeq)) : PureQuotM CmdStx := do
   let paramNames := parsedParams.map (·.1.getId.eraseMacroScopes)
-  let paramBinders ← parsedParams.mapM fun (pId, pTy) => `(bracketedBinder| ($pId:ident : $pTy:term))
-  let whereBinders ← whereTerms.zipIdx.mapM fun ((wStx, wT), idx) => `(bracketedBinder| ($(mkIdentFrom wStx (Name.mkSimple s!"_hWhere{idx}")):ident : $wT:term))
+  let paramBinders ← Lang.mapPQ parsedParams fun (pId, pTy) => `(bracketedBinder| ($pId:ident : $pTy:term))
+  let whereBinders ← Lang.mapIdxPQ whereTerms fun (wStx, wT) idx => `(bracketedBinder| ($(mkIdentFrom wStx (Name.mkSimple s!"_hWhere{idx}")):ident : $wT:term))
   let predBody0 ← bindMentionedFieldsPure spec (fun nm => !paramNames.contains nm && mentionsIdent goalTerm.raw nm) goalTerm
   let pred ← `(fun (s : $(spec.stateId)) => $(← match propsTerm? with | some pt => `(let p : $(spec.propsId) := $pt; $predBody0) | none => pure predBody0))
   let emitsTerm? ← emitsRaw?.mapM fun evVal => do
-    let mut evBound ← bindMentionedFieldsPure spec (fun nm => !paramNames.contains nm && !spec.fieldNames.contains nm && mentionsIdent evVal.raw nm) evVal
-    for bd in spec.binds.reverse do
+    let ev0 ← bindMentionedFieldsPure spec (fun nm => !paramNames.contains nm && !spec.fieldNames.contains nm && mentionsIdent evVal.raw nm) evVal
+    let evBound ← Lang.foldrPQ spec.binds ev0 fun bd acc =>
       let sn := bindSetName bd.id.getId
-      if mentionsIdent evBound.raw sn then evBound ← `(let $(mkIdent sn):ident := $(spec.outCtor sn); $evBound)
+      if mentionsIdent acc.raw sn then `(let $(mkIdent sn):ident := $(spec.outCtor sn); $acc) else pure acc
     let evFinal ← match propsTerm? with | some pt => `(let p : $(spec.propsId) := $pt; $evBound) | none => pure evBound
     `(($evFinal : $(spec.id `Out)))
   let updTerm ← match propsTerm? with | some pt => `(($(spec.updateId) $pt)) | none => pure spec.updateId
@@ -200,51 +207,44 @@ private def parseCompExRecord (recStx : Syntax) (validFields : Array Name) (kind
   let pf ← match manualTac? with
     | some tacSeq => `(by qedWithFreshHeartbeats $tacSeq)
     | none        => `(by qedDischargeReachable $updTerm $initTerm $thmId $lbl)
-  if hasRpcReplies then
-    let stepsTerm ← `(([$[$stepTerms:term],*] : List (Qed.TraceStep $(spec.msgId))))
-    match emitsTerm? with
-    | some evT => `(command| set_option linter.unusedVariables false in theorem $thmId:ident $[$allBinders:bracketedBinder]* : Qed.optSat (Qed.runTraceAsyncEmits $updTerm $initTerm $stepsTerm) (fun _tr => ($pred) _tr.1 ∧ ($evT ∈ _tr.2)) := $pf)
-    | none     => `(command| set_option linter.unusedVariables false in theorem $thmId:ident $[$allBinders:bracketedBinder]* : Qed.optSat (Qed.runTraceAsync $updTerm $initTerm $stepsTerm) ($pred) := $pf)
-  else
-    let traceTerm ← `(([$[$stepTerms:term],*] : List $(spec.msgId)))
-    match emitsTerm? with
-    | some evT => `(command| set_option linter.unusedVariables false in theorem $thmId:ident $[$allBinders:bracketedBinder]* : let _tr := Qed.runTraceEmits $updTerm $initTerm $traceTerm; ($pred) _tr.1 ∧ ($evT ∈ _tr.2) := $pf)
-    | none     => `(command| set_option linter.unusedVariables false in theorem $thmId:ident $[$allBinders:bracketedBinder]* : Qed.Reachable $updTerm $initTerm ($pred) := Qed.reachable_of_trace $updTerm $initTerm ($pred) $traceTerm $pf)
+  let (propT, proofT) ← if hasRpcReplies then
+      let stepsTerm ← `(([$[$stepTerms:term],*] : List (Qed.TraceStep $(spec.msgId))))
+      match emitsTerm? with
+      | some evT => pure (← `(Qed.optSat (Qed.runTraceAsyncEmits $updTerm $initTerm $stepsTerm) (fun _tr => ($pred) _tr.1 ∧ ($evT ∈ _tr.2))), pf)
+      | none     => pure (← `(Qed.optSat (Qed.runTraceAsync $updTerm $initTerm $stepsTerm) ($pred)), pf)
+    else
+      let traceTerm ← `(([$[$stepTerms:term],*] : List $(spec.msgId)))
+      match emitsTerm? with
+      | some evT => pure (← `(let _tr := Qed.runTraceEmits $updTerm $initTerm $traceTerm; ($pred) _tr.1 ∧ ($evT ∈ _tr.2)), pf)
+      | none     => pure (← `(Qed.Reachable $updTerm $initTerm ($pred)), ← `(Qed.reachable_of_trace $updTerm $initTerm ($pred) $traceTerm $pf))
+  `(command| set_option linter.unusedVariables false in theorem $thmId:ident $[$allBinders:bracketedBinder]* : $propT := $proofT)
 
 @[noinline] private def elabCompExampleClause (spec : ComponentSpec) (cl : Syntax) : CommandElabM Unit := do
   let nameIdent : Ident := ⟨cl.getArg 1⟩; let thmId := mkIdentFrom nameIdent (spec.t.getId ++ nameIdent.getId.eraseMacroScopes)
   let parsedParams ← parseParamList (cl.getArg 2)
-  for (pId, _) in parsedParams do
+  Lang.foldlCmd parsedParams () fun _ (pId, _) => do
     let pName := pId.getId.eraseMacroScopes
     if spec.allNames.contains pName then throwErrorAt pId s!"`example` parameter `{pName}` shadows a field of `{spec.t.getId}`; rename the parameter"
   let optProps := cl.getArg 3
   let propsTerm? : Option Term ← if optProps.getNumArgs == 1 then
       unless spec.hasProps do throwErrorAt optProps s!"`with props` cannot be used on component `{spec.t.getId}` which has no `prop` or `bind` fields"
-      let wp := optProps.getArg 0
-      if wp.getNumArgs == 3 && (wp.getArg 2).getKind == `Qed.compExRecord then
-        let pairs ← parseCompExRecord (wp.getArg 2) (spec.props.map (·.id.getId.eraseMacroScopes)) "prop" spec.t.getId
-        let (fIds, fVals) := (pairs.map (·.1), pairs.map (·.2)); some <$> runPureQuot `(({ $[$fIds:ident := $fVals:term],* } : $(spec.propsId)))
-      else let v ← lowerCompExpr .val (wp.getArg 3); some <$> runPureQuot `(($v : $(spec.propsId)))
+      let wp := optProps.getArg 0; let pNode := if wp.getNumArgs == 3 && (wp.getArg 2).getKind == `Qed.compExRecord then wp.getArg 2 else wp.getArg 3
+      some <$> lowerCompExRecOrExpr pNode (spec.props.map (·.id.getId.eraseMacroScopes)) "prop" spec.t.getId spec.propsId
     else if spec.hasProps then
       let reqProps := spec.props.filter (·.def?.isNone)
-      if reqProps.isEmpty then some <$> runPureQuot `(({} : $(spec.propsId)))
+      if reqProps.isEmpty then some <$> Lang.runPQ `(({} : $(spec.propsId)))
       else throwErrorAt cl s!"`example {nameIdent.getId}` on prop-bearing component `{spec.t.getId}` requires `with props \{ ... }` for required prop(s): {String.intercalate ", " (reqProps.toList.map (·.id.getId.toString))}"
     else pure none
   let optFrom := cl.getArg 4
   let initTerm : Term ← if optFrom.getNumArgs == 1 then
-      let fNode := (optFrom.getArg 0).getArg 1
-      if fNode.getKind == `Qed.compExRecord then
-        let pairs ← parseCompExRecord fNode (spec.states.map (·.id.getId.eraseMacroScopes)) "state field" spec.t.getId
-        let (fIds, fVals) := (pairs.map (·.1), pairs.map (·.2))
-        runPureQuot (if spec.mountable then `(({ $(spec.initId) with $[$fIds:ident := $fVals:term],* } : $(spec.stateId))) else `(({ $[$fIds:ident := $fVals:term],* } : $(spec.stateId))))
-      else let v ← lowerCompExpr .val fNode; runPureQuot `(($v : $(spec.stateId)))
+      lowerCompExRecOrExpr ((optFrom.getArg 0).getArg 1) (spec.states.map (·.id.getId.eraseMacroScopes)) "state field" spec.t.getId spec.stateId (if spec.mountable then some spec.initId else none)
     else
       unless spec.mountable do throwErrorAt cl s!"`example {nameIdent.getId}` on non-mountable component `{spec.t.getId}` requires `from \{ ... }` to specify initial state"
       pure spec.initId
-  let whereTerms ← if (cl.getArg 5).getNumArgs == 2 then ((cl.getArg 5).getArg 1).getSepArgs.mapM fun w => return (w, ← lowerCompExpr .propInv w) else pure #[]
+  let whereTerms ← if (cl.getArg 5).getNumArgs == 2 then Lang.mapCmd ((cl.getArg 5).getArg 1).getSepArgs fun w => return (w, ← lowerCompExpr .propInv w) else pure #[]
   let rawSteps := (cl.getArg 7).getSepArgs; let hasRpcReplies := rawSteps.any (·.getKind == `Qed.compExOnReply)
   if hasRpcReplies && !spec.hasEffects then throwErrorAt cl s!"`on ... => ...` in `example {nameIdent.getId}` requires component `{spec.t.getId}` to have `await` / async effects"
-  let stepTerms ← if hasRpcReplies then rawSteps.mapM (lowerExampleRpcStep spec) else rawSteps.mapM (lowerCompExpr .val)
+  let stepTerms ← if hasRpcReplies then Lang.mapCmd rawSteps (lowerExampleRpcStep spec) else lowerCompExprs .val rawSteps
   let rawGoal := cl.getArg 9; let goalTerm ← lowerCompExpr .propInv rawGoal
   let optEmits := cl.getArg 10
   let emitsRaw? ← if optEmits.getNumArgs == 1 then
@@ -253,10 +253,10 @@ private def parseCompExRecord (recStx : Syntax) (validFields : Array Name) (kind
     else pure none
   let lbl := Syntax.mkStrLit (let s := stxSnippet rawGoal; if s.isEmpty then "target" else s)
   let manualTac? := if (cl.getArg 11).getNumArgs == 3 then some (⟨(cl.getArg 11).getArg 2⟩ : TSyntax `Lean.Parser.Tactic.tacticSeq) else none
-  elabIsolatedTheorem (← runPureQuot (mkCompExampleCmdPure spec thmId parsedParams whereTerms propsTerm? initTerm goalTerm emitsRaw? hasRpcReplies stepTerms lbl manualTac?))
+  elabIsolatedTheorem (← Lang.runPQ (mkCompExampleCmdPure spec thmId parsedParams whereTerms propsTerm? initTerm goalTerm emitsRaw? hasRpcReplies stepTerms lbl manualTac?))
 
-@[noinline] def elabCompReachableAndWitnesses (spec : ComponentSpec) : CommandElabM Unit := do
-  for cl in spec.invariants do if cl.getKind == ``compExampleClause then elabCompExampleClause spec cl
+@[noinline] def elabCompReachableAndWitnesses (spec : ComponentSpec) : CommandElabM Unit :=
+  Lang.foldlCmd spec.invariants () fun _ cl => if cl.getKind == ``compExampleClause then elabCompExampleClause spec cl else pure ()
 
 end CompElab
 end Qed

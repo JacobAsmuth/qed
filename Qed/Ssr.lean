@@ -67,22 +67,20 @@ private structure SsrNeed where
 @[reducible] def ssrSlotBytes (slot : Bool × Bool × String) : Except String ByteArray :=
   if slot.1 then if slot.2.1 then Proto.decodeHex slot.2.2 else .ok slot.2.2.toUTF8 else .error slot.2.2
 
+private def ssrDrainStep (onHit : Model → List (Cmd Msg) → Nat → Model × Array SsrNeed)
+    (app : App Model Msg) (results : Array (Bool × Bool × String)) (m : Model) (rest : List (Cmd Msg)) (i : Nat) (needs : Array SsrNeed)
+    (mkMsg : Bool × Bool × String → Msg) (mkNeed : Unit → SsrNeed) (cont : Array SsrNeed → Model × Array SsrNeed) : Model × Array SsrNeed :=
+  if h : needs.isEmpty ∧ i < results.size then
+    let (m', c') := app.update m (mkMsg results[i]); onHit m' (rest ++ Cmd.flatten c') (i + 1)
+  else cont (needs.push (mkNeed ()))
+
 private def ssrDrainWith (onHit : Model → List (Cmd Msg) → Nat → Model × Array SsrNeed)
     (app : App Model Msg) (results : Array (Bool × Bool × String)) :
     Model → List (Cmd Msg) → Nat → Array SsrNeed → Model × Array SsrNeed
   | m, [], _, needs => (m, needs)
-  | m, c :: rest, i, needs =>
-    match c with
-    | .request method url body onResult =>
-        if h : needs.isEmpty ∧ i < results.size then
-          let (m', c') := app.update m (onResult (ssrSlotText results[i]))
-          onHit m' (rest ++ Cmd.flatten c') (i + 1)
-        else ssrDrainWith onHit app results m rest i (needs.push ⟨method, url, body, false⟩)
-    | .requestBytes method url body onResult =>
-        if h : needs.isEmpty ∧ i < results.size then
-          let (m', c') := app.update m (onResult (ssrSlotBytes results[i]))
-          onHit m' (rest ++ Cmd.flatten c') (i + 1)
-        else ssrDrainWith onHit app results m rest i (needs.push ⟨method, url, Proto.encodeHex body, true⟩)
+  | m, c :: rest, i, needs => match c with
+    | .request method url body onResult => ssrDrainStep onHit app results m rest i needs (onResult ∘ ssrSlotText) (fun _ => ⟨method, url, body, false⟩) (ssrDrainWith onHit app results m rest i)
+    | .requestBytes method url body onResult => ssrDrainStep onHit app results m rest i needs (onResult ∘ ssrSlotBytes) (fun _ => ⟨method, url, Proto.encodeHex body, true⟩) (ssrDrainWith onHit app results m rest i)
     | _ => ssrDrainWith onHit app results m rest i needs
 
 private def ssrDrainFuel (app : App Model Msg) (results : Array (Bool × Bool × String)) :
@@ -210,7 +208,7 @@ private theorem ssrDrain_eq_ssrDrainQueueM {Model Msg : Type} (app : App Model M
   | @reqHit i hi _ _ _ _ _ _ _ _ hdisp _ ih | @reqBytesHit i hi _ _ _ _ _ _ _ _ hdisp _ ih =>
       unfold ssrDrain
       rw [show results.size - i = (results.size - (i + 1)) + 1 by omega]
-      simp only [ssrDrainFuel, ssrDrainWith, Array.isEmpty_empty, hi, and_self, ↓reduceDIte, ssrDrainQueueM, hdisp, bind]
+      simp only [ssrDrainFuel, ssrDrainWith, ssrDrainStep, Function.comp_apply, Array.isEmpty_empty, hi, and_self, ↓reduceDIte, ssrDrainQueueM, hdisp, bind]
       exact ih
   | @skip i c hnot _ _ _ _ _ ih =>
       cases c with

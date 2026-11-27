@@ -91,31 +91,27 @@ private def extractKeyPure (attrsList : Syntax) : PureQuotM (Option (Term × Ter
   match keyV with | some v => return some (⟨v⟩, ← `([$kept,*])) | none => return none
 
 @[noinline] private def wrapFieldLetsPure (m : Ident) (fields : Array Ident) (body : Term) : PureQuotM Term :=
-  fields.foldrM (init := body) fun f out => if viewMentions f.getId out.raw then `(let $f:ident := $m.$f:ident; $out) else pure out
+  Lang.foldrPQ fields body fun f out => if viewMentions f.getId out.raw then `(let $f:ident := $m.$f:ident; $out) else pure out
 private def mkModelFnPure (m : Ident) (fields : Array Ident) (body : Term) : PureQuotM Term := do `(fun $m => $(← wrapFieldLetsPure m fields body))
 
 @[noinline] private def catchAllPure (m : Ident) (fields : Array Ident) (stx : Syntax) : PureQuotM Syntax := do
   if viewMentionsAny m.getId fields stx then `(qedInternalChild% fun $m => $(← wrapFieldLetsPure m fields ⟨stx⟩)) else `(Qed.V.static $(⟨stx⟩))
 
-@[noinline] private def tryAttrPure (m : Ident) (fields : Array Ident) (stx : Syntax) : PureQuotM (Option Syntax) := do
-  let some (hn, args) := asIdentApp? stx | return none
-  if let some an := stringAttrName? hn then
-    if args.size == 1 && viewMentionsAny m.getId fields args[0]! then
-      let rawV : Term := ⟨args[0]!⟩
-      let v : Term ← if ["href", "src", "action"].contains hn then `(Qed.ToHref.toHref $rawV) else if hn == "value" then `(toString $rawV) else pure rawV
-      return some (← `(Qed.V.dynAttr $(⟨Syntax.mkStrLit an⟩) $(← mkModelFnPure m fields v)))
-  if hn == "attr" && args.size == 2 && viewMentionsAny m.getId fields args[1]! then
-    return some (← `(Qed.V.dynAttr $(⟨args[0]!⟩) $(← mkModelFnPure m fields (← `(toString $(⟨args[1]!⟩))))))
-  if ["onClick", "onInput", "onCheck"].contains hn && args.size == 1 && viewMentionsAny m.getId fields args[0]! then
-    return some (← `($(mkIdent ((`Qed.V).append (Name.mkSimple (hn ++ "'")))) $(← mkModelFnPure m fields ⟨args[0]!⟩)))
-  return none
-
 @[noinline] private def liftAttrListPure (m : Ident) (fields : Array Ident) (lst : Syntax) : PureQuotM (Option Term) := do
   let some elems := asListElems? lst | return none
-  let lifted ← elems.mapM fun a => do
-    match ← tryAttrPure m fields a with
-    | some a' => pure (⟨a'⟩ : Term)
-    | none => if viewMentionsAny m.getId fields a then `(Qed.VAttr.bind $(← mkModelFnPure m fields ⟨a⟩)) else `(Qed.VAttr.stat $(⟨a⟩))
+  let lifted ← Lang.mapPQ elems fun a => do
+    let dyn := viewMentionsAny m.getId fields
+    if let some (hn, args) := asIdentApp? a then
+      if args.size == 1 && dyn args[0]! then
+        let rawV : Term := ⟨args[0]!⟩
+        if let some an := stringAttrName? hn then
+          let v : Term ← if ["href", "src", "action"].contains hn then `(Qed.ToHref.toHref $rawV) else if hn == "value" then `(toString $rawV) else pure rawV
+          return ← `(Qed.V.dynAttr $(⟨Syntax.mkStrLit an⟩) $(← mkModelFnPure m fields v))
+        if ["onClick", "onInput", "onCheck"].contains hn then
+          return ← `($(mkIdent ((`Qed.V).append (Name.mkSimple (hn ++ "'")))) $(← mkModelFnPure m fields rawV))
+      if hn == "attr" && args.size == 2 && dyn args[1]! then
+        return ← `(Qed.V.dynAttr $(⟨args[0]!⟩) $(← mkModelFnPure m fields (← `(toString $(⟨args[1]!⟩)))))
+    if dyn a then `(Qed.VAttr.bind $(← mkModelFnPure m fields ⟨a⟩)) else `(Qed.VAttr.stat $(⟨a⟩))
   return some (← `([$lifted,*]))
 
 mutual
@@ -142,7 +138,7 @@ mutual
     let empty : Term ← `([])
     let some attrsL ← (if args.size ≥ 1 then liftAttrListPure m fields args[0]! else pure (some empty)) | return none
     let some kidsL ← (if args.size ≥ 2 then
-      match asListElems? args[1]! with | some elems => do let ks ← elems.mapM (fun k => do pure (⟨← viewLiftPure m fields k⟩ : Term)); pure (some (← `([$ks,*]))) | none => pure none
+      match asListElems? args[1]! with | some elems => do let ks ← Lang.mapPQ elems (fun k => do pure (⟨← viewLiftPure m fields k⟩ : Term)); pure (some (← `([$ks,*]))) | none => pure none
       else pure (some empty)) | return none
     return some (← `(Qed.V.el $(⟨Syntax.mkStrLit tag⟩) $attrsL $kidsL))
 
@@ -171,7 +167,7 @@ mutual
 end
 
 namespace Internal
-def liftViewWithFields (m : Ident) (fields : Array Ident) (stx : Syntax) : MacroM Syntax := runPureQuot (viewLiftPure m fields stx)
+def liftViewWithFields (m : Ident) (fields : Array Ident) (stx : Syntax) : MacroM Syntax := runPQMacro (viewLiftPure m fields stx)
 end Internal
 
 end ViewLift

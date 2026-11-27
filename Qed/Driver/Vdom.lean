@@ -213,6 +213,8 @@ def patchHtmlSubtreeM [MonadDom msg m] (parent : Dom.Node) (index : UInt32) (nod
   match diff oldHtml newHtml with
   | .replace h2 => do let n2 ← buildDomM (← MonadDom.childNamespace parent) h2; MonadDom.replaceChild parent index n2; return n2
   | p => do applyToDomM parent index node p; return node
-@[inline] def buildDom (h : Handlers msg) (ns : String) (tree : Html msg) : IO Dom.Node := ReaderT.run (buildDomM (m := DomM msg) ns tree) h
-@[inline] def hydrateDom (h : Handlers msg) (tree : Html msg) (node : Dom.Node) : IO Unit := ReaderT.run (hydrateDomM (m := DomM msg) tree node) h
+@[noinline] def buildDom (h : Handlers msg) (ns : String) (tree : Html msg) : IO Dom.Node := ReaderT.run (buildDomM (m := DomM msg) ns tree) h
+@[noinline] def hydrateDom (h : Handlers msg) (tree : Html msg) (node : Dom.Node) : IO Unit := ReaderT.run (hydrateDomM (m := DomM msg) tree node) h
+@[noinline] def patchHtmlSubtree (h : Handlers msg) (parent : Dom.Node) (index : UInt32) (node : Dom.Node) (oldHtml newHtml : Html msg) : IO Dom.Node :=
+  ReaderT.run (patchHtmlSubtreeM (m := DomM msg) parent index node oldHtml newHtml) h
 end Qed

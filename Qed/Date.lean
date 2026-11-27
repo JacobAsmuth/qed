@@ -59,52 +59,24 @@ def replace (s old new : String) : String :=
 
 private theorem dropWhileWs_length_le : ∀ cs : List Char, (dropWhileWs cs).length ≤ cs.length
   | [] => Nat.le_refl 0
-  | c :: cs => by
-      unfold dropWhileWs; split
-      · exact Nat.le_trans (dropWhileWs_length_le cs) (Nat.le_succ _)
-      · exact Nat.le_refl _
+  | c :: cs => by unfold dropWhileWs; split; exact Nat.le_trans (dropWhileWs_length_le cs) (Nat.le_succ _); exact Nat.le_refl _
 
-theorem take_length (s : String) (n : Nat) : (take s n).length = min s.length n := by
-  simp only [take, String.length_ofList, List.length_take, String.length_toList]; exact Nat.min_comm _ _
-
-theorem take_length_le (s : String) (n : Nat) : (take s n).length ≤ n := by
-  rw [take_length]; exact Nat.min_le_right _ _
-
-theorem drop_length (s : String) (n : Nat) : (drop s n).length = s.length - n := by
-  simp only [drop, String.length_ofList, List.length_drop, String.length_toList]
-
-theorem trimLeft_length_le (s : String) : (trimLeft s).length ≤ s.length := by
-  simpa only [trimLeft, String.length_ofList, String.length_toList] using dropWhileWs_length_le s.toList
-
-theorem trimRight_length_le (s : String) : (trimRight s).length ≤ s.length := by
-  have h := dropWhileWs_length_le s.toList.reverse
-  simpa only [trimRight, String.length_ofList, List.length_reverse, String.length_toList] using h
-
+theorem take_length (s : String) (n : Nat) : (take s n).length = min s.length n := by simp only [take, String.length_ofList, List.length_take, String.length_toList]; exact Nat.min_comm _ _
+theorem take_length_le (s : String) (n : Nat) : (take s n).length ≤ n := by rw [take_length]; exact Nat.min_le_right _ _
+theorem drop_length (s : String) (n : Nat) : (drop s n).length = s.length - n := by simp only [drop, String.length_ofList, List.length_drop, String.length_toList]
+theorem trimLeft_length_le (s : String) : (trimLeft s).length ≤ s.length := by simpa only [trimLeft, String.length_ofList, String.length_toList] using dropWhileWs_length_le s.toList
+theorem trimRight_length_le (s : String) : (trimRight s).length ≤ s.length := by simpa only [trimRight, String.length_ofList, List.length_reverse, String.length_toList] using dropWhileWs_length_le s.toList.reverse
 theorem trim_length_le (s : String) : (trim s).length ≤ s.length := by
-  have h1 := dropWhileWs_length_le (dropWhileWs s.toList).reverse
-  have h2 := dropWhileWs_length_le s.toList
   have : (dropWhileWs (dropWhileWs s.toList).reverse).reverse.length ≤ s.toList.length := by
-    rw [List.length_reverse]; exact Nat.le_trans h1 (by rw [List.length_reverse]; exact h2)
+    rw [List.length_reverse]; exact Nat.le_trans (dropWhileWs_length_le _) (by rw [List.length_reverse]; exact dropWhileWs_length_le _)
   simpa only [trim, String.length_ofList, String.length_toList] using this
-
-theorem toLower_length (s : String) : (toLower s).length = s.length := by
-  simp only [toLower, String.length_ofList, List.length_map, String.length_toList]
-
-theorem toUpper_length (s : String) : (toUpper s).length = s.length := by
-  simp only [toUpper, String.length_ofList, List.length_map, String.length_toList]
-
+theorem toLower_length (s : String) : (toLower s).length = s.length := by simp only [toLower, String.length_ofList, List.length_map, String.length_toList]
+theorem toUpper_length (s : String) : (toUpper s).length = s.length := by simp only [toUpper, String.length_ofList, List.length_map, String.length_toList]
 theorem truncate_length (s : String) (maxLen : Nat) (ellipsis : String := "...") :
     (truncate s maxLen ellipsis).length = min s.length maxLen := by
-  unfold truncate
-  split
-  · omega
-  · split
-    · exact take_length s maxLen
+  unfold truncate; split; · omega
+  · split; · exact take_length s maxLen
     · rw [String.length_append, take_length]; omega
-
-theorem truncate_length_le (s : String) (maxLen : Nat) (ellipsis : String := "...") :
-    (truncate s maxLen ellipsis).length ≤ maxLen := by
-  rw [truncate_length s maxLen ellipsis]; exact Nat.min_le_right _ _
 
 -- Prevent `Meta.whnf`/`isDefEq` from unfolding string helper internals during DB `where` / invariant proofs
 -- while keeping kernel `decide +kernel` working.

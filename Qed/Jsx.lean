@@ -12,34 +12,30 @@ private def mkTokenParserFn (kind : Name) (pred : Char → Bool) (desc : String)
   if s.hasError then s else mkNodeToken kind startPos true c s
 
 def jsxText : Parser := { fn := mkTokenParserFn `Qed.Jsx.jsxText (fun ch => ch != '<' && ch != '{' && ch != '}') "JSX text" }
-@[combinator_formatter Qed.Jsx.jsxText] def jsxText.formatter : Formatter := Formatter.visitAtom `Qed.Jsx.jsxText
-@[combinator_parenthesizer Qed.Jsx.jsxText] def jsxText.parenthesizer : Parenthesizer := Parenthesizer.visitToken
 def jsxName : Parser := { fn := mkTokenParserFn `Qed.Jsx.jsxName (fun ch => ch.isAlphanum || ch == '-' || ch == '_' || ch == '.' || ch == ':') "tag or attribute name" }
-@[combinator_formatter Qed.Jsx.jsxName] def jsxName.formatter : Formatter := Formatter.visitAtom `Qed.Jsx.jsxName
-@[combinator_parenthesizer Qed.Jsx.jsxName] def jsxName.parenthesizer : Parenthesizer := Parenthesizer.visitToken
 
 declare_syntax_cat jsxElement
 declare_syntax_cat jsxAttr
 declare_syntax_cat jsxAttrVal
 
-@[qedExpr_parser] def qedExprJsx : Parser := leading_parser:maxPrec atomic (categoryParser `jsxElement 0)
+@[qedExpr_parser] def qedExprJsx : Parser := opaqueP (leadingNode `Qed.Jsx.qedExprJsx maxPrec (atomic (categoryParser `jsxElement 0)))
 def jsxAssignOp   : Parser := (symbol "=" >> notFollowedBy (symbol "=") "=") <|> symbol "+=" <|> symbol "-="
 def jsxAssignItem : Parser := node `Qed.Jsx.jsxAssignItem (ident >> jsxAssignOp >> categoryParser `qedExpr 0)
 
-@[jsxAttrVal_parser] def attrValStr    : Parser := leading_parser strLit
-@[jsxAttrVal_parser] def attrValAssign : Parser := leading_parser
+@[jsxAttrVal_parser] def attrValStr    : Parser := opaqueP (leadingNode `Qed.Jsx.attrValStr maxPrec strLit)
+@[jsxAttrVal_parser] def attrValAssign : Parser := opaqueP (leadingNode `Qed.Jsx.attrValAssign maxPrec (
   "{" >> atomic (ident >> jsxAssignOp) >> categoryParser `qedExpr 0 >>
-  many (atomic (";" >> jsxAssignItem)) >> optional (atomic (";" >> categoryParser `qedExpr 0)) >> "}"
-@[jsxAttrVal_parser] def attrValExpr   : Parser := leading_parser "{" >> categoryParser `qedExpr 0 >> "}"
+  many (atomic (";" >> jsxAssignItem)) >> optional (atomic (";" >> categoryParser `qedExpr 0)) >> "}"))
+@[jsxAttrVal_parser] def attrValExpr   : Parser := opaqueP (leadingNode `Qed.Jsx.attrValExpr maxPrec ("{" >> categoryParser `qedExpr 0 >> "}"))
 
-syntax (name := attrNamed)  jsxName ("=" jsxAttrVal)? : jsxAttr
-syntax (name := attrSplice) "{" qedExpr "}" : jsxAttr
+@[jsxAttr_parser] def attrNamed  : Parser := opaqueP (leadingNode `Qed.Jsx.attrNamed maxPrec (jsxName >> optional ("=" >> categoryParser `jsxAttrVal 0)))
+@[jsxAttr_parser] def attrSplice : Parser := opaqueP (leadingNode `Qed.Jsx.attrSplice maxPrec ("{" >> categoryParser `qedExpr 0 >> "}"))
 -- Ordered `<|>` (not a syntax category) so `jsxText` runs before tokenizing non-token chars like `•`.
-syntax jsxChild := jsxText <|> ("{" qedExpr "}") <|> jsxElement
-syntax (name := jsxFragment)  atomic("<" ">") jsxChild* "</" ">" : jsxElement
-syntax (name := selfClosing)  "<" jsxName jsxAttr* "/>" : jsxElement
-syntax (name := withChildren) "<" jsxName jsxAttr* ">" jsxChild* "</" jsxName ">" : jsxElement
-syntax:max (name := jsxTerm) atomic(jsxElement) : term
+def jsxChild : Parser := node `Qed.Jsx.jsxChild (jsxText <|> group ("{" >> categoryParser `qedExpr 0 >> "}") <|> categoryParser `jsxElement 0)
+@[jsxElement_parser] def jsxFragment  : Parser := opaqueP (leadingNode `Qed.Jsx.jsxFragment maxPrec (atomic ("<" >> ">") >> many jsxChild >> "</" >> ">"))
+@[jsxElement_parser] def selfClosing  : Parser := opaqueP (leadingNode `Qed.Jsx.selfClosing maxPrec ("<" >> jsxName >> many (categoryParser `jsxAttr 0) >> "/>"))
+@[jsxElement_parser] def withChildren : Parser := opaqueP (leadingNode `Qed.Jsx.withChildren maxPrec ("<" >> jsxName >> many (categoryParser `jsxAttr 0) >> ">" >> many jsxChild >> "</" >> jsxName >> ">"))
+@[term_parser] def jsxTerm : Parser := opaqueP (leadingNode `Qed.Jsx.jsxTerm maxPrec (atomic (categoryParser `jsxElement 0)))
 syntax qedCompProp := str "=" term
 syntax (name := qedCompTerm) "qedComp%" str str num "[" qedCompProp,* "]" term : term
 syntax (name := qedCheckUrlValTerm) "qedCheckUrlVal%" str term:max : term
@@ -111,13 +107,11 @@ private def isCheckboxAttrs (attrStxs : Array Syntax) : Bool := attrStxs.any fun
   pure #[← `($(mkCIdent (if isCheck then ``Qed.checked else ``Qed.value)) $valE), ← `($(mkCIdent (if isCheck then ``Qed.onCheck else textEvt)) $setE)]
 
 @[noinline] private def mkKidListsPure (parts : Array KidPart) : PureQuotM Term := do
-  let mut lists : Array Term := #[]; let mut cur : Array Term := #[]
-  for p in parts do match p with
-    | .single t => cur := cur.push t
-    | .many lt  => if !cur.isEmpty then lists := lists.push (← `([$cur,*])); cur := #[]
-                   lists := lists.push lt
-  if !cur.isEmpty then lists := lists.push (← `([$cur,*]))
-  match lists.toList with | [] => `([]) | l :: ls => ls.foldlM (init := l) fun acc x => `($acc ++ $x)
+  let (lists, cur) ← Lang.foldlPQ parts (#[], #[]) fun (ls, cur) p => match p with
+    | .single t => pure (ls, cur.push t)
+    | .many lt  => if cur.isEmpty then pure (ls.push lt, #[]) else do pure ((ls.push (← `([$cur,*]))).push lt, #[])
+  let lists ← if cur.isEmpty then pure lists else do pure (lists.push (← `([$cur,*])))
+  if lists.isEmpty then `([]) else Lang.foldlPQ (lists.extract 1 lists.size) lists[0]! fun acc x => `($acc ++ $x)
 
 @[noinline] private def mkAwaitCallPure (ofT singleKid : Term) (asId? errId? : Option Ident) (attrs : Std.HashMap String Term) : PureQuotM Term := do
   let readyT ← match asId? with | some b => `(fun $b:ident => $singleKid) | none => pure singleKid
@@ -172,26 +166,23 @@ mutual
 
 @[noinline] private partial def expandOneAttr (isCheck : Bool) (textEvt : Name) (stx : Syntax) : MacroM (Array Term) := withRef stx do
   if stx.getKind == ``attrSplice then return #[(← expandJsxExpr "" none (`(Qed.Attr.empty)) (stx.getArg 1)).1]
-  let (name, valNode) := (tokenVal (stx.getArg 0), stx.getArg 1)
+  let (name, valNode) := (tokenVal (stx.getArg 0), stx.getArg 1); let isUrl := isUrlAttrName name
   if name == "bind" then
     if valNode.getNumArgs == 0 then Macro.throwErrorAt stx "`bind` requires `{field}` (in a component) or `{(value, onEdit)}`"
     let vT ← expandAttrVal valNode (`(""))
     if vT.raw.isIdent then Macro.throwErrorAt vT s!"`bind=\{{vT.raw.getId}}` shorthands state binding inside a `component`; outside a `component` view, pass `bind=\{({vT.raw.getId}, onEdit)}`"
-    return ← runPureQuot (mkBindAttrsPure isCheck textEvt vT)
-  let isUrl := isUrlAttrName name
+    return ← runPQMacro (mkBindAttrsPure isCheck textEvt vT)
   if valNode.getNumArgs == 0 then
-    if flagAttrs.contains name then return #[← runPureQuot `($(mkCIdent (Name.mkStr2 "Qed" name)) true)]
+    if flagAttrs.contains name then return #[← runPQMacro `($(mkCIdent (Name.mkStr2 "Qed" name)) true)]
     checkSafeAttrName (stx.getArg 0) name
     if isUrl then Macro.throwErrorAt (stx.getArg 0) s!"URL attribute `{name}` requires a value (a `Router` route or `Url`, e.g. `{name}=\{Route.home}` or `{name}=\{url(\"/path\")}`)"
-    return #[← runPureQuot `(Qed.attr $(Syntax.mkStrLit name) "")]
+    return #[← runPQMacro `(Qed.attr $(Syntax.mkStrLit name) "")]
   if isUrl && (valNode.getArg 1).getKind == ``attrValStr then
     let raw := (⟨(valNode.getArg 1).getArg 0⟩ : TSyntax `str).getString
-    Macro.throwErrorAt ((valNode.getArg 1).getArg 0)
-      s!"URL attribute `{name}` cannot take raw string literal `\"{raw}\"` (raw strings are disallowed to prevent XSS and broken links).\nPass a typed `Router` route or a compile-time checked literal: `{name}=\{url(\"{raw}\")}`."
-  let vT ← expandAttrVal valNode (`(""))
-  let h? := attrHelper? name
+    Macro.throwErrorAt ((valNode.getArg 1).getArg 0) s!"URL attribute `{name}` cannot take raw string literal `\"{raw}\"` (raw strings are disallowed to prevent XSS and broken links).\nPass a typed `Router` route or a compile-time checked literal: `{name}=\{url(\"{raw}\")}`."
+  let vT ← expandAttrVal valNode (`("")); let h? := attrHelper? name
   if h?.isNone then checkSafeAttrName (stx.getArg 0) name
-  return #[← runPureQuot do
+  return #[← runPQMacro do
     let vChecked ← if isUrl then withRef (valNode.getArg 1) `(qedCheckUrlVal% $(Syntax.mkStrLit name) ($vT)) else pure vT
     match h? with
     | some h => `($(mkCIdent h) $vChecked)
@@ -199,13 +190,11 @@ mutual
 
 @[noinline] partial def attrsToTerms (rawAttrs : Array Syntax) (tag : String := "") : MacroM (Array Term) := do
   let (isCheck, textEvt) := (isCheckboxAttrs rawAttrs, if tag == "select" then ``Qed.onChange else ``Qed.onInput)
-  let mut out : Array Term := #[]
-  for stx in rawAttrs do out := out ++ (← expandOneAttr isCheck textEvt stx)
-  return out
+  return (← mapArrM rawAttrs (expandOneAttr isCheck textEvt)).flatten
 
 private partial def expandKidExpr (pPath : String) (parentCtx? : Option (String × HtmlCtx)) (exprStx : Syntax) : MacroM KidPart := do
   let (t, isList) ← expandJsxExpr pPath parentCtx? (`(Qed.Html.text "")) exprStx
-  if isMapCall t.raw then return .many (← runPureQuot `(($t).toList)) else return if isList then .many t else .single t
+  if isMapCall t.raw then return .many (← runPQMacro `(($t).toList)) else return if isList then .many t else .single t
 
 @[noinline] partial def collectKidParts (pPath : String) (parentCtx? : Option (String × HtmlCtx)) (opener : Syntax) (kids : Array Syntax) : MacroM (Array KidPart) := do
   let mut parts : Array KidPart := #[]; let mut prev := opener
@@ -231,8 +220,8 @@ private partial def expandKidExpr (pPath : String) (parentCtx? : Option (String 
 
 @[noinline] partial def childrenToTerm (pPath : String) (parentCtx? : Option (String × HtmlCtx)) (opener : Syntax) (kids : Array Syntax) : MacroM Term := do
   if kids.size == 1 && !isJsxTextKid kids[0]! && !isJsxElementKid kids[0]! then
-    match ← expandKidExpr pPath parentCtx? kids[0]![0][1] with | .many t => return t | .single t => return ← runPureQuot `([$t])
-  runPureQuot (mkKidListsPure (← collectKidParts pPath parentCtx? opener kids))
+    match ← expandKidExpr pPath parentCtx? kids[0]![0][1] with | .many t => return t | .single t => return ← runPQMacro `([$t])
+  runPQMacro (mkKidListsPure (← collectKidParts pPath parentCtx? opener kids))
 
 @[noinline] partial def expandAwaitTag (pPath : String) (parentCtx? : Option (String × HtmlCtx)) (stx opener : Syntax) (attrStxs kids : Array Syntax) : MacroM Term := withRef stx do
   let valid := ["of", "as", "err", "loading", "failed", "idle"]
@@ -250,18 +239,18 @@ private partial def expandKidExpr (pPath : String) (parentCtx? : Option (String 
   let (asId?, errId?) := (← attrs["as"]?.mapM (parseVar "as"), ← attrs["err"]?.mapM (parseVar "err"))
   if errId?.isSome && !attrs.contains "failed" then Macro.throwErrorAt stx "<Await>: `err={…}` requires a `failed={…}` view"
   let #[.single singleKid] ← collectKidParts pPath parentCtx? opener kids | Macro.throwErrorAt stx "<Await> expects a single child element (with `as={val}`) or a lambda `{val => ...}`"
-  runPureQuot (mkAwaitCallPure ofT singleKid asId? errId? attrs)
+  runPQMacro (mkAwaitCallPure ofT singleKid asId? errId? attrs)
 
 @[noinline] partial def componentToTerm (pPath : String) (parentCtx? : Option (String × HtmlCtx)) (stx opener : Syntax) (tag : String) (attrStxs kids : Array Syntax) : MacroM Term := withRef stx do
   if tag == "Await" then return ← expandAwaitTag pPath parentCtx? stx opener attrStxs kids
-  let propVals ← attrStxs.mapM fun a => do
+  let propVals ← mapArrM attrStxs fun a => do
     if a.getKind == ``attrSplice then
       Macro.throwErrorAt a s!"<{tag}>: component tags do not accept spliced attributes (`\{...}`); pass named props (`prop=\{...}`) instead, or apply styles/attributes on an HTML element inside `{tag}`"
-    let v : Term ← if (a.getArg 1).getNumArgs == 0 then runPureQuot `(Bool.true) else expandAttrVal (a.getArg 1) (`(""))
+    let v : Term ← if (a.getArg 1).getNumArgs == 0 then runPQMacro `(Bool.true) else expandAttrVal (a.getArg 1) (`(""))
     pure (Syntax.mkStrLit (tokenVal (a.getArg 0)) (info := (a.getArg 0).getHeadInfo), v)
-  let kidsT ← if kids.isEmpty then runPureQuot `([]) else childrenToTerm "" none opener kids
-  runPureQuot do
-    let compProps ← propVals.mapM fun (nameLit, v) => `(qedCompProp| $nameLit:str = $v)
+  let kidsT ← if kids.isEmpty then runPQMacro `([]) else childrenToTerm "" none opener kids
+  runPQMacro do
+    let compProps ← Lang.mapPQ propVals fun (nameLit, v) => `(qedCompProp| $nameLit:str = $v)
     `(qedComp% $(Syntax.mkStrLit tag) $(Syntax.mkStrLit pPath) $(Syntax.mkNumLit (toString ((stx.getPos?.map (·.byteIdx)).getD 0))) [$[$compProps],*] $kidsT)
 
 @[noinline] partial def elementToTerm (pPath : String) (parentCtx? : Option (String × HtmlCtx)) (stx : Syntax) : MacroM Term := withRef stx do
@@ -276,22 +265,22 @@ private partial def expandKidExpr (pPath : String) (parentCtx? : Option (String 
     if hasKids && isVoidTag tag then Macro.throwErrorAt stx s!"<{tag}> is an HTML5 void element and cannot have children; write it self-closing (<{tag} …/>)"
     let childCtx ← validateHtmlTag (stx.getArg 1) tag parentCtx?
     let attrs ← attrsToTerms (stx.getArg 2).getArgs tag
-    let kids ← if hasKids then childrenToTerm (if pPath.isEmpty then tag else pPath ++ "/" ++ tag) (some (tag, childCtx)) (stx.getArg 3) (stx.getArg 4).getArgs else runPureQuot `([])
-    runPureQuot `(Qed.el $(Syntax.mkStrLit tag) [$attrs,*] $kids)
+    let kids ← if hasKids then childrenToTerm (if pPath.isEmpty then tag else pPath ++ "/" ++ tag) (some (tag, childCtx)) (stx.getArg 3) (stx.getArg 4).getArgs else runPQMacro `([])
+    runPQMacro `(Qed.el $(Syntax.mkStrLit tag) [$attrs,*] $kids)
   else Macro.throwUnsupported
 end
 
 partial def expandJsxIn (stx : Syntax) : MacroM Syntax := do
   if stx.getKind == ``jsxTerm then elementToTerm "" none (stx.getArg 0)
-  else match stx with | .node info kind args => return .node info kind (← args.mapM expandJsxIn) | other => return other
+  else match stx with | .node info kind args => return .node info kind (← mapArrM args expandJsxIn) | other => return other
 
 @[macro jsxTerm] def expandJsxTerm : Macro := fun stx => do return (← elementToTerm "" none (stx.getArg 0))
 
-@[term_parser] def qedUrlLit : Parser := leading_parser:maxPrec atomic (kw "url" >> checkNoWsBefore "" >> "(") >> strLit >> ")"
+@[term_parser] def qedUrlLit : Parser := opaqueP (leadingNode `Qed.Jsx.qedUrlLit maxPrec (atomic (kw "url" >> checkNoWsBefore "" >> "(") >> strLit >> ")"))
 @[macro qedUrlLit] def expandQedUrlLit : Macro := fun stx => do
   let s : TSyntax `str := ⟨stx.getArg 2⟩
   if !Qed.isSafeUrl s.getString then
     Macro.throwErrorAt s s!"unsafe URL literal `{s.getString}`: URLs must be root-relative (`/path`, not `//`), `#fragment`, `?query`, or explicit `https://`, `http://`, `mailto:`, `tel:` with no whitespace or control characters"
-  runPureQuot `(Qed.Url.mk $s (by decide))
+  runPQMacro `(Qed.Url.mk $s (by decide))
 
 end Qed.Jsx

@@ -8,8 +8,8 @@ namespace Qed
 
 /-! ## Persistent Component Registry (`componentRegistry`) -/
 
-inductive CompMountKind | pureView | stateful deriving Inhabited, BEq, Repr
-structure CompEventSig where mk :: (name : Lean.Name) (arity : Nat) deriving Inhabited, Repr
+inductive CompMountKind | pureView | stateful deriving Inhabited, BEq
+structure CompEventSig where mk :: (name : Lean.Name) (arity : Nat) deriving Inhabited
 
 structure ComponentInfo where mk ::
   (fullName : Lean.Name) (kind : CompMountKind) (hasProps : Bool)
@@ -110,10 +110,10 @@ def compClause : Parser :=
   kwNode `Qed.compActionClause `action (ident >> compParamsOpt >> ":" >> qedSuite) <|>
   compInvAny
 
-@[command_parser] def componentCmd : Parser := leading_parser
+@[command_parser] def componentCmd : Parser := opaqueP (node `Qed.componentCmd (
   optional Command.docComment >>
   withPosition ("component " >> ident >> ":" >> many (checkColGt >> compClause) >>
-    checkColGt >> identEq `view >> ":" >> (checkLineEq <|> checkColGt) >> pExpr >> many (checkColGt >> compInvAny))
+    checkColGt >> identEq `view >> ":" >> (checkLineEq <|> checkColGt) >> pExpr >> many (checkColGt >> compInvAny))))
 
 end CompParsers
 
@@ -156,7 +156,7 @@ def hasReturnStmt (stx : Syntax) : Bool := stxAny (·.getKind == ``qedStmtReturn
 def lowerTypeStx (stx : Syntax) : CommandElabM Term := liftMacroM (return (← lowerQedType stx false).1)
 def lowerOptType (optNode : Syntax) : CommandElabM (Option Term) := if optNode.getNumArgs == 2 then some <$> lowerTypeStx (optNode.getArg 1) else pure none
 def parseParamList (optNode : Syntax) : CommandElabM (Array (Ident × Term)) :=
-  if optNode.getNumArgs == 3 then (optNode.getArg 1).getSepArgs.mapM fun p => return (⟨p.getArg 0⟩, ← lowerTypeStx (p.getArg 2)) else pure #[]
+  if optNode.getNumArgs == 3 then Lang.mapCmd (optNode.getArg 1).getSepArgs fun p => return (⟨p.getArg 0⟩, ← lowerTypeStx (p.getArg 2)) else pure #[]
 def getErrorCount : CommandElabM Nat := return (← get).messages.toList.filter (·.severity == .error) |>.length
 
 def matchNamedAttr? (a : Syntax) : Option (Syntax × String × Syntax) :=
@@ -206,9 +206,9 @@ def classifyCompPropPure (evSigs : Array CompEventSig) (nm : String) (v : Term) 
   else return .dataProp (Name.mkSimple nm) v
 
 @[noinline] def mkOutMatchTermPure (baseName : Name) (totalCtors : Nat) (arms : Array OutArm) (outVar : Ident) : PureQuotM Term := do
-  let mut alts ← arms.mapM fun arm => do
+  let mut alts ← Lang.mapPQ arms fun arm => do
     let patTerms : Array Term := (Array.range arm.arity).map fun i => ⟨(mkIdent (Name.mkSimple s!"_a{i}")).raw⟩
-    `(Lean.Parser.Term.matchAltExpr| | $(mkIdent (baseName ++ `Out ++ arm.ctor)) $patTerms* => some ($(← Qed.Lang.mkAppTerms arm.handler patTerms)))
+    `(Lean.Parser.Term.matchAltExpr| | $(mkIdent (baseName ++ `Out ++ arm.ctor)) $patTerms* => some ($(← Qed.Lang.mkAppTermsPure arm.handler patTerms)))
   if arms.size < totalCtors then alts := alts.push (← `(Lean.Parser.Term.matchAltExpr| | _ => none))
   `(match $outVar:ident with $[$alts:matchAlt]*)
 

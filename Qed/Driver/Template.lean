@@ -369,7 +369,7 @@ def hydrateViewKidsM [MonadDom msg m] (node : Dom.Node) (s : σ) (i : UInt32) (i
       return (← hydrateViewM k s kn) :: (← hydrateViewKidsM node s (i + 1) nextRun rest)
 end
 
-@[inline] def buildView (h : Handlers msg) (ns : String) (v : View σ msg) (s : σ) : IO (Dom.Node × VState σ msg) := ReaderT.run (buildViewM (m := DomM msg) ns v s) h
-@[inline] def patchView (h : Handlers msg) (parent : Dom.Node) (index : UInt32) (v : View σ msg) (s : σ) (st : VState σ msg) : IO (VState σ msg) := ReaderT.run (patchViewM (m := DomM msg) parent index v s st) h
-@[inline] def hydrateView (h : Handlers msg) (v : View σ msg) (s : σ) (node : Dom.Node) : IO (VState σ msg) := ReaderT.run (hydrateViewM (m := DomM msg) v s node) h
+@[noinline] def buildView (h : Handlers msg) (ns : String) (v : View σ msg) (s : σ) : IO (Dom.Node × VState σ msg) := ReaderT.run (buildViewM (m := DomM msg) ns v s) h
+@[noinline] def patchView (h : Handlers msg) (parent : Dom.Node) (index : UInt32) (v : View σ msg) (s : σ) (st : VState σ msg) : IO (VState σ msg) := ReaderT.run (patchViewM (m := DomM msg) parent index v s st) h
+@[noinline] def hydrateView (h : Handlers msg) (v : View σ msg) (s : σ) (node : Dom.Node) : IO (VState σ msg) := ReaderT.run (hydrateViewM (m := DomM msg) v s node) h
 end Qed

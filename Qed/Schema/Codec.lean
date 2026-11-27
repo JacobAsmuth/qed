@@ -48,18 +48,16 @@ theorem fromProtoField_of_field {α : Type} (c : Codec α) [FromProtoField α]
     (k : Nat) (fs : List (Nat × Proto.WireVal)) (f : Field c.valid) (h : FromProtoField.decodeProtoField k fs = .ok f.val) :
     c.fromProtoField k fs = .ok f := c.validateField_ok s!"field {k}" f _ h
 
-private theorem av_kv {msg : Type} (k v : String) (hs : isSafeAttrName k = true) (hu : isUrlAttrName k = false) :
+private theorem av_kv {msg : Type} (k v : String) (hs : isSafeAttrName k = true := by rfl) (hu : isUrlAttrName k = false := by rfl) :
     Attr.valid (msg := msg) (.attr k v) = true := by
   simp only [Attr.valid, Attr.validKeyValue, hs, hu, Bool.not_false, Bool.true_or, Bool.and_self]
-private theorem av_value   {msg : Type} (v : String)       : (value v : Attr msg).valid = true := av_kv "value" v rfl rfl
-private theorem av_type    {msg : Type} (v : String)       : (type' v : Attr msg).valid = true := av_kv "type" v rfl rfl
+private theorem av_cons {msg : Type} {a : Attr msg} {as : List (Attr msg)} (ha : a.valid = true) (has : Attr.validList as = true := by rfl) :
+    Attr.validList (a :: as) = true := Attr.validList_cons_intro a as ha has
+private theorem av_value   {msg : Type} (v : String)       : (value v : Attr msg).valid = true := av_kv "value" v
+private theorem av_type    {msg : Type} (v : String)       : (type' v : Attr msg).valid = true := av_kv "type" v
 private theorem av_onInput {msg : Type} (f : String → msg) : (onInput f : Attr msg).valid = true := rfl
-private theorem av_onChg   {msg : Type} (f : String → msg) : (onChange f : Attr msg).valid = true := av_onInput f
+private theorem av_onChg   {msg : Type} (f : String → msg) : (onChange f : Attr msg).valid = true := rfl
 private theorem av_checked {msg : Type} (b : Bool)         : (checked b : Attr msg).valid = true := rfl
-
-local macro "solve_attrs" : tactic =>
-  `(tactic| (dsimp only [Attr.validList]; simp only [Attr.valid_cls, cls, av_value, av_type, av_onInput, av_onChg, av_checked,
-      Bool.and_true, Bool.true_and, Bool.and_eq_true]; repeat any_goals constructor) <;> first | exact av_kv _ _ rfl rfl | rfl)
 
 private theorem validIn_el {msg : Type} {ctx next : HtmlCtx} {tag : String} {attrs : List (Attr msg)} {kids : List (Html msg)}
     (hstep : stepHtmlCtx ctx tag = some next) (hvoid : isVoidTag tag = false ∨ kids = [])
@@ -100,23 +98,23 @@ private abbrev mkInputCodec {α : Type} (parse : String → Option α) (attrs : 
     (hl : ∀ {msg : Type} (raw : String) (set : String → msg), Attr.hasLocalCell (attrs raw set) = false := by intros; rfl) : Codec α :=
   mkSimpleCodec parse (fun raw set => el "input" (attrs raw set)) (fun inForm raw set => validIn_el (step_input inForm) (.inr rfl) (hv raw set) (hl raw set))
 
-def text     : Codec String := mkInputCodec some (fun raw set => [value raw, onInput set]) (fun _ _ => by solve_attrs)
-def textarea : Codec String := mkSimpleCodec some (fun raw set => el "textarea" [value raw, onInput set]) (fun inForm _ _ => validIn_nf inForm rfl (by solve_attrs))
+def text     : Codec String := mkInputCodec some (fun raw set => [value raw, onInput set]) (fun _ _ => av_cons (av_value _) (av_cons (av_onInput _)))
+def textarea : Codec String := mkSimpleCodec some (fun raw set => el "textarea" [value raw, onInput set]) (fun inForm _ _ => validIn_nf inForm rfl (av_cons (av_value _) (av_cons (av_onInput _))))
 
 @[simp] theorem run_refine_text (p : String → Prop) [DecidablePred p]
     (f : Field (refine text p).valid) : (refine text p).run f.val = some f := run_field_of_parse _ _ f rfl
 @[simp] theorem run_refine_textarea (p : String → Prop) [DecidablePred p]
     (f : Field (refine textarea p).valid) : (refine textarea p).run f.val = some f := run_field_of_parse _ _ f rfl
-def nat      : Codec Nat    := mkInputCodec Qed.Str.parseNat? (fun raw set => [type' "number", attr "min" "0", value raw, onInput set]) (fun _ _ => by solve_attrs)
-def int      : Codec Int    := mkInputCodec Qed.Str.parseInt? (fun raw set => [type' "number", value raw, onInput set]) (fun _ _ => by solve_attrs)
-def checkbox : Codec Bool   := mkInputCodec (fun s => some (s == "true")) (fun raw set => [type' "checkbox", checked (raw == "true"), onCheck (fun b => set (toString b))]) (fun _ _ => by solve_attrs)
-def date     : Codec Date   := mkInputCodec Date.parse? (fun raw set => [type' "date", value raw, onInput set]) (fun _ _ => by solve_attrs)
+def nat      : Codec Nat    := mkInputCodec Qed.Str.parseNat? (fun raw set => [type' "number", attr "min" "0", value raw, onInput set]) (fun _ _ => av_cons (av_type _) (av_cons (av_kv "min" _) (av_cons (av_value _) (av_cons (av_onInput _)))))
+def int      : Codec Int    := mkInputCodec Qed.Str.parseInt? (fun raw set => [type' "number", value raw, onInput set]) (fun _ _ => av_cons (av_type _) (av_cons (av_value _) (av_cons (av_onInput _))))
+def checkbox : Codec Bool   := mkInputCodec (fun s => some (s == "true")) (fun raw set => [type' "checkbox", checked (raw == "true"), onCheck (fun b => set (toString b))]) (fun _ _ => av_cons (av_type _) (av_cons (av_checked _) (av_cons rfl)))
+def date     : Codec Date   := mkInputCodec Date.parse? (fun raw set => [type' "date", value raw, onInput set]) (fun _ _ => av_cons (av_type _) (av_cons (av_value _) (av_cons (av_onInput _))))
 
 def select (options : List (String × String)) : Codec String :=
   mkSimpleCodec (fun s => if options.any (·.1 == s) then some s else none)
     (fun raw set => el "select" [value raw, onChange set] (options.map fun (v, lbl) => el "option" [value v] [lbl]))
-    (fun inForm _ _ => validIn_nf inForm rfl (by solve_attrs)
-      (Html.validListIn_map_intro _ _ _ fun _ => validIn_el (next := ⟨.option, false, true, inForm⟩) rfl (.inl rfl) (by solve_attrs)))
+    (fun inForm _ _ => validIn_nf inForm rfl (av_cons (av_value _) (av_cons (av_onChg _)))
+      (Html.validListIn_map_intro _ _ _ fun _ => validIn_el (next := ⟨.option, false, true, inForm⟩) rfl (.inl rfl) (av_cons (av_value _))))
 
 def radios (group : String) (options : List (String × String)) : Codec String :=
   mkSimpleCodec (fun s => if options.any (·.1 == s) then some s else none)
@@ -125,7 +123,7 @@ def radios (group : String) (options : List (String × String)) : Codec String :
     (fun inForm _ _ => validIn_nf (m := .normal) (p := false) (inter := false) inForm rfl (hk := Html.validListIn_map_intro _ _ _ fun _ =>
       validIn_nf (m := .normal) (p := false) (inter := false) inForm rfl (hk := by
         simp only [Html.validListIn, Bool.and_true, Bool.and_eq_true]
-        exact ⟨validIn_el (step_input inForm) (.inr rfl) (by solve_attrs), rfl⟩))) (wrapLabel := false)
+        exact ⟨validIn_el (step_input inForm) (.inr rfl) (av_cons (av_type _) (av_cons (av_kv "name" _) (av_cons (av_value _) (av_cons (av_checked _) (av_cons (av_onChg _)))))), rfl⟩))) (wrapLabel := false)
 
 def json (α : Type) [ToJson α] [FromJson α] : Codec α :=
   mkSimpleCodec (fun _ => none) (fun _ _ => el "span" [] []) (fun inForm _ _ => validIn_nf inForm rfl) (inForm := false)
@@ -152,7 +150,7 @@ def formFieldRow {msg : Type} (inForm wrapLabel bad : Bool) (label err : String)
       cases wrapLabel <;> exact step_inForm ctxInForm rfl rfl
     have hVoid : isVoidTag (if wrapLabel then "label" else "fieldset") = false := by cases wrapLabel <;> rfl
     dsimp only [formFieldRow]; simp only [ite_true, Html.validListIn, Bool.and_true]
-    exact validIn_el hStep (.inl hVoid) (by solve_attrs) rfl (by simp only [List.cons_append, List.nil_append, Html.validListIn, hLbl, hctrl, hTail, Bool.and_self])
+    exact validIn_el hStep (.inl hVoid) (av_cons rfl (av_cons (av_kv "aria-invalid" _))) rfl (by simp only [List.cons_append, List.nil_append, Html.validListIn, hLbl, hctrl, hTail, Bool.and_self])
 
 theorem formDiv_validIn {msg : Type} (inForm : Bool) (kids : List (Html msg)) (hk : Html.validListIn ⟨.normal, false, false, inForm⟩ kids = true) :
     Html.validIn ⟨.normal, false, false, inForm⟩ (el "div" [cls "qed-form"] kids) = true := validIn_nf inForm rfl (hk := hk)
@@ -177,7 +175,7 @@ def submitBtn {msg α : Type} (o : Option α) (submit : α → msg) : Html msg :
 theorem submitBtn_validIn {msg α : Type} (inForm : Bool) (o : Option α) (submit : α → msg) :
     Html.validListIn ⟨.normal, false, false, inForm⟩ [submitBtn o submit] = true := by
   have hb := step_inForm inForm (tag := "button") rfl rfl
-  cases o <;> (simp only [submitBtn, Html.validListIn, Bool.and_true]; exact validIn_el hb (.inl rfl) (by solve_attrs))
+  cases o <;> (simp only [submitBtn, Html.validListIn, Bool.and_true]; exact validIn_el hb (.inl rfl) (av_cons rfl))
 
 def ofField {α : Type} (c : Codec α) (p : α → Prop) [DecidablePred p] : Codec (Field p) where
   parse s := (c.parse s).bind (Field.parse? p)

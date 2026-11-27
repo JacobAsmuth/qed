@@ -202,23 +202,10 @@ theorem Cached.all_put {P : α → Prop} {c : Cached α} {k currentKey : String}
     | _ => exact hall.2 kv hkv⟩
 theorem Cached.all_lookup_state {P : α → Prop} {c : Cached α} {k : String} (hall : c.all P) : (c.activate k).all P :=
   ⟨by dsimp only [Cached.activate]; cases hlk : c.lookup k with | none => trivial | some a => exact Cached.lookup_of_all (P := P) hall hlk, hall.2⟩
-theorem Cached.all_setKey {P : α → Prop} {c : Cached α} {k : String} {v : α} (hall : c.all P) (hv : P v) :
-    (c.setKey k v).all P := Cached.all_put hall hv
-theorem Cached.all_updateCurrent {P : α → Prop} {c : Cached α} {k : String} {f : α → α} (hall : c.all P)
-    (hf : ∀ a, P a → P (f a)) : (c.updateCurrent k f).all P := by
-  unfold Cached.updateCurrent; cases hs : c.state with
-  | ok a => have h1 := hall.1; rw [hs] at h1; exact Cached.all_put hall (hf a h1)
-  | _ => exact hall
-theorem Cached.all_invalidateKey {P : α → Prop} {c : Cached α} {k : String} (hall : c.all P) :
-    (c.invalidateKey k).all P :=
-  ⟨trivial, fun kv hkv => hall.2 kv (List.mem_filter.1 hkv).1⟩
-@[simp] theorem Cached.all_markRefetch {P : α → Prop} {c : Cached α} :
-    (c.markRefetch).all P ↔ c.all P := Iff.rfl
-@[simp] theorem Cached.all_invalidateAll {P : α → Prop} {c : Cached α} :
-    (c.invalidateAll).all P := ⟨trivial, fun _ h => nomatch h⟩
+@[simp] theorem Cached.all_markRefetch {P : α → Prop} {c : Cached α} : (c.markRefetch).all P ↔ c.all P := Iff.rfl
+@[simp] theorem Cached.all_invalidateAll {P : α → Prop} {c : Cached α} : (c.invalidateAll).all P := ⟨trivial, fun _ h => nomatch h⟩
 theorem Cached.all_putRev {P : α → Prop} {c : Cached α} {k currentDataKey : String} {r : Resource α} (hall : c.all P) (hr : r.all P) :
-    (c.putRev k r currentDataKey).all P := by
-  unfold Cached.putRev; split <;> first | exact Cached.all_put hall hr | exact hall
+    (c.putRev k r currentDataKey).all P := by unfold Cached.putRev; split <;> first | exact Cached.all_put hall hr | exact hall
 end CachedProofs
 
 section QueryProofs

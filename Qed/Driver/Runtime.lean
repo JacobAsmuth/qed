@@ -27,7 +27,7 @@ def gcLocals (ctx : LocalCtx) : IO Unit := do
 def localRerender (inst : LocalInstance) (s' : String) : IO Unit := do
   inst.handlers.click.set #[]; inst.handlers.input.set #[]
   let (h, newTree, cur) := ({ inst.handlers with reuseSlots := false }, inst.view s', ← Dom.childAt inst.host 0)
-  if cur != 0 then discard <| ReaderT.run (patchHtmlSubtreeM (m := DomM LocalMsg) inst.host 0 cur (← inst.treeRef.get) newTree) h
+  if cur != 0 then discard <| patchHtmlSubtree h inst.host 0 cur (← inst.treeRef.get) newTree
   else Dom.appendChild inst.host (← buildDom h (← Dom.childNamespace inst.host) newTree)
   inst.treeRef.set newTree
 
@@ -35,6 +35,10 @@ def localRun (ctx : LocalCtx) (fk : String) (inst : LocalInstance) (lm : LocalMs
   let (s', o) := lm.run ((← ctx.store.get).getD fk "")
   ctx.store.modify (·.insert fk s'); localRerender inst s'; gcLocals ctx
   if let some out := o then inst.onOutput out
+
+private def localMountChild (lh : Handlers LocalMsg) (host : Dom.Node) (tree : Html LocalMsg) (childCnt : UInt32) : IO Unit := do
+  if childCnt > 0 then hydrateDom lh tree (← Dom.childAt host 0)
+  else Dom.appendChild host (← buildDom lh (← Dom.childNamespace host) tree)
 
 def localMountRoot {Msg : Type} (ctx : LocalCtx) (dispatchMsg : Msg → IO Unit)
     (key component : String) (init? : Option String) (props : String) (bubble : String → Option Msg) (host : Dom.Node) : IO Unit :=
@@ -47,20 +51,17 @@ where
         let some ldef := ctx.registry[component]? | IO.eprintln s!"qed: component '{component}' is not registered"
         let onOut : String → IO Unit := fun out => if let some lm := bubble out then parentBubble lm else pure ()
         let childCnt ← Dom.childCount host
-        let reusable? := ((← ctx.instances.get)[fk]?).bind fun inst => if inst.host == host && childCnt > 0 then some inst else none
-        match reusable? with
-        | some inst =>
-            let next := { inst with view := ldef.viewForProps props, props, onOutput := onOut }
-            ctx.instances.modify (·.insert fk next)
-            if props != inst.props then localRerender next ((← ctx.store.get).getD fk ldef.init)
-        | none =>
-            let s0 := (← ctx.store.get).getD fk (init?.getD ldef.init); ctx.store.modify (·.insert fk s0)
-            let lh ← Handlers.mkNew (reuseSlots := false) fun k c i p b hn =>
-              go fuel (fun lm => do if let some self := (← ctx.instances.get)[fk]? then localRun ctx fk self lm) k c i p b hn
-            let view := ldef.viewForProps props; let tree := view s0
-            if childCnt > 0 then hydrateDom lh tree (← Dom.childAt host 0)
-            else Dom.appendChild host (← buildDom lh (← Dom.childNamespace host) tree)
-            ctx.instances.modify (·.insert fk { handlers := lh, treeRef := ← IO.mkRef tree, host, view, props, onOutput := onOut })
+        if let some inst := ((← ctx.instances.get)[fk]?).filter fun i => i.host == host && childCnt > 0 then
+          let next := { inst with view := ldef.viewForProps props, props, onOutput := onOut }
+          ctx.instances.modify (·.insert fk next)
+          if props != inst.props then localRerender next ((← ctx.store.get).getD fk ldef.init)
+        else
+          let s0 := (← ctx.store.get).getD fk (init?.getD ldef.init); ctx.store.modify (·.insert fk s0)
+          let lh ← Handlers.mkNew (reuseSlots := false) fun k c i p b hn =>
+            go fuel (fun lm => do if let some self := (← ctx.instances.get)[fk]? then localRun ctx fk self lm) k c i p b hn
+          let view := ldef.viewForProps props; let tree := view s0
+          localMountChild lh host tree childCnt
+          ctx.instances.modify (·.insert fk { handlers := lh, treeRef := ← IO.mkRef tree, host, view, props, onOutput := onOut })
 
 /-! ## Browser Runtime & Exported FFI Entry Points -/
 
@@ -268,11 +269,12 @@ private def handleWsOpen (cid : UInt32) : IO Unit :=
       | .mux ch params _ _ => Dom.wsSendBytes cid (WsMuxFrame.encode (.sub sub.subId ch params))
       | .ext onJoin _ _    => dispatchMsg env (sub.onStatus .connected); dispatchMsg env (onJoin ())
 
+private def forExtSubs (pool : WsPool Msg) (f : WsSubMode Msg → Option Msg) : IO Unit := do
+  for (_, sub) in pool.subs.toList do if let some m := f sub.mode then dispatchMsg env m
+
 private def handleWsBytes (cid : UInt32) (bytes : ByteArray) : IO Unit :=
   withActivePool env cid false fun poolKey pool => do
-    if !pool.isMux then
-      for (_, sub) in pool.subs.toList do if let .ext _ _ onBytes := sub.mode then dispatchMsg env (onBytes bytes)
-      return
+    if !pool.isMux then forExtSubs env pool (fun | .ext _ _ onBytes => some (onBytes bytes) | _ => none); return
     let updSub (sid : UInt32) (f : WsSub Msg → Std.HashMap UInt32 (WsSub Msg) → Std.HashMap UInt32 (WsSub Msg)) (st : SocketStatus) : IO (Option (WsSub Msg)) := do
       let some sub := pool.subs[sid]? | return none
       putPool env poolKey { pool with subs := f sub pool.subs }; dispatchMsg env (sub.onStatus st); return some sub
@@ -284,23 +286,38 @@ private def handleWsBytes (cid : UInt32) (bytes : ByteArray) : IO Unit :=
     | .ok (.closed sid _) => discard <| updSub sid (fun _ m => m.erase sid) .disconnected
     | _ => pure ()
 
+private def handleWsText (cid : UInt32) (text : String) : IO Unit :=
+  withActivePool env cid false fun _ pool => do
+    if !pool.isMux then forExtSubs env pool (fun | .ext _ onText _ => some (onText text) | _ => none)
+
 private def handleWsClose (cid : UInt32) (err : String) (nowMs : Nat) : IO Unit :=
   withActivePool env cid true fun poolKey pool => do
     if !err.isEmpty then dropPool env poolKey pool; for (_, sub) in pool.subs.toList do dispatchMsg env (sub.onStatus (.failed err)); return
     let (keptSubs, statusMsgs, minDelay?) := pool.subs.fold (init := ((∅ : Std.HashMap UInt32 (WsSub Msg)), (#[] : Array Msg), (none : Option Nat)))
       fun (kept, msgs, md?) sid sub =>
-        if sub.pendingRetry && nowMs < sub.nextAtMs then
-          let rem := sub.nextAtMs - nowMs; (kept.insert sid sub, msgs, some (md?.elim rem (min · rem)))
+        let bump (d : Nat) (sub' : WsSub Msg) (msgs' : Array Msg) := (kept.insert sid sub', msgs', some (md?.elim d (min · d)))
+        if sub.pendingRetry && nowMs < sub.nextAtMs then bump (sub.nextAtMs - nowMs) sub msgs
         else match sub.reconnect.nextDelayMs sub.attempt with
           | none => (kept, msgs.push (sub.onStatus (wsClosedStatus sub.reconnect)), md?)
-          | some d =>
-              let sub' := { sub with attempt := sub.attempt + 1, pendingRetry := pool.isMux, nextAtMs := nowMs + d }
-              (kept.insert sid sub', msgs.push (sub.onStatus (.reconnecting sub'.attempt)), some (md?.elim d (min · d)))
+          | some d => let sub' := { sub with attempt := sub.attempt + 1, pendingRetry := pool.isMux, nextAtMs := nowMs + d }
+                      bump d sub' (msgs.push (sub.onStatus (.reconnecting sub'.attempt)))
     if keptSubs.isEmpty then dropPool env poolKey pool
     else
       let tid? ← setTimer env ("ws:" ++ poolKey) pool.timerId (some (minDelay?.getD 0, openPoolConn env poolKey))
       putPool env poolKey { pool with connId := none, isOpen := false, timerId := tid?, subs := keptSubs }
     statusMsgs.forM (dispatchMsg env)
+
+private def handleStream (id : UInt32) (chunk? : Option String) : IO Unit := do
+  let n := id.toNat
+  if let some (f, done, buf) := (← env.state.get).streams[n]? then
+    match chunk? with
+    | some raw =>
+        let (events, rem) := parseSseBuffer (buf ++ raw)
+        env.state.modify fun s => { s with streams := s.streams.setIfInBounds n (f, done, rem) }
+        events.forM (dispatchMsg env ∘ f)
+    | none =>
+        env.state.modify fun s => { s with streams := s.streams.setIfInBounds n (f, done, "") }
+        dispatchMsg env done
 end RuntimeOps
 
 def runWithHttpTimeout (app : App Model Msg) (httpTimeoutMs : Nat) : IO Unit := do
@@ -321,16 +338,7 @@ def runWithHttpTimeout (app : App Model Msg) (httpTimeoutMs : Nat) : IO Unit := 
                 runCmd app.init.2; boot (app.onHydrate (← state.get).model)
     dispatch := fun id => do match (← handlers.click.get)[id.toNat]? with | some msg => dispatchMsg env msg | none => IO.eprintln s!"qed: unknown click id {id}"
     dispatchStr := dispatchStrWithRows handlers.input handlers.rowEv (dispatchMsg env)
-    streamChunk := fun cid rawChunk => do
-      let n := cid.toNat
-      if let some (f, done, buf) := (← state.get).streams[n]? then
-        let (events, rem) := parseSseBuffer (buf ++ rawChunk)
-        state.modify fun s => { s with streams := s.streams.setIfInBounds n (f, done, rem) }
-        events.forM (dispatchMsg env ∘ f)
-    streamDone := fun did => do
-      let n := did.toNat
-      if let some (f, msg, _) := (← state.get).streams[n]? then
-        state.modify fun s => { s with streams := s.streams.setIfInBounds n (f, msg, "") }; dispatchMsg env msg
+    streamChunk := fun cid raw => handleStream env cid (some raw), streamDone := fun did => handleStream env did none
     httpDone := fun id ok text => handleHttpResp env id (.inl (if ok then .ok text else .error text))
     httpBytesDone := fun id ok bytes => handleHttpResp env id (.inr (if ok then .ok bytes else .error ((String.fromUTF8? bytes).getD "RPC transport error")))
     urlChanged := fun path => do if let some f := app.onUrlChange then dispatchMsg env (f path)
@@ -346,9 +354,7 @@ def runWithHttpTimeout (app : App Model Msg) (httpTimeoutMs : Nat) : IO Unit := 
     effectDone := fun id result => do
       if let some act ← state.modifyGet fun s => (s.effectCb[id.toNat]?, { s with effectCb := s.effectCb.erase id.toNat }) then act result
     portRecv := fun nm payload => do if let some f := app.onPort then if let some m := f nm payload then dispatchMsg env m
-    wsOpen := handleWsOpen env, wsBytes := handleWsBytes env, wsClose := handleWsClose env
-    wsText := fun cid text => withActivePool env cid false fun _ pool => do
-      if !pool.isMux then for (_, sub) in pool.subs.toList do if let .ext _ onText _ := sub.mode then dispatchMsg env (onText text)
+    wsOpen := handleWsOpen env, wsBytes := handleWsBytes env, wsText := handleWsText env, wsClose := handleWsClose env
   })
 
 def run (app : App Model Msg) : IO Unit := runWithHttpTimeout app defaultHttpTimeoutMs

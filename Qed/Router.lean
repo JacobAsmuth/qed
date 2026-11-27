@@ -12,15 +12,15 @@ syntax:max (name := qedOptType) term:max noWs "?" : term
 @[macro qedOptType] def expandQedOptType : Lean.Macro := fun stx => `(Option $(⟨stx.getArg 0⟩))
 
 section RouterParsers
-open Lean Parser
-def routeEnumAltP : Parser := node `Qed.routeEnumAlt (ident >> optional ("=" >> strLit))
-@[command_parser] def routeEnumCmd : Parser := leading_parser withPosition
-  ("route_enum " >> ident >> ":" >> checkColGt "expected indented `route_enum` variants" >> many1Indent routeEnumAltP)
-def routeParamP : Parser := node `Qed.routeParam (ident >> optional (":" >> withPosition (categoryParser `qedType 0)))
-def routeAltP : Parser := node `Qed.routeAlt (withPosition
+open Lean Parser Qed.Lang
+private def routeEnumAltP : Parser := node `Qed.routeEnumAlt (ident >> optional ("=" >> strLit))
+@[command_parser] def routeEnumCmd : Parser := opaqueP (node `Qed.routeEnumCmd (withPosition
+  ("route_enum " >> ident >> ":" >> checkColGt "expected indented `route_enum` variants" >> many1Indent routeEnumAltP)))
+private def routeParamP : Parser := node `Qed.routeParam (ident >> optional (":" >> withPosition (categoryParser `qedType 0)))
+private def routeAltP : Parser := node `Qed.routeAlt (withPosition
   (optional (symbol "*") >> ident >> optional (checkLineEq >> "(" >> sepBy1 routeParamP "," >> ")") >> optional ("=" >> strLit)))
-@[command_parser] def routerCmd : Parser := leading_parser withPosition
-  ("router " >> ident >> ":" >> checkColGt "expected indented `router` routes" >> many1Indent routeAltP)
+@[command_parser] def routerCmd : Parser := opaqueP (node `Qed.routerCmd (withPosition
+  ("router " >> ident >> ":" >> checkColGt "expected indented `router` routes" >> many1Indent routeAltP)))
 end RouterParsers
 
 section RouterElab
@@ -32,7 +32,7 @@ private structure RouteAltInfo where mk ::
 @[noinline] private def mkRouteEnumCmdPure (t : Ident) (alts : Array (Ident × Term)) : PureQuotM Syntax := do
   let (toSegId, fromSegId, rtId) := (mkIdent (t.getId ++ `toSeg), mkIdent (t.getId ++ `fromSeg), mkIdent (t.getId ++ `round_trip))
   let (ctors, slugs) := (alts.map (·.1), alts.map (·.2)); let ctorPats : Array Term := ctors.map fun c => mkIdent (t.getId ++ c.getId)
-  let parsePats := slugs.push (← `(_)); let parseRhss := (← ctorPats.mapM fun cp => `(some $cp)).push (← `(none))
+  let parsePats := slugs.push (← `(_)); let parseRhss := (← Lang.mapPQ ctorPats fun cp => `(some $cp)).push (← `(none))
   `(inductive $t:ident where $[| $ctors:ident]*
     deriving Repr, DecidableEq, Inhabited
     def $toSegId:ident (x : $t) : String := match x with $[| $ctorPats:term => $slugs:term]*
@@ -41,7 +41,7 @@ private structure RouteAltInfo where mk ::
     instance : RouteParam $t:ident := ⟨$toSegId, $fromSegId, $rtId⟩)
 
 @[noinline, macro routeEnumCmd] def expandRouteEnumCmd : Macro := fun stx =>
-  runPureQuot (mkRouteEnumCmdPure ⟨stx.getArg 1⟩ ((stx.getArg 3).getArgs.map fun alt =>
+  runPQMacro (mkRouteEnumCmdPure ⟨stx.getArg 1⟩ ((stx.getArg 3).getArgs.map fun alt =>
     let c : Ident := ⟨alt.getArg 0⟩; (c, if (alt.getArg 1).getNumArgs == 2 then (⟨(alt.getArg 1).getArg 1⟩ : Term) else quote (toString c.getId))))
 
 @[noinline] private def parseRouteAlt (tName : Name) (strTy : Term) (alt : Syntax) : MacroM RouteAltInfo := do
@@ -70,9 +70,9 @@ private structure RouteAltInfo where mk ::
 
 @[noinline] private def mkRouterRowPure (tName : Name) (a : RouteAltInfo) : PureQuotM (Term × Term × Term × Term) := do
   let bs := a.params.map (·.1); let ctorId := mkIdent (tName ++ a.ctor.getId)
-  let printSeg ← a.segments.mapM fun | .inl s => pure (quote s : Term) | .inr b => `(RouteParam.toSeg $(⟨b.raw⟩))
+  let printSeg ← Lang.mapPQ a.segments fun | .inl s => pure (quote s : Term) | .inr b => `(RouteParam.toSeg $(⟨b.raw⟩))
   let parseSeg : Array Term := a.segments.map fun | .inl s => quote s | .inr b => ⟨b.raw⟩
-  let parseBody ← a.params.foldrM (init := ← `(some ($ctorId $bs*))) fun (b, bt) body =>
+  let parseBody ← Lang.foldrPQ a.params (← `(some ($ctorId $bs*))) fun (b, bt) body =>
     let bT : Term := ⟨b.raw⟩; `(match (RouteParam.fromSeg $bT : Option $bt) with | some $bT => $body | none => none)
   return (← `($ctorId $bs*), ← `([$printSeg,*]), ← `([$parseSeg,*]), parseBody)
 
@@ -80,7 +80,7 @@ private structure RouteAltInfo where mk ::
   let (printId, parseId, rtId) := (mkIdent (t.getId ++ `print), mkIdent (t.getId ++ `parse), mkIdent (t.getId ++ `round_trip))
   let (toPathId, toUrlId, fromPathId) := (mkIdent (t.getId ++ `toPath), mkIdent (t.getId ++ `toUrl), mkIdent (t.getId ++ `fromPath))
   let (ctorNames, ctorBs, ctorBts) := (alts.map (·.ctor), alts.map (·.params.map (·.1)), alts.map (·.params.map (·.2)))
-  let rows ← alts.mapM (mkRouterRowPure t.getId)
+  let rows ← Lang.mapPQ alts (mkRouterRowPure t.getId)
   let (printPats, printRhss) := (rows.map (·.1), rows.map (·.2.1))
   let (parsePatsAll, parseRhssAll) := ((rows.map (·.2.2.1)).push (← `(_)), (rows.map (·.2.2.2)).push (← `(none)))
   let inhCmd : TSyntax `command ← markedCtor.elim `(deriving instance Inhabited for $t) fun mc => `(instance : Inhabited $t := ⟨$(mkIdent (t.getId ++ mc.getId))⟩)
@@ -100,7 +100,7 @@ private structure RouteAltInfo where mk ::
     instance : ToString $t:ident := ⟨$toPathId⟩)
 
 @[noinline, macro routerCmd] def expandRouterCmd : Macro := fun stx => do
-  let t : Ident := ⟨stx.getArg 1⟩; let strTy ← runPureQuot `(String)
+  let t : Ident := ⟨stx.getArg 1⟩; let strTy ← runPQMacro `(String)
   let err (s : Syntax) (msg : String) := Macro.throwErrorAt s s!"router `{t.getId}`: {msg}"
   let mut alts := #[]; let mut patShapes : Array (Ident × Array (Option String)) := #[]; let mut markedCtor : Option Ident := none
   for alt in (stx.getArg 3).getArgs do
@@ -114,7 +114,7 @@ private structure RouteAltInfo where mk ::
       if !info.params.isEmpty then err info.ctor s!"fallback route `{info.ctor.getId}` (marked `*`) must take no arguments because it handles arbitrary unmatched URLs"
       markedCtor := some info.ctor
     alts := alts.push info; patShapes := patShapes.push (info.ctor, patShape)
-  runPureQuot (mkRouterCmdPure t alts markedCtor)
+  runPQMacro (mkRouterCmdPure t alts markedCtor)
 end RouterElab
 
 private def decodeRouteSegs [Router R] (segs : List String) : Except String R := (Router.parse segs).elim (.error "invalid route") .ok
@@ -133,24 +133,36 @@ instance (priority := low) {α : Type} [LawfulJson α] : LawfulKey α where
 
 private theorem unhex_hexDigit (n : UInt8) (hn : n.toNat < 16) : unhex (hexDigit n) = some n := by
   simp only [unhex, hexDigit, Option.map_eq_some_iff]; exact ⟨n.toNat, unhexNat?_hexDigitUpper hn, UInt8.ofNat_toNat⟩
-private theorem bitvec8_nibbles : ∀ x : BitVec 8,
-    (((x >>> 4) <<< 4) ||| (x &&& 0x0F#8) = x) ∧ (x >>> 4#8).toNat < 16 ∧ (x &&& 0x0F#8).toNat < 16 := by decide
+private theorem bitvec8_nibbles (x : BitVec 8) :
+    (((x >>> 4) <<< 4) ||| (x &&& 0x0F#8) = x) ∧ (x >>> 4#8).toNat < 16 ∧ (x &&& 0x0F#8).toNat < 16 := by
+  have hlt := x.isLt
+  refine ⟨BitVec.eq_of_getLsbD_eq fun i hi => ?_, by change (x >>> 4).toNat < 16; rw [BitVec.toNat_ushiftRight, Nat.shiftRight_eq_div_pow]; omega, ?_⟩
+  · simp only [BitVec.getLsbD_or, BitVec.getLsbD_shiftLeft, BitVec.getLsbD_ushiftRight, BitVec.getLsbD_and]
+    by_cases h4 : i < 4
+    · have h0f : (0x0F#8).getLsbD i = true := by have hi4 : i = 0 ∨ i = 1 ∨ i = 2 ∨ i = 3 := (by omega); rcases hi4 with rfl | rfl | rfl | rfl <;> rfl
+      simp only [decide_eq_true hi, decide_eq_true h4, Bool.not_true, Bool.and_false, Bool.false_and, Bool.false_or, h0f, Bool.and_true]
+    · have h0f : (0x0F#8).getLsbD i = false := by have hi4 : i = 4 ∨ i = 5 ∨ i = 6 ∨ i = 7 := (by omega); rcases hi4 with rfl | rfl | rfl | rfl <;> rfl
+      simp only [decide_eq_true hi, decide_eq_false h4, Bool.not_false, Bool.and_true, Bool.true_and, show 4 + (i - 4) = i by omega, h0f, Bool.and_false, Bool.or_false]
+  · simp only [BitVec.toNat_and, BitVec.toNat_ofNat]; exact Nat.lt_of_le_of_lt Nat.and_le_right (by decide)
 private theorem encodeUTF8Loop_toList (bs : ByteArray) (i : Nat) :
     ∀ acc, (encodeUTF8Loop bs i acc).toList = acc.toList ++ (encodeUTF8Loop bs i "").toList := by
   induction hfuel : bs.size - i generalizing i with
-  | zero => intro acc; rw [encodeUTF8Loop.eq_1 (acc := acc), encodeUTF8Loop.eq_1 (acc := "")]; simp [show ¬ i < bs.size by omega]
+  | zero => intro acc; rw [encodeUTF8Loop.eq_1 (acc := acc), encodeUTF8Loop.eq_1 (acc := "")]; simp only [show ¬ i < bs.size by omega, ↓reduceDIte, String.toList_empty, List.append_nil]
   | succ _ ih =>
       intro acc; have h : i < bs.size := by omega
       rw [encodeUTF8Loop.eq_1 (acc := acc), encodeUTF8Loop.eq_1 (acc := ""), dite_eq_left h, dite_eq_left h]
       by_cases hu : isUnreserved bs[i] <;>
         (simp only [hu, Bool.false_eq_true, ↓reduceIte]; conv => rhs; rw [ih (i + 1) (by omega)]
-         rw [ih (i + 1) (by omega)]; simp [String.toList_push, List.append_assoc])
+         rw [ih (i + 1) (by omega)]; simp only [String.toList_push, String.toList_empty, List.nil_append, List.append_assoc])
 private theorem decodeBytes_unreserved {b : UInt8} (hu : isUnreserved b = true) (rest : List Char) (acc : ByteArray) :
     decodeBytes (Char.ofNat b.toNat :: rest) acc = decodeBytes rest (acc.push b) := by
   have ⟨hle, hne37, htn⟩ := unreserved_toNat hu
   have hne : Char.ofNat b.toNat ≠ '%' := fun h => hne37 (htn ▸ congrArg Char.toNat h)
   have hstep : decodeBytes (Char.ofNat b.toNat :: rest) acc = decodeBytes rest (acc ++ (Char.ofNat b.toNat).toString.toUTF8) := by
-    cases rest with | nil => simp [decodeBytes] | cons _ r => cases r <;> simp [decodeBytes, hne]
+    rw [decodeBytes.eq_def]; split
+    · next _ _ _ he => exact absurd (List.cons.inj he).1 hne
+    · next _ _ _ he => cases List.cons.inj he with | intro h1 h2 => rw [h1, h2]
+    · next he => cases he
   have hutf : (Char.ofNat b.toNat).toString.toUTF8 = ByteArray.mk #[b] := by
     apply ByteArray.ext; change (String.ofList [Char.ofNat b.toNat]).toByteArray.data = #[b]
     rw [String.toByteArray_ofList, List.utf8Encode_singleton, String.utf8EncodeChar]

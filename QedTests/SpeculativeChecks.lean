@@ -73,11 +73,7 @@ bad_spec_act "`rollback` requires a `predict` clause on the same `await`" BadRol
       catch:
         case _: pass
     remaining = rem
-expect_err "`predict`, `on_confirm`, `rollback`, and `catch` can only be used on an `await` server RPC call" in
-component BadPredictOnNonAwait:
-  state count : Nat = 0
-  action bump: let n = count + 1 predict 2; count = n
-  view: <span>{count}</span>
+bad_comp_act "`predict`, `on_confirm`, `rollback`, and `catch` can only be used on an `await` server RPC call" BadPredictOnNonAwait count : Nat = 0 | bump : let n = count + 1 predict 2; count = n
 bad_comp_act "`predict` can only be used on an `await` server RPC call" BadPredictOnAssign count : Nat = 0 | bump : count = 1 predict 2
 bad_spec_act "`predict:` computes a predicted server response and cannot mutate state or perform side effects" BadMutateInPredict :
   if user.isSome:
@@ -92,17 +88,12 @@ bad_srv1 "`predict`, `on_confirm`, and `rollback` are only supported on client `
     return x
 bad_spec_act "`await StoreSrv.placeOrder(...)` has unhandled domain error(s): .outOfStock" BadPredictUnhandledDomainErr :
   if user.isSome and 1 <= remaining: let rem = await StoreSrv.placeOrder(1) predict remaining - 1; remaining = rem
-expect_err "Invariant `BadRollbackInv.bounded` failed in `BadRollbackInv.update`:\n  • `rollback` branch must satisfy:  20000 <= 10000" in
-component BadRollbackInv:
-  state val : Nat = 0
-  invariant bounded: val <= 10000
-  action go:
-    let r = await StoreSrv.claim(1) predict 1
-      rollback: val = 20000
-      catch:
-        case _: pass
-    val = r
-  view: <span>{val}</span>
+bad_comp_inv "Invariant `BadRollbackInv.bounded` failed in `BadRollbackInv.update`:\n  • `rollback` branch must satisfy:  20000 <= 10000" BadRollbackInv val : Nat = 0 | bounded : val <= 10000 | go :
+  let r = await StoreSrv.claim(1) predict 1
+    rollback: val = 20000
+    catch:
+      case _: pass
+  | val = r
 
 /-! ## 2. Positive Runtime & Proof Tests -/
 component CheckoutSpec:
@@ -209,11 +200,10 @@ example : PProd (LawfulBEq SpecBook ∧ LawfulBEq Date) (SpecEq SpecBook × Spec
 private structure UnlawfulEq where n : Nat
 private instance : BEq UnlawfulEq := ⟨fun _ _ => true⟩
 expect_err "failed to synthesize instance of type class\n  SpecEq UnlawfulEq" in example : SpecEq UnlawfulEq := inferInstance
-example : True := by
-  have _ := @CheckoutSpec.specClassify_pure; have _ := @ClaimSpec.specClassify_pure; have _ := @CatalogSpec.specClassify_pure; have _ := @ResourceSpec.specClassify_pure
-  have _ := @CheckoutSpec._specPredict_ens_0; have _ := @ClaimSpec._specPredict_ens_0; have _ := @CatalogSpec._specPredict_ens_0
-  have _ := @CheckoutSpec.specApp_init_inv; have _ := @CheckoutSpec.specApp_preserves_inv; have _ := @CheckoutSpec.specApp_init_coherent; have _ := @CheckoutSpec.specApp_preserves_coherent
-  have _ := @CheckoutSpec.specApp_init_wellFormedIds; have _ := @CheckoutSpec.specApp_preserves_wellFormedIds; have _ := @CatalogSpec.specApp_init_inv; have _ := @CatalogSpec.specApp_preserves_inv; trivial
+check_decls [CheckoutSpec.specClassify_pure, ClaimSpec.specClassify_pure, CatalogSpec.specClassify_pure, ResourceSpec.specClassify_pure,
+  CheckoutSpec._specPredict_ens_0, ClaimSpec._specPredict_ens_0, CatalogSpec._specPredict_ens_0,
+  CheckoutSpec.specApp_init_inv, CheckoutSpec.specApp_preserves_inv, CheckoutSpec.specApp_init_coherent, CheckoutSpec.specApp_preserves_coherent,
+  CheckoutSpec.specApp_init_wellFormedIds, CheckoutSpec.specApp_preserves_wellFormedIds, CatalogSpec.specApp_init_inv, CatalogSpec.specApp_preserves_inv]
 fullstack SpecMain:
   server StoreSrv
   client CheckoutSpec

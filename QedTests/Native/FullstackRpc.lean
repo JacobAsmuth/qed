@@ -135,9 +135,11 @@ private def runServiceAndExternalSuite (c : TestChecker) : IO Unit := do
       let oldHdr := s!"{oldTs},{oldSig}"
       -- 2. Service dispatch via ServiceHost RPCs (`verifyWebhook`, `getOddToken`, `createCheckout`, `rotateSecret`)
       let callHost (fn : String) (req : ByteArray) := @ServerChecks.ServiceHost.dispatchM IO _ srvInst {} fn req
-      c.checkProto "[svc-ext] verifyWebhook accepts valid HMAC within tolerance" (← callHost "verifyWebhook" (Qed.Proto.encode (payload, goodHdr))) true
-      c.checkProto "[svc-ext] verifyWebhook rejects tampered HMAC (constEq)" (← callHost "verifyWebhook" (Qed.Proto.encode (payload, badSigHdr))) false
-      c.checkProto "[svc-ext] verifyWebhook rejects replayed timestamp outside tolerance" (← callHost "verifyWebhook" (Qed.Proto.encode (payload, oldHdr))) false
+      for (lbl, hdr, want) in [
+          ("accepts valid HMAC within tolerance", goodHdr, true),
+          ("rejects tampered HMAC (constEq)", badSigHdr, false),
+          ("rejects replayed timestamp outside tolerance", oldHdr, false)] do
+        c.checkProto s!"[svc-ext] verifyWebhook {lbl}" (← callHost "verifyWebhook" (Qed.Proto.encode (payload, hdr))) want
       c.checkProto "[svc-ext] getOddToken proves ensures via prove: and returns 15" (← callHost "getOddToken" (Qed.Proto.encode (7 : Nat))) (15 : Nat)
       let checkoutReq : ServerChecks.StripeCheckoutReq := { mode := "payment", successUrl := "https://app.test/ok", quantity := 3, coupon := none }
       c.checkProtoBy (α := String) "[svc-ext] createCheckout sends Form(T) and returns cs_live_1"
@@ -153,8 +155,7 @@ private def runServiceAndExternalSuite (c : TestChecker) : IO Unit := do
         (← callHost "rotateSecret" (Qed.Proto.encode ("p1", ("my-key", "secret-val")))) (·.contains "versions/1") true
       c.check "[svc-ext] SecretManagerApi set ssrfGuard=true on OutboundReq" (← ssrfSeenRef.get)
       -- Default ssrf_guard=true blocks localhost on real Native MonadServer with actionable hint; ssrf_guard false allows it!
-      let nativeInst := Native.mkNativeServerInst none none
-      let blockedRes ← @ServerChecks.GuardedLocalApi.ping IO _ nativeInst
+      let blockedRes ← @ServerChecks.GuardedLocalApi.ping IO _ baseInst
       c.check "[svc-ext] default ssrf_guard blocks 127.0.0.1 with opt-out hint" (match blockedRes with
         | .error e => e.message.contains "SSRF blocked:" && e.message.contains "add `ssrf_guard false` to `external GuardedLocalApi`"
         | .ok _ => false) (match blockedRes with | .error e => e.message | .ok v => s!"unexpected ok: {v}")
@@ -207,10 +208,13 @@ def run : IO Bool := do
         c.checkStatus "RPC accepts same-origin protobuf with 200" (← httpRpc srv.port "Catalog" "list" ByteArray.empty none #[ckHdr, ("Origin", s!"http://127.0.0.1:{srv.port}"), ("Sec-Fetch-Site", "same-origin")]) 200
         let orderReq (idx qty : Nat) := Qed.Proto.encode (idx, qty)
         -- Cookie vs Bearer separation + random-JTI v3 bearer tokens
-        c.checkStatus "v1 bearer token in qed_session cookie rejected 401" (← httpRpc srv.port "Catalog" "order" (orderReq 0 99) none #[("Cookie", s!"qed_session={validV1}"), ("Origin", s!"http://127.0.0.1:{srv.port}")]) 401
-        c.checkStatus "legacy HMAC token in qed_session cookie rejected 401" (← httpRpc srv.port "Catalog" "order" (orderReq 0 99) none #[("Cookie", s!"qed_session={validTok}"), ("Origin", s!"http://127.0.0.1:{srv.port}")]) 401
-        c.checkStatus "v2 session cookie in Authorization Bearer rejected 401" (← postRpc "order" (orderReq 0 99) (some validV2)) 401
-        c.checkStatus "v2 session cookie accepted in qed_session (hits requires 400)" (← httpRpc srv.port "Catalog" "order" (orderReq 0 99) none #[ckHdr, ("Origin", s!"http://127.0.0.1:{srv.port}")]) 400
+        let sameOrig := ("Origin", s!"http://127.0.0.1:{srv.port}")
+        let orderCk (tok : String) := httpRpc srv.port "Catalog" "order" (orderReq 0 99) none #[("Cookie", s!"qed_session={tok}"), sameOrig]
+        for (lbl, tok, want) in [
+            ("v1 bearer token in qed_session cookie rejected 401", validV1, 401),
+            ("legacy HMAC token in qed_session cookie rejected 401", validTok, 401),
+            ("v2 session cookie accepted in qed_session (hits requires 400)", validV2, 400)] do
+          c.checkStatus lbl (← orderCk tok) want
         let mintInst : MonadServer IO := { exec := fun | .readEnv "QED_AUTH_SECRET" => pure (some authSecret) | eff => (inferInstance : MonadServer IO).exec eff }
         let mint1 ← @Qed.Server.mintBearerToken IO _ mintInst "alice" 3600 "QED_AUTH_SECRET"
         let mint2 ← @Qed.Server.mintBearerToken IO _ mintInst "alice" 3600 "QED_AUTH_SECRET"
@@ -218,9 +222,10 @@ def run : IO Bool := do
         | .ok t1, .ok t2 =>
             c.check "mintBearerToken emits distinct random-JTI v3 tokens in same second" (t1.startsWith "v3." && t2.startsWith "v3." && t1 != t2) s!"got {t1} vs {t2}"
             c.checkStatus "v3 bearer token accepted in Authorization Bearer (hits requires 400)" (← postRpc "order" (orderReq 0 99) (some t1)) 400
-            c.checkStatus "v3 bearer token in qed_session cookie rejected 401" (← httpRpc srv.port "Catalog" "order" (orderReq 0 99) none #[("Cookie", s!"qed_session={t1}"), ("Origin", s!"http://127.0.0.1:{srv.port}")]) 401
+            c.checkStatus "v3 bearer token in qed_session cookie rejected 401" (← orderCk t1) 401
         | e1, e2 => c.check "mintBearerToken succeeded" false s!"{repr e1} / {repr e2}"
         for (lbl, req, tok?, want) in [("unauth order rejected 401", orderReq 0 1, none, 401), ("forged HMAC rejected 401", orderReq 0 1, some ("alice." ++ String.ofList (List.replicate 64 '0')), 401),
+            ("v2 session cookie in Authorization Bearer rejected 401", orderReq 0 99, some validV2, 401),
             ("expired v1 token rejected 401", orderReq 0 1, some expiredV1, 401), ("requires qty <= 50 rejected 400", orderReq 0 99, some validV1, 400),
             ("rotated QED_AUTH_SECRET_PREV accepted (hits requires 400)", orderReq 0 99, some rotatedV1, 400)] do
           c.checkStatus lbl (← postRpc "order" req tok?) want

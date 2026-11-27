@@ -24,10 +24,10 @@ database VaultDb:
 
 def sameCompiledSql (q1 q2 : Qed.Server.Db.SqlQuery) : Bool := (q1.compile .postgres).1 == (q2.compile .postgres).1 && (q1.compile .sqlite).1 == (q2.compile .sqlite).1
 example : (
-  let pg := VaultDb.ddl .postgres; let mk (v : String) := Qed.Server.Db.SqlQuery.select ⟨"notes", by decide⟩ [⟨"id", by decide⟩] (.binOp .eq (.col ⟨"ownerId", by decide⟩) (.param (.text v)))
-  ["CREATE TABLE IF NOT EXISTS \"notes\"", "CHECK (1 <= LENGTH(\"body\") AND LENGTH(\"body\") <= 2000)"].all (Qed.Str.contains pg ·) &&
-  Qed.Str.contains (VaultDb.ddl .sqlite) "CREATE INDEX IF NOT EXISTS \"idx_notes_0\" ON \"notes\" (\"ownerId\", \"version\")" &&
-  ["ENABLE ROW LEVEL SECURITY", "current_setting('qed.user_id', true)"].all (Qed.Str.contains VaultDb.rlsDdl ·) && sameCompiledSql (mk "alice") (mk "' OR 1=1; DROP TABLE notes; --")) = true := by decide +kernel
+  let mk (v : String) := Qed.Server.Db.SqlQuery.select (sql!"notes") [sql!"id"] (.binOp .eq (.col (sql!"ownerId")) (.param (.text v)))
+  strHasAll (VaultDb.ddl .postgres) ["CREATE TABLE IF NOT EXISTS \"notes\"", "CHECK (1 <= LENGTH(\"body\") AND LENGTH(\"body\") <= 2000)"] &&
+  strHas (VaultDb.ddl .sqlite) "CREATE INDEX IF NOT EXISTS \"idx_notes_0\" ON \"notes\" (\"ownerId\", \"version\")" &&
+  strHasAll VaultDb.rlsDdl ["ENABLE ROW LEVEL SECURITY", "current_setting('qed.user_id', true)"] && sameCompiledSql (mk "alice") (mk "' OR 1=1; DROP TABLE notes; --")) = true := by decide +kernel
 server VaultApi:
   use db : VaultDb
   rpc listBooks() -> VaultDb.books[]!: return await db.books.select(orderBy = "id")?
@@ -130,11 +130,7 @@ bad_comp_sess "RPC `VaultApi.createNote` precondition `1 <= body.length <= 2000`
   if user.isSome:
     let _ = await VaultApi.createNote(1, "") catch:
       case _: pass
-expect_err "reactive `query bad` cannot call mutating server RPC `VaultApi.deleteNote`" in
-component BadClientQueryMut:
-  session user
-  query bad = VaultApi.deleteNote(1) if user.isSome
-  view: <p>hi</p>
+bad_comp_query "reactive `query bad` cannot call mutating server RPC `VaultApi.deleteNote`" BadClientQueryMut bad = VaultApi.deleteNote(1) if user.isSome
 
 /-! ## Extended Verified Database Layer: Richer SQL, FK Joins, Transactions & Migrations -/
 database ShopDb:
@@ -177,8 +173,8 @@ example : (
   let (pgDdl, sqDdl) := (Qed.Server.Db.renderMigrationDdl .postgres steps, Qed.Server.Db.renderMigrationDdl .sqlite steps)
   sameCompiledSql (mk "Rust" "Lean" "a" "b") (mk "'; DROP TABLE items; --" "%' OR 1=1 --" "'; DELETE FROM items;" "x") &&
   steps.length == 3 && (Qed.Server.Db.verifyMigrationSafe steps).isOk &&
-  ["ADD COLUMN IF NOT EXISTS \"notes\" TEXT", "ADD COLUMN IF NOT EXISTS \"views\" BIGINT NOT NULL DEFAULT 0"].all (Qed.Str.contains pgDdl ·) &&
-  ["ADD COLUMN \"views\" INTEGER NOT NULL DEFAULT 0", "CREATE INDEX IF NOT EXISTS \"idx_items_0\""].all (Qed.Str.contains sqDdl ·) &&
+  strHasAll pgDdl ["ADD COLUMN IF NOT EXISTS \"notes\" TEXT", "ADD COLUMN IF NOT EXISTS \"views\" BIGINT NOT NULL DEFAULT 0"] &&
+  strHasAll sqDdl ["ADD COLUMN \"views\" INTEGER NOT NULL DEFAULT 0", "CREATE INDEX IF NOT EXISTS \"idx_items_0\""] &&
   (Qed.Server.Db.diffTableSchemas [newTbl] [newTbl]).isEmpty && !(Qed.Server.Db.verifyMigrationSafe [.addColumn ⟨"items", by decide⟩ unsafeCol none]).isOk) = true := by decide +kernel
 server ShopApi:
   use db : ShopDb
@@ -361,13 +357,6 @@ mapping DriftMap:
   encode(bs): return Qed.Base64.encode(bs)
   decode(s):  return Qed.Base64.decode(s)?
 
-database EncSecretDb:
-  url secret("QED_TEST_ENC_DB_URL")
-  dev sqlite ".qed/enc_secret_check.db"
-  table items:
-    id   : Nat primary_key
-    body : encrypted(String, key = secret("QED_REQUIRED_ENC_KEY")) where 1 <= body.utf8ByteSize <= 200
-
 database EncVaultDb:
   url secret("QED_TEST_ENC_VAULT_URL")
   dev sqlite ".qed/enc_vault_checks.db"
@@ -380,11 +369,10 @@ database EncVaultDb:
     policy read, write requires some(row.ownerId) == ctx.userId
 
 example : (
-  let pg := EncVaultDb.ddl .postgres
-  Qed.Str.contains pg "\"body\" TEXT NOT NULL CHECK (40 <= LENGTH(\"body\") AND LENGTH(\"body\") <= 304)" &&
-  Qed.Str.contains pg "\"note\" TEXT NOT NULL CHECK (40 <= LENGTH(\"note\") AND LENGTH(\"note\") <= 1104)" &&
-  Qed.Str.contains pg "\"raw\" TEXT CHECK (40 <= LENGTH(\"raw\"))" &&
-  EncSecretDb.secrets.contains "QED_REQUIRED_ENC_KEY" &&
+  strHasAll (EncVaultDb.ddl .postgres) [
+    "\"body\" TEXT NOT NULL CHECK (40 <= LENGTH(\"body\") AND LENGTH(\"body\") <= 304)",
+    "\"note\" TEXT NOT NULL CHECK (40 <= LENGTH(\"note\") AND LENGTH(\"note\") <= 1104)",
+    "\"raw\" TEXT CHECK (40 <= LENGTH(\"raw\"))"] &&
   !(EncVaultDb.secrets.contains "QED_TEST_ENC_KEY")) = true := by decide +kernel
 
 server EncVaultApi:
@@ -418,19 +406,8 @@ bad_db1 "cannot reference encrypted column `entries.body` inside SQL `where`" En
 bad_db1 "cannot `orderBy` encrypted column `entries.body`" EncVaultDb badOrder(x: Nat) -> EncVaultDb.entries[]! : return await db.entries.select(where = r => r.ownerId == ctx.userId.getD(""), orderBy = "body")?
 bad_db1 "cannot compute SQL aggregate on encrypted column `entries.body`" EncVaultDb badAgg(x: Nat) -> String?! : return await db.entries.min(col = "body", where = r => r.ownerId == ctx.userId.getD(""))?
 bad_db1 "cannot update encrypted column `EncVaultDb.entries.body` using a row-dependent SQL expression" EncVaultDb badSet(x: Nat) -> EncVaultDb.entries?! : return await db.entries.updateOne(where = r => r.id == x and r.ownerId == ctx.userId.getD(""), set = r => { body = r.body })?
-expect_err "cannot index encrypted column `bad.body`" in
-database BadEncIndexDb:
-  sqlite ".qed/bad_idx.db"
-  table bad:
-    id   : Nat primary_key
-    body : encrypted(String, key = secret("K"))
-    index (body)
-expect_err "encrypted column `bad.body` cannot be `unique`" in
-database BadEncUniqueDb:
-  sqlite ".qed/bad_uniq.db"
-  table bad:
-    id   : Nat primary_key
-    body : encrypted(String, key = secret("K")) unique
+bad_db_tbl "cannot index encrypted column `bad.body`" BadEncIndexDb bad : id : Nat primary_key | body : encrypted(String, key = secret("K")) | index (body)
+bad_db_tbl "encrypted column `bad.body` cannot be `unique`" BadEncUniqueDb bad : id : Nat primary_key | body : encrypted(String, key = secret("K")) unique
 
 database TierCheckDb:
   sqlite ".qed/tier_checks.db"
@@ -444,12 +421,11 @@ database TierCheckDb:
       (plan == "pro" or plan == "enterprise") or (minInstances == 0 and maxInstances <= 1)
 
 example : (
-  let pg := TierCheckDb.ddl .postgres
-  let chk := Qed.Server.Db.renderDatabaseCheckDdl TierCheckDb.config.tables
-  Qed.Str.contains pg "CONSTRAINT \"qed_chk_scaling_0\" CHECK (\"minInstances\" <= \"maxInstances\")" &&
-  Qed.Str.contains pg "CONSTRAINT \"qed_chk_scaling_1\" CHECK ((((\"plan\" = 'pro' OR \"plan\" = 'enterprise')) OR ((\"minInstances\" = 0 AND \"maxInstances\" <= 1))))" &&
-  Qed.Str.contains chk "ADD CONSTRAINT \"qed_chk_scaling_1\" CHECK" &&
-  Qed.Str.contains chk "NOT VALID") = true := by decide +kernel
+  strHasAll (TierCheckDb.ddl .postgres) [
+    "CONSTRAINT \"qed_chk_scaling_0\" CHECK (\"minInstances\" <= \"maxInstances\")",
+    "CONSTRAINT \"qed_chk_scaling_1\" CHECK ((((\"plan\" = 'pro' OR \"plan\" = 'enterprise')) OR ((\"minInstances\" = 0 AND \"maxInstances\" <= 1))))"] &&
+  strHasAll (Qed.Server.Db.renderDatabaseCheckDdl TierCheckDb.config.tables) [
+    "ADD CONSTRAINT \"qed_chk_scaling_1\" CHECK", "NOT VALID"]) = true := by decide +kernel
 
 bad_db "Database table constraint `TierCheckDb.scaling.RowInv` failed in `badFreeWarm → TierCheckDb.scaling.insert`" TierCheckDb :
   rpc badFreeWarm(appId: String) -> TierCheckDb.scaling!:
@@ -492,22 +468,16 @@ database RoadmapDb:
   backfill projects set { note = "migrated" } where r => r.note == none
 
 example : (
-  let pg := RoadmapDb.ddl .postgres
-  let sq := RoadmapDb.ddl .sqlite
   let d? := Date.mk? 2026 11 25
-  Qed.Str.contains pg "ON DELETE CASCADE" &&
-  Qed.Str.contains pg "ON DELETE SET NULL" &&
-  Qed.Str.contains pg "ON DELETE RESTRICT" &&
-  Qed.Str.contains pg "CHECK (\"stage\" IN ('queued', 'in-progress', 'live', 'failed'))" &&
-  Qed.Str.contains pg "\"slug\" TEXT NOT NULL PRIMARY KEY" &&
-  Qed.Str.contains pg "\"port\" BIGINT NOT NULL CHECK (\"port\" >= 0)" &&
-  Qed.Str.contains pg "\"altPort\" BIGINT" &&
-  Qed.Str.contains sq "\"port\" INTEGER NOT NULL CHECK (\"port\" >= 0)" &&
-  Qed.Str.contains sq "ON DELETE CASCADE" &&
+  strHasAll (RoadmapDb.ddl .postgres) [
+    "ON DELETE CASCADE", "ON DELETE SET NULL", "ON DELETE RESTRICT",
+    "CHECK (\"stage\" IN ('queued', 'in-progress', 'live', 'failed'))",
+    "\"slug\" TEXT NOT NULL PRIMARY KEY", "\"port\" BIGINT NOT NULL CHECK (\"port\" >= 0)", "\"altPort\" BIGINT"] &&
+  strHasAll (RoadmapDb.ddl .sqlite) ["\"port\" INTEGER NOT NULL CHECK (\"port\" >= 0)", "ON DELETE CASCADE"] &&
   (match d?.map fun d => Qed.Server.Db.FromSql.fromSql (α := Date) (Qed.Server.Db.ToSql.toSql d) with
    | some (.ok d') => some d' == d? | _ => false) &&
   RoadmapDb.config.backfills.length == 1 &&
-  (RoadmapDb.config.backfills[0]?.map fun q => Qed.Str.contains (q.compile .postgres).1 "UPDATE \"projects\" SET \"note\" = $1 WHERE (\"note\" IS NULL)") == some true) = true := by decide +kernel
+  (RoadmapDb.config.backfills[0]?.map fun q => strHas (q.compile .postgres).1 "UPDATE \"projects\" SET \"note\" = $1 WHERE (\"note\" IS NULL)") == some true) = true := by decide +kernel
 
 server RoadmapApi:
   use db : RoadmapDb
@@ -545,7 +515,7 @@ example : (
   let emptySel := (Qed.Server.Db.SqlQuery.select tbl [] .litTrue).compile .postgres
   let explicitAll := (Qed.Server.Db.SqlQuery.selectAll tbl .litTrue).compile .postgres
   let insIgn := (Qed.Server.Db.SqlQuery.insertOrIgnore tbl [(col, .text "a")] [] [col]).compile .postgres
-  !Qed.Str.contains emptySel.1 "*" && Qed.Str.contains emptySel.1 "0 = 1" &&
+  !strHas emptySel.1 "*" && strHas emptySel.1 "0 = 1" &&
   explicitAll.1 == "SELECT * FROM \"projects\" WHERE TRUE" &&
   insIgn.1 == "INSERT INTO \"projects\" (\"owner_id\") VALUES ($1) ON CONFLICT DO NOTHING RETURNING \"owner_id\"") = true := by decide +kernel
 
@@ -559,14 +529,12 @@ bad_db "Database upsert conflict update policy `RoadmapDb.projects.update` faile
     requires auth, 1 <= orgId.length <= 64, 1 <= projId.length <= 64
     return await db.projects.upsert(on = "id", id = projId, orgId = orgId, ownerId = uid, stage = .queued, note = none)?
 
-expect_err "`on_delete set_null` on `bad.orgId` requires a nullable column (`T?`)" in
-database BadSetNullDb:
-  sqlite ".qed/bad_set_null.db"
+bad_db_def "`on_delete set_null` on `bad.orgId` requires a nullable column (`T?`)" BadSetNullDb :
   table orgs:
     id : String primary_key
-  table bad:
-    id    : String primary_key
-    orgId : String references orgs(id) on_delete set_null
+  | table bad:
+      id    : String primary_key
+      orgId : String references orgs(id) on_delete set_null
 
 /-! ## Item 6: Encrypted Column Projections (`Meta`, `selectMeta`, `columns = [...]`) & `prevKeys` Rotation -/
 
@@ -709,22 +677,14 @@ bad_db "update policy `MultiTenantDb.apps.update`" MultiTenantDb :
       where = r => r.id == appId and (any m in app_members: m.appId == r.id and some(m.userId) == ctx.userId and m.status == "accepted" and m.role == "viewer"),
       set = r => { name = newName })?
 
-expect_err "unknown table `ghosts` in cross-table `any m in ghosts:`" in
-database BadCrossTableRefDb:
-  sqlite ".qed/bad_cross.db"
-  table apps:
-    id : String primary_key
-    policy read requires any m in ghosts: m.appId == row.id
-
-expect_err "cannot reference encrypted column `secrets.val` inside cross-table `any s in secrets:`" in
-database BadCrossEncDb:
-  sqlite ".qed/bad_cross_enc.db"
+bad_db_tbl "unknown table `ghosts` in cross-table `any m in ghosts:`" BadCrossTableRefDb apps : id : String primary_key | policy read requires any m in ghosts: m.appId == row.id
+bad_db_def "cannot reference encrypted column `secrets.val` inside cross-table `any s in secrets:`" BadCrossEncDb :
   table apps:
     id : String primary_key
     policy read requires any s in secrets: s.val == row.id
-  table secrets:
-    id  : String primary_key
-    val : encrypted(String, key = secret("K"))
+  | table secrets:
+      id  : String primary_key
+      val : encrypted(String, key = secret("K"))
 
 /-! ## Item 5: Database `example`, `rejects`, `transition_example`, `transition_rejects`, `policy_allows`, `policy_denies` -/
 
@@ -772,63 +732,22 @@ database VerifiedExamplesDb:
     userId  : String immutable where 1 <= userId.length <= 64
     policy read, write requires ctx.userId != none
 
-expect_err "Database `example badRow`" in
-database BadDbExample:
-  sqlite ".qed/bad_db_ex.db"
-  table items:
-    id : String primary_key where 1 <= id.length <= 16
-    example badRow: id = ""
-
-expect_err "Database `rejects badReject`" in
-database BadDbRejects:
-  sqlite ".qed/bad_db_rej.db"
-  table items:
-    id : String primary_key where 1 <= id.length <= 16
-    rejects badReject: id = "ok"
-
-expect_err "Database `transition_example badStep`" in
-database BadDbTransEx:
-  sqlite ".qed/bad_db_tex.db"
-  table jobs:
-    id : String primary_key where 1 <= id.length <= 16
-    status : String where status in ["queued", "done"]
-    invariant flow: transition status: "queued" -> "done"
-    example doneJob: id = "j1", status = "done"
-    transition_example badStep: doneJob -> status = "queued"
-
-expect_err "Database `transition_rejects badRejStep`" in
-database BadDbTransRej:
-  sqlite ".qed/bad_db_trej.db"
-  table jobs:
-    id : String primary_key where 1 <= id.length <= 16
-    status : String where status in ["queued", "done"]
-    invariant flow: transition status: "queued" -> "done"
-    example queuedJob: id = "j1", status = "queued"
-    transition_rejects badRejStep: queuedJob -> status = "done"
-
-expect_err "Database `policy_allows read badAllow`" in
-database BadDbPolAllow:
-  sqlite ".qed/bad_db_pallow.db"
-  table docs:
-    id : String primary_key where 1 <= id.length <= 16
-    ownerId : String where 1 <= ownerId.length <= 16
-    policy read requires some(ownerId) == ctx.userId
-    example d1: id = "d1", ownerId = "alice"
-    policy_allows read badAllow:
-      user = "bob"
-      row = d1
-
-expect_err "Database `policy_denies read badDeny`" in
-database BadDbPolDeny:
-  sqlite ".qed/bad_db_pdeny.db"
-  table docs:
-    id : String primary_key where 1 <= id.length <= 16
-    ownerId : String where 1 <= ownerId.length <= 16
-    policy read requires some(ownerId) == ctx.userId
-    example d1: id = "d1", ownerId = "alice"
-    policy_denies read badDeny:
-      user = "alice"
-      row = d1
+bad_db_tbl "Database `example badRow`" BadDbExample items : id : String primary_key where 1 <= id.length <= 16 | example badRow: id = ""
+bad_db_tbl "Database `rejects badReject`" BadDbRejects items : id : String primary_key where 1 <= id.length <= 16 | rejects badReject: id = "ok"
+bad_db_tbl "Database `transition_example badStep`" BadDbTransEx jobs :
+  id : String primary_key where 1 <= id.length <= 16 | status : String where status in ["queued", "done"] | invariant flow: transition status: "queued" -> "done" | example doneJob: id = "j1", status = "done" | transition_example badStep: doneJob -> status = "queued"
+bad_db_tbl "Database `transition_rejects badRejStep`" BadDbTransRej jobs :
+  id : String primary_key where 1 <= id.length <= 16 | status : String where status in ["queued", "done"] | invariant flow: transition status: "queued" -> "done" | example queuedJob: id = "j1", status = "queued" | transition_rejects badRejStep: queuedJob -> status = "done"
+bad_db_tbl "Database `policy_allows read badAllow`" BadDbPolAllow docs :
+  id : String primary_key where 1 <= id.length <= 16 | ownerId : String where 1 <= ownerId.length <= 16 | policy read requires some(ownerId) == ctx.userId | example d1: id = "d1", ownerId = "alice" |
+  policy_allows read badAllow:
+    user = "bob"
+    row = d1
+bad_db_tbl "Database `policy_denies read badDeny`" BadDbPolDeny docs :
+  id : String primary_key where 1 <= id.length <= 16 | ownerId : String where 1 <= ownerId.length <= 16 | policy read requires some(ownerId) == ctx.userId | example d1: id = "d1", ownerId = "alice" |
+  policy_denies read badDeny:
+    user = "alice"
+    row = d1
 
 /-! ## Transactional and Conditional-Where DB Upgrades -/
 
@@ -906,52 +825,21 @@ server stateless TxLeaseSrv:
     call listMyLeases(true, none)
     expect ok([{ id = "l1", ownerId = "alice", status = "open", retries = 0 }])
 
-expect_err "Database `policy_allows read badOwnerAllow`" in
-database BadOwnerPolAllow:
-  sqlite ".qed/bad_owner_pallow.db"
-  table leases:
-    id      : String primary_key where 1 <= id.length <= 32
-    ownerId : String             where 1 <= ownerId.length <= 32
-    policy read requires some(ownerId) == ctx.userId
-    example l1: id = "l1", ownerId = "alice"
-    policy_allows read badOwnerAllow:
-      user = "bob"
-      row = l1
-
-expect_err "Database read policy `TxLeaseDb.leases.read` failed in `sneakyReadAll → TxLeaseDb.leases.select`" in
-server stateless BadNonOwnerRead:
-  use db : TxLeaseDb
-  rpc sneakyReadAll() -> TxLeaseDb.leases[]!:
-    return await db.leases.select()?
-
-expect_err "Database read policy `TxLeaseDb.leases.read` failed in `leakySelect → TxLeaseDb.leases.select`" in
-server stateless BadCondWhereRls:
-  use db : TxLeaseDb
+bad_db "Database read policy `TxLeaseDb.leases.read` failed in `sneakyReadAll → TxLeaseDb.leases.select`" TxLeaseDb :
+  rpc sneakyReadAll() -> TxLeaseDb.leases[]!: return await db.leases.select()?
+bad_db "Database read policy `TxLeaseDb.leases.read` failed in `leakySelect → TxLeaseDb.leases.select`" TxLeaseDb :
   read_only rpc leakySelect(onlyOpen: Bool) -> TxLeaseDb.leases[]!:
     requires auth
-    return await db.leases.select(
-      where = r =>
-        if onlyOpen:
-          r.ownerId == uid and r.status == "open"
-        else:
-          r.status == "done")?
-
-expect_err "Database update policy `TxLeaseDb.leases.update` failed in `badTxUpdate → TxLeaseDb.leases.updateOne`" in
-service BadTxPolicyHelper:
-  use db : TxLeaseDb
+    return await db.leases.select(where = r => if onlyOpen: r.ownerId == uid and r.status == "open" else: r.status == "done")?
+bad_svc "Database update policy `TxLeaseDb.leases.update` failed in `badTxUpdate → TxLeaseDb.leases.updateOne`" BadTxPolicyHelper :
+  use db : TxLeaseDb |
   fn badTxUpdate(tx: db.Tx, leaseId: String) -> TxLeaseDb.leases?!:
-    return await tx.leases.updateOne(
-      where = r => r.id == leaseId and r.status == "open" and r.retries < 10,
-      set = r => { status = "claimed" })?
-
-expect_err "Database transition/monotonicity invariant `TxLeaseDb.leases.TransInv` failed in `invalidReopen → TxLeaseDb.leases.updateOne`" in
-service BadTxTransInv:
-  use db : TxLeaseDb
+    return await tx.leases.updateOne(where = r => r.id == leaseId and r.status == "open" and r.retries < 10, set = r => { status = "claimed" })?
+bad_svc "Database transition/monotonicity invariant `TxLeaseDb.leases.TransInv` failed in `invalidReopen → TxLeaseDb.leases.updateOne`" BadTxTransInv :
+  use db : TxLeaseDb |
   fn invalidReopen(leaseId: String) -> TxLeaseDb.leases?!:
     requires auth
-    return await db.leases.updateOne(
-      where = r => r.id == leaseId and r.ownerId == uid and r.status == "done",
-      set = r => { status = "open" })?
+    return await db.leases.updateOne(where = r => r.id == leaseId and r.ownerId == uid and r.status == "done", set = r => { status = "open" })?
 
 /-! ## `Str.truncate` / `Str.*` Length Bounds in `RowInv` & `FromSql Int` Kernel Reduction -/
 

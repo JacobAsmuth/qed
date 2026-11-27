@@ -1,6 +1,5 @@
 import Qed.Cloud.Executor
 import Qed.Cloud.Protocol
-import Qed.Server.Http
 import Qed.Auth.Oidc
 import Cli.Verify
 import Cli.Build
@@ -315,11 +314,13 @@ private def testCliDeployChecks (c : TestChecker) (baseUrl : String) : IO Unit :
       ("qed deploy rejects ambiguous multiple deploy blocks without --deploy", #["--dry-run"], false, [], []),
       ("qed deploy rejects leading-dash --dist", #["--deploy", "NotesDeploy", "--dry-run", "--dist", "-rf"], false, [], [])] do
     let (rc, out) ← runDeploy args; c.check lbl ((rc == 0) == wantOk && has.all (out.contains ·) && omits.all (!out.contains ·)) out
-  for badUrl in ["http://127.evil.com", "https://evil.example", "https://googleapis.com@evil.example", "https://storage.googleapis.com/attacker-bucket/poison.json#",
+  let badApiUrls := ["http://127.evil.com", "https://evil.example", "https://googleapis.com@evil.example", "https://storage.googleapis.com/attacker-bucket/poison.json#",
       "https://storage.googleapis.com", "https://attacker-bucket.storage.googleapis.com", "https://commondatastorage.googleapis.com", "https://bucket.commondatastorage.googleapis.com",
       "https://storage-download.googleapis.com", "https://storage-upload.googleapis.com", "https://storage.us-central1.rep.googleapis.com", "https://googleapis.com",
-      "https://firebasestorage.googleapis.com", "https://www.googleapis.com", "https://run.googleapis.com/v2/evil", "https://run.googleapis.com?x=1", "https://run.googleapis.com#frag"] do
-    c.check s!"qed deploy rejects --api-base ({badUrl})" ((← runDeploy #["--deploy", "NotesDeploy", "--dry-run", "--api-base", badUrl]).1 != 0)
+      "https://firebasestorage.googleapis.com", "https://www.googleapis.com", "https://run.googleapis.com/v2/evil", "https://run.googleapis.com?x=1", "https://run.googleapis.com#frag"]
+  let apiTasks ← badApiUrls.mapM fun u => return (u, ← IO.asTask (prio := .dedicated) (runDeploy #["--deploy", "NotesDeploy", "--dry-run", "--api-base", u]))
+  for (badUrl, t) in apiTasks do
+    c.check s!"qed deploy rejects --api-base ({badUrl})" ((← IO.wait t).toOption.map (·.1 != 0) == some true)
 
 private def testCloudDeployEndToEnd (c : TestChecker) : IO Unit := do
   let (stRef, portRef) := (← IO.mkRef ({} : MockGcpState), ← IO.mkRef (0 : UInt16))
@@ -531,18 +532,13 @@ private def handleMockCloudApi (stRef : IO.Ref MockCloudState)
     let q := Qed.Auth.parseQueryParams query
     let slug := (q.lookup "app").getD ""
     return jsonResp 200 (toJson ({ appSlug := slug, names := #["prod:API_KEY", "staging:STAGE_KEY"] } : SecretsListResp))
-  if method == "POST" && path == "/api/v1/secrets" then
-    match Json.parse bodyStr >>= (fromJson : Json → Except String SecretSetReq) with
-    | .ok req => stRef.modify fun s => { s with lastSecretSet := some req }; return jsonResp 200 (.obj [("ok", .bool true)])
+  let handlePost {α : Type} [FromJson α] (onOk : α → MockCloudState → MockCloudState) (resp : List (String × Json) := [("ok", .bool true)]) : IO (Nat × String × ByteArray) := do
+    match decodeJson α bodyStr with
+    | .ok req => stRef.modify (onOk req); return jsonResp 200 (.obj resp)
     | .error e => return jsonErrResp 400 e
-  if method == "POST" && path == "/api/v1/secrets/delete" then
-    match Json.parse bodyStr >>= (fromJson : Json → Except String SecretDeleteReq) with
-    | .ok req => stRef.modify fun s => { s with lastSecretDel := some req }; return jsonResp 200 (.obj [("ok", .bool true)])
-    | .error e => return jsonErrResp 400 e
-  if method == "POST" && path == "/api/v1/deployment/cancel" then
-    match Json.parse bodyStr >>= (fromJson : Json → Except String CancelDeployReq) with
-    | .ok req => stRef.modify fun s => { s with lastCancel := some req }; return jsonResp 200 (.obj [("ok", .bool true), ("status", .str "canceled")])
-    | .error e => return jsonErrResp 400 e
+  if method == "POST" && path == "/api/v1/secrets" then return ← handlePost (α := SecretSetReq) fun r s => { s with lastSecretSet := some r }
+  if method == "POST" && path == "/api/v1/secrets/delete" then return ← handlePost (α := SecretDeleteReq) fun r s => { s with lastSecretDel := some r }
+  if method == "POST" && path == "/api/v1/deployment/cancel" then return ← handlePost (α := CancelDeployReq) (fun r s => { s with lastCancel := some r }) [("ok", .bool true), ("status", .str "canceled")]
   if method == "GET" && path == "/api/v1/deployment" then
     let depId := ((Qed.Auth.parseQueryParams query).lookup "id").getD "dep_canceled_1"
     return jsonResp 200 (toJson ({
@@ -565,8 +561,6 @@ private def testCloudProtocolAndCli (c : TestChecker) : IO Unit := do
     let bs := ByteArray.mk ((List.range n).toArray.map fun i => UInt8.ofNat ((i * 73 + 19) % 256))
     decodeBase64? (encodeBase64 bs) == some bs
   let pngMagic := ByteArray.mk #[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0xFF, 0xFE]
-  let legacySfJson := "{\"path\":\"App.lean\",\"content\":\"def x := 1\"}"
-  let legacySf : Except String SourceFile := Json.parse legacySfJson >>= fromJson
   let binSf : SourceFile := { path := "public/logo.png", content := encodeBase64 pngMagic, encoding := "base64" }
   let mixedBundle : SourceBundle := { files := #[{ path := "App.lean", content := "def x := 1" }, binSf] }
   let delReq : SecretDeleteReq := { appSlug := "my-app", env := "staging", name := "API_KEY" }
@@ -575,14 +569,14 @@ private def testCloudProtocolAndCli (c : TestChecker) : IO Unit := do
     appSlug := "my-app", env := "preview", pr := 42,
     logs := #[{ id := "l1", timestamp := "2026-11-25 12:00:00 UTC", severity := "warn", source := "stderr", message := "slow query" }],
     nextPageToken := some "p2" }
-  let rtMinJson := "{\"appSlug\":\"my-app\",\"env\":\"prod\",\"logs\":[]}"
-  let rtMinDec : Except String RuntimeLogsResp := Json.parse rtMinJson >>= fromJson
   let revResp : TokenRevokeResp := { revoked := true }
   for (lbl, ok) in [
       ("encodeBase64/decodeBase64? round-trips lengths 0..64 & PNG magic bytes", b64LengthsOk && decodeBase64? (encodeBase64 pngMagic) == some pngMagic),
       ("decodeBase64? rejects invalid & non-canonical padded base64 inputs",
         ["abc", "a", "ab!d", "AA==AAAA", "====", "ab cd", "AB==", "AP==", "AAB=", "///=", "//=="].all fun s => (decodeBase64? s).isNone),
       ("maxSourceFileBytes = 2 MiB & maxTotalSourceBytes = 16 MiB", maxSourceFileBytes == 2 * 1024 * 1024 && maxTotalSourceBytes == 16 * 1024 * 1024),
+      ("isValidAppSlug validates lowercase slug grammar",
+        isValidAppSlug "my-app-1" && ["A", "my--app", "-bad"].all (!isValidAppSlug ·)),
       ("isValidDeployStatus accepts canceled and rejects invalid", isValidDeployStatus "canceled" && isValidDeployStatus "live" && !isValidDeployStatus "bogus"),
       ("isValidDeploymentId requires ASCII alphanumeric start and rejects leading `-`",
         ["dep_abc-1", "0123", "A_b-9"].all isValidDeploymentId && ["", "-bad", "--help", "_bad", "dep/bad"].all (!isValidDeploymentId ·)),
@@ -597,36 +591,35 @@ private def testCloudProtocolAndCli (c : TestChecker) : IO Unit := do
          ".docker/config.json", ".ssh/id_rsa.txt", ".htaccess.txt", "..png", ".a.png",
          "public/.png", "public/.a.png", "dist/a.js", "sub/dist/a.js",
          "node_modules/p/i.js", "target/a.txt", "/abs.png", "a\\b.png", "a.png?v=1", "a.png#h",
-         "a:b.png", "a\nb.png", ".png", ".lean"].all (!isValidSourceRelPath ·)),
+         "a:b.png", "a\nb.png", ".png", ".lean", ".json"].all (!isValidSourceRelPath ·)),
       ("isBinarySourceExt inspects leaf segment and rejects dotfile stems",
         ["a.png", "public/logo.png", "a.woff2", "a.ico", "A.JPG"].all isBinarySourceExt &&
         ["App.lean", "a.css", "a.svg", "a.json", "robots.txt", ".png", "public/.png", "public/.a.png"].all (!isBinarySourceExt ·)),
       ("SourceFile backwards-compat FromJson defaults omitted encoding to utf8",
-        legacySf == .ok { path := "App.lean", content := "def x := 1", encoding := "utf8" }),
+        decodeJson SourceFile "{\"path\":\"App.lean\",\"content\":\"def x := 1\"}" == .ok { path := "App.lean", content := "def x := 1", encoding := "utf8" }),
       ("SourceBundle mixed utf8 + base64 JSON round-trip & decodedBytes",
-        (Json.parse (toJson mixedBundle).render >>= fromJson) == .ok mixedBundle && binSf.decodedBytes == .ok pngMagic),
+        jsonRt mixedBundle && binSf.decodedBytes == .ok pngMagic),
       ("SourceBundle.validate rejects bad encoding, bad base64, & empty/no-lean bundles",
-        !({ files := #[{ path := "App.lean", content := "x", encoding := "hex" }] } : SourceBundle).validate.isOk &&
-        !({ files := #[{ path := "App.lean", content := "x" }, { path := "logo.png", content := "not!b64", encoding := "base64" }] } : SourceBundle).validate.isOk &&
-        !({ files := #[{ path := "App.lean", content := "x" }, { path := "logo.png", content := "AB==", encoding := "base64" }] } : SourceBundle).validate.isOk &&
-        !({ files := #[binSf] } : SourceBundle).validate.isOk),
+        [#[{ path := "App.lean", content := "x", encoding := "hex" }],
+         #[{ path := "App.lean", content := "x" }, { path := "logo.png", content := "not!b64", encoding := "base64" }],
+         #[{ path := "App.lean", content := "x" }, { path := "logo.png", content := "AB==", encoding := "base64" }],
+         #[binSf]].all fun fs => !({ files := fs } : SourceBundle).validate.isOk),
       ("SecretDeleteReq JSON round-trip, default env, & validation",
-        (Json.parse (toJson delReq).render >>= fromJson) == .ok delReq &&
-        (Json.parse "{\"appSlug\":\"my-app\",\"name\":\"API_KEY\"}" >>= (fromJson : Json → Except String SecretDeleteReq)) == .ok { appSlug := "my-app", env := "prod", name := "API_KEY" } &&
-        !(Json.parse "{\"appSlug\":\"BAD\",\"env\":\"prod\",\"name\":\"API_KEY\"}" >>= (fromJson : Json → Except String SecretDeleteReq)).isOk &&
-        !(Json.parse "{\"appSlug\":\"my-app\",\"env\":\"dev\",\"name\":\"API_KEY\"}" >>= (fromJson : Json → Except String SecretDeleteReq)).isOk &&
-        !(Json.parse "{\"appSlug\":\"my-app\",\"env\":\"prod\",\"name\":\"bad_key\"}" >>= (fromJson : Json → Except String SecretDeleteReq)).isOk),
+        jsonRt delReq &&
+        decodeJson SecretDeleteReq "{\"appSlug\":\"my-app\",\"name\":\"API_KEY\"}" == .ok { appSlug := "my-app", env := "prod", name := "API_KEY" } &&
+        ["{\"appSlug\":\"BAD\",\"env\":\"prod\",\"name\":\"API_KEY\"}", "{\"appSlug\":\"my-app\",\"env\":\"dev\",\"name\":\"API_KEY\"}",
+         "{\"appSlug\":\"my-app\",\"env\":\"prod\",\"name\":\"bad_key\"}"].all (badJson SecretDeleteReq)),
       ("CancelDeployReq JSON round-trip & validation",
-        (Json.parse (toJson cancelReq).render >>= fromJson) == .ok cancelReq &&
-        !(Json.parse "{\"deploymentId\":\"\"}" >>= (fromJson : Json → Except String CancelDeployReq)).isOk &&
-        !(Json.parse "{\"deploymentId\":\"-bad\"}" >>= (fromJson : Json → Except String CancelDeployReq)).isOk &&
-        !(Json.parse "{\"deploymentId\":\"dep/bad?x=1\"}" >>= (fromJson : Json → Except String CancelDeployReq)).isOk),
+        jsonRt cancelReq && ["{\"deploymentId\":\"\"}", "{\"deploymentId\":\"-bad\"}", "{\"deploymentId\":\"dep/bad?x=1\"}"].all (badJson CancelDeployReq)),
       ("RuntimeLogsResp & TokenRevokeResp JSON round-trips (incl. omitted optional fields)",
-        (Json.parse (toJson rtResp).render >>= fromJson) == .ok rtResp &&
-        rtMinDec == .ok { appSlug := "my-app", env := "prod", pr := 0, logs := #[], nextPageToken := none } &&
-        (Json.parse (toJson revResp).render >>= fromJson) == .ok revResp),
-      ("defaultCloudApiUrl? is https://api.qed.cloud and passes isValidCloudApiUrl",
-        Qed.Cli.defaultCloudApiUrl? == some "https://api.qed.cloud" && isValidCloudApiUrl "https://api.qed.cloud"),
+        jsonRt rtResp &&
+        decodeJson RuntimeLogsResp "{\"appSlug\":\"my-app\",\"env\":\"prod\",\"logs\":[]}" == .ok { appSlug := "my-app", env := "prod", pr := 0, logs := #[], nextPageToken := none } &&
+        jsonRt revResp),
+      ("defaultCloudApiUrl?, isValidCloudApiUrl, & isValidDeviceUserCode",
+        Qed.Cli.defaultCloudApiUrl? == some "https://api.qed.cloud" &&
+        ["http://127.0.0.1:8080", "https://api.qed.cloud", "https://qed-cloud-abc-uc.a.run.app"].all isValidCloudApiUrl &&
+        ["http://example.com", "https://a.run.app/path"].all (!isValidCloudApiUrl ·) &&
+        isValidDeviceUserCode "ABCD-2345" && !isValidDeviceUserCode "abcd-2345" && !isValidDeviceUserCode "ABCD2345"),
       ("splitSecretAssignment preserves `=` inside secret values",
         Qed.Cli.splitSecretAssignment "API_KEY=sk_123" == some ("API_KEY", "sk_123") &&
         Qed.Cli.splitSecretAssignment "DB_URL=postgres://u:p@h/d?a=1&b=2" == some ("DB_URL", "postgres://u:p@h/d?a=1&b=2") &&
@@ -712,36 +705,28 @@ private def testCloudProtocolAndCli (c : TestChecker) : IO Unit := do
       let runCli (args : Array String) (extraEnv : Array (String × Option String) := #[]) : IO (UInt32 × String) := do
         let (code, o, e) ← runCmd qedBin args (env := baseEnv ++ extraEnv); return (code, o ++ e)
       -- CI auth via --token, --token=, & QED_CLOUD_TOKEN without credentials.json (never echoing token)
-      let (rc1, out1) ← runCli #["whoami", "--api", apiUrl, "--token", "tok_flag_999"]
-      c.check "qed whoami --token authenticates without credentials.json and never echoes token"
-        (rc1 == 0 && out1.contains "ci@qed.cloud" && !out1.contains "tok_flag_999" && (← stRef.get).reqs.any fun r => r.2.1 == "/api/v1/whoami" && r.2.2.1 == some "Bearer tok_flag_999") out1
-      let (rc1Eq, out1Eq) ← runCli #["whoami", s!"--api={apiUrl}", "--token=tok_eq_SECRET"]
-      c.check "qed whoami --api=... --token=... works and never echoes token"
-        (rc1Eq == 0 && out1Eq.contains "ci@qed.cloud" && !out1Eq.contains "tok_eq_SECRET" && (← stRef.get).reqs.any fun r => r.2.1 == "/api/v1/whoami" && r.2.2.1 == some "Bearer tok_eq_SECRET") out1Eq
-      let (rc2, out2) ← runCli #["whoami", "--api", apiUrl] #[("QED_CLOUD_TOKEN", some "tok_env_888")]
-      c.check "qed whoami with QED_CLOUD_TOKEN authenticates without credentials.json and never echoes token"
-        (rc2 == 0 && out2.contains "ci@qed.cloud" && !out2.contains "tok_env_888" && (← stRef.get).reqs.any fun r => r.2.1 == "/api/v1/whoami" && r.2.2.1 == some "Bearer tok_env_888") out2
+      for (lbl, args, extraEnv, tok) in [
+          ("qed whoami --token authenticates without credentials.json and never echoes token", #["whoami", "--api", apiUrl, "--token", "tok_flag_999"], #[], "tok_flag_999"),
+          ("qed whoami --api=... --token=... works and never echoes token", #["whoami", s!"--api={apiUrl}", "--token=tok_eq_SECRET"], #[], "tok_eq_SECRET"),
+          ("qed whoami with QED_CLOUD_TOKEN authenticates without credentials.json and never echoes token", #["whoami", "--api", apiUrl], #[("QED_CLOUD_TOKEN", some "tok_env_888")], "tok_env_888")] do
+        let (rc, out) ← runCli args extraEnv; let st ← stRef.get
+        c.check lbl (rc == 0 && out.contains "ci@qed.cloud" && !out.contains tok && st.reqs.any fun r => r.2.1 == "/api/v1/whoami" && r.2.2.1 == some s!"Bearer {tok}") out
       -- Secrets list, set (KEY=VALUE, --app KEY=VALUE, --value=, QED_SECRET_VALUE with whitespace), & delete
-      let (rcList, outList) ← runCli #["secrets", "list", "my-app", "--env", "staging", "--api", apiUrl, "--token", "tok_1"]
+      let (rcList, outList) ← runCli #["secrets", "list", "my-app", "--env", "staging", "--api", apiUrl, "--token", "tok_1"]; let stList ← stRef.get
       c.check "qed secrets list --env filters staging secrets and passes env query param"
         (rcList == 0 && outList.contains "staging:STAGE_KEY" && !outList.contains "prod:API_KEY" &&
-          (← stRef.get).reqs.any fun r => r.2.1 == "/api/v1/secrets?app=my-app&env=staging") outList
-      let (rcSet1, outSet1) ← runCli #["secrets", "set", "my-app", "STRIPE_KEY=sk_live=abc==", "--env", "prod", "--api", apiUrl, "--token", "tok_1"]
-      c.check "qed secrets set <app> KEY=VALUE preserves `=` and never echoes value"
-        (rcSet1 == 0 && !outSet1.contains "sk_live=abc==" && (← stRef.get).lastSecretSet == some { appSlug := "my-app", env := "prod", name := "STRIPE_KEY", value := "sk_live=abc==" }) outSet1
-      let (rcSet2, outSet2) ← runCli #["secrets", "set", "--app", "my-app", "DB_URL=postgres://u:p@h/d?ssl=1", "--env", "staging", "--api", apiUrl, "--token", "tok_1"]
-      c.check "qed secrets set --app <app> KEY=VALUE works and never echoes value"
-        (rcSet2 == 0 && !outSet2.contains "postgres://" && (← stRef.get).lastSecretSet == some { appSlug := "my-app", env := "staging", name := "DB_URL", value := "postgres://u:p@h/d?ssl=1" }) outSet2
-      let (rcSetValEq, outSetValEq) ← runCli #["secrets", "set", "my-app", "EQ_SEC", "--value=VAL_SECRET_EQ", "--api", apiUrl, "--token=tok_1"]
-      c.check "qed secrets set --value=SECRET works and never echoes value"
-        (rcSetValEq == 0 && !outSetValEq.contains "VAL_SECRET_EQ" && (← stRef.get).lastSecretSet == some { appSlug := "my-app", env := "prod", name := "EQ_SEC", value := "VAL_SECRET_EQ" }) outSetValEq
+          stList.reqs.any fun r => r.2.1 == "/api/v1/secrets?app=my-app&env=staging") outList
       let rawWsSecret := "  secret val \n"
-      let (rcSet3, outSet3) ← runCli #["secrets", "set", "my-app", "ENV_SEC", "--env", "preview", "--api", apiUrl, "--token", "tok_1"] #[("QED_SECRET_VALUE", some rawWsSecret)]
-      c.check "qed secrets set preserves leading/trailing whitespace & newline in QED_SECRET_VALUE"
-        (rcSet3 == 0 && !outSet3.contains "secret val" && (← stRef.get).lastSecretSet == some { appSlug := "my-app", env := "preview", name := "ENV_SEC", value := rawWsSecret }) outSet3
-      let (rcDel, outDel) ← runCli #["secrets", "delete", "my-app", "STRIPE_KEY", "--env", "prod", "--api", apiUrl, "--token", "tok_1"]
+      for (lbl, args, extraEnv, leak, want) in [
+          ("qed secrets set <app> KEY=VALUE preserves `=` and never echoes value", #["secrets", "set", "my-app", "STRIPE_KEY=sk_live=abc==", "--env", "prod", "--api", apiUrl, "--token", "tok_1"], #[], "sk_live=abc==", ({ appSlug := "my-app", env := "prod", name := "STRIPE_KEY", value := "sk_live=abc==" } : SecretSetReq)),
+          ("qed secrets set --app <app> KEY=VALUE works and never echoes value", #["secrets", "set", "--app", "my-app", "DB_URL=postgres://u:p@h/d?ssl=1", "--env", "staging", "--api", apiUrl, "--token", "tok_1"], #[], "postgres://", { appSlug := "my-app", env := "staging", name := "DB_URL", value := "postgres://u:p@h/d?ssl=1" }),
+          ("qed secrets set --value=SECRET works and never echoes value", #["secrets", "set", "my-app", "EQ_SEC", "--value=VAL_SECRET_EQ", "--api", apiUrl, "--token=tok_1"], #[], "VAL_SECRET_EQ", { appSlug := "my-app", env := "prod", name := "EQ_SEC", value := "VAL_SECRET_EQ" }),
+          ("qed secrets set preserves leading/trailing whitespace & newline in QED_SECRET_VALUE", #["secrets", "set", "my-app", "ENV_SEC", "--env", "preview", "--api", apiUrl, "--token", "tok_1"], #[("QED_SECRET_VALUE", some rawWsSecret)], "secret val", { appSlug := "my-app", env := "preview", name := "ENV_SEC", value := rawWsSecret })] do
+        let (rc, out) ← runCli args extraEnv; let st ← stRef.get
+        c.check lbl (rc == 0 && !out.contains leak && st.lastSecretSet == some want) out
+      let (rcDel, outDel) ← runCli #["secrets", "delete", "my-app", "STRIPE_KEY", "--env", "prod", "--api", apiUrl, "--token", "tok_1"]; let stDel ← stRef.get
       c.check "qed secrets delete sends SecretDeleteReq to /api/v1/secrets/delete"
-        (rcDel == 0 && (← stRef.get).lastSecretDel == some { appSlug := "my-app", env := "prod", name := "STRIPE_KEY" }) outDel
+        (rcDel == 0 && stDel.lastSecretDel == some { appSlug := "my-app", env := "prod", name := "STRIPE_KEY" }) outDel
       -- Redaction & leading-dash unknown flag rejection (NEVER echo secrets/tokens on errors)
       for (lbl, args, forbidden) in [
           ("whoami --token=SECRET --bad=LEAK redacts errors", #["whoami", "--token=SECRET", "--bad=LEAK"], ["SECRET", "LEAK"]),
@@ -755,49 +740,33 @@ private def testCloudProtocolAndCli (c : TestChecker) : IO Unit := do
         let (rcBad, outBad) ← runCli args
         c.check lbl (rcBad != 0 && forbidden.all (!outBad.contains ·)) outBad
       -- Runtime logs & cancel & canceled build log --follow
-      let (rcRt, outRt) ← runCli #["logs", "my-app", "--runtime", "--env", "prod", "--severity", "error", "--search", "hello world&x=1", "--api", apiUrl, "--token", "tok_1"]
+      let (rcRt, outRt) ← runCli #["logs", "my-app", "--runtime", "--env", "prod", "--severity", "error", "--search", "hello world&x=1", "--api", apiUrl, "--token", "tok_1"]; let stRt ← stRef.get
       c.check "qed logs --runtime URL-encodes query params and formats runtime logs"
         (rcRt == 0 && outRt.contains "GET /boom -> 500" &&
-          (← stRef.get).reqs.any fun r => r.2.1 == "/api/v1/logs/runtime?app=my-app&env=prod&severity=error&search=hello%20world%26x%3D1") outRt
-      let (rcCan, outCan) ← runCli #["cancel", "dep_abc123", "--api", apiUrl, "--token", "tok_1"]
+          stRt.reqs.any fun r => r.2.1 == "/api/v1/logs/runtime?app=my-app&env=prod&severity=error&search=hello%20world%26x%3D1") outRt
+      let (rcCan, outCan) ← runCli #["cancel", "dep_abc123", "--api", apiUrl, "--token", "tok_1"]; let stCan ← stRef.get
       c.check "qed cancel sends CancelDeployReq to /api/v1/deployment/cancel"
-        (rcCan == 0 && (← stRef.get).lastCancel == some { deploymentId := "dep_abc123" }) outCan
+        (rcCan == 0 && stCan.lastCancel == some { deploymentId := "dep_abc123" }) outCan
       let (rcFol, outFol) ← runCli #["logs", "dep_canceled_1", "--follow", "--api", apiUrl, "--token", "tok_1"]
       c.check "qed logs <id> --follow exits cleanly on canceled status" (rcFol != 0 && outFol.contains "Deployment canceled") outFol
       -- Logout: --token without credentials.json, --token preserving existing credentials.json, stored creds, mismatched --api, & server failure
-      stRef.modify fun s => { s with reqs := #[], failRevoke := false }
-      let (rcLoTok0, outLoTok0) ← runCli #["logout", "--api", apiUrl, "--token", "tok_ci_only"]
-      c.check "qed logout --token revokes explicit token when no credentials file exists"
-        (rcLoTok0 == 0 && !outLoTok0.contains "tok_ci_only" &&
-          (← stRef.get).reqs.any fun r => r.1 == "POST" && r.2.1 == "/api/v1/tokens/revoke-current" && r.2.2.1 == some "Bearer tok_ci_only") outLoTok0
       let seedCreds : Qed.Cli.CloudCredentials := { apiBase := apiUrl, token := "tok_stored_777", userId := "u1", email := "u1@qed.cloud" }
-      IO.FS.writeFile (System.FilePath.mk credsFile) ((toJson seedCreds).render ++ "\n")
-      stRef.modify fun s => { s with reqs := #[] }
-      let (rcLoTok1, outLoTok1) ← runCli #["logout", "--api", apiUrl, "--token=tok_ci_keep_file"]
-      c.check "qed logout --token revokes explicit token without deleting unrelated credentials.json"
-        (rcLoTok1 == 0 && !outLoTok1.contains "tok_ci_keep_file" && (← (System.FilePath.mk credsFile).pathExists) &&
-          (← stRef.get).reqs.any (fun r => r.2.2.1 == some "Bearer tok_ci_keep_file") &&
-          !(← stRef.get).reqs.any (fun r => r.2.2.1 == some "Bearer tok_stored_777")) outLoTok1
-      -- Mismatched --api with stored credentials: warns, does NOT send stored token to wrong host, removes local credentials
-      stRef.modify fun s => { s with reqs := #[] }
-      let (rcLoMis, outLoMis) ← runCli #["logout", "--api", "http://127.0.0.1:1"]
-      c.check "qed logout with mismatched --api warns, skips remote revoke, and removes local credentials"
-        (rcLoMis == 0 && outLoMis.contains "warning:" && !(← (System.FilePath.mk credsFile).pathExists) && (← stRef.get).reqs.isEmpty) outLoMis
-      -- Matching stored credentials: revokes remotely and removes local credentials
-      IO.FS.writeFile (System.FilePath.mk credsFile) ((toJson seedCreds).render ++ "\n")
-      let (rcLo1, outLo1) ← runCli #["logout", "--api", apiUrl]
-      c.check "qed logout calls POST /api/v1/tokens/revoke-current and removes credentials file"
-        (rcLo1 == 0 && !outLo1.contains "tok_stored_777" && !(← (System.FilePath.mk credsFile).pathExists) &&
-          (← stRef.get).reqs.any fun r => r.1 == "POST" && r.2.1 == "/api/v1/tokens/revoke-current" && r.2.2.1 == some "Bearer tok_stored_777") outLo1
-      -- Server error on revoke: stored-creds logout warns & removes local file; explicit --token fails non-zero
-      stRef.modify fun s => { s with failRevoke := true }
-      IO.FS.writeFile (System.FilePath.mk credsFile) ((toJson seedCreds).render ++ "\n")
-      let (rcLo2, outLo2) ← runCli #["logout", "--api", apiUrl]
-      c.check "qed logout warns and still removes local credentials when remote revoke fails"
-        (rcLo2 == 0 && outLo2.contains "warning:" && !(← (System.FilePath.mk credsFile).pathExists)) outLo2
-      let (rcLoTokFail, outLoTokFail) ← runCli #["logout", "--api", apiUrl, "--token", "tok_fail_secret"]
-      c.check "qed logout --token fails non-zero on server error without printing success or token"
-        (rcLoTokFail != 0 && !outLoTokFail.contains "token revoked" && !outLoTokFail.contains "tok_fail_secret") outLoTokFail
+      let seedJson := (toJson seedCreds).render ++ "\n"
+      for (lbl, seed, failRev, args, wantOk, has, omits, keepFile, wantTok?, noTok?) in [
+          ("qed logout --token revokes explicit token when no credentials file exists", false, false, #["logout", "--api", apiUrl, "--token", "tok_ci_only"], true, [], ["tok_ci_only"], false, some "tok_ci_only", none),
+          ("qed logout --token revokes explicit token without deleting unrelated credentials.json", true, false, #["logout", "--api", apiUrl, "--token=tok_ci_keep_file"], true, [], ["tok_ci_keep_file"], true, some "tok_ci_keep_file", some "tok_stored_777"),
+          ("qed logout with mismatched --api warns, skips remote revoke, and removes local credentials", true, false, #["logout", "--api", "http://127.0.0.1:1"], true, ["warning:"], [], false, none, some "tok_stored_777"),
+          ("qed logout calls POST /api/v1/tokens/revoke-current and removes credentials file", true, false, #["logout", "--api", apiUrl], true, [], ["tok_stored_777"], false, some "tok_stored_777", none),
+          ("qed logout warns and still removes local credentials when remote revoke fails", true, true, #["logout", "--api", apiUrl], true, ["warning:"], [], false, none, none),
+          ("qed logout --token fails non-zero on server error without printing success or token", false, true, #["logout", "--api", apiUrl, "--token", "tok_fail_secret"], false, [], ["token revoked", "tok_fail_secret"], false, none, none)] do
+        if seed then IO.FS.writeFile (System.FilePath.mk credsFile) seedJson
+        stRef.modify fun s => { s with reqs := #[], failRevoke := failRev }
+        let (rc, out) ← runCli args
+        let reqs := (← stRef.get).reqs; let existsF ← (System.FilePath.mk credsFile).pathExists
+        let hasTok := wantTok?.all fun t => reqs.any fun r => r.1 == "POST" && r.2.1 == "/api/v1/tokens/revoke-current" && r.2.2.1 == some s!"Bearer {t}"
+        let skipsTok := noTok?.all fun t => !reqs.any fun r => r.2.2.1 == some s!"Bearer {t}"
+        let noReqsOk := if lbl.contains "mismatched" then reqs.isEmpty else true
+        c.check lbl ((rc == 0) == wantOk && has.all (out.contains ·) && omits.all (!out.contains ·) && existsF == keepFile && hasTok && skipsTok && noReqsOk) out
 
 def run : IO Bool := do let c ← mkChecker "cloud-deploy"; testCloudDeployEndToEnd c; testCloudProtocolAndCli c; c.finish
 

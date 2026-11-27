@@ -109,20 +109,9 @@ server QuerySrv:
     requires ctx.userId != none, 1 <= qty <= 50
     ensures result == qty, 1 <= result <= 50
     return qty
-expect_err "reactive `query count` cannot call mutating server RPC `QuerySrv.bump`" in
-component BadMutatingQuery:
-  query count = QuerySrv.bump()
-  view: <span>ok</span>
-expect_err "RPC `QuerySrv.quote` precondition `1 <= qty <= 50` could not be proved here:\n  • must satisfy:  1 <= 0 and 0 <= 50" in
-component BadQueryRequiresParam:
-  session user
-  query q = QuerySrv.quote(0) if user.isSome
-  view: <span>ok</span>
-expect_err "RPC `QuerySrv.quote` requires an authenticated session (`user != none`)" in
-component BadQueryRequiresAuth:
-  session user
-  query q = QuerySrv.quote(5)
-  view: <span>ok</span>
+bad_comp_query "reactive `query count` cannot call mutating server RPC `QuerySrv.bump`" BadMutatingQuery count = QuerySrv.bump()
+bad_comp_query "RPC `QuerySrv.quote` precondition `1 <= qty <= 50` could not be proved here:\n  • must satisfy:  1 <= 0 and 0 <= 50" BadQueryRequiresParam q = QuerySrv.quote(0) if user.isSome
+bad_comp_query "RPC `QuerySrv.quote` requires an authenticated session (`user != none`)" BadQueryRequiresAuth q = QuerySrv.quote(5)
 component VerifiedQueryFlow:
   session user
   state qty : Nat = 5
@@ -133,11 +122,7 @@ component VerifiedQueryFlow:
   invariant echoedValid: echoed.all(v => 1 <= v <= 50)
   action setQty(q: Nat): if 1 <= q <= 50: qty = q
   view: <div><Await of={quote} as={v}><span>{f"{v}"}</span></Await><Await of={echoed} as={e}><span>{f"{e}"}</span></Await></div>
-expect_err "`external BadAuthWs` declares client-usable `ws` channels and cannot attach server `auth` secrets" in
-external BadAuthWs:
-  base "wss://ws.example.com"
-  auth bearer(secret("WS_SECRET"))
-  ws "/stream" feed() -> String
+bad_ext "`external BadAuthWs` declares client-usable `ws` channels and cannot attach server `auth` secrets" BadAuthWs : base "wss://ws.example.com" | auth bearer(secret("WS_SECRET")) | ws "/stream" feed() -> String
 expect_err "Channel `ensures` postcondition failed at `emit`:\n  • must satisfy:  99 <= 50" in
 server BadEmitSrv:
   channel bounded() -> Nat:
@@ -155,25 +140,9 @@ server WsCheckSrv:
       requires v <= 50
       gauge.emit(room, v)
     on_leave: pass
-expect_err "RPC `WsCheckSrv.gauge` requires an authenticated session (`user != none`)" in
-component BadSubNoAuth:
-  session user
-  subscribe g = WsCheckSrv.gauge(1):
-    on_message(_): pass
-  view: <span>ok</span>
-expect_err "RPC `WsCheckSrv.gauge` precondition `room <= 10` could not be proved here:\n  • must satisfy:  99 <= 10" in
-component BadSubBadParam:
-  session user
-  subscribe g = WsCheckSrv.gauge(99) if user.isSome:
-    on_message(_): pass
-  view: <span>ok</span>
-expect_err "RPC `WsCheckSrv.gauge.send` precondition `v <= 50` could not be proved here:\n  • must satisfy:  77 <= 50" in
-component BadSendParam:
-  session user
-  subscribe g = WsCheckSrv.gauge(1) if user.isSome:
-    on_message(_): pass
-  action go: g.send(77)
-  view: <span>ok</span>
+bad_comp_sub "RPC `WsCheckSrv.gauge` requires an authenticated session (`user != none`)" BadSubNoAuth g = WsCheckSrv.gauge(1)
+bad_comp_sub "RPC `WsCheckSrv.gauge` precondition `room <= 10` could not be proved here:\n  • must satisfy:  99 <= 10" BadSubBadParam g = WsCheckSrv.gauge(99) if user.isSome
+bad_comp_sub "RPC `WsCheckSrv.gauge.send` precondition `v <= 50` could not be proved here:\n  • must satisfy:  77 <= 50" BadSendParam g = WsCheckSrv.gauge(1) if user.isSome | go : g.send(77)
 component SubOtherWs:
   session user
   subscribe g = WsCheckSrv.gauge(1) if user.isSome:
@@ -196,28 +165,7 @@ example : (
   strHasAll ck ["qed_session=tokX-Evil: 1", "HttpOnly", "SameSite=Lax", "Secure", "Max-Age=3600"] && !ck.toList.contains '\r' && !ck.toList.contains '\n' &&
   parseGz "br, gzip, deflate" == some true && parseGz "gzip;q=0" == some false &&
   strHasAll doc ["<title>Page &lt;/title&gt;&lt;script&gt;alert(1)&lt;/script&gt;</title>", "<meta name=\"description\" content=\"Desc &quot;quoted&quot; &lt;tag&gt;\">", "<meta name=\"og:title\" content=\"OG &quot;bad&quot;\">", "<link rel=\"canonical\" href=\"https://example.com/posts/1\">"] &&
-  !strHas doc "<script>alert(1)</script>" && !strHas badDoc "rel=\"canonical\"" && !strHas badDoc "javascript:") = true := by decide +kernel
-server WebEssentialsSrv:
-  state hits : Nat = 0
-  invariant hitsBounded: hits <= 1000
-  rpc login(token: String) -> String:
-    setCookie("qed_session", token)
-    return "ok"
-  get "/robots.txt": return text("User-agent: *\nAllow: /\n")
-  post "/webhook":
-    requires ctx.isAuthenticated
-    atomic: if hits < 1000: hits += 1
-    setCookie("wh_seen", "1")
-    return json({ ok = true })
-  post "/echo-cookie":
-    atomic: if hits < 1000: hits += 1
-    setCookie("echo_ck", ctx.body)
-    return json({ ok = true })
-  get "/stats": return json({ ok = true, hits = hits })
-  get "/hits": return json(hits)
-  stream "/events":
-    send("hello", event = "greeting", id = "1")
-    send("world")
+  !strHas doc "<script>alert(1)</script>" && strHasNone badDoc ["rel=\"canonical\"", "javascript:"]) = true := by decide +kernel
 bad_srv_inv "Server invariant `hitsBounded` failed in `POST /bad`:\n  • must satisfy:  hits + 5 <= 10" BadHttpRouteInv hits : Nat = 0 | hitsBounded : hits <= 10 |
   post "/bad":
     hits += 5
@@ -274,10 +222,7 @@ server stateless RedactedHub:
     requires ctx.userId != none
     room.emit(code, { code = code, secretLocation = loc, secretPack = pack, spyIds = spies })
 
-example := @RedactedHub.is_stateless
-example := @RedactedHub.room_project_ensures
-example := @RedactedHub.room_project_blindTo
-example := @RedactedHub.room_project_channel_ensures
+check_decls [RedactedHub.is_stateless, RedactedHub.room_project_ensures, RedactedHub.room_project_blindTo, RedactedHub.room_project_channel_ensures]
 
 example : (
   let raw : RawGameRoom := { code := "ABCD", secretLocation := "Casino", secretPack := "Classic", spyIds := #["bob"] }
@@ -422,19 +367,10 @@ example : (
   (Qed.Server.WebhookUrl.parse? "http://insecure.example.com").isNone &&
   ({ query := "?a=1&tag=hi+qed", body := "{\"msg\":\"yo\"}" : Qed.Server.RequestCtx }).queryParam "tag" == some "hi qed") = true := by decide +kernel
 
-example := @Qed.Server.ApiError.wireMessage_prod_5xx
+check_decls [Qed.Server.ApiError.wireMessage_prod_5xx]
 
-expect_err "`read_only rpc badMut` is not read-only: it mutates server state" in
-server BadReadOnlyMutSrv:
-  state x : Nat = 0
-  read_only rpc badMut() -> Nat:
-    x += 1
-    return x
-
-expect_err "`read_only rpc badCookie` is not read-only: it sets or clears cookies" in
-server stateless BadReadOnlyCookieSrv:
-  read_only rpc badCookie() -> Unit:
-    setCookie("a", "b")
+bad_srv_st "`read_only rpc badMut` is not read-only: it mutates server state" BadReadOnlyMutSrv x : Nat = 0 | read_only rpc badMut() -> Nat: x += 1; return x
+bad_srv1 "`read_only rpc badCookie` is not read-only: it sets or clears cookies" BadReadOnlyCookieSrv : read_only rpc badCookie() -> Unit: setCookie("a", "b")
 
 /-! ## Phase 3 Tests: Richer `external`, `service`, `Crypto`/`Time`/`Random`/`secret`, Default Params, Guard-`let`, `prove:` -/
 
@@ -467,15 +403,8 @@ external UnguardedLocalApi:
   ssrf_guard false
   get "/ping" ping() -> String
 
-expect_err "`Form(T)` is only supported for HTTP request body parameters, not response types" in
-external BadFormRetApi:
-  base "https://api.example.com"
-  get "/bad" bad() -> Form(StripeCheckoutReq)
-
-expect_err "HTTP status code `999` in `ok [...]` must be between 100 and 599" in
-external BadOkStatusApi:
-  base "https://api.example.com"
-  get "/bad" bad() -> String ok [200, 999]
+bad_ext "`Form(T)` is only supported for HTTP request body parameters, not response types" BadFormRetApi : base "https://api.example.com" | get "/bad" bad() -> Form(StripeCheckoutReq)
+bad_ext "HTTP status code `999` in `ok [...]` must be between 100 and 599" BadOkStatusApi : base "https://api.example.com" | get "/bad" bad() -> String ok [200, 999]
 
 private def doublePlus (n : Nat) : Nat := n + n + 1
 private theorem doublePlus_odd (n : Nat) : doublePlus n % 2 = 1 := by unfold doublePlus; omega
@@ -725,41 +654,29 @@ server VaultExApi:
     post "/echo"
     expect status == 200
 
-expect_err "Server invariant `no_http` failed in `sneaky`" in
-service BadNoHttpSvc:
+bad_svc "Server invariant `no_http` failed in `sneaky`" BadNoHttpSvc :
   fn sneaky(id: String) -> String!:
     no_http
     return await ItemSyncApi.syncOne(id)?
-
-expect_err "Server invariant `no_decrypt` failed in `readSecret`" in
-server stateless BadNoDecryptSrv:
-  use db : ExVaultDb
+bad_db "Server invariant `no_decrypt` failed in `readSecret`" ExVaultDb :
   read_only rpc readSecret() -> ExVaultDb.vault_items[]!:
     requires auth
     no_decrypt
     return await db.vault_items.select(where = r => r.ownerId == uid)?
-
-expect_err "Server invariant `no_db_write` failed in `sneakyInsert`" in
-server stateless BadNoDbWriteSrv:
-  use db : ExVaultDb
+bad_db "Server invariant `no_db_write` failed in `sneakyInsert`" ExVaultDb :
   rpc sneakyInsert(id: String, label: String, payload: String) -> ExVaultDb.vault_items!:
     requires auth, 1 <= id.length <= 64, 1 <= label.length <= 120, 1 <= uid.length <= 64
     no_db_write
     return await db.vault_items.insert(id = id, ownerId = uid, label = label, payload = payload)?
-
-expect_err "Server postcondition `ensures ensures_fails 400` failed in `actuallySucceeds`" in
-service BadEnsuresFailsSvc:
+bad_svc "Server postcondition `ensures ensures_fails 400` failed in `actuallySucceeds`" BadEnsuresFailsSvc :
   fn actuallySucceeds(n: Nat) -> Nat!:
     ensures_fails 400
     return n + 1
-
-expect_err "proved that the proposition" in
-service BadSrvExampleSvc:
-  fn inc(n: Nat) -> Nat!:
-    return n + 1
-  example wrongResult:
-    call inc(1)
-    expect ok(99)
+bad_svc "proved that the proposition" BadSrvExampleSvc :
+  fn inc(n: Nat) -> Nat!: return n + 1
+  | example wrongResult:
+      call inc(1)
+      expect ok(99)
 
 /-! ## Multi-Origin External, Async Loops/Retry, and Verified `every` Jobs -/
 
@@ -847,50 +764,20 @@ server WorkerLoopSrv:
 
 example : (WorkerLoopSrv.jobs.size == 2 && (WorkerLoopSrv.jobs[0]?.map (·.name) == some "drainOne") && (WorkerLoopSrv.jobs[0]?.map (·.runWorkM?.isSome) == some true)) = true := by decide +kernel
 
-expect_err "has no matching `where region : Enum` or `where region in [...]` allowlist" in
-external BadMissingBaseWhere:
-  base "https://{region}-run.googleapis.com"
-  get "/ping" ping(region: String) -> String
-
-expect_err "must be a unit `enum`" in
-external BadPayloadEnumWhere:
-  base "https://{p}.example.com" where p : PayloadEnum
-  get "/ping" ping(p: PayloadEnum) -> String
-
-expect_err "invalid expanded `base` origin" in
-external BadExpandedOrigin:
-  base "https://{host}.example.com" where host in ["good", "bad@evil"]
-  get "/ping" ping(host: String) -> String
-
-expect_err "requires a matching parameter `region` on endpoint `ping`" in
-external BadMissingEndpointBaseParam:
-  base "https://{region}-run.googleapis.com" where region : CloudRegion
-  get "/ping" ping() -> String
-
-expect_err "Server invariant `no_http` failed in `badJob`" in
-server stateless BadEveryNoHttpSrv:
+bad_ext "has no matching `where region : Enum` or `where region in [...]` allowlist" BadMissingBaseWhere : base "https://{region}-run.googleapis.com" | get "/ping" ping(region: String) -> String
+bad_ext "must be a unit `enum`" BadPayloadEnumWhere : base "https://{p}.example.com" where p : PayloadEnum | get "/ping" ping(p: PayloadEnum) -> String
+bad_ext "invalid expanded `base` origin" BadExpandedOrigin : base "https://{host}.example.com" where host in ["good", "bad@evil"] | get "/ping" ping(host: String) -> String
+bad_ext "requires a matching parameter `region` on endpoint `ping`" BadMissingEndpointBaseParam : base "https://{region}-run.googleapis.com" where region : CloudRegion | get "/ping" ping() -> String
+bad_srv1 "Server invariant `no_http` failed in `badJob`" BadEveryNoHttpSrv :
   every 10s badJob -> Bool:
     no_http
     let _ = await PingApi.ping()
       catch _err:
         return false
     return true
-
-expect_err "`every` job `badRet` return type must be `Bool`" in
-server stateless BadEveryRetTypeSrv:
-  every 10s badRet -> String:
-    return "nope"
-
-expect_err "missing `return` on fallthrough path of `-> Bool` job `badFallthrough`" in
-server stateless BadEveryFallthroughSrv:
-  every 10s badFallthrough -> Bool:
-    let _x = 1
-
-expect_err "`break` can only be used inside a `for` loop" in
-service BadAsyncBreakSvc:
-  fn bad() -> Nat!:
-    break
-    return 1
+bad_srv1 "`every` job `badRet` return type must be `Bool`" BadEveryRetTypeSrv : every 10s badRet -> String: return "nope"
+bad_srv1 "missing `return` on fallthrough path of `-> Bool` job `badFallthrough`" BadEveryFallthroughSrv : every 10s badFallthrough -> Bool: let _x = 1
+bad_svc "`break` can only be used inside a `for` loop" BadAsyncBreakSvc : fn bad() -> Nat!: break; return 1
 
 /-! ## Kernel Reduction, Webhook Effects & Ergonomics Regressions -/
 
@@ -1001,8 +888,7 @@ service ErgoAndKernelSvc:
     call buildJsonList(["a", "b"], "k")
     expect result == .ok(Json.arr([Json.obj([("tag", .str("k")), ("v", .str("a"))]), Json.obj([("tag", .str("k")), ("v", .str("b"))])]))
 
-expect_err "Server invariant `no_http` failed in `badWebhookNoHttp`" in
-service BadWebhookNoHttpSvc:
+bad_svc "Server invariant `no_http` failed in `badWebhookNoHttp`" BadWebhookNoHttpSvc :
   fn badWebhookNoHttp(url: WebhookUrl) -> String!:
     no_http
     let resp : Json = await Qed.Server.Webhook.postJson(url, Json.null)?

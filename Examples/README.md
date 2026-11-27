@@ -23,7 +23,7 @@ QED_WEB_ROOT=Examples.CloudBooks ./scripts/qed dev
 QED_WEB_ROOT=Examples.LiveRoom ./scripts/qed dev
 ```
 
-Run all proof checks and the 6 native test suites from the repo root:
+Run all proof checks and the 7 native test suites from the repo root:
 
 ```bash
 ./scripts/qed check
@@ -34,16 +34,16 @@ Run all proof checks and the 6 native test suites from the repo root:
 
 ## Tour
 
-1. **[Counter.lean](Counter.lean)** — Basic component state, explicit `action`s, DOM focus preservation across updates, and an automatic `0 <= count` invariant.
-2. **[Todo.lean](Todo.lean)** — Child `Row` components inside a parent `collection` using `push`, `filter`, and `sortBy`, scoped `style` blocks, and `for_each` invariants lifting both child state and view styling rules.
-3. **[Signup.lean](Signup.lean)** — A `schema` with `where` validation predicates, automatic JSON and Protobuf codecs, and a self-hosted `<Account.Form reset onSubmit={...}/>` gated on schema validity.
-4. **[Chat.lean](Chat.lean)** — Streaming Server-Sent Events with `Cmd.stream`, loop rendering, and an effect-safety invariant `pending -> 0 < turns.size`.
-5. **[Bookshelf.lean](Bookshelf.lean)** — Routed SPA and native SSR app combining `router`, `<Book.Form>`, `style` and `theme`, `Resource` HTTP requests, `<Await>`, `Cmd.pushUrl`, and SSR hydration.
-6. **[CloudBooks.lean](CloudBooks.lean)** — Full-stack app pairing typed `external` HTTP APIs and a stateful native `server` with `invariant`, `requires`/`ensures`, `atomic:`, and `session` auth alongside a `Storefront` client component.
-7. **[LiveRoom.lean](LiveRoom.lean)** — Full-stack WebSocket app combining multiplexed binary server `channel`s with `on_join`, `on_send`, `on_leave`, and transactional `emit`, plus third-party `external` `ws` feeds with per-subscription `reconnect` policies.
+1. **[Counter.lean](Counter.lean)**: Basic component state, explicit `action`s, DOM focus preservation across updates, and an automatic `0 <= count` invariant.
+2. **[Todo.lean](Todo.lean)**: Child `Row` components inside a parent `collection` using `push`, `filter`, and `sortBy`, scoped `style` blocks, and `for_each` invariants lifting both child state and view styling rules.
+3. **[Signup.lean](Signup.lean)**: A `schema` with `where` validation predicates, automatic JSON and Protobuf codecs, and a self-hosted `<Account.Form reset onSubmit={...}/>` gated on schema validity.
+4. **[Chat.lean](Chat.lean)**: Streaming Server-Sent Events with `Cmd.stream`, loop rendering, and an effect-safety invariant `pending -> 0 < turns.size`.
+5. **[Bookshelf.lean](Bookshelf.lean)**: Routed SPA and native SSR app combining `router`, `<Book.Form>`, `style` and `theme`, `Resource` HTTP requests, `<Await>`, `Cmd.pushUrl`, and SSR hydration.
+6. **[CloudBooks.lean](CloudBooks.lean)**: Full-stack app pairing typed `external` HTTP APIs and a stateful native `server` with `invariant`, `requires`/`ensures`, `atomic:`, and `session` auth alongside a `Storefront` client component.
+7. **[LiveRoom.lean](LiveRoom.lean)**: Full-stack WebSocket app combining multiplexed binary server `channel`s with `on_join`, `on_send`, `on_leave`, and transactional `emit`, plus third-party `external` `ws` feeds with per-subscription `reconnect` policies.
 
 ---
 
 ## Compiler Gates & Benchmarks
 
-Compiler and runtime test modules live in [../QedTests/](../QedTests/), covering `SyntaxChecks`, `ServerChecks`, `DbChecks`, `CssChecks`, `JsGate`, `SpeculativeChecks`, and the native `QedTests/Runner.lean` test runner. Pipeline benchmarks live in [../Bench/](../Bench/) via `lake exe bench`.
+Compiler and runtime test modules live in [../QedTests/](../QedTests/), covering `SyntaxChecks`, `ServerChecks`, `DbChecks`, `CssChecks`, `AuthChecks`, `CloudChecks`, `VerificationChecks`, `SpeculativeChecks`, `JsGate`, and the 7 native test suites in `QedTests/Runner.lean`. Pipeline benchmarks live in [../Bench/](../Bench/) via `lake exe bench`.

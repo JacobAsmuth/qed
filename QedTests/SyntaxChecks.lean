@@ -176,7 +176,7 @@ example : (
   [("/docs/bench/5", some (DocRoute.sec .benchmarks 5)), ("/docs/unknown/5", none), ("/docs/arch/2?tab=api#top", some (DocRoute.sec .architecture 2)), ("/?utm=1#hero", some DocRoute.home)].all (fun (u, w) => Router.fromURL u == w) &&
   (RoutedDehydrated.app.rehydrate (RoutedDehydrated.app.dehydrate { r := .sec .benchmarks 3 })).map (·.r) == some (.sec .benchmarks 3) &&
   strHas (Html.render (TypedLink.view { target := .sec .architecture 2 } { cur := .home })) "href=\"/docs/arch/2\"" &&
-  AutoStyled.app.styles.length == 2 && strHas (AutoStyled.app.ssrStep "T" "/qed.js" "/" "") navOn.raw &&
+  AutoStyled.app.styles.length == 2 && strHas (renderStyleSheet AutoStyled.app.styles) navOn.raw &&
   strHas ResetTheme.style.raw ":where(*, *::before) { margin: 0px; }" && typedBorderStyle.raw == "border: 1px solid var(--border-subtle); border-bottom: 2px dashed #333; border-top: none;" &&
   strHas (Html.render (ParentPage.view { route := .sec .architecture 3 })) "/docs/arch/1" &&
   Router.toURL (RepoRoute.edit "acme" "qed") == "/orgs/acme/repos/qed/edit" &&
@@ -280,26 +280,21 @@ example : (
   let s1 := CompositeDemo.update CompositeDemo.init (._sub_0 (._emit (.set_filter "lean4")))
   let s2 := CompositeDemo.update s1 (._sub_0 (._emit (.onPick "lean4")))
   let s3 := CompositeDemo.update s2 (._sub_1 .toggle)
-  Qed.Str.contains gl "href=\"/docs/guide\"" && Qed.Str.contains gl "<span>3</span>" &&
+  strHasAll gl ["href=\"/docs/guide\"", "<span>3</span>"] &&
   fracStyle.raw == "text-align: center; padding: 0.35rem 0 0.5rem; margin: 2rem auto; gap: 4px 8px; line-height: 1.5; font-weight: 600; opacity: 0.85; z-index: -1;" &&
   (match (Resource.ok (none : Option Nat)).someOr "missing" with | .failed "missing" => true | _ => false) &&
   (match (Resource.ok (some 42)).someOr "missing" with | .ok 42 => true | _ => false) &&
   (match (({} : Cached Nat).put "a" (.ok 1) "b").state with | .idle => true | _ => false) &&
   ((({} : Cached Nat).put "a" (.ok 1) "b").lookup "a" == some 1) && (match (({} : Cached Nat).put "a" (.ok 7) "a").state with | .ok 7 => true | _ => false) &&
-  Qed.Str.contains cs "<h3>Docs</h3><span class=\"badge\">v2</span>" && Qed.Str.contains cs "<li class=\"chip\">Alpha</li>" && !Qed.Str.contains cs "data-qed-local" &&
-  s1.query == "lean4" && s2.picked == "lean4" && !Qed.Str.contains (Html.render (CompositeDemo.view CompositeDemo.init)) "class=\"panel\"" &&
-  Qed.Str.contains (Html.render (CompositeDemo.view s3)) "class=\"panel\"" &&
+  strHasAll cs ["<h3>Docs</h3><span class=\"badge\">v2</span>", "<li class=\"chip\">Alpha</li>"] && !strHas cs "data-qed-local" &&
+  s1.query == "lean4" && s2.picked == "lean4" && !strHas (Html.render (CompositeDemo.view CompositeDemo.init)) "class=\"panel\"" &&
+  strHas (Html.render (CompositeDemo.view s3)) "class=\"panel\"" &&
   (CompositeDemo.app.rehydrate (CompositeDemo.app.dehydrate { s3 with clicks := 5, scratch := 0 })).map (fun s => (s.query, s.clicks, s.scratch)) == some ("lean4", 5, 99) &&
-  Qed.Str.contains (Html.render (awaitSample .loading)) "<p>Wait</p>" && Qed.Str.contains (Html.render (awaitSample (.failed "boom"))) "<p class=\"err\">boom</p>" &&
+  strHas (Html.render (awaitSample .loading)) "<p>Wait</p>" && strHas (Html.render (awaitSample (.failed "boom"))) "<p class=\"err\">boom</p>" &&
   (EarlyReturnCheck.update { x := 5 } (.step 0)).x == 5 && (EarlyReturnCheck.update { x := 5 } (.step 3)).x == 8 &&
   (EarlyReturnCheck.app.rehydrate (EarlyReturnCheck.app.dehydrate { x := 5 })).map (·.x) == some 5 && (EarlyReturnCheck.app.rehydrate (EarlyReturnCheck.app.dehydrate { x := -1 })).isNone &&
   (match FineGrainedCheck.app.template with | .element "div" _ [.element "span" _ [.dyn _], .ifElse _ _ _, .memo _, .keyedList "ul" _ _ _ _ _ _ (some _)] => true | _ => false)) = true := by decide +kernel
-expect_err "Invariant `BadUnguardedDecrease.inRange` failed in `BadUnguardedDecrease.update`:\n  • action `decrease` must satisfy:  1 <= quantity - 1 and quantity - 1 <= 10" in
-component BadUnguardedDecrease:
-  state quantity = 1
-  action decrease: quantity -= 1
-  invariant inRange: 1 <= quantity <= 10
-  view: <span>{quantity}</span>
+bad_comp_inv "Invariant `BadUnguardedDecrease.inRange` failed in `BadUnguardedDecrease.update`:\n  • action `decrease` must satisfy:  1 <= quantity - 1 and quantity - 1 <= 10" BadUnguardedDecrease quantity : Nat = 1 | inRange : 1 <= quantity <= 10 | decrease : quantity -= 1
 bad_comp_act "`qunatity` is not a `state` field of this component (did you mean `quantity`?) (`state` fields: `quantity`)" BadStateFieldTypo quantity : Nat = 1 | inc : qunatity += 1
 style safeBtnStyle:
   background-color: #111
@@ -485,23 +480,14 @@ example (s : OptSchema) : Option String := s.note
 example : (default : GamePhase) = .lobby := rfl
 example : (default : RoomSnapshotRec).phase = .lobby ∧ (default : RoomSnapshotRec).spyCount.val = 1 := ⟨rfl, rfl⟩
 example : (default : CustomInhabRec).count = 42 := rfl
-example : LawfulJson GamePhase := inferInstance
-example : LawfulProto GamePhase := inferInstance
-example : LawfulJson (Option GamePhase) := inferInstance
-example : LawfulJson RoleCard := inferInstance
-example : LawfulProto RoleCard := inferInstance
-example : LawfulJson (Option RoleCard) := inferInstance
-example : LawfulJson TickEvent := inferInstance
-example : LawfulProto TickEvent := inferInstance
-example : LawfulJson RoomSnapshotRec := inferInstance
-example : LawfulProto RoomSnapshotRec := inferInstance
-example : LawfulJson (Option RoomSnapshotRec) := inferInstance
-example : LawfulJson OptSchema := inferInstance
-example : LawfulProto OptSchema := inferInstance
-example : DecidableEq RoomSnapshotRec := inferInstance
-example : Repr RoomSnapshotRec := inferInstance
-example : DecidableEq RoleCard := inferInstance
-example : Repr RoleCard := inferInstance
+example : LawfulJson GamePhase × LawfulProto GamePhase × LawfulJson (Option GamePhase) ×
+    LawfulJson RoleCard × LawfulProto RoleCard × LawfulJson (Option RoleCard) ×
+    LawfulJson TickEvent × LawfulProto TickEvent :=
+  (inferInstance, inferInstance, inferInstance, inferInstance, inferInstance, inferInstance, inferInstance, inferInstance)
+example : LawfulJson RoomSnapshotRec × LawfulProto RoomSnapshotRec × LawfulJson (Option RoomSnapshotRec) ×
+    LawfulJson OptSchema × LawfulProto OptSchema ×
+    DecidableEq RoomSnapshotRec × Repr RoomSnapshotRec × DecidableEq RoleCard × Repr RoleCard :=
+  (inferInstance, inferInstance, inferInstance, inferInstance, inferInstance, inferInstance, inferInstance, inferInstance, inferInstance)
 
 mapping RoomFrameMap:
   from RoomSnapshotRec
@@ -589,13 +575,8 @@ fn redactSingleField(room: SecretRoom, viewerId: String) -> String?:
   if viewerId in room.spyIds: return none
   return some(room.secretLocation)
 
-example := @projectSecretRoom_ensures_1
-example := @projectSecretRoom_ensures_2
-example := @projectSecretRoom_blindTo
-example := @clampRoundMins_ensures
-example := @hideWholeParam_ensures
-example := @hideWholeParam_blindTo
-example := @redactSingleField_blindTo
+check_decls [projectSecretRoom_ensures_1, projectSecretRoom_ensures_2, projectSecretRoom_blindTo,
+  clampRoundMins_ensures, hideWholeParam_ensures, hideWholeParam_blindTo, redactSingleField_blindTo]
 
 expect_err "`blindTo room.secretLocation` failed in `leakyProjection`" in
 fn leakyProjection(room: SecretRoom, viewerId: String) -> RedactedView:
@@ -610,10 +591,7 @@ fn leakyProjection(room: SecretRoom, viewerId: String) -> RedactedView:
     isSpy = isSpy
   }
 
-expect_err "`ensures` contract failed for `badClamp`" in
-fn badClamp(n: Nat) -> Nat:
-  ensures result <= 10
-  return n
+bad_fn "`ensures` contract failed for `badClamp`" badClamp(n: Nat) -> Nat | ensures result <= 10 : return n
 
 -- Component `fn` (pure + state-mutating), implication invariants, per-action `prove:`, and keyed hoisted sub-components
 enum ViewTab:
@@ -669,9 +647,7 @@ component CompFnAndProve:
 
   view: <div><span>{heading("Room")}</span><PureFnBadge name={title}/></div>
 
-example := @CompFnAndProve.homeClean
-example := @CompFnAndProve.nonNeg
-example := @CompFnAndProve.app_view_eq
+check_decls [CompFnAndProve.homeClean, CompFnAndProve.nonNeg, CompFnAndProve.app_view_eq]
 
 expect_err "unknown action/message `noSuchAction` in `prove:` on invariant `BadProveCase.ok`" in
 component BadProveCase:
@@ -765,14 +741,14 @@ component PureForwardHost:
   action setLang(c : String): lang = c
   view: <main><PureContentPage lang={lang} bind:query={query} onLang={.setLang} onClear={lang = "en"} onTag={tag = _}/></main>
 
-example := @PureForwardHost.app_view_eq
+check_decls [PureForwardHost.app_view_eq]
 example : Type → Type := PureContentPage.Props
 example : (
   let rendered := Html.render (PureForwardHost.view PureForwardHost.init)
   let (_, hs) := renderNode #[] (PureForwardHost.view PureForwardHost.init)
   let s1 := PureForwardHost.update PureForwardHost.init (hs[0]?.getD (.setLang ""))
   let s2 := PureForwardHost.update s1 (hs[1]?.getD (.setLang ""))
-  Qed.Str.contains rendered "class=\"lang-select\"" && Qed.Str.contains rendered "data-qed-local=\"SyntaxChecks.KeyedTagPicker@tp\"" &&
+  strHasAll rendered ["class=\"lang-select\"", "data-qed-local=\"SyntaxChecks.KeyedTagPicker@tp\""] &&
   PureForwardHost.app.locals.any (·.id == "SyntaxChecks.KeyedTagPicker") &&
   s1.lang == "fr" && s2.lang == "en") = true := by decide +kernel
 
@@ -931,10 +907,7 @@ enum BadDupWireEnum:
 expect_err "Field `BadImpossibleField` is unsatisfiable" in
 field BadImpossibleField : Nat where n => n > 10, n < 5
 
-example := @ShortSlug.satisfiable
-example := @ServicePort.satisfiable
-example := @SessionParentShell.app_view_eq
-example := @MultiStyleSpliceDemo.app_view_eq
+check_decls [ShortSlug.satisfiable, ServicePort.satisfiable, SessionParentShell.app_view_eq, MultiStyleSpliceDemo.app_view_eq]
 
 example : (
   let s0 := SessionParentShell.init
@@ -1195,48 +1168,13 @@ example : (
   deduped == #[("a", 1), ("b", 2), ("c", 3)] &&
   Json.render jobj == "{\"k\":\"v\",\"n\":7}") = true := by decide +kernel
 
-expect_err "`break` can only be used inside a `for` loop" in
-fn badBreakOutsideFor(n: Nat) -> Nat:
-  break
-  return n
-
-expect_err "`continue` can only be used inside a `for` loop" in
-fn badContinueOutsideFor(n: Nat) -> Nat:
-  continue
-  return n
-
-expect_err "cannot assign to `x` in pure" in
-fn badAssignImmutable(n: Nat) -> Nat:
-  let x = n
-  x = 5
-  return x
-
-expect_err "mutable variable `acc` is already declared in this scope" in
-fn badDupLetMut(n: Nat) -> Nat:
-  let mut acc = 0
-  let mut acc = n
-  return acc
-
-expect_err "shadows mutable variable `acc`" in
-fn badForShadowMut(n: Nat) -> Nat:
-  let mut acc = 0
-  for acc in range(n):
-    acc += 1
-  return acc
-
-expect_err "`range(...)` expects 1, 2, or 3 arguments" in
-fn badRangeZero() -> Nat:
-  let mut s = 0
-  for i in range():
-    s += i
-  return s
-
-expect_err "`range(...)` expects 1, 2, or 3 arguments" in
-fn badRangeFour() -> Nat:
-  let mut s = 0
-  for i in range(0, 10, 2, 1):
-    s += i
-  return s
+bad_fn "`break` can only be used inside a `for` loop" badBreakOutsideFor(n: Nat) -> Nat : break | return n
+bad_fn "`continue` can only be used inside a `for` loop" badContinueOutsideFor(n: Nat) -> Nat : continue | return n
+bad_fn "cannot assign to `x` in pure" badAssignImmutable(n: Nat) -> Nat : let x = n | x = 5 | return x
+bad_fn "mutable variable `acc` is already declared in this scope" badDupLetMut(n: Nat) -> Nat : let mut acc = 0 | let mut acc = n | return acc
+bad_fn "shadows mutable variable `acc`" badForShadowMut(n: Nat) -> Nat : let mut acc = 0 | for acc in range(n): acc += 1 | return acc
+bad_fn "`range(...)` expects 1, 2, or 3 arguments" badRangeZero() -> Nat : let mut s = 0 | for i in range(): s += i | return s
+bad_fn "`range(...)` expects 1, 2, or 3 arguments" badRangeFour() -> Nat : let mut s = 0 | for i in range(0, 10, 2, 1): s += i | return s
 
 /-! ## Ground Kernel `example`, Cons Patterns, Tuple `let`, Multiline Signatures & Type Inference -/
 
@@ -1381,37 +1319,14 @@ fn mkDeepKey10?(a: Nat, b: Nat, c: Nat, g: Nat, d: String, e: String, f: String)
     return none
   return some(f"pfx-{a}-{b}-{c}-{g}-{d}-{e}-{f}")
 
-example := @mkGcpSecretId?_ensures_1
-example := @mkGcpSecretId?_ensures_2
-example := @mkBucketKey?_ensures
-example := @mkIntKey?_ensures
-example := @mkHelperKey?_ensures
-example := @clamp0_100_ensures
-example := @normalizePort_ensures
-example := @mkScopedKey_ensures
-example := @mkDeepKey10?_ensures
+check_decls [mkGcpSecretId?_ensures_1, mkGcpSecretId?_ensures_2, mkBucketKey?_ensures, mkIntKey?_ensures,
+  mkHelperKey?_ensures, clamp0_100_ensures, normalizePort_ensures, mkScopedKey_ensures, mkDeepKey10?_ensures]
 
-expect_err "`ensures` contract failed for `mkBadSecretId?`:\n  • action `right` must satisfy:  env = e2\n  • action `right` must satisfy:  name = n2" in
-fn mkBadSecretId?(tenantId: Nat, env: String, name: String) -> String?:
-  ensures all t2: Nat, e2: String, n2: String:
-    if result.isSome and result == mkBadSecretId?(t2, e2, n2):
-      tenantId == t2 and env == e2 and name == n2
-  if env not in ["dev", "dev-eu", "prod"]:
-    return none
-  if name.length == 0:
-    return none
-  return some(f"qed-t{tenantId}-{env}-{name}")
+bad_fn "`ensures` contract failed for `mkBadSecretId?`:\n  • action `right` must satisfy:  env = e2\n  • action `right` must satisfy:  name = n2" mkBadSecretId?(tenantId: Nat, env: String, name: String) -> String? |
+  ensures all t2: Nat, e2: String, n2: String: if result.isSome and result == mkBadSecretId?(t2, e2, n2): tenantId == t2 and env == e2 and name == n2 :
+  if env not in ["dev", "dev-eu", "prod"]: return none | if name.length == 0: return none | return some(f"qed-t{tenantId}-{env}-{name}")
 
-expect_err "`ensures` contract failed for `mkBadConcat`:\n  • action `left` must satisfy:  a = a2\n  • action `right` must satisfy:  b = b2" in
-fn mkBadConcat(a: Nat, b: Nat) -> String:
-  ensures all a2: Nat, b2: Nat: result == mkBadConcat(a2, b2) -> a == a2 and b == b2
-  return f"k-{a}{b}"
-
-expect_err "`ensures` contract failed for `mkBadValidity?`" in
-fn mkBadValidity?(tenantId: Nat, name: String) -> String?:
-  ensures if let some(id) = result: isValidGcpSecretId(id)
-  if name.length == 0:
-    return none
-  return some(f"k-{tenantId}-{name}")
+bad_fn "`ensures` contract failed for `mkBadConcat`:\n  • action `left` must satisfy:  a = a2\n  • action `right` must satisfy:  b = b2" mkBadConcat(a: Nat, b: Nat) -> String | ensures all a2: Nat, b2: Nat: result == mkBadConcat(a2, b2) -> a == a2 and b == b2 : return f"k-{a}{b}"
+bad_fn "`ensures` contract failed for `mkBadValidity?`" mkBadValidity?(tenantId: Nat, name: String) -> String? | ensures if let some(id) = result: isValidGcpSecretId(id) : if name.length == 0: return none | return some(f"k-{tenantId}-{name}")
 
 end SyntaxChecks

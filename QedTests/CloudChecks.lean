@@ -124,15 +124,11 @@ example : (
 bad_deploy1 "`deploy BadStatefulMultiRegion`: server `StatefulApi` uses in-memory `state`, which can only run in a single region" BadStatefulMultiRegion StatefulApi : regions [us_central1, europe_west1]
 bad_deploy1 "`deploy BadTimeout`: `timeout` (7201s) must be between 1s and 3600s" BadTimeout NotesApp : timeout 7201s
 bad_deploy1 "`deploy BadDomain`: invalid RFC 1123 production `domain` `https://notes.example.com`" BadDomain NotesApp : domain "https://notes.example.com"
-expect_err "`deploy BadOverlap`: preview host `*.example.com` overlaps production domain `notes.example.com`" in
-deploy BadOverlap:
-  app    NotesApp
-  domain "notes.example.com"
+bad_deploy1 "`deploy BadOverlap`: preview host `*.example.com` overlaps production domain `notes.example.com`" BadOverlap NotesApp :
+  domain "notes.example.com" |
   preview:
     domain "*.example.com"
-expect_err "`deploy BadPublicPreview`: `auth ManagedAuth` uses `managed` auth" in
-deploy BadPublicPreview:
-  app NotesApp
+bad_deploy1 "`deploy BadPublicPreview`: `auth ManagedAuth` uses `managed` auth" BadPublicPreview NotesApp :
   preview:
     protection public
 database BadSqliteDb:
@@ -163,11 +159,7 @@ database BadManagedProdDb:
     prod sqlite "/tmp/bad.db"
   table t:
     id : Nat primary_key
-expect_err "deploy invariant `BadInv.wrongTier` failed to prove" in
-deploy BadInv:
-  app     NotesApp
-  compute standard
-  invariant wrongTier: compute == xlarge
+bad_deploy1 "deploy invariant `BadInv.wrongTier` failed to prove" BadInv NotesApp : compute standard | invariant wrongTier: compute == xlarge
 bad_deploy1 "use `timeout_sec` (Option Nat, in seconds) inside deploy invariants" BadInvField NotesApp : invariant badField: timeout == none
 
 end CloudChecks

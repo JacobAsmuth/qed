@@ -1,6 +1,5 @@
 import Qed.Auth.Oidc
 import Qed.Server.Native
-import Qed.Cloud.Executor
 import Qed.Deploy
 import Cli.DevAuth
 import Cli.Scaffold
@@ -138,84 +137,49 @@ private def testOidcFlowAndDeployManifest (c : TestChecker) : IO Unit :=
 
 private def testRoadmapRuntimeFeatures (c : TestChecker) : IO Unit := do
   -- 1. `before:` middleware hook across RPC, HTTP route, and WebSocket join/send (and passthrough on unmatched HTTP)
-  let box ← Prim.mkStateBox ServerChecks.GuardedApi.initState
-  let inst := Native.withStateBox box
+  let inst := Native.withStateBox (← Prim.mkStateBox ServerChecks.GuardedApi.initState)
   let okCtx : RequestCtx := { userId := some "usr_alice", headers := [("authorization", "Bearer good_tok")] }
   let revCtx : RequestCtx := { userId := some "usr_alice", headers := [("authorization", "Bearer bad_tok")] }
-  -- Revoke "Bearer bad_tok"
-  let revBody := Qed.Proto.encode "Bearer bad_tok"
-  let _ ← @ServerChecks.GuardedApi.dispatchM IO _ _ inst okCtx "revokeHeader" revBody
-  -- RPC allowed for good token, blocked (401) for revoked token
-  c.expectOk "[before] RPC allows non-revoked bearer" (← @ServerChecks.GuardedApi.dispatchM IO _ _ inst okCtx "hello" ByteArray.empty) fun bs =>
-    c.expectOk "[before] RPC decode hello" (Qed.Proto.decode (α := String) bs) fun s =>
-      c.checkEq "[before] hello returned greeting + helper bump" s "hi usr_alice:1"
-  match ← @ServerChecks.GuardedApi.dispatchM IO _ _ inst revCtx "hello" ByteArray.empty with
-  | .error e => c.checkEq "[before] RPC rejects revoked bearer (401)" (e.code, e.message) (401, "token revoked")
-  | .ok _ => c.check "[before] RPC rejects revoked bearer" false "unexpectedly succeeded"
-  -- HTTP route allowed for good token, blocked for revoked token, unmatched passes through as none
-  match ← @ServerChecks.GuardedApi.httpDispatchM IO _ _ inst okCtx "GET" "/api/ping" with
-  | .ok (some resp) => c.checkEq "[before] HTTP route allows good bearer" (resp.status, utf8Str resp.body) (200, "pong")
-  | _ => c.check "[before] HTTP route allows good bearer" false
-  match ← @ServerChecks.GuardedApi.httpDispatchM IO _ _ inst revCtx "GET" "/api/ping" with
-  | .error e => c.checkEq "[before] HTTP route rejects revoked bearer (401)" e.code 401
-  | _ => c.check "[before] HTTP route rejects revoked bearer" false
-  match ← @ServerChecks.GuardedApi.httpDispatchM IO _ _ inst revCtx "GET" "/unmatched" with
-  | .ok none => c.check "[before] unmatched HTTP route bypasses before hook" true
-  | _ => c.check "[before] unmatched HTTP route bypasses before hook" false
-  -- `ctx.parseJson` + `ctx.queryParam` in HTTP routes (200 on valid JSON, 400 on malformed JSON)
-  let echoOkCtx : RequestCtx := { okCtx with query := "?tag=hello+world", body := "{\"msg\":\"qed\"}" }
-  match ← @ServerChecks.GuardedApi.httpDispatchM IO _ _ inst echoOkCtx "POST" "/api/echo" with
-  | .ok (some resp) => c.checkEq "[ctx-http] parseJson + queryParam succeeds" (resp.status, utf8Str resp.body) (200, "hello world:qed")
-  | _ => c.check "[ctx-http] parseJson + queryParam succeeds" false
-  let echoBadCtx : RequestCtx := { okCtx with body := "{not json" }
-  match ← @ServerChecks.GuardedApi.httpDispatchM IO _ _ inst echoBadCtx "POST" "/api/echo" with
-  | .error e => c.checkEq "[ctx-http] parseJson rejects malformed JSON (400)" e.code 400
-  | _ => c.check "[ctx-http] parseJson rejects malformed JSON (400)" false
-  -- WebSocket join (1) & send (2) blocked for revoked token, allowed for good token; leave (3) bypasses `before:`
-  match ← @ServerChecks.GuardedApi.wsDispatchM IO _ _ inst okCtx 1 "feed" ByteArray.empty ByteArray.empty with
-  | .ok _ => c.check "[before] WS join allows good bearer" true
-  | .error e => c.check "[before] WS join allows good bearer" false e.message
-  match ← @ServerChecks.GuardedApi.wsDispatchM IO _ _ inst revCtx 1 "feed" ByteArray.empty ByteArray.empty with
-  | .error e => c.checkEq "[before] WS join rejects revoked bearer (401)" e.code 401
-  | .ok _ => c.check "[before] WS join rejects revoked bearer" false
-  match ← @ServerChecks.GuardedApi.wsDispatchM IO _ _ inst revCtx 2 "feed" ByteArray.empty (Qed.Proto.encode "hi") with
-  | .error e => c.checkEq "[before] WS send rejects revoked bearer (401)" e.code 401
-  | .ok _ => c.check "[before] WS send rejects revoked bearer" false
-  match ← @ServerChecks.GuardedApi.wsDispatchM IO _ _ inst revCtx 3 "feed" ByteArray.empty ByteArray.empty with
-  | .ok _ => c.check "[before] WS leave bypasses before hook" true
-  | .error e => c.check "[before] WS leave bypasses before hook" false e.message
-  -- Private helper not reachable via RPC dispatch
-  match ← @ServerChecks.GuardedApi.dispatchM IO _ _ inst okCtx "bump" (Qed.Proto.encode (1 : Nat)) with
-  | .error e => c.checkEq "[fn-private] private fn unreachable via dispatchM (404)" e.code 404
-  | .ok _ => c.check "[fn-private] private fn unreachable via dispatchM" false
+  let rpc (ctx : RequestCtx) (fn : String) (body := ByteArray.empty) := @ServerChecks.GuardedApi.dispatchM IO _ _ inst ctx fn body
+  let http (ctx : RequestCtx) (m path : String) := @ServerChecks.GuardedApi.httpDispatchM IO _ _ inst ctx m path
+  let ws (ctx : RequestCtx) (op : UInt8) (body := ByteArray.empty) := @ServerChecks.GuardedApi.wsDispatchM IO _ _ inst ctx op "feed" ByteArray.empty body
+  let _ ← rpc okCtx "revokeHeader" (Qed.Proto.encode "Bearer bad_tok")
+  c.checkProto "[before] RPC hello returned greeting + helper bump" (← rpc okCtx "hello") "hi usr_alice:1"
+  c.checkErrCode "[before] RPC rejects revoked bearer (401)" (← rpc revCtx "hello") 401 (some "token revoked")
+  c.checkErrCode "[fn-private] private fn unreachable via dispatchM (404)" (← rpc okCtx "bump" (Qed.Proto.encode (1 : Nat))) 404
+  for (lbl, ctx, m, path, want) in [
+      ("[before] HTTP route allows good bearer", okCtx, "GET", "/api/ping", some (200, "pong")),
+      ("[before] unmatched HTTP route bypasses before hook", revCtx, "GET", "/unmatched", none),
+      ("[ctx-http] parseJson + queryParam succeeds", { okCtx with query := "?tag=hello+world", body := "{\"msg\":\"qed\"}" }, "POST", "/api/echo", some (200, "hello world:qed"))] do
+    c.checkOkBy lbl (← http ctx m path) (·.map fun r => (r.status, utf8Str r.body)) want
+  for (lbl, ctx, m, path, code) in [
+      ("[before] HTTP route rejects revoked bearer (401)", revCtx, "GET", "/api/ping", 401),
+      ("[ctx-http] parseJson rejects malformed JSON (400)", { okCtx with body := "{not json" }, "POST", "/api/echo", 400)] do
+    c.checkErrCode lbl (← http ctx m path) code
+  for (lbl, ctx, op) in [("[before] WS join allows good bearer", okCtx, 1), ("[before] WS leave bypasses before hook", revCtx, 3)] do
+    c.expectOk lbl (← ws ctx op) fun _ => c.check lbl true
+  for (lbl, op, body) in [("[before] WS join rejects revoked bearer (401)", 1, ByteArray.empty), ("[before] WS send rejects revoked bearer (401)", 2, Qed.Proto.encode "hi")] do
+    c.checkErrCode lbl (← ws revCtx op body) 401
   -- 2. `hashBearerToken` + `mintBearerToken` validation
   c.expectOk "[token] hashBearerToken deterministic 64-hex" (← Qed.Server.hashBearerToken (m := IO) "sample-token") fun h1 => do
     c.expectOk "[token] hashBearerToken second call" (← Qed.Server.hashBearerToken (m := IO) "sample-token") fun h2 =>
       c.check "[token] hash deterministic and 64 hex chars" (h1 == h2 && h1.length == 64)
-  c.check "[token] mintBearerToken rejects empty userId" (match ← Qed.Server.mintBearerToken (m := IO) "" with | .error e => e.code == 400 | .ok _ => false)
-  c.check "[token] mintBearerToken rejects missing secret env" (match ← Qed.Server.mintBearerToken (m := IO) "usr_1" 60 "QED_NONEXISTENT_TOKEN_SECRET_XYZ" with | .error e => e.code == 500 | .ok _ => false)
+  c.checkErrCode "[token] mintBearerToken rejects empty userId" (← Qed.Server.mintBearerToken (m := IO) "") 400
+  c.checkErrCode "[token] mintBearerToken rejects missing secret env" (← Qed.Server.mintBearerToken (m := IO) "usr_1" 60 "QED_NONEXISTENT_TOKEN_SECRET_XYZ") 500
   -- 3. `fetchGcpMetadataToken` & `GcpAuthMode.metadata` against local mock metadata server
   let flavorOkRef ← IO.mkRef false
-  let mockRes ← startMockHttpServer fun _ path hdrs _ => do
-    let hasFlavor := hdrs.any fun (k, v) => k.toLower == "metadata-flavor" && v == "Google"
-    if !hasFlavor then return (403, "text/plain", "missing Metadata-Flavor".toUTF8)
+  let startMeta := startMockHttpServer fun _ path hdrs _ => do
+    if !hdrs.any fun (k, v) => k.toLower == "metadata-flavor" && v == "Google" then return txtResp 403 "missing Metadata-Flavor"
     flavorOkRef.set true
-    if path.startsWith "/computeMetadata/v1/instance/service-accounts/default/identity" then
-      return (200, "text/plain", "mock-oidc-id-jwt".toUTF8)
-    else if path == "/computeMetadata/v1/instance/service-accounts/default/token" then
-      return (200, "application/json", "{\"access_token\":\"mock-adc-access-tok\",\"expires_in\":1800}".toUTF8)
-    else return (404, "text/plain", "not found".toUTF8)
-  c.expectOk "[gcp-metadata] mock server started" mockRes fun (port, stop) => do
-    try
-      let cache ← Prim.mkStateBox (#[] : Array Native.GcpTokenCacheEntry)
-      let base := s!"http://127.0.0.1:{port}"
-      c.expectOk "[gcp-metadata] fetchGcpMetadataToken OAuth2 succeeds" (← Native.fetchGcpMetadataToken (some cache) none (some base)) fun tok =>
-        c.checkEq "[gcp-metadata] OAuth2 token matches mock" tok "mock-adc-access-tok"
-      c.expectOk "[gcp-metadata] fetchGcpMetadataToken OIDC identity succeeds" (← Native.fetchGcpMetadataToken (some cache) (some "https://svc.run.app") (some base)) fun idTok =>
-        c.checkEq "[gcp-metadata] OIDC id token matches mock" idTok "mock-oidc-id-jwt"
-      c.check "[gcp-metadata] Metadata-Flavor: Google header sent" (← flavorOkRef.get)
-    finally
-      stop
+    if path.startsWith "/computeMetadata/v1/instance/service-accounts/default/identity" then return txtResp 200 "mock-oidc-id-jwt"
+    else if path == "/computeMetadata/v1/instance/service-accounts/default/token" then return jsonStrResp 200 "{\"access_token\":\"mock-adc-access-tok\",\"expires_in\":1800}"
+    else return txtResp 404 "not found"
+  withMockServer c "[gcp-metadata] mock server started" startMeta (·.2) fun (port, _) => do
+    let cache ← Prim.mkStateBox (#[] : Array Native.GcpTokenCacheEntry)
+    let base := s!"http://127.0.0.1:{port}"
+    c.checkOkBy "[gcp-metadata] OAuth2 token matches mock" (← Native.fetchGcpMetadataToken (some cache) none (some base)) id "mock-adc-access-tok"
+    c.checkOkBy "[gcp-metadata] OIDC id token matches mock" (← Native.fetchGcpMetadataToken (some cache) (some "https://svc.run.app") (some base)) id "mock-oidc-id-jwt"
+    c.check "[gcp-metadata] Metadata-Flavor: Google header sent" (← flavorOkRef.get)
   -- 4. `Cli.renderStagedLakefile` extracts authoritative `QedServer` roots from `lakefile.lean`
   let lakeSrc ← IO.FS.readFile "lakefile.lean"
   c.expectOk "[stage-sdk] renderStagedLakefile succeeds" (Qed.Cli.renderStagedLakefile lakeSrc) fun staged => do

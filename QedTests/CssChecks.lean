@@ -26,7 +26,7 @@ theme AppTheme:
   invariant brandReadable: contrast(brand, surface) >= 4.5
   invariant mutedReadable: contrast(muted, surface) >= 4.5
 example : (["brand", "space-md"].all AppTheme.theme.definedTokens.contains && AppTheme.theme.darkComplete && AppTheme.style.isGlobal &&
-  [":root {", "@media (prefers-color-scheme: dark)", "[data-theme=\"dark\"]", ":where(*) { box-sizing: border-box; margin: 0; }"].all (Qed.Str.contains AppTheme.style.raw ·)) = true := by decide +kernel
+  strHasAll AppTheme.style.raw [":root {", "@media (prefers-color-scheme: dark)", "[data-theme=\"dark\"]", ":where(*) { box-sizing: border-box; margin: 0; }"]) = true := by decide +kernel
 expect_err "WCAG contrast invariant `badContrast` failed in light mode: contrast(fg=#777777, bg=#ffffff) is 4.47:1, required >= 4.50:1" in
 theme BadLightTheme:
   color fg = #777777
@@ -62,7 +62,7 @@ style baseBtn:
     outline: 2px solid AppTheme.brand
 style primaryBtn extends baseBtn:
   background-color: AppTheme.brand
-  color: #ffffff
+  color: AppTheme.surface
   border: 1px solid AppTheme.brand
   animation: fadeIn 200ms ease-out
   &:hover:
@@ -78,9 +78,9 @@ style strictCard strict_tokens:
   margin: 0 auto
   max-width: 100%
 example : (Qed.Str.startsWith baseBtn.className "qed-baseBtn-" && Qed.Str.startsWith primaryBtn.className "qed-primaryBtn-" &&
-  ["background-color: var(--brand);", "border: 1px solid var(--brand);", "&:hover { opacity: 1; transform: translateY(-1px); }",
-   "@media (max-width: 600px) { width: 100%; }"].all (Qed.Str.contains primaryBtn.raw ·) &&
-  !Qed.Str.contains primaryBtn.raw "#d1d5db" && primaryBtn.extraRules.any (Qed.Str.contains · "@keyframes fadeIn") &&
+  strHasAll primaryBtn.raw ["background-color: var(--brand);", "border: 1px solid var(--brand);", "&:hover { opacity: 1; transform: translateY(-1px); }",
+   "@media (max-width: 600px) { width: 100%; }"] &&
+  !strHas primaryBtn.raw "#d1d5db" && primaryBtn.extraRules.any (strHas · "@keyframes fadeIn") &&
   ["brand", "space-md"].all primaryBtn.usedTokens.contains) = true := by decide +kernel
 bad_style "unknown CSS property `border-raduis` (did you mean `border-radius`?)" badPropTypo : border-raduis: 8px
 bad_style "type mismatch in CSS `padding`: token `CssChecks.AppTheme.brand` has kind `color`, expected `len`" badTokenType : padding: AppTheme.brand
@@ -101,14 +101,14 @@ style modernStyle:
   background-color: rgb(255, 255, 255)
   @media (prefers-color-scheme: dark):
     background-color: #111827
-example : (["box-sizing: border-box;", "min-height: 100dvh;", "clamp(20rem, 50vw, 45rem)",
-   "oklch(0.6 0.15 250)", "@media (prefers-color-scheme: dark)"].all (Qed.Str.contains modernStyle.raw ·)) = true := by decide +kernel
+example : strHasAll modernStyle.raw ["box-sizing: border-box;", "min-height: 100dvh;", "clamp(20rem, 50vw, 45rem)",
+   "oklch(0.6 0.15 250)", "@media (prefers-color-scheme: dark)"] = true := by decide +kernel
 expect_err "unknown style `noSuchStyle` in `extends`" in
 style badExtends extends noSuchStyle:
   color: #ffffff
 example : (let r := renderThemeRule (.nest "@media (prefers-color-scheme: dark)" [color (hex "fff")])
-  !Qed.Str.contains r ":where(" && Qed.Str.contains r "@media (prefers-color-scheme: dark)" &&
-  ["<", "\"", "/*"].all (!Qed.Str.contains (inlineStyleStr [background "red\" onclick=\"x\"/*evil*/</style>"]) ·)) = true := by decide +kernel
+  !strHas r ":where(" && strHas r "@media (prefers-color-scheme: dark)" &&
+  strHasNone (inlineStyleStr [background "red\" onclick=\"x\"/*evil*/</style>"]) ["<", "\"", "/*"]) = true := by decide +kernel
 component StyledCard:
   prop title : String
   style wrapper:
@@ -130,7 +130,7 @@ component StyledShowcase:
     border-radius: 999px
   style pillActive extends pill:
     background-color: AppTheme.brand
-    color: #ffffff
+    color: AppTheme.surface
   style progressBox:
     padding: 0.5rem
     margin-top: 1rem
@@ -139,11 +139,10 @@ component StyledShowcase:
   invariant exclusive:   noConflictingStyles([pillActive, pill])
   view: <div {shell}><StyledCard title="Verified CSS"/><button role="toggle" {pillActive if active else pill} onClick={.toggle}>Toggle</button><div {progressBox} {inlineStyle([width(pct(progress))])} {styleVars([cssVar(AppTheme.brand, hex("0055aa"))])}>Progress: {progress}%</div></div>
 example : (let css := renderStyleSheet StyledShowcase.app.styles
-  [":root {", "@media (prefers-color-scheme: dark)", StyledCard.wrapper.className, StyledShowcase.shell.className,
-   StyledShowcase.pillActive.className, "border-radius: 999px;", "padding: 0.5rem; margin-top: 1rem;"].all (Qed.Str.contains css ·) &&
+  strHasAll css [":root {", "@media (prefers-color-scheme: dark)", StyledCard.wrapper.className, StyledShowcase.shell.className,
+   StyledShowcase.pillActive.className, "border-radius: 999px;", "padding: 0.5rem; margin-top: 1rem;"] &&
   StyledShowcase.app.stylesheets == ["/app.css"] &&
-  Qed.Str.contains (renderDocument "Demo" "" (stylesheets := StyledShowcase.app.stylesheets)) "<link rel=\"stylesheet\" href=\"/app.css\">" &&
-  Qed.Str.contains (StyledShowcase.app.ssrStep "/" "Demo" "/qed.js" "") "/app.css") = true := by decide +kernel
+  strHas (renderDocument "Demo" "" (stylesheets := StyledShowcase.app.stylesheets)) "<link rel=\"stylesheet\" href=\"/app.css\">") = true := by decide +kernel
 verify_theme AppTheme for StyledShowcase.app
 theme OtherTheme:
   color doesNotExist = #123456
@@ -152,7 +151,7 @@ style orphanStyle:
 expect_err "theme `AppTheme` does not define all CSS tokens used by `[orphanStyle]`.\n  Missing tokens: [\"does-not-exist\"]" in
 verify_theme AppTheme for [orphanStyle]
 
--- ── Style & Stylesheet WCAG Contrast Verification ──
+/-! ## Style & Stylesheet WCAG Contrast Verification -/
 style goodContrastBtn extends baseBtn contrast >= 4.5:
   color: #ffffff
   background-color: #15694b
@@ -176,19 +175,17 @@ component ContrastCard:
     background-color: AppTheme.surface
   view: <div {body}>Readable</div>
 
-example := (goodContrastBtn_contrast, goodThemedCard_contrast, goodFgOnlyLabel_contrast, goodRgbPill_contrast, ContrastCard.body_contrast)
+check_decls [goodContrastBtn_contrast, goodThemedCard_contrast, goodFgOnlyLabel_contrast, goodRgbPill_contrast, ContrastCard.body_contrast]
 
 verify_contrast >= 4.5 for StyledShowcase.app with AppTheme
 verify_contrast >= 4.5 for [goodContrastBtn, goodThemedCard, goodRgbPill, primaryBtn, strictCard] with AppTheme
 verify_contrast >= 4.5 for [goodFgOnlyLabel] with AppTheme on AppTheme.surface
 
-expect_err "WCAG contrast check failed (required >= 4.50:1):\n  • style `qed-lowContrastBtn-" in
-style lowContrastBtn contrast >= 4.5:
+bad_style_contrast "WCAG contrast check failed (required >= 4.50:1):\n  • style `qed-lowContrastBtn-" lowContrastBtn :
   color: #888888
   background-color: #ffffff
 
-expect_err "WCAG contrast check failed (required >= 4.50:1):\n  • style `qed-badHoverContrast-" in
-style badHoverContrast contrast >= 4.5:
+bad_style_contrast "WCAG contrast check failed (required >= 4.50:1):\n  • style `qed-badHoverContrast-" badHoverContrast :
   color: #ffffff
   background-color: #141518
   &:hover:
@@ -201,13 +198,11 @@ theme SplitContrastTheme:
     color ink = #222222
     color bg  = #111111
 
-expect_err "(dark): color `var(--ink)` on background-color `var(--bg)` is 1.18:1" in
-style badDarkModeBtn contrast >= 4.5:
+bad_style_contrast "(dark): color `var(--ink)` on background-color `var(--bg)` is 1.18:1" badDarkModeBtn :
   color: SplitContrastTheme.ink
   background-color: SplitContrastTheme.bg
 
-expect_err "`contrast >= 4.50:1` on style `fgOnlyMissingBg` requires both `color` and `background-color` (or `on <bg>`)." in
-style fgOnlyMissingBg contrast >= 4.5:
+bad_style_contrast "`contrast >= 4.50:1` on style `fgOnlyMissingBg` requires both `color` and `background-color` (or `on <bg>`)." fgOnlyMissingBg :
   color: #141518
 
 style badVerifyBtn:

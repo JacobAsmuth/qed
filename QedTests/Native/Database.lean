@@ -1,7 +1,5 @@
 import QedTests.Native.Harness
 import QedTests.DbChecks
-import Qed.Server.Db.Core
-import Qed.Server.Db.PgWire
 import Qed.Server.Native
 open Qed.Server Qed.Server.Db
 
@@ -238,8 +236,8 @@ private def runShopDirectSuite (c : TestChecker) (label : String) (srvInst : Mon
     c.checkEq (lbl "atomic txOps incremented 3 times inside transactions") (← Prim.atomicRead stBox (·.txOps)) 3
     c.checkRpcDomainErr (E := DbChecks.ShopApi.createPairDotSyntax.Error) (α := DbChecks.ShopDb.items) (lbl "db.transaction: returned fail(.aborted)")
       (← alice "createPairDotSyntax" (mkTxReq "a_rolled_back" "Ghost Author" "i_ghost" "Ghost Item" 99999)) (·.tag == .aborted)
-    c.expectOk (lbl "verify rolled-back author") (← @MonadServer.dbExec IO srvInst DbChecks.ShopDb.config (SqlQuery.count ⟨"authors", by decide⟩ (.binOp .eq (.col ⟨"id", by decide⟩) (.param (.text "a_rolled_back"))))) fun res =>
-      c.checkEq (lbl "rolled-back author does NOT exist in DB") (match res.rows[0]?.bind (·[0]?) with | some (SqlVal.int n) => n | _ => -1) (0 : Int)
+    c.checkOkBy (lbl "rolled-back author does NOT exist in DB") (← @MonadServer.dbExec IO srvInst DbChecks.ShopDb.config (SqlQuery.count (sql!"authors") (.binOp .eq (.col (sql!"id")) (.param (.text "a_rolled_back")))))
+      (fun res => match res.rows[0]?.bind (·[0]?) with | some (SqlVal.int n) => n | _ => -1) (0 : Int)
     for (tag, pfx, sub, off, want) in [("startsWith+contains+orderBy(-price) returns [i2, i1]", "Lean", "4", 0, #["i2", "i1"]), ("offset=1 returns [i1]", "Lean", "4", 1, #["i1"]), ("LIKE escapes literal % safely", "Rust", "100%", 0, #["i3"])] do
       c.checkProtoBy (α := Array DbChecks.ShopDb.items) (lbl tag) (← alice "searchItems" (Qed.Proto.encode (pfx, (sub, off)))) (·.map (·.id)) want
     c.checkProtoBy (α := Array DbChecks.ShopDb.items) (lbl "IN list returns [i1, i3]") (← alice "filterByIds" (Qed.Proto.encode (#["i3", "i1"] : Array String))) (·.map (·.id)) #["i1", "i3"]
@@ -254,17 +252,16 @@ private def runShopDirectSuite (c : TestChecker) (label : String) (srvInst : Mon
 
 private def runMigrationSuite (c : TestChecker) (tmpDir : String) : IO Unit := do
   let migDb := s!"{tmpDir}/migrate.db"
-  let (v1Table, v2Table, unsafeCol) := DbChecks.mkMigrationFixture ⟨"widgets", by decide⟩ [{ name := ⟨"name", by decide⟩, colType := .text }] ⟨"sku", by decide⟩
+  let (v1Table, v2Table, unsafeCol) := DbChecks.mkMigrationFixture (sql!"widgets") [{ name := sql!"name", colType := .text }] (sql!"sku")
   let mkCfg (t : TableSchema) : DbConfig := { name := "MigDb", endpoint := .sqlitePath migDb, tables := [t] }
   c.expectOk "[migrate] v1 init" (← Native.migrateDatabase (mkCfg v1Table)) fun steps => do
     c.checkEq "[migrate] v1 initial creates 1 table" steps.length 1
-    let (insSql, insParams) := (SqlQuery.insert ⟨"widgets", by decide⟩ [(⟨"id", by decide⟩, .text "w1"), (⟨"name", by decide⟩, .text "Sprocket")] []).compile .sqlite
+    let (insSql, insParams) := (SqlQuery.insert (sql!"widgets") [(sql!"id", .text "w1"), (sql!"name", .text "Sprocket")] []).compile .sqlite
     c.expectOk "[migrate] insert v1 row" (← Prim.sqliteExec migDb insSql insParams) fun _ => pure ()
     let v2Cfg := mkCfg v2Table
-    c.expectOk "[migrate] v1 -> v2" (← Native.migrateDatabase v2Cfg) fun steps => c.checkEq "[migrate] v1 -> v2 applied 3 additive steps (2 cols + 1 idx)" steps.length 3
-    c.expectOk "[migrate] select v2 row" (← Prim.sqliteExec migDb "SELECT \"id\", \"name\", \"notes\", \"views\" FROM \"widgets\" WHERE \"id\" = ?" #[.text "w1"]) fun res =>
-      c.check "[migrate] existing row preserved with NULL + default 0" (res.rows == #[#[.text "w1", .text "Sprocket", .null, .int 0]])
-    c.expectOk "[migrate] v2 idempotent" (← Native.migrateDatabase v2Cfg) fun steps => c.checkEq "[migrate] v2 re-run is idempotent (0 steps)" steps.length 0
+    c.checkOkBy "[migrate] v1 -> v2 applied 3 additive steps (2 cols + 1 idx)" (← Native.migrateDatabase v2Cfg) List.length 3
+    c.checkOkBy "[migrate] existing row preserved with NULL + default 0" (← Prim.sqliteExec migDb "SELECT \"id\", \"name\", \"notes\", \"views\" FROM \"widgets\" WHERE \"id\" = ?" #[.text "w1"]) (·.rows == #[#[.text "w1", .text "Sprocket", .null, .int 0]]) true
+    c.checkOkBy "[migrate] v2 re-run is idempotent (0 steps)" (← Native.migrateDatabase v2Cfg) List.length 0
     c.checkErrContains "[migrate] unsafe v3 migration rejected" (← Native.migrateDatabase (mkCfg { v2Table with columns := v2Table.columns ++ [unsafeCol] })) "unsafe additive migration"
 
 private def runEncryptedColumnSuite (c : TestChecker) (srvInst : MonadServer IO) : IO Unit := do
@@ -278,7 +275,7 @@ private def runEncryptedColumnSuite (c : TestChecker) (srvInst : MonadServer IO)
       (← alice "save" (Qed.Proto.encode ((1 : Nat), (inp1, (some blob : Option ByteArray))))) fun r1 =>
       c.check "[enc-db] insert returns plaintext" (r1.body == "top-secret payload 🔐" && r1.raw == some blob)
     c.expectOk "[enc-db] insert row 2 (same plaintext)" (← alice "save" (Qed.Proto.encode ((2 : Nat), (inp1, (none : Option ByteArray))))) fun _ => pure ()
-    let rawQ := SqlQuery.select ⟨"entries", by decide⟩ [⟨"id", by decide⟩, ⟨"body", by decide⟩] .litTrue (some (⟨"id", by decide⟩, .asc)) none none
+    let rawQ := SqlQuery.select (sql!"entries") [sql!"id", sql!"body"] .litTrue (some (sql!"id", .asc)) none none
     c.expectOk "[enc-db] raw SQLite read" (← @MonadServer.dbExec IO srvInst cfg rawQ) fun res => do
       c.check "[enc-db] 2 raw rows stored" (res.rows.size == 2)
       match res.rows[0]?.bind (·[1]?), res.rows[1]?.bind (·[1]?) with
@@ -293,10 +290,10 @@ private def runEncryptedColumnSuite (c : TestChecker) (srvInst : MonadServer IO)
       (← alice "list") (fun rs => rs.map fun r => (r.id, r.body, r.raw)) #[(1, "top-secret payload 🔐", some blob), (2, "top-secret payload 🔐", none)]
     c.checkProtoBy (α := Option DbChecks.EncVaultDb.entries) "[enc-db] updateOne re-encrypts"
       (← alice "edit" (Qed.Proto.encode ((1 : Nat), inp2))) (fun opt => opt.map (·.body)) (some "updated secret 🔑")
-    let tamperQ := SqlQuery.update ⟨"entries", by decide⟩ [(⟨"body", by decide⟩, .param (.text (String.ofList (List.replicate 44 'A'))))] (.binOp .eq (.col ⟨"id", by decide⟩) (.param (.int 2))) []
+    let tamperQ := SqlQuery.update (sql!"entries") [(sql!"body", .param (.text (String.ofList (List.replicate 44 'A'))))] (.binOp .eq (.col (sql!"id")) (.param (.int 2))) []
     c.expectOk "[enc-db] raw tamper update" (← @MonadServer.dbExec IO srvInst cfg tamperQ) fun _ => do
       c.check "[enc-db] tampered ciphertext rejected on read" (!(← alice "get" (Qed.Proto.encode (2 : Nat))).isOk)
-    let badLenQ := SqlQuery.insert ⟨"entries", by decide⟩ [(⟨"id", by decide⟩, .int 99), (⟨"ownerId", by decide⟩, .text "alice"), (⟨"body", by decide⟩, .text (String.ofList (List.replicate 308 'A'))), (⟨"note", by decide⟩, .text (String.ofList (List.replicate 44 'A'))), (⟨"raw", by decide⟩, .null)] []
+    let badLenQ := SqlQuery.insert (sql!"entries") [(sql!"id", .int 99), (sql!"ownerId", .text "alice"), (sql!"body", .text (String.ofList (List.replicate 308 'A'))), (sql!"note", .text (String.ofList (List.replicate 44 'A'))), (sql!"raw", .null)] []
     c.check "[enc-db] SQLite CHECK rejects oversized ciphertext" (!(← @MonadServer.dbExec IO srvInst cfg badLenQ).isOk)
 
 private def runRoadmapSuite (c : TestChecker) (tmpDir : String) : IO Unit := do
@@ -304,48 +301,32 @@ private def runRoadmapSuite (c : TestChecker) (tmpDir : String) : IO Unit := do
   let cfg := { DbChecks.RoadmapDb.config with endpoint := .sqlitePath dbPath, devFallback? := none, envEndpoints? := none }
   let db := DbChecks.RoadmapDb.clientWith cfg
   c.expectOk "[roadmap] migrateDatabase creates tables" (← Native.migrateDatabase cfg) fun _ => do
-    c.expectOk "[roadmap] client insert org" (← db.orgs.insert { id := "org1", name := "Acme" }) fun o =>
-      c.checkEq "[roadmap] org inserted" o.name "Acme"
-    c.expectOk "[roadmap] client insert project with null note" (← db.projects.insert { id := "p1", orgId := "org1", ownerId := "alice", stage := .queued, note := none }) fun p =>
-      c.checkEq "[roadmap] enum roundtrip (.queued)" p.stage DbChecks.DeployStage.queued
+    c.checkOkBy "[roadmap] org inserted" (← db.orgs.insert { id := "org1", name := "Acme" }) (·.name) "Acme"
+    c.checkOkBy "[roadmap] enum roundtrip (.queued)" (← db.projects.insert { id := "p1", orgId := "org1", ownerId := "alice", stage := .queued, note := none }) (·.stage) DbChecks.DeployStage.queued
     -- Re-run migrateDatabase to verify declarative `backfill` populates NULL notes.
     c.expectOk "[roadmap] migrateDatabase runs backfill" (← Native.migrateDatabase cfg) fun _ => do
-      c.expectOk "[roadmap] backfill updated null note to migrated" (← db.projects.findOne (.eq "id" "p1")) fun
-        | some p => c.checkEq "[roadmap] note == some migrated" p.note (some "migrated")
-        | none => c.check "[roadmap] backfilled project exists" false
+      c.checkOkBy "[roadmap] backfill updated null note to migrated" (← db.projects.findOne (.eq "id" "p1")) (·.bind (·.note)) (some "migrated")
     -- Standalone client upsert (insert new + update existing + policy-guarded conflict)
-    c.expectOk "[roadmap] client upsert updates existing row" (← db.projects.upsert { id := "p1", orgId := "org1", ownerId := "alice", stage := .building, note := some "v2" } ["id"] ["stage", "note"] (conflictWhere? := some (.eq "ownerId" "alice"))) fun
-      | some p => c.checkEq "[roadmap] upsert updated stage & note" (p.stage, p.note) (DbChecks.DeployStage.building, some "v2")
-      | none => c.check "[roadmap] upsert returned updated row" false
-    c.expectOk "[roadmap] client upsert rejects conflict when owner mismatches" (← db.projects.upsert { id := "p1", orgId := "org1", ownerId := "alice", stage := .live, note := some "hijack" } ["id"] ["stage", "note"] (conflictWhere? := some (.eq "ownerId" "bob"))) fun opt =>
-      c.check "[roadmap] conflict where filtered out update" opt.isNone
-    c.expectOk "[roadmap] client updateReturning" (← db.projects.updateReturning [sqlSet "stage" DbChecks.DeployStage.live] (.eq "id" "p1")) fun rows =>
-      c.checkEq "[roadmap] updateReturning returned live row" (rows.size, rows[0]?.map (·.stage)) (1, some DbChecks.DeployStage.live)
-    c.expectOk "[roadmap] client count with enum filter" (← db.projects.count (.eq "stage" DbChecks.DeployStage.live)) fun n =>
-      c.checkEq "[roadmap] live count == 1" n 1
+    c.checkOkBy "[roadmap] upsert updated stage & note" (← db.projects.upsert { id := "p1", orgId := "org1", ownerId := "alice", stage := .building, note := some "v2" } ["id"] ["stage", "note"] (conflictWhere? := some (.eq "ownerId" "alice")))
+      (·.map fun p => (p.stage, p.note)) (some (DbChecks.DeployStage.building, some "v2"))
+    c.checkOkBy "[roadmap] conflict where filtered out update" (← db.projects.upsert { id := "p1", orgId := "org1", ownerId := "alice", stage := .live, note := some "hijack" } ["id"] ["stage", "note"] (conflictWhere? := some (.eq "ownerId" "bob"))) Option.isNone true
+    c.checkOkBy "[roadmap] updateReturning returned live row" (← db.projects.updateReturning [sqlSet "stage" DbChecks.DeployStage.live] (.eq "id" "p1"))
+      (fun rows => (rows.size, rows[0]?.map (·.stage))) (1, some DbChecks.DeployStage.live)
+    c.checkOkBy "[roadmap] live count == 1" (← db.projects.count (.eq "stage" DbChecks.DeployStage.live)) id 1
     -- Transaction rollback leaves DB untouched
     let txRes ← db.transaction fun tx => do
       let _ ← db.orgs.insert { id := "org_rb", name := "Rolled Back" } (txId? := some tx)
       return (.error (ApiError.badRequest "abort tx") : Except ApiError Unit)
     c.check "[roadmap] transaction returned error" (!txRes.isOk)
-    c.expectOk "[roadmap] rolled-back org not present" (← db.orgs.findOne (.eq "id" "org_rb")) fun opt =>
-      c.check "[roadmap] rollback verified" opt.isNone
-    -- Unknown column rejected cleanly before SQL compilation
-    let badCol ← db.projects.select (.eq "nonexistent_col" "x")
-    c.check "[roadmap] unknown column rejected" (!badCol.isOk)
+    c.checkOkBy "[roadmap] rollback verified" (← db.orgs.findOne (.eq "id" "org_rb")) Option.isNone true
+    c.check "[roadmap] unknown column rejected" (!(← db.projects.select (.eq "nonexistent_col" "x")).isOk)
     -- `insertOrIgnore` + atomic `sqlAdd` / `sqlSub` + `updateOneReturning`
-    c.expectOk "[roadmap] insertOrIgnore inserts new org" (← db.orgs.insertOrIgnore { id := "org_ign", name := "First" }) fun opt =>
-      c.checkEq "[roadmap] insertOrIgnore returned some" (opt.map (·.name)) (some "First")
-    c.expectOk "[roadmap] insertOrIgnore returns none on duplicate" (← db.orgs.insertOrIgnore { id := "org_ign", name := "Second" }) fun opt =>
-      c.check "[roadmap] duplicate ignored" opt.isNone
+    for (lbl, name, want) in [("[roadmap] insertOrIgnore returned some", "First", some "First"), ("[roadmap] duplicate ignored", "Second", none)] do
+      c.checkOkBy lbl (← db.orgs.insertOrIgnore { id := "org_ign", name }) (·.map (·.name)) want
     c.expectOk "[roadmap] insert service for atomic +=" (← db.services.insert { slug := DbChecks.ServiceSlug.make "web", port := DbChecks.ServicePort.make 8080, altPort := none }) fun _ => do
-      c.expectOk "[roadmap] updateOneReturning with sqlAdd" (← db.services.updateOneReturning [sqlAdd "port" (5 : Nat)] (.eq "slug" "web")) fun opt =>
-        c.checkEq "[roadmap] port incremented atomically" (opt.map (·.port.val)) (some 8085)
-      c.expectOk "[roadmap] updateOneReturning with sqlSub" (← db.services.updateOneReturning [sqlSub "port" (3 : Nat)] (.eq "slug" "web")) fun opt =>
-        c.checkEq "[roadmap] port decremented atomically" (opt.map (·.port.val)) (some 8082)
-    -- Delete cleanup
-    c.expectOk "[roadmap] client delete project" (← db.projects.delete (.eq "id" "p1")) fun n =>
-      c.checkEq "[roadmap] deleted 1 row" n 1
+      for (lbl, op, want) in [("[roadmap] port incremented atomically", sqlAdd "port" (5 : Nat), some 8085), ("[roadmap] port decremented atomically", sqlSub "port" (3 : Nat), some 8082)] do
+        c.checkOkBy lbl (← db.services.updateOneReturning [op] (.eq "slug" "web")) (·.map (·.port.val)) want
+    c.checkOkBy "[roadmap] deleted 1 row" (← db.projects.delete (.eq "id" "p1")) id 1
 
 private def runKeyRotationAndMetaSuite (c : TestChecker) (tmpDir : String) : IO Unit := do
   let dbPath := s!"{tmpDir}/rotating_vault.db"
@@ -356,8 +337,8 @@ private def runKeyRotationAndMetaSuite (c : TestChecker) (tmpDir : String) : IO 
   c.expectOk "[enc-rot] schema init" (← @MonadServer.dbExecDdl IO srvInst cfg) fun () => do
     let alice (fn : String) (req := ByteArray.empty) := @DbChecks.RotatingVaultApi.dispatchM IO _ srvInst { userId := some "alice" } fn req
     -- Write 2 rows encrypted with K1
-    c.expectOk "[enc-rot] save row 1 under K1" (← alice "save" (Qed.Proto.encode ((1 : Nat), ("stripe-live", "sk_live_alpha")))) fun _ => pure ()
-    c.expectOk "[enc-rot] save row 2 under K1" (← alice "save" (Qed.Proto.encode ((2 : Nat), ("github-pat", "ghp_beta")))) fun _ => pure ()
+    for (id, label, sec) in [((1 : Nat), "stripe-live", "sk_live_alpha"), (2, "github-pat", "ghp_beta")] do
+      c.expectOk s!"[enc-rot] save row {id} under K1" (← alice "save" (Qed.Proto.encode (id, (label, sec)))) fun _ => pure ()
     -- Unset ALL encryption keys: metadata projections MUST succeed with ZERO aeadDecrypt calls!
     envRef.set []
     decCountRef.set 0
@@ -373,8 +354,7 @@ private def runKeyRotationAndMetaSuite (c : TestChecker) (tmpDir : String) : IO 
     let dbClient := DbChecks.RotatingVaultDb.clientWith clientCfg
     let projRes ← (letI : MonadServer IO := srvInst
       dbClient.entries.selectProjected DbChecks.RotatingVaultDb.entries.metaColNames DbChecks.RotatingVaultDb.entries.decodeMetaRow (.eq "ownerId" "alice") (orderBy? := some ("id", true)))
-    c.expectOk "[enc-meta] TableHandle.selectProjected succeeds without key" projRes fun ms =>
-      c.checkEq "[enc-meta] TableHandle.selectProjected rows match" (ms.map (·.label)) #["stripe-live", "github-pat"]
+    c.checkOkBy "[enc-meta] TableHandle.selectProjected rows match" projRes (·.map (·.label)) #["stripe-live", "github-pat"]
     c.checkEq "[enc-meta] ZERO aeadDecrypt calls across all metadata projections" (← decCountRef.get) 0
     -- Primary key missing while prevKey IS set MUST STILL FAIL CLOSED!
     envRef.set [("VAULT_PREV_KEY", "key-v1-initial-material-32bytes!")]
@@ -397,16 +377,11 @@ private def runMultiTenantCrossTableSuite (c : TestChecker) (tmpDir : String) : 
   c.expectOk "[cross-rls] schema init" (← @MonadServer.dbExecDdl IO srvInst DbChecks.MultiTenantDb.config) fun () => do
     let asUser (u : String) (fn : String) (req := ByteArray.empty) :=
       @DbChecks.MultiTenantApi.dispatchM IO _ srvInst { userId := some u } fn req
-    let mkApp (id name : String) (orgId : Option String) := Qed.Proto.encode (id, (name, orgId))
-    let mkMem (id appId userId role status : String) := Qed.Proto.encode (id, (appId, (userId, (role, status))))
-    let mkOrgMem (id orgId userId : String) := Qed.Proto.encode (id, (orgId, userId))
-    c.expectOk "[cross-rls] alice creates app1" (← asUser "alice" "createApp" (mkApp "app1" "Alpha" none)) fun _ => pure ()
-    c.expectOk "[cross-rls] alice creates app2 in org1" (← asUser "alice" "createApp" (mkApp "app2" "Beta Org" (some "org1"))) fun _ => pure ()
-    c.expectOk "[cross-rls] bob creates app3" (← asUser "bob" "createApp" (mkApp "app3" "Bob Private" none)) fun _ => pure ()
-    c.expectOk "[cross-rls] add charlie (accepted admin) on app1" (← asUser "alice" "addMember" (mkMem "m1" "app1" "charlie" "admin" "accepted")) fun _ => pure ()
-    c.expectOk "[cross-rls] add dave (accepted viewer) on app1" (← asUser "alice" "addMember" (mkMem "m2" "app1" "dave" "viewer" "accepted")) fun _ => pure ()
-    c.expectOk "[cross-rls] add eve (pending admin) on app1" (← asUser "alice" "addMember" (mkMem "m3" "app1" "eve" "admin" "pending")) fun _ => pure ()
-    c.expectOk "[cross-rls] add frank in org1" (← asUser "alice" "addOrgMember" (mkOrgMem "om1" "org1" "frank")) fun _ => pure ()
+    for (u, id, name, orgId) in [("alice", "app1", "Alpha", none), ("alice", "app2", "Beta Org", some "org1"), ("bob", "app3", "Bob Private", none)] do
+      c.expectOk s!"[cross-rls] {u} creates {id}" (← asUser u "createApp" (Qed.Proto.encode (id, (name, orgId)))) fun _ => pure ()
+    for (id, appId, u, role, status) in [("m1", "app1", "charlie", "admin", "accepted"), ("m2", "app1", "dave", "viewer", "accepted"), ("m3", "app1", "eve", "admin", "pending")] do
+      c.expectOk s!"[cross-rls] add {u} ({status} {role}) on {appId}" (← asUser "alice" "addMember" (Qed.Proto.encode (id, (appId, (u, (role, status)))))) fun _ => pure ()
+    c.expectOk "[cross-rls] add frank in org1" (← asUser "alice" "addOrgMember" (Qed.Proto.encode ("om1", ("org1", "frank")))) fun _ => pure ()
     for (tag, u, want) in [
         ("alice sees own app1, app2", "alice", #["app1", "app2"]),
         ("charlie sees shared app1", "charlie", #["app1"]),
@@ -419,14 +394,13 @@ private def runMultiTenantCrossTableSuite (c : TestChecker) (tmpDir : String) : 
         (← asUser u "listAccessibleApps") (·.map (·.id)) want
     c.checkProtoBy (α := Array DbChecks.MultiTenantDb.apps) "[cross-rls] listSharedApps for charlie returns [app1]"
       (← asUser "charlie" "listSharedApps") (·.map (·.id)) #["app1"]
-    c.checkProtoBy (α := Option DbChecks.MultiTenantDb.apps) "[cross-rls] dave (viewer) cannot rename app1"
-      (← asUser "dave" "renameAppAsAdmin" (Qed.Proto.encode ("app1", "Hacked"))) (·.map (·.name)) none
-    c.checkProtoBy (α := Option DbChecks.MultiTenantDb.apps) "[cross-rls] eve (pending admin) cannot rename app1"
-      (← asUser "eve" "renameAppAsAdmin" (Qed.Proto.encode ("app1", "PendingHack"))) (·.map (·.name)) none
-    c.checkProtoBy (α := Option DbChecks.MultiTenantDb.apps) "[cross-rls] charlie (accepted admin) renames app1 via role in [owner, admin]"
-      (← asUser "charlie" "renameAppAsAdmin" (Qed.Proto.encode ("app1", "Alpha v2"))) (·.map (·.name)) (some "Alpha v2")
-    c.checkProtoBy (α := Option DbChecks.MultiTenantDb.apps) "[cross-rls] charlie renames app1 via role == admin"
-      (← asUser "charlie" "renameAppAsSpecificAdmin" (Qed.Proto.encode ("app1", "Alpha v3"))) (·.map (·.name)) (some "Alpha v3")
+    for (tag, u, fn, newName, want) in [
+        ("dave (viewer) cannot rename app1", "dave", "renameAppAsAdmin", "Hacked", none),
+        ("eve (pending admin) cannot rename app1", "eve", "renameAppAsAdmin", "PendingHack", none),
+        ("charlie (accepted admin) renames app1 via role in [owner, admin]", "charlie", "renameAppAsAdmin", "Alpha v2", some "Alpha v2"),
+        ("charlie renames app1 via role == admin", "charlie", "renameAppAsSpecificAdmin", "Alpha v3", some "Alpha v3")] do
+      c.checkProtoBy (α := Option DbChecks.MultiTenantDb.apps) s!"[cross-rls] {tag}"
+        (← asUser u fn (Qed.Proto.encode ("app1", newName))) (·.map (·.name)) want
 
 def run : IO Bool := do
   let c ← mkChecker "database"

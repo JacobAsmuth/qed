@@ -24,11 +24,21 @@ def TestChecker.check (c : TestChecker) (label : String) (ok : Bool) (detail : S
   if !ok then IO.eprintln s!"  FAIL  {label}{if detail.isEmpty then "" else s!": {detail}"}"
 def TestChecker.checkEq {α : Type} [BEq α] [Repr α] (c : TestChecker) (label : String) (got want : α) : IO Unit := c.check label (got == want) s!"got {reprStr got}, want {reprStr want}"
 def TestChecker.expectOk {ε α : Type} [ErrMsg ε] (c : TestChecker) (label : String) (res : Except ε α) (k : α → IO Unit) : IO Unit := match res with | .ok v => k v | .error e => c.check label false (ErrMsg.errMsg e)
+def TestChecker.checkOkBy {ε α β : Type} [ErrMsg ε] [BEq β] [Repr β] (c : TestChecker) (label : String) (res : Except ε α) (f : α → β) (want : β) : IO Unit :=
+  c.expectOk label res fun v => c.checkEq label (f v) want
+def TestChecker.checkErrCode {α : Type} (c : TestChecker) (label : String) (res : Except ApiError α) (wantCode : Nat) (wantMsg? : Option String := none) : IO Unit :=
+  match res with
+  | .error e => if let some m := wantMsg? then c.checkEq label (e.code, e.message) (wantCode, m) else c.checkEq label e.code wantCode
+  | .ok _ => c.check label false s!"expected ApiError {wantCode}, got ok"
 def TestChecker.checkErrContains {ε α : Type} [ErrMsg ε] (c : TestChecker) (label : String) (res : Except ε α) (sub : String) : IO Unit :=
   match res with | .error e => let m := ErrMsg.errMsg e; c.check label (m.contains sub) m | .ok _ => c.check label false s!"expected error containing `{sub}`, got ok"
 def TestChecker.finish (c : TestChecker) : IO Bool := do
   let (p, f) ← c.state.get; if f == 0 then IO.println s!"  ✓ {c.name} ({p})"; return true
   IO.eprintln s!"  ✗ {c.name}: {f} failed ({p} passed)"; return false
+
+def decodeJson (α : Type) [Qed.FromJson α] (s : String) : Except String α := Qed.Json.parse s >>= Qed.fromJson
+def jsonRt {α : Type} [Qed.ToJson α] [Qed.FromJson α] [BEq α] (x : α) : Bool := decodeJson α (Qed.toJson x).render == .ok x
+def badJson (α : Type) [Qed.FromJson α] (s : String) : Bool := !(decodeJson α s).isOk
 
 def runCmd (cmd : String) (args : Array String) (cwd : Option FilePath := none) (env : Array (String × Option String) := #[]) : IO (UInt32 × String × String) := do
   let o ← IO.Process.output { cmd, args, cwd, env }; return (o.exitCode, o.stdout, o.stderr)
@@ -38,7 +48,7 @@ def qedjsBinPath : IO String := buildBinPath "qedjs"
 def getLeanPath : IO String := do
   if let some lp ← IO.getEnv "LEAN_PATH" then if !lp.isEmpty then return lp
   let (code, out, _) ← runCmd "lake" #["env", "printenv", "LEAN_PATH"]; return if code == 0 then out.trimAscii.toString else ""
-def buildDevApp (webRoot : String) : IO (Option String) := do
+private def buildDevApp (webRoot : String) : IO (Option String) := do
   let cwd ← IO.currentDir; let outDir := (cwd / ".qed" / "test" / webRoot).toString
   let (code, out, err) ← runCmd (← qedBinPath) #["build", "--dev"] (cwd := some cwd)
     (env := #[("QED_HOME", some cwd.toString), ("QED_WEB_ROOT", some webRoot), ("QED_OUT_DIR", some outDir), ("QED_SKIP_VERIFY", some "1"), ("QED_PREBUILT", some "1")])
@@ -64,7 +74,7 @@ def txtResp (st : Nat) (s : String) : Nat × String × ByteArray := (st, "text/p
 def jsonErrResp (st : Nat) (msg : String) : Nat × String × ByteArray := jsonResp st (.obj [("error", .str msg)])
 def splitPathQuery (target : String) : String × String := match target.splitOn "?" with | [] => ("/", "") | [p] => (p, "") | p :: qs => (p, String.intercalate "?" qs)
 
-def readSocketUntil (handle : UInt64) (buf : ByteArray) (done : ByteArray → Bool) (maxReads : Nat := 10000) (chunkSize : UInt32 := 16384) : IO (Option ByteArray) := do
+private def readSocketUntil (handle : UInt64) (buf : ByteArray) (done : ByteArray → Bool) (maxReads : Nat := 10000) (chunkSize : UInt32 := 16384) : IO (Option ByteArray) := do
   let mut b := buf
   for _ in [0 : maxReads] do
     if done b then return some b
@@ -73,7 +83,7 @@ def readSocketUntil (handle : UInt64) (buf : ByteArray) (done : ByteArray → Bo
 def readHeadUntilCrlfCrlf (handle : UInt64) (maxReads : Nat := 64) : IO (Option (ByteArray × Nat)) := do
   return (← readSocketUntil handle ByteArray.empty (fun b => (Net.findCrlfCrlf b).isSome) maxReads).bind fun b => (Net.findCrlfCrlf b).map (b, ·)
 def readExact (handle : UInt64) (buf : ByteArray) (n : Nat) : IO (Option ByteArray) := readSocketUntil handle buf (·.size >= n)
-def readAllSocket (handle : UInt64) : IO ByteArray := do
+private def readAllSocket (handle : UInt64) : IO ByteArray := do
   let mut acc := ByteArray.empty
   for _ in [0 : 100000] do
     match ← Prim.outboundReadSome handle 65536 with | .ok c => if c.size == 0 then break else acc := acc ++ c | .error _ => break
@@ -144,7 +154,7 @@ def TestChecker.checkProto {ε α : Type} [ErrMsg ε] [Qed.FromProto α] [BEq α
 def TestChecker.checkRpcProtoBy {α β : Type} [Qed.FromProto α] [BEq β] [Repr β] (c : TestChecker) (label : String) (res : Except String HttpResp) (f : α → β) (want : β) : IO Unit := c.checkProtoBy label (res.map (·.body)) f want
 def TestChecker.checkRpcProto {α : Type} [Qed.FromProto α] [BEq α] [Repr α] (c : TestChecker) (label : String) (res : Except String HttpResp) (want : α) : IO Unit := c.checkProtoBy label (res.map (·.body)) id want
 
-def waitHealth (port : UInt16) (timeoutMs : Nat := 5000) : IO Bool := do
+private def waitHealth (port : UInt16) (timeoutMs : Nat := 5000) : IO Bool := do
   let deadline := (← Prim.nowMs).toNat + timeoutMs
   for _ in [0 : 200] do
     if let .ok r ← httpReq port "GET" "/_qed/health" then if r.status == 200 then return true

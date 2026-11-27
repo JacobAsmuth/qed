@@ -21,10 +21,12 @@ theorem App.ssr_hydrate_patch_equiv {Model Msg : Type} (app : App Model Msg) (m 
   dsimp only [StateT.run] at hroot haHydGe haHydBound haHydFr hVstHyd hEquivHyd ⊢
   have hrootLt : (hydrateViewM (m := ArenaM Msg) app.template m' root a).1.rootNode.toNat < (hydrateViewM (m := ArenaM Msg) app.template m' root a).2.nextId := by
     rcases VStateValid_root_mem hVstHyd with h1 | h2 <;> omega
-  have ⟨_, _, _, _, hVstPatch, hEquivPatch⟩ := patchViewM_spec (f + 1) "" parent "" ptag pst pmg app.template m' (app.update m' msg).1
-    [] [] (HydSet lo hi a.nextId (hydrateViewM (m := ArenaM Msg) app.template m' root a).2.nextId) _ _ rfl hclean (by simp only [List.length_nil]; decide)
-    (by dsimp only [App.view] at hbound hboundNext; omega) hdepNext (by omega) (by omega) (by rw [haHydFr parent (.inl hparLo) (by omega), hpar, hroot]; rfl) (by simp)
-    (fun h => h.elim (fun _ => by omega) (fun _ => by omega)) (fun _ hk => hk.elim (fun _ => by omega) (·.2)) (fun _ hr => by simp only [List.nil_append, List.mem_singleton] at hr; exact hr ▸ hrootLt) hVstHyd
+  have ⟨_, _, _, _, hVstPatch, hEquivPatch⟩ := patchViewM_spec ⟨f + 1, "", parent, "", ptag, pst, pmg⟩ app.template m' (app.update m' msg).1
+    [] [] (HydSet lo hi a.nextId (hydrateViewM (m := ArenaM Msg) app.template m' root a).2.nextId) _ _
+    ⟨rfl, by simp only [List.length_nil]; decide, by dsimp only; omega, by omega, by rw [haHydFr parent (.inl hparLo) (by omega), hpar, hroot]; rfl, by simp,
+      fun h => h.elim (fun _ => by dsimp only at *; omega) (fun _ => by dsimp only at *; omega), fun _ hk => hk.elim (fun _ => by omega) (·.2),
+      fun _ hr => by simp only [List.nil_append, List.mem_singleton] at hr; exact hr ▸ hrootLt⟩
+    hclean (by dsimp only [App.view] at hbound hboundNext; omega) hdepNext hVstHyd
   dsimp only [App.view] at hVstPatch hEquivPatch hview ⊢
   exact ⟨by rw [← hview, hroot]; exact hEquivHyd, hVstPatch, hEquivPatch⟩
 

@@ -82,15 +82,16 @@ private def writeJsBundle (env : Environment) (avail? : Option (Std.HashSet Stri
   IO.println s!"wrote {outPath} ({js.length} bytes){mapNote}"
 
 private def tryImport (mods : List String) : IO (Option Environment) := (some <$> loadEnv mods) <|> pure none
+@[noinline] private def parSum (a b : IO Nat) : IO Nat := do
+  let ta ← IO.asTask a; let tb ← IO.asTask b
+  return (← IO.ofExcept (← IO.wait ta)) + (← IO.ofExcept (← IO.wait tb))
 
 private partial def verifyModBatch (mods : List String) (skipFw : Bool) : IO Nat := do
   match mods with
   | [] => pure 0
   | [m] => orThrow (Js.verifyProjectEnv (← loadEnv [m]) skipFw)
-  | _ => if let some env ← tryImport mods then orThrow (Js.verifyProjectEnv env skipFw) else
-      let mid := mods.length / 2
-      let tL ← IO.asTask (verifyModBatch (mods.take mid) skipFw); let tR ← IO.asTask (verifyModBatch (mods.drop mid) skipFw)
-      return (← IO.ofExcept (← IO.wait tL)) + (← IO.ofExcept (← IO.wait tR))
+  | _ => if let some env ← tryImport mods then orThrow (Js.verifyProjectEnv env skipFw)
+         else let mid := mods.length / 2; parSum (verifyModBatch (mods.take mid) skipFw) (verifyModBatch (mods.drop mid) skipFw)
 
 private unsafe def evalCssForAppUnsafe (env : Environment) (appName : Name) : IO (String × List String) := do
   let m : MetaM (String × List String) := do
@@ -230,13 +231,8 @@ def main (args : List String) : IO Unit := do
   | "--verify-env" :: rest =>
     let skipFw := rest.contains "--skip-qed"; let mods := rest.filter (· ≠ "--skip-qed")
     if mods.isEmpty then fail "usage: qedjs --verify-env [--skip-qed] <module>…"
-    let total ← match ← tryImport mods with
-      | some env => orThrow (Js.verifyProjectEnv env skipFw)
-      | none =>
-          let (fwMods, userMods) := mods.partition fun m => Js.isFrameworkModule m.toName
-          let tFw ← IO.asTask (if fwMods.isEmpty then pure 0 else verifyModBatch fwMods skipFw)
-          let tUsr ← IO.asTask (verifyModBatch userMods skipFw)
-          pure ((← IO.ofExcept (← IO.wait tFw)) + (← IO.ofExcept (← IO.wait tUsr)))
+    let total ← if let some env ← tryImport mods then orThrow (Js.verifyProjectEnv env skipFw)
+      else let (fw, usr) := mods.partition (Js.isFrameworkModule ·.toName); parSum (verifyModBatch fw skipFw) (verifyModBatch usr skipFw)
     IO.println s!"kernel-verified {total} declarations across {mods.length} root module(s)"
   | "--check-externs" :: rtPath :: rest =>
     let (mods, entryArgs) := splitDashes rest
@@ -249,16 +245,13 @@ def main (args : List String) : IO Unit := do
       | m :: ds => pure (m, ds)
       | [] => fail "usage: qedjs --check-leak-each <module> <decl1> [<decl2> ...]"
     if decls.isEmpty then fail "usage: qedjs --check-leak-each <module> <decl1> [<decl2> ...]"
-    let env ← loadEnv [mod]
-    let mut failed := 0
+    let env ← loadEnv [mod]; let mut failed := 0
     for decl in decls do
       match Js.collectProgramExterns env [(parseEntry decl).1] with
       | .error err =>
-          let cleanErr := err.replace "\n" " "
-          if err.contains "client bundle leak gate" then
-            IO.println s!"PASS\t{decl}\t{cleanErr}"
-          else
-            IO.println s!"FAIL\t{decl}\t{cleanErr}"; failed := failed + 1
+          let ok := err.contains "client bundle leak gate"
+          IO.println s!"{if ok then "PASS" else "FAIL"}\t{decl}\t{err.replace "\n" " "}"
+          if !ok then failed := failed + 1
       | .ok _ =>
           IO.println s!"FAIL\t{decl}\tallowed in client bundle (not blocked by client bundle leak gate)"
           failed := failed + 1

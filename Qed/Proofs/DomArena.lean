@@ -557,6 +557,8 @@ theorem of_alloc {e : ArenaEntry msg} (hb : 1 ≤ b) (hlt : a.nextId < UInt32.si
 theorem trans (h1 : ArenaExt a₁ a₂ W₁ b₁) (h2 : ArenaExt a₂ a₃ W₂ b₂) (hW1 : ∀ k, W₁ k → W k) (hW2 : ∀ k, k < a₁.nextId → W₂ k → W k) (hb : b₁ + b₂ ≤ b) : ArenaExt a₁ a₃ W b :=
   ⟨Nat.le_trans h1.next_ge h2.next_ge, Nat.le_trans h2.next_le (by have := h1.next_le; omega),
    fun m hm hnW => (h2.frame m (Nat.lt_of_lt_of_le hm h1.next_ge) fun hw2 => hnW (hW2 _ hm hw2)).trans (h1.frame m hm fun hw1 => hnW (hW1 _ hw1))⟩
+theorem trans_same (h1 : ArenaExt a₁ a₂ W b₁) (h2 : ArenaExt a₂ a₃ W b₂) (hb : b₁ + b₂ ≤ b := by omega) : ArenaExt a₁ a₃ W b :=
+  h1.trans h2 (fun _ h => h) (fun _ _ h => h) hb
 theorem mono (h : ArenaExt a a' W b) (hW : ∀ k, W k → W' k) (hb : b ≤ b') : ArenaExt a a' W' b' :=
   ⟨h.next_ge, Nat.le_trans h.next_le (Nat.add_le_add_left hb _), fun m hm hnw => h.frame m hm fun hw => hnw (hW _ hw)⟩
 theorem set_right (h : ArenaExt a₁ a₂ W b) {n : Dom.Node} {e : ArenaEntry msg} (hW : W n.toNat) : ArenaExt a₁ (a₂.set n e) W b :=
@@ -682,7 +684,6 @@ private abbrev BuildDomPost (ns : String) (h : Html msg) (a : DomArena msg) (f :
 private abbrev BuildDomListPost (childNs : String) (cs : List (Html msg)) (aBase : DomArena msg) (parent : Dom.Node) (mkPar : List Dom.Node → ArenaEntry msg) (acc : List Dom.Node) (f : Nat) : Prop :=
   let aIn := aBase.set parent (mkPar acc); let aOut := ((buildDomListM (m := ArenaM msg) childNs parent cs).run aIn).2
   ∃ (csNew : List Dom.Node) (aBase' : DomArena msg), aOut = aBase'.set parent (mkPar (acc ++ csNew)) ∧ ArenaExt aBase aOut (· = parent.toNat) (htmlListNodeCount cs) ∧
-    (∀ m : Dom.Node, m.toNat < aBase.nextId → m ≠ parent → aBase'.get m = aIn.get m) ∧
     ((∀ c ∈ acc, SubtreeInRange f aIn (parent.toNat + 1) aBase.nextId c) → (∀ c ∈ acc ++ csNew, SubtreeInRange f aOut (parent.toNat + 1) aOut.nextId c) ∧ (acc ++ csNew).map (readDomTree f aOut) = acc.map (readDomTree f aIn) ++ specDomList childNs cs) ∧
     (∀ (hsAcc : List (Html msg)) (Sacc : Nat → Prop), Html.DomCleanList cs = true → (∀ k, Sacc k → parent.toNat < k ∧ k < aBase.nextId) →
       CleanDomChildren f childNs hsAcc aIn Sacc acc → CleanDomChildren f childNs (hsAcc ++ cs) aOut (fun k => Sacc k ∨ (aBase.nextId ≤ k ∧ k < aOut.nextId)) (acc ++ csNew))
@@ -691,7 +692,7 @@ private theorem buildDomListM_spec_full_of (f : Nat) (hBuild : ∀ (ns : String)
       aBase.nextId + htmlListNodeCount cs < UInt32.size → htmlListDepth cs ≤ f → (∀ c ∈ acc, c.toNat < aBase.nextId) → BuildDomListPost childNs cs aBase parent mkPar acc f := by
   induction cs with
   | nil => intro aBase parent mkPar _ acc _ _ _ _ _
-           exact ⟨[], aBase, by simp only [buildDomListM, StateT.run, pure, StateT.pure, List.append_nil], ArenaExt.of_set (n := parent) (e := mkPar acc) rfl, fun _ _ hne => (DomArena.get_set_ne _ _ hne).symm,
+           exact ⟨[], aBase, by simp only [buildDomListM, StateT.run, pure, StateT.pure, List.append_nil], ArenaExt.of_set (n := parent) (e := mkPar acc) rfl,
              fun h => ⟨by simpa only [buildDomListM, StateT.run, pure, StateT.pure, List.append_nil, DomArena.nextId_set] using h, by simp only [buildDomListM, StateT.run, pure, StateT.pure, List.append_nil, specDomList]⟩,
              fun _ _ _ _ h => by simpa only [buildDomListM, StateT.run, pure, StateT.pure, List.append_nil] using CleanDomChildren_mono (fun _ => .inl) h⟩
   | cons c rest ih =>
@@ -706,12 +707,12 @@ private theorem buildDomListM_spec_full_of (f : Nat) (hBuild : ∀ (ns : String)
       let aAfter := aMid.set parent (mkPar (acc ++ [cn]))
       have hfrAfter : ∀ m : Dom.Node, parent.toNat < m.toNat → m.toNat < aBase.nextId → aAfter.get m = aIn.get m := fun m hlo hhi => (aMid.get_set_ne_of_gt _ hlo).trans (haMidExt.frame_lt hhi)
       rcases ih aMid parent mkPar hmk (acc ++ [cn]) (haMidExt.lt hparLt) (haMidExt.lt hpos) (haMidExt.bound_sub hbound) (Nat.le_trans (Nat.le_max_right _ _) hdep)
-        (fun x hx => (List.mem_append.1 hx).elim (fun h1 => haMidExt.lt (haccLt x h1)) (fun h2 => List.mem_singleton.1 h2 ▸ hcnLt)) with ⟨csRest, aBase'', haOutEq, haOutExt, hframeRest, hsubRestFn, hcleanRestFn⟩
+        (fun x hx => (List.mem_append.1 hx).elim (fun h1 => haMidExt.lt (haccLt x h1)) (fun h2 => List.mem_singleton.1 h2 ▸ hcnLt)) with ⟨csRest, aBase'', haOutEq, haOutExt, hsubRestFn, hcleanRestFn⟩
       dsimp only [BuildDomListPost]; simp only [htmlListNodeCount]
       rw [buildDomListM_step childNs parent c rest aIn aMid cn mkPar hmk acc rfl ((haMidExt.frame_lt hparLt).trans (DomArena.get_set_self ..)) hcnNotFrag (fun hm => Nat.not_lt_of_ge hcnGe (haccLt cn hm))]
       rw [List.append_assoc, List.singleton_append] at haOutEq hsubRestFn hcleanRestFn
-      refine ⟨cn :: csRest, aBase'', haOutEq, ((ArenaExt.of_set (W := (· = parent.toNat)) rfl).trans haMidExt (fun _ h => h) (fun _ _ h => h.elim) (Nat.zero_add _ ▸ Nat.le_refl _)).trans haOutExt (fun _ h => h) (fun _ _ h => h) (Nat.le_refl _),
-        fun m hm hne => by rw [hframeRest m (haMidExt.lt hm) hne, DomArena.get_set_ne _ _ hne]; exact haMidExt.frame_lt hm, fun haccSub => ?_, fun hsAcc Sacc hclean hSacc haccClean => ?_⟩
+      refine ⟨cn :: csRest, aBase'', haOutEq, ((ArenaExt.of_set (W := (· = parent.toNat)) rfl).trans haMidExt (fun _ h => h) (fun _ _ h => h.elim) (Nat.zero_add _ ▸ Nat.le_refl _)).trans_same haOutExt (Nat.le_refl _),
+        fun haccSub => ?_, fun hsAcc Sacc hclean hSacc haccClean => ?_⟩
       · have haccMid := fun x hx => SubtreeInRange_frame (fun m hlo hhi => hfrAfter m (Nat.lt_of_succ_le hlo) hhi) (haccSub x hx)
         have hcnAfter := SubtreeInRange_frame (fun _ hlo _ => aMid.get_set_ne_of_gt (mkPar (acc ++ [cn])) (Nat.lt_of_succ_le hlo)) (SubtreeInRange_mono hparLt (Nat.le_refl _) hcnSub)
         have ⟨hsubFinal, hreadFinal⟩ := hsubRestFn fun x hx => (List.mem_append.1 hx).elim (fun h1 => SubtreeInRange_mono (Nat.le_refl _) haMidExt.next_ge (haccMid x h1).1) (fun h2 => by cases List.mem_singleton.1 h2; exact hcnAfter.1)
@@ -752,7 +753,7 @@ theorem buildDomM_spec_full (ns : String) (h : Html msg) (a : DomArena msg) (fue
           | false =>
               simp only [Bool.not_false, ↓reduceIte]
               rcases buildDomListM_spec_full_of f (fun ns' h' a' => ih ns' h' a') (Dom.childNsOf ns tag) children a1 node (ArenaEntry.element realNs tag st mg) (.inl ⟨realNs, tag, st, mg, fun _ => rfl⟩) []
-                hhi (Nat.succ_pos _) (Nat.add_assoc a.nextId 1 _ ▸ hbound) (Nat.le_of_add_le_add_left (a := 1) (Nat.add_comm f 1 ▸ hdep)) (fun _ h => nomatch h) with ⟨csNew, aBase', ha'Eq, haOutExt, _, hsubKidsFn, hcleanKidsFn⟩
+                hhi (Nat.succ_pos _) (Nat.add_assoc a.nextId 1 _ ▸ hbound) (Nat.le_of_add_le_add_left (a := 1) (Nat.add_comm f 1 ▸ hdep)) (fun _ h => nomatch h) with ⟨csNew, aBase', ha'Eq, haOutExt, hsubKidsFn, hcleanKidsFn⟩
               have ⟨hsubKids, hreadKids⟩ := hsubKidsFn (fun _ h => nomatch h); dsimp only [aElem]; have hnodeLtOut : node.toNat < _ := haOutExt.lt hhi
               refine ⟨hlo, hnodeLtOut, ⟨Nat.le_trans (Nat.le_succ _) haOutExt.next_ge, Nat.add_assoc a.nextId 1 _ ▸ haOutExt.next_le, fun m hm _ => haOutExt.frame m (Nat.lt_succ_of_lt hm) (fun h => Nat.ne_of_lt hm (h.trans hnodeNat))⟩,
                 ⟨⟨hlo, hnodeLtOut⟩, by rw [ha'Eq, DomArena.get_set_self]; exact fun c hc => SubtreeInRange_mono (hnodeNat.symm ▸ Nat.le_succ _) (Nat.le_refl _) (ha'Eq ▸ hsubKids c hc)⟩,

@@ -19,40 +19,40 @@ private def metaLeanPrefixes : Array String := #["Syntax", "TSyntax", "Macro", "
 private def isMetaNamespaceConst (env : Environment) (n : Name) : Bool :=
   match rootTwoAux n none with | some ("Lean", some s) => metaLeanPrefixes.any (s.startsWith ·) && isToolchainModule (definingModule env n) | _ => false
 
-private def forbiddenRuntimeLoopExact : Std.HashSet Name := Std.HashSet.ofList [
-  `IO.iterate, `repeatM, `runST, `runEST, `IO.FS.Stream.mk, `IO.FS.Stream.readToEnd, `IO.FS.Stream.readBinToEnd,
-  `IO.FS.Stream.readBinToEndInto, `IO.FS.Stream.lines, `Std.Stream.forIn, `Std.instForInOfMonadOfStream,
-  `Std.Rci.iter, `Std.Roi.iter, `Std.Rii.iter, `Std.Rcc.iter, `Std.Rco.iter, `Std.Roc.iter, `Std.Roo.iter,
-  `Std.Ric.iter, `Std.Rio.iter, `Std.Rxi.Iterator, `Std.Rxi.instIteratorIteratorIdOfUpwardEnumerable,
-  `Std.Rxc.instIteratorIteratorIdOfUpwardEnumerableOfDecidableLE,
-  `Std.Rxo.instIteratorIteratorIdOfUpwardEnumerableOfDecidableLT,
-  `Std.Rxi.Iterator.instIteratorLoop.loop, `Std.Rxc.Iterator.instIteratorLoop.loop,
-  `Std.Rxo.Iterator.instIteratorLoop.loop, `Std.IterM.DefaultConsumers.forIn', `Std.Iter.atIdxSlow?,
-  `Std.IterM.toArray.go, `Std.IterM.toListRev.go, `Std.Iterator.mk, `Std.IteratorLoop.mk, `Std.Stream.mk,
-  `Std.PRange.UpwardEnumerable.mk, `String.Slice.Pattern.ForwardPattern.mk, `String.Slice.Pattern.BackwardPattern.mk,
-  `Std.Iter.repeat, `Std.IterM.repeat, `Std.Iterators.Types.RepeatIterator, `Std.Iter.allowNontermination,
-  `Std.IterM.allowNontermination, `Std.Iter.Partial, `Std.IterM.Partial, `Std.IteratorLoop.defaultImplementation,
-  `Std.Internal.Parsec.manyCore, `Std.Internal.Parsec.manyCharsCore, `Std.Internal.Parsec.many,
-  `Std.Internal.Parsec.many1, `Std.Internal.Parsec.manyChars, `Std.Internal.Parsec.many1Chars,
-  `Std.Broadcast.Receiver.forAsync, `Std.Bounded.Receiver.forAsync, `Std.Broadcast.Sync.Receiver.forIn,
-  `Std.Broadcast.Sync.Receiver.instForInOfInhabitedOfMonadOfMonadLiftTBaseIO,
-  `Std.Channel.forAsync, `Std.CloseableChannel.forAsync, `Std.Channel.Sync.forIn, `Std.CloseableChannel.Sync.forIn,
-  `Std.Channel.Sync.instForInOfInhabitedOfMonadOfMonadLiftTBaseIO,
-  `Std.CloseableChannel.Sync.instForInOfMonadOfMonadLiftTBaseIO,
-  `Std.Async.EAsync.forIn, `Std.Async.EAsync.instForInLoopUnit,
-  `Std.Async.ContextAsync.forIn, `Std.Async.ContextAsync.instForInLoopUnit,
-  `Std.Http.Body.Stream.forIn, `Std.Http.Body.Stream.forIn', `Std.Http.Body.Stream.readAll,
-  `Std.Http.Body.Stream.drain,
-  `Std.Http.Body.instForInAsyncStreamChunk, `Std.Http.Body.instForInContextAsyncStreamChunk
-]
+@[noinline] private def mkNameSet (s : String) : Std.HashSet Name :=
+  ((s.replace "\n" " ").splitOn " ").foldl (init := {}) fun acc w =>
+    if w.isEmpty then acc else acc.insert ((w.splitOn ".").foldl Name.mkStr .anonymous)
+
+private def forbiddenRuntimeLoopExact : Std.HashSet Name := mkNameSet "
+  IO.iterate repeatM runST runEST IO.FS.Stream.mk IO.FS.Stream.readToEnd IO.FS.Stream.readBinToEnd
+  IO.FS.Stream.readBinToEndInto IO.FS.Stream.lines Std.Stream.forIn Std.instForInOfMonadOfStream
+  Std.Rci.iter Std.Roi.iter Std.Rii.iter Std.Rcc.iter Std.Rco.iter Std.Roc.iter Std.Roo.iter
+  Std.Ric.iter Std.Rio.iter Std.Rxi.Iterator Std.Rxi.instIteratorIteratorIdOfUpwardEnumerable
+  Std.Rxc.instIteratorIteratorIdOfUpwardEnumerableOfDecidableLE
+  Std.Rxo.instIteratorIteratorIdOfUpwardEnumerableOfDecidableLT
+  Std.Rxi.Iterator.instIteratorLoop.loop Std.Rxc.Iterator.instIteratorLoop.loop
+  Std.Rxo.Iterator.instIteratorLoop.loop Std.IterM.DefaultConsumers.forIn' Std.Iter.atIdxSlow?
+  Std.IterM.toArray.go Std.IterM.toListRev.go Std.Iterator.mk Std.IteratorLoop.mk Std.Stream.mk
+  Std.PRange.UpwardEnumerable.mk String.Slice.Pattern.ForwardPattern.mk String.Slice.Pattern.BackwardPattern.mk
+  Std.Iter.repeat Std.IterM.repeat Std.Iterators.Types.RepeatIterator Std.Iter.allowNontermination
+  Std.IterM.allowNontermination Std.Iter.Partial Std.IterM.Partial Std.IteratorLoop.defaultImplementation
+  Std.Internal.Parsec.manyCore Std.Internal.Parsec.manyCharsCore Std.Internal.Parsec.many
+  Std.Internal.Parsec.many1 Std.Internal.Parsec.manyChars Std.Internal.Parsec.many1Chars
+  Std.Broadcast.Receiver.forAsync Std.Bounded.Receiver.forAsync Std.Broadcast.Sync.Receiver.forIn
+  Std.Broadcast.Sync.Receiver.instForInOfInhabitedOfMonadOfMonadLiftTBaseIO
+  Std.Channel.forAsync Std.CloseableChannel.forAsync Std.Channel.Sync.forIn Std.CloseableChannel.Sync.forIn
+  Std.Channel.Sync.instForInOfInhabitedOfMonadOfMonadLiftTBaseIO
+  Std.CloseableChannel.Sync.instForInOfMonadOfMonadLiftTBaseIO
+  Std.Async.EAsync.forIn Std.Async.EAsync.instForInLoopUnit
+  Std.Async.ContextAsync.forIn Std.Async.ContextAsync.instForInLoopUnit
+  Std.Http.Body.Stream.forIn Std.Http.Body.Stream.forIn' Std.Http.Body.Stream.readAll
+  Std.Http.Body.Stream.drain Std.Http.Body.instForInAsyncStreamChunk Std.Http.Body.instForInContextAsyncStreamChunk"
 private def forbiddenRuntimeLoopDottedSubstrs : Array String := #[
   "IO.iterate", "repeatM.erased", "repeatM.impl", "IterM.Partial", "Lean.Loop.forIn", "Lean.Order.fix",
-  "Std.Stream.forIn", "IteratorLoop.defaultImplementation", "Parsec.manyCore", "Parsec.manyCharsCore"
-]
+  "Std.Stream.forIn", "IteratorLoop.defaultImplementation", "Parsec.manyCore", "Parsec.manyCharsCore"]
 private def wfOpaqueLeaves : Array String := #["opaqueFix", "opaqueFix₂", "opaqueFix₃"]
 private def wfExtrinsicLeaves : Array String := #[
-  "extrinsicFix", "extrinsicFix₂", "extrinsicFix₃", "partialExtrinsicFix", "partialExtrinsicFix₂", "partialExtrinsicFix₃"
-]
+  "extrinsicFix", "extrinsicFix₂", "extrinsicFix₃", "partialExtrinsicFix", "partialExtrinsicFix₂", "partialExtrinsicFix₃"]
 private def parsecLoopLeaves : Array String := #["manyCore", "manyCharsCore", "many", "many1", "manyChars", "many1Chars"]
 
 private def isRuntimeLoopHit : Name → Bool
@@ -74,30 +74,24 @@ private def isRuntimeLoopHit : Name → Bool
 private def isWfFixLeaf (inclExt : Bool) : Name → Bool
   | .str (.str _ "WellFounded") leaf => wfOpaqueLeaves.contains leaf || (inclExt && wfExtrinsicLeaves.contains leaf)
   | _ => false
-
-private def isRuntimeLoopConst (n : Name) : Bool :=
-  withPriv (hasNamePrefix isRuntimeLoopHit) n || withPriv (isWfFixLeaf false) n
-
+private def isRuntimeLoopConst (n : Name) : Bool := withPriv (hasNamePrefix isRuntimeLoopHit) n || withPriv (isWfFixLeaf false) n
 private def isWhileLoopConst (n : Name) : Bool := isRuntimeLoopConst n || hasNamePrefix (isWfFixLeaf true) n
 
-private def forbiddenUserMutableRefExact : Std.HashSet Name := Std.HashSet.ofList [
-  `ST.mkRef, `ST.Prim.mkRef, `IO.mkRef, `ST.Ref.set, `ST.Prim.Ref.set, `ST.Ref.modify, `ST.Ref.modifyGet,
-  `ST.Prim.Ref.modifyGet, `IO.Ref.set, `IO.Ref.modify, `IO.Ref.modifyGet, `ST.Ref.swap, `ST.Prim.Ref.swap,
-  `IO.Ref.swap, `ST.Ref.take, `ST.Prim.Ref.take, `IO.Ref.take, `IO.Promise.new, `IO.Promise.resolve,
-  `IO.Promise.result?, `IO.Promise.result!, `IO.Promise.resultD, `Std.BaseMutex.new, `Std.BaseRecursiveMutex.new,
-  `Std.BaseSharedMutex.new, `Std.Condvar.new, `Std.Barrier.new, `Std.Notify.new, `Std.Semaphore.new,
-  `Std.CancellationContext.new, `Std.CancellationToken.new,
-  `Std.Mutex.new, `Std.Mutex.atomically, `Std.Mutex.tryAtomically, `Std.Mutex.atomicallyOnce,
-  `Std.RecursiveMutex.new, `Std.RecursiveMutex.atomically, `Std.RecursiveMutex.tryAtomically,
-  `Std.SharedMutex.new, `Std.SharedMutex.atomically, `Std.SharedMutex.tryAtomically,
-  `Std.SharedMutex.atomicallyRead, `Std.SharedMutex.tryAtomicallyRead,
-  `StateRefT'.run, `StateRefT'.run', `StateRefT'.set, `StateRefT'.modifyGet,
-  `StateRefT'.instMonadStateOfOfMonadLiftTST, `Std.Channel.new, `Std.Channel.Sync.new,
-  `Std.CloseableChannel.new, `Std.CloseableChannel.Sync.new, `Std.Broadcast.new, `Std.Broadcast.Sync.new,
-  `Std.Bounded.new, `Qed.Server.Prim.mkStateBox, `Qed.Server.Prim.atomicRead, `Qed.Server.Prim.atomicModify,
-  `Qed.Server.Native.withStateBox, `Qed.Handlers.mkNew, `Qed.registerHandler, `Qed.dispatchStrWithRows,
-  `Qed.localRerender, `Qed.localRun
-]
+private def forbiddenUserMutableRefExact : Std.HashSet Name := mkNameSet "
+  ST.mkRef ST.Prim.mkRef IO.mkRef ST.Ref.set ST.Prim.Ref.set ST.Ref.modify ST.Ref.modifyGet
+  ST.Prim.Ref.modifyGet IO.Ref.set IO.Ref.modify IO.Ref.modifyGet ST.Ref.swap ST.Prim.Ref.swap
+  IO.Ref.swap ST.Ref.take ST.Prim.Ref.take IO.Ref.take IO.Promise.new IO.Promise.resolve
+  IO.Promise.result? IO.Promise.result! IO.Promise.resultD Std.BaseMutex.new Std.BaseRecursiveMutex.new
+  Std.BaseSharedMutex.new Std.Condvar.new Std.Barrier.new Std.Notify.new Std.Semaphore.new
+  Std.CancellationContext.new Std.CancellationToken.new Std.Mutex.new Std.Mutex.atomically
+  Std.Mutex.tryAtomically Std.Mutex.atomicallyOnce Std.RecursiveMutex.new Std.RecursiveMutex.atomically
+  Std.RecursiveMutex.tryAtomically Std.SharedMutex.new Std.SharedMutex.atomically Std.SharedMutex.tryAtomically
+  Std.SharedMutex.atomicallyRead Std.SharedMutex.tryAtomicallyRead StateRefT'.run StateRefT'.run'
+  StateRefT'.set StateRefT'.modifyGet StateRefT'.instMonadStateOfOfMonadLiftTST Std.Channel.new
+  Std.Channel.Sync.new Std.CloseableChannel.new Std.CloseableChannel.Sync.new Std.Broadcast.new
+  Std.Broadcast.Sync.new Std.Bounded.new Qed.Server.Prim.mkStateBox Qed.Server.Prim.atomicRead
+  Qed.Server.Prim.atomicModify Qed.Server.Native.withStateBox Qed.Handlers.mkNew Qed.registerHandler
+  Qed.dispatchStrWithRows Qed.localRerender Qed.localRun"
 
 private def isMutableRefConst (n : Name) : Bool := withPriv (hasNamePrefix forbiddenUserMutableRefExact.contains) n
 private def hasRegBuiltin (n : Name) : Bool := hasNamePrefix (fun | .str _ s => s.contains "_regBuiltin" | _ => false) n
@@ -165,11 +159,10 @@ def isForbiddenToolchainPartial (env : Environment) (c : Name) : Bool :=
   | some (.opaqueInfo _) => !Lean.isExtern env c && env.contains (Name.str c "_unsafe_rec")
   | some (.defnInfo dv) => dv.safety == .partial && !isTotalCompilerAux env c | _ => false
 private def forbiddenCustomClass (c : Name) : Bool := c == `Std.Iterator || c == `Std.IteratorLoop || c == `Std.Stream || c == `Std.PRange.UpwardEnumerable
-private def metaAliasAllowlist : Array Name := #[
-  `Lean.MacroM, `Lean.Macro, `Lean.CoreM, `Lean.Meta.MetaM, `Lean.Elab.Command.CommandElabM, `Lean.Elab.Command.CommandElab,
-  `Lean.Elab.Term.TermElabM, `Lean.Elab.Term.TermElab, `Lean.Elab.Tactic.TacticM, `Lean.Elab.Tactic.Tactic,
-  `Lean.PrettyPrinter.Formatter, `Lean.PrettyPrinter.Parenthesizer, `Lean.PrettyPrinter.Unexpander, `Lean.PrettyPrinter.Delaborator.Delab
-]
+private def metaAliasAllowlist : Std.HashSet Name := mkNameSet "
+  Lean.MacroM Lean.Macro Lean.CoreM Lean.Meta.MetaM Lean.Elab.Command.CommandElabM Lean.Elab.Command.CommandElab
+  Lean.Elab.Term.TermElabM Lean.Elab.Term.TermElab Lean.Elab.Tactic.TacticM Lean.Elab.Tactic.Tactic
+  Lean.PrettyPrinter.Formatter Lean.PrettyPrinter.Parenthesizer Lean.PrettyPrinter.Unexpander Lean.PrettyPrinter.Delaborator.Delab"
 private def stripTypeBinders : Expr → Expr | .forallE _ _ b _ | .lam _ _ b _ | .mdata _ b => stripTypeBinders b | e => e
 private def unfoldReturnHead (env : Environment) (stop : Name → Bool) (e : Expr) (fuel : Nat := 16) : Except String (Option Name) :=
   let e0 := stripTypeBinders ((stripTypeBinders e).headBeta)
@@ -231,12 +224,9 @@ private def isCompilerCtorIdxImpl (env : Environment) (n : Name) : Bool :=
   | .str (.str ind "ctorIdx") "_impl" =>
       match env.find? ind, env.find? n, Compiler.getImplementedBy? env (Name.str ind "ctorIdx") with
       | some (.inductInfo _), some (.defnInfo dv), some impl =>
-          if impl != n then false
-          else
-            let rec peel : Expr → Expr | .lam _ _ b _ => peel b | e => e
-            match peel dv.value with
-            | .app (.app (.const ``getObjTagNat _) ty) (.bvar 0) =>
-                match ty.getAppFn with | .const c _ => c == ind | _ => false
+          let rec peel : Expr → Expr | .lam _ _ b _ => peel b | e => e
+          impl == n && match peel dv.value with
+            | .app (.app (.const ``getObjTagNat _) ty) (.bvar 0) => match ty.getAppFn with | .const c _ => c == ind | _ => false
             | _ => false
       | _, _, _ => false
   | _ => false
@@ -244,33 +234,33 @@ private def isCompilerCtorIdxImpl (env : Environment) (n : Name) : Bool :=
 private def verifyUserDecl (env : Environment) (modName n : Name) (ci? : Option ConstantInfo) (checkIr : Bool := true) : Except String Unit := do
   let ownerMod := if !modName.isAnonymous then modName else definingModule env ((owningKernelConst? env n).getD n)
   let isNonFw := !isFrameworkModule ownerMod
+  let gate (msg : String) := s!"kernel gate: {msg}"
   if isNonFw && (Lean.isIOUnitInitFn env n || Lean.isIOUnitBuiltinInitFn env n ||
       (Lean.getInitFnNameFor? env n).isSome || (Lean.builtinInitAttr.getParam? env n).isSome) then
-    throw s!"kernel gate: `initialize`/`@[init]` declaration `{n}` in `{modName}` is forbidden outside framework modules"
+    throw (gate s!"`initialize`/`@[init]` declaration `{n}` in `{modName}` is forbidden outside framework modules")
   if (Lean.getExportNameFor? env n).isSome && ownerMod != `Qed.Driver.Runtime then
-    throw s!"kernel gate: `@[export]` declaration `{n}` in `{modName}` is forbidden outside `Qed.Driver.Runtime`"
+    throw (gate s!"`@[export]` declaration `{n}` in `{modName}` is forbidden outside `Qed.Driver.Runtime`")
   if let some impl := Compiler.getImplementedBy? env n then
     if !(impl == Name.str n "_impl" && isCompilerCtorIdxImpl env impl) then
-      throw s!"kernel gate: `@[implemented_by {impl}]` or `partial def` on `{n}` in `{modName}` is forbidden"
+      throw (gate s!"`@[implemented_by {impl}]` or `partial def` on `{n}` in `{modName}` is forbidden")
   if let some ci := ci? then
     let isCtorIdxImpl := isCompilerCtorIdxImpl env n
-    if ci.isUnsafe && !isCtorIdxImpl then throw s!"kernel gate: `unsafe` declaration `{n}` in `{modName}` is forbidden"
+    if ci.isUnsafe && !isCtorIdxImpl then throw (gate s!"`unsafe` declaration `{n}` in `{modName}` is forbidden")
     match unfoldReturnHead env forbiddenCustomClass ci.type with
-    | .error err => throw s!"kernel gate: `{n}` in `{modName}` failed return-type check ({err})"
-    | .ok (some rtHead) => if forbiddenCustomClass rtHead then throw s!"kernel gate: custom `{rtHead}` instance `{n}` in `{modName}` is forbidden"
+    | .error err => throw (gate s!"`{n}` in `{modName}` failed return-type check ({err})")
+    | .ok (some rtHead) => if forbiddenCustomClass rtHead then throw (gate s!"custom `{rtHead}` instance `{n}` in `{modName}` is forbidden")
     | .ok none => pure ()
-    let opaqueErr (nm : Name) := s!"kernel gate: `partial` or `opaque` declaration `{nm}` in `{modName}` is forbidden outside `Qed.Dom` and `Qed.Server.Prim`"
+    let opaqueErr (nm : Name) := gate s!"`partial` or `opaque` declaration `{nm}` in `{modName}` is forbidden outside `Qed.Dom` and `Qed.Server.Prim`"
     match ci with
     | .opaqueInfo _ => if !isLegitOpaque env modName n then throw (opaqueErr n)
     | .defnInfo dv =>
         if dv.safety != .safe && !isTotalCompilerAux env n && !isCtorIdxImpl then
-          if let .str root "_unsafe_rec" := n then
-            if let some (.opaqueInfo _) := env.find? root then throw (opaqueErr root)
-          throw s!"kernel gate: `partial` or non-safe definition `{n}` in `{modName}` is forbidden"
+          let opaqueRoot? := match n with | .str root "_unsafe_rec" => if (env.find? root).any (· matches ConstantInfo.opaqueInfo _) then some root else none | _ => none
+          throw (opaqueRoot?.elim (gate s!"`partial` or non-safe definition `{n}` in `{modName}` is forbidden") opaqueErr)
         let bad : UInt8 := dv.value.foldConsts 0 fun c acc =>
-          if acc == 1 then 1 else if isWhileLoopConst c then 1 else if isNonFw && acc == 0 && isMutableRefConst c then 2 else acc
-        if bad == 1 then throw s!"kernel gate: unbounded `while`/`repeat`/`partial_fixpoint` loop inside `{n}` in `{modName}` is forbidden"
-        if bad == 2 then throw s!"kernel gate: mutable reference primitive (Landin's knot) inside `{n}` in `{modName}` is forbidden outside framework modules"
+          if acc == 1 || isWhileLoopConst c then 1 else if isNonFw && acc == 0 && isMutableRefConst c then 2 else acc
+        if bad == 1 then throw (gate s!"unbounded `while`/`repeat`/`partial_fixpoint` loop inside `{n}` in `{modName}` is forbidden")
+        if bad == 2 then throw (gate s!"mutable reference primitive (Landin's knot) inside `{n}` in `{modName}` is forbidden outside framework modules")
     | _ => pure ()
   if checkIr then
     let checkTcPartials := isNonFw && !ci?.any (hasMetaReturnType env ·.type)
@@ -278,19 +268,11 @@ private def verifyUserDecl (env : Environment) (modName n : Name) (ci? : Option 
       if let some (.fdecl (body := b) ..) := Lean.IR.findEnvDecl env irName then
         for c in callees b #[] do checkIrCallee env isNonFw checkTcPartials n modName false c
   if Lean.isExtern env n && !isAllowedExternMod modName then
-    throw s!"kernel gate: unverified `@[extern]` `{n}` in `{modName}` is forbidden outside `Qed.Dom` and `Qed.Server.Prim`"
+    throw (gate s!"unverified `@[extern]` `{n}` in `{modName}` is forbidden outside `Qed.Dom` and `Qed.Server.Prim`")
 
-@[inline] private def hasOwnerMarker (env : Environment) (owner marker : Name) : Bool :=
-  !owner.isAnonymous && env.contains (owner ++ marker)
-
-def isServerOwner (env : Environment) (owner : Name) : Bool :=
-  !owner.isAnonymous && (hasOwnerMarker env owner `_qed_server_marker ||
-    (env.find? (owner ++ `dispatchM)).any (exprHasConst (· == `Qed.Server.RequestCtx) ·.type))
-def isExternalOwner (env : Environment) (owner : Name) : Bool := hasOwnerMarker env owner `_qed_external_marker
-def isServiceOwner (env : Environment) (owner : Name) : Bool := hasOwnerMarker env owner `_qed_service_marker
-def isDatabaseOwner (env : Environment) (owner : Name) : Bool := hasOwnerMarker env owner `_qed_database_marker
-def isAuthOwner (env : Environment) (owner : Name) : Bool := hasOwnerMarker env owner `_qed_auth_marker
-def isDeployOwner (env : Environment) (owner : Name) : Bool := hasOwnerMarker env owner `_qed_deploy_marker
+@[inline] private def hasOwnerMarker (env : Environment) (owner marker : Name) : Bool := !owner.isAnonymous && env.contains (owner ++ marker)
+private def isServerOwner (env : Environment) (owner : Name) : Bool :=
+  !owner.isAnonymous && (hasOwnerMarker env owner `_qed_server_marker || (env.find? (owner ++ `dispatchM)).any (exprHasConst (· == `Qed.Server.RequestCtx) ·.type))
 
 private def collectExprStrLits : Expr → Std.HashSet String → Std.HashSet String
   | .lit (.strVal s), acc => acc.insert s
@@ -299,8 +281,8 @@ private def collectExprStrLits : Expr → Std.HashSet String → Std.HashSet Str
   | .mdata _ e, acc | .proj _ _ e, acc => collectExprStrLits e acc
   | _, acc => acc
 
-def externalHasSecrets (env : Environment) (owner : Name) : Bool :=
-  isExternalOwner env owner && match env.find? (owner ++ `secrets) with
+private def externalHasSecrets (env : Environment) (owner : Name) : Bool :=
+  hasOwnerMarker env owner `_qed_external_marker && match env.find? (owner ++ `secrets) with
     | some (.defnInfo dv) => !(collectExprStrLits dv.value {}).isEmpty | _ => false
 
 private def isBenignEmptyCseThunk (env : Environment) (n : Name) : Bool :=
@@ -312,55 +294,48 @@ private def isBenignEmptyCseThunk (env : Environment) (n : Name) : Bool :=
 
 private def serverOnlyLeaves : Array String := #[
   "dispatchM", "wsDispatchM", "wsProject", "httpDispatchM", "authHookM", "initState", "runServer",
-  "jobs", "verifiedJobs", "jobNames", "readOnlyMethods", "methods", "channels"
-]
+  "jobs", "verifiedJobs", "jobNames", "readOnlyMethods", "methods", "channels"]
 private def dbOnlyLeaves : Array String := #["config", "ensureSchema", "ddl", "rlsDdl", "instSafeIOEnsureSchema", "Snap"]
+private def dbMetaLeaves : Array String := #["schema", "decodeRow", "decodeMetaRow", "metaColumns"]
+private def secretOwnerMarkers : Array Name := #[`_qed_external_marker, `_qed_service_marker, `_qed_database_marker, `_qed_auth_marker]
 
 def isServerOnlyDeclName (env : Environment) : Name → Bool
   | .anonymous => false | .num p _ => isServerOnlyDeclName env p
   | .str owner s =>
       if s.startsWith "_closed_" then isServerOnlyDeclName env owner && !isBenignEmptyCseThunk env (.str owner s)
       else ((serverOnlyLeaves.contains s || s.endsWith "_step" || s.endsWith "_handler" || s.endsWith "_project") && isServerOwner env owner) ||
-        (dbOnlyLeaves.contains s && isDatabaseOwner env owner) ||
-        ((s == "schema" || s == "decodeRow" || s == "decodeMetaRow" || s == "metaColumns") && (isDatabaseOwner env owner || isDatabaseOwner env owner.getPrefix)) ||
-        (s == "config" && isAuthOwner env owner) || (s == "spec" && isDeployOwner env owner) ||
+        (dbOnlyLeaves.contains s && hasOwnerMarker env owner `_qed_database_marker) ||
+        (dbMetaLeaves.contains s && (hasOwnerMarker env owner `_qed_database_marker || hasOwnerMarker env owner.getPrefix `_qed_database_marker)) ||
+        (s == "config" && hasOwnerMarker env owner `_qed_auth_marker) || (s == "spec" && hasOwnerMarker env owner `_qed_deploy_marker) ||
         (s == "baseUrl" && externalHasSecrets env owner) ||
-        (s == "secrets" && (isServerOwner env owner || isExternalOwner env owner || isServiceOwner env owner || isDatabaseOwner env owner || isAuthOwner env owner)) ||
+        (s == "secrets" && (isServerOwner env owner || secretOwnerMarkers.any (hasOwnerMarker env owner ·))) ||
         isServerOnlyDeclName env owner
 
-private def serverOnlyModules : Std.HashSet Name := Std.HashSet.ofList [
-  `Qed.Server.Prim, `Qed.Server.Native, `Qed.Server.Http, `Qed.Server.Net, `Qed.Server.Db.PgWire,
-  `Qed.Auth.Oidc, `Qed.Deploy, `Qed.Cloud.Compile, `Qed.Cloud.Proofs,
-  `Qed.Cloud.GcpApi, `Qed.Cloud.Executor
-]
-private def serverOnlyDecls : Std.HashSet Name := Std.HashSet.ofList [
-  `Qed.Server.ServerEffect, `Qed.Server.execExternalRaw, `Qed.Server.MonadServer.exec, `Qed.Server.MonadServer.httpCall,
-  `Qed.Server.MonadServer.dbExec, `Qed.Server.MonadServer.dbExecDdl, `Qed.Server.MonadServer.dbTxBegin,
-  `Qed.Server.MonadServer.dbTxExec, `Qed.Server.MonadServer.dbTxCommit, `Qed.Server.MonadServer.dbTxRollback,
-  `Qed.Server.MonadServer.setCookie, `Qed.Server.MonadServer.sendSse, `Qed.Server.MonadServer.readEnv,
-  `Qed.Server.MonadServer.nowMs, `Qed.Server.MonadServer.randomHex, `Qed.Server.MonadServer.randomBytes,
-  `Qed.Server.MonadServer.hmacSha256, `Qed.Server.MonadServer.sha256, `Qed.Server.MonadServer.constEq,
-  `Qed.Server.MonadServer.aeadEncrypt, `Qed.Server.MonadServer.aeadDecrypt,
-  `Qed.Server.MonadServer.wsBroadcast, `Qed.Server.flushWsEmits, `Qed.Server.MonadAtomic.runAtomic,
-  `Qed.Server.MonadAtomic.runAtomicRead, `Qed.Server.Webhook.postJson, `Qed.Server.Webhook.postBytes,
-  `Qed.Crypto.hmacSha256, `Qed.Crypto.hmacSha256Hex, `Qed.Crypto.constEq, `Qed.Crypto.sha256, `Qed.Crypto.sha256Hex,
-  `Qed.Time.nowMs, `Qed.Time.nowSec, `Qed.Random.hex, `Qed.Random.bytes, `Qed.Random.uuid
-]
+private def serverOnlyModules : Std.HashSet Name := mkNameSet "
+  Qed.Server.Prim Qed.Server.Native Qed.Server.Http Qed.Server.Net Qed.Server.Db.PgWire
+  Qed.Auth.Oidc Qed.Deploy Qed.Cloud.Compile Qed.Cloud.Proofs Qed.Cloud.GcpApi Qed.Cloud.Executor"
+private def serverOnlyDecls : Std.HashSet Name := mkNameSet "
+  Qed.Server.ServerEffect Qed.Server.execExternalRaw Qed.Server.MonadServer.exec Qed.Server.MonadServer.httpCall
+  Qed.Server.MonadServer.dbExec Qed.Server.MonadServer.dbExecDdl Qed.Server.MonadServer.dbTxBegin
+  Qed.Server.MonadServer.dbTxExec Qed.Server.MonadServer.dbTxCommit Qed.Server.MonadServer.dbTxRollback
+  Qed.Server.MonadServer.setCookie Qed.Server.MonadServer.sendSse Qed.Server.MonadServer.readEnv
+  Qed.Server.MonadServer.nowMs Qed.Server.MonadServer.randomHex Qed.Server.MonadServer.randomBytes
+  Qed.Server.MonadServer.hmacSha256 Qed.Server.MonadServer.sha256 Qed.Server.MonadServer.constEq
+  Qed.Server.MonadServer.aeadEncrypt Qed.Server.MonadServer.aeadDecrypt Qed.Server.MonadServer.wsBroadcast
+  Qed.Server.flushWsEmits Qed.Server.MonadAtomic.runAtomic Qed.Server.MonadAtomic.runAtomicRead
+  Qed.Server.Webhook.postJson Qed.Server.Webhook.postBytes Qed.Crypto.hmacSha256 Qed.Crypto.hmacSha256Hex
+  Qed.Crypto.constEq Qed.Crypto.sha256 Qed.Crypto.sha256Hex Qed.Time.nowMs Qed.Time.nowSec
+  Qed.Random.hex Qed.Random.bytes Qed.Random.uuid"
 
 def clientLeakReason? (env : Environment) (n : Name) : Option String :=
   let modName := definingModule env n
-  if serverOnlyModules.contains modName then
-    some s!"client bundle leak gate: server runtime primitive `{n}` (`{modName}`) cannot be bundled into client JavaScript"
-  else if serverOnlyDecls.contains n || n.getPrefix == `Qed.Server.ServerEffect || withPriv (hasNamePrefix (· == `Qed.Server.Db.HttpSql)) n then
-    some s!"client bundle leak gate: server I/O or state primitive `{n}` cannot be bundled into client JavaScript"
-  else if isServerOnlyDeclName env n then
-    some s!"client bundle leak gate: server secret/state/handler `{n}` cannot be bundled into client JavaScript"
+  if serverOnlyModules.contains modName then some s!"client bundle leak gate: server runtime primitive `{n}` (`{modName}`) cannot be bundled into client JavaScript"
+  else if serverOnlyDecls.contains n || n.getPrefix == `Qed.Server.ServerEffect then some s!"client bundle leak gate: server I/O or state primitive `{n}` cannot be bundled into client JavaScript"
+  else if isServerOnlyDeclName env n then some s!"client bundle leak gate: server secret/state/handler `{n}` cannot be bundled into client JavaScript"
   else none
 
 def verifyNoServerLeakInClient (env : Environment) (reachable : Array Name) : Except String Unit := do
-  for n in reachable do
-    if let some err := clientLeakReason? env n then
-      throw err
+  for n in reachable do if let some err := clientLeakReason? env n then throw err
 
 private inductive DfsMode where
   | partials (declName : Name) | mutRefs (declName : Name) | axioms (declName : Name)
@@ -383,18 +358,20 @@ private def envDfsAux (mode : DfsMode) (env : Environment) :
             else
               let ci? := firstCi?.orElse fun _ => env.find? n
               match mode with
-              | .partials declName =>
-                  if isForbiddenToolchainPartial env n then .error s!"kernel gate: `{declName}` depends on non-total toolchain `partial` declaration `{n}`"
+              | .partials d =>
+                  if isForbiddenToolchainPartial env n then .error s!"kernel gate: `{d}` depends on non-total toolchain `partial` declaration `{n}`"
                   else let visited := visited.insert n; envDfsAux mode env fuel visited (pushValAndImplDeps env n ci? visited stack) none strLits
-              | .mutRefs declName =>
-                  if isMutableRefConst n then .error s!"kernel gate: `{declName}` transitively uses mutable reference primitive `{n}` (Landin's knot) outside framework modules"
+              | .mutRefs d =>
+                  if isMutableRefConst n then .error s!"kernel gate: `{d}` transitively uses mutable reference primitive `{n}` (Landin's knot) outside framework modules"
                   else let visited := visited.insert n; envDfsAux mode env fuel visited (if isFrameworkModule (definingModule env n) then stack else pushValAndImplDeps env n ci? visited stack) none strLits
-              | .axioms declName => match ci? with
-                  | none => envDfsAux mode env fuel (visited.insert n) stack none strLits
+              | .axioms d =>
+                  let visited := visited.insert n
+                  match ci? with
                   | some (.axiomInfo ax) =>
-                      if allowedKernelAxioms.contains ax.name && !ax.isUnsafe then envDfsAux mode env fuel (visited.insert n) stack none strLits
-                      else .error s!"kernel gate: `{declName}` depends on disallowed axiom `{ax.name}` (only {allowedKernelAxioms} are permitted)"
-                  | some ci => let visited := visited.insert n; envDfsAux mode env fuel visited (pushConstDeps ci visited stack) none strLits
+                      if allowedKernelAxioms.contains ax.name && !ax.isUnsafe then envDfsAux mode env fuel visited stack none strLits
+                      else .error s!"kernel gate: `{d}` depends on disallowed axiom `{ax.name}` (only {allowedKernelAxioms} are permitted)"
+                  | some ci => envDfsAux mode env fuel visited (pushConstDeps ci visited stack) none strLits
+                  | none => envDfsAux mode env fuel visited stack none strLits
               | .kernel csimpRepls checkLeak =>
                   match if checkLeak then clientLeakReason? env n else none with
                   | some err => .error err
@@ -407,17 +384,13 @@ private def envDfsAux (mode : DfsMode) (env : Environment) :
                         let stack := (Compiler.getImplementedBy? env n).elim stack (pushUnseen visited stack)
                         let stack := let u := Name.str n "_unsafe_rec"; if env.contains u then pushUnseen visited stack u else stack
                         let stack := (csimpRepls.getD n #[]).foldl (pushUnseen visited) stack
-                        let (stack, strLits) := match ci? with
-                          | none => (stack, strLits)
-                          | some ci => (pushConstDeps ci visited stack (withRecAll := false),
-                              if checkLeak then match ci with | .defnInfo v | .opaqueInfo v => collectExprStrLits v.value strLits | _ => strLits else strLits)
+                        let (stack, strLits) := ci?.elim (stack, strLits) fun ci =>
+                          (pushConstDeps ci visited stack (withRecAll := false),
+                           if checkLeak then match ci with | .defnInfo v | .opaqueInfo v => collectExprStrLits v.value strLits | _ => strLits else strLits)
                         envDfsAux mode env fuel visited stack none strLits
 
 private def dfsClean (mode : DfsMode) (env : Environment) (declName : Name) (clean : Std.HashSet Name) (initCi? : Option ConstantInfo := none) : Except String (Std.HashSet Name) :=
   if clean.contains declName then .ok clean else (envDfsAux mode env 2000000 clean #[declName] initCi? {}).map Prod.fst
-def verifyNoToolchainPartials (env : Environment) (declName : Name) (clean : Std.HashSet Name) (initCi? : Option ConstantInfo := none) : Except String (Std.HashSet Name) := dfsClean (.partials declName) env declName clean initCi?
-def verifyNoMutableRefs (env : Environment) (declName : Name) (clean : Std.HashSet Name) (initCi? : Option ConstantInfo := none) : Except String (Std.HashSet Name) := dfsClean (.mutRefs declName) env declName clean initCi?
-def verifyConstAxioms (env : Environment) (declName : Name) (clean : Std.HashSet Name) (initCi? : Option ConstantInfo := none) : Except String (Std.HashSet Name) := dfsClean (.axioms declName) env declName clean initCi?
 private def walkKernelClosure (env : Environment) (csimpRepls : Std.HashMap Name (Array Name)) (checkLeak : Bool) (seeds : Array Name) (initVisited : Std.HashSet Name) (initStrLits : Std.HashSet String := {}) : Except String (Std.HashSet Name × Std.HashSet String) :=
   envDfsAux (.kernel csimpRepls checkLeak) env 1000000 initVisited seeds none initStrLits
 
@@ -461,15 +434,15 @@ private structure VerifyCache where
 @[noinline] private def checkDeclCache (env : Environment) (n : Name) (ci? : Option ConstantInfo)
     (doAx doPart doRef : Bool) (c : VerifyCache) : Except String VerifyCache := do
   let { axioms, partials, mutRefs, irNodes } := c
-  let axioms ← if doAx then verifyConstAxioms env n axioms ci? else pure axioms
-  let partials ← if doPart then verifyNoToolchainPartials env n partials ci? else pure partials
-  let mutRefs ← if doRef then verifyNoMutableRefs env n mutRefs ci? else pure mutRefs
+  let axioms ← if doAx then dfsClean (.axioms n) env n axioms ci? else pure axioms
+  let partials ← if doPart then dfsClean (.partials n) env n partials ci? else pure partials
+  let mutRefs ← if doRef then dfsClean (.mutRefs n) env n mutRefs ci? else pure mutRefs
   return { axioms, partials, mutRefs, irNodes }
 
 @[noinline] private def verifyReachableEntry (env : Environment) (st : Std.HashSet Name × Array Name) (n : Name) :
     Except String (Std.HashSet Name × Array Name) := do
   if isRuntimeLoopConst n then throw s!"kernel gate: unbounded `while`/`repeat`/`partial_fixpoint` loop (`{n}`) is reachable at runtime"
-  let (clean, seeds) := st; let clean ← verifyConstAxioms env n clean
+  let (clean, seeds) := st; let clean ← dfsClean (.axioms n) env n clean
   let modName := definingModule env n; if !isToolchainModule modName then verifyUserDecl env modName n (env.find? n)
   let owner := (owningKernelConst? env n).getD n
   if isForbiddenToolchainPartial env owner then throw s!"kernel gate: non-total toolchain `partial` declaration `{owner}` (via `{n}`) is reachable at runtime"

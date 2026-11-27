@@ -20,19 +20,19 @@ theorem list_mapM_map_ok {α β ε : Type} (f : α → β) (g : β → Except ε
     ∀ xs : List α, (xs.map f).mapM (m := Except ε) g = .ok xs
   | [] => rfl | x :: xs => by simp only [List.map_cons, List.mapM_cons, h x, list_mapM_map_ok f g h xs]; rfl
 
-@[reducible] def ToJson.ofEquiv {α β : Type} [ToJson β] (toB : α → β) : ToJson α := ⟨fun a => toJson (toB a)⟩
-@[reducible] def FromJson.ofEquiv {α β : Type} [FromJson β] (ofB : β → α) : FromJson α := ⟨fun j => (fromJson j : Except String β).map ofB⟩
-@[reducible] def FromJson.ofRetract {α β : Type} [FromJson β] (ofB : β → Except String α) : FromJson α := ⟨fun j => (fromJson j : Except String β).bind ofB⟩
+@[reducible, noinline, nospecialize] def ToJson.ofEquiv {α β : Type} [ToJson β] (toB : α → β) : ToJson α := ⟨fun a => toJson (toB a)⟩
+@[reducible, noinline, nospecialize] def FromJson.ofEquiv {α β : Type} [FromJson β] (ofB : β → α) : FromJson α := ⟨fun j => (fromJson j : Except String β).map ofB⟩
+@[reducible, noinline, nospecialize] def FromJson.ofRetract {α β : Type} [FromJson β] (ofB : β → Except String α) : FromJson α := ⟨fun j => (fromJson j : Except String β).bind ofB⟩
 
-@[reducible] def LawfulJson.iso {α β : Type} (inst : LawfulJson β) (toB : α → β) (fromB : β → α) (left_inv : ∀ a, fromB (toB a) = a) : LawfulJson α where
+@[reducible, noinline, nospecialize] def LawfulJson.iso {α β : Type} (inst : LawfulJson β) (toB : α → β) (fromB : β → α) (left_inv : ∀ a, fromB (toB a) = a) : LawfulJson α where
   toJson a := @ToJson.toJson β inst.toToJson (toB a); fromJson j := (@FromJson.fromJson β inst.toFromJson j).map fromB
   depthBound := @LawfulJson.depthBound β inst; depth_toJson a := @LawfulJson.depth_toJson β inst (toB a)
   fromJson_toJson a := (congrArg (Except.map fromB) (@LawfulJson.fromJson_toJson β inst (toB a))).trans (congrArg Except.ok (left_inv a))
 
-@[reducible] def LawfulJson.ofEquiv {α β : Type} [LawfulJson β] (toB : α → β) (ofB : β → α) (hinv : ∀ a, ofB (toB a) = a) : LawfulJson α :=
+@[reducible, noinline, nospecialize] def LawfulJson.ofEquiv {α β : Type} [LawfulJson β] (toB : α → β) (ofB : β → α) (hinv : ∀ a, ofB (toB a) = a) : LawfulJson α :=
   LawfulJson.iso inferInstance toB ofB hinv
 
-@[reducible] def LawfulJson.ofRetract {α β : Type} [LawfulJson β] (toB : α → β) (ofB : β → Except String α) (hinv : ∀ a, ofB (toB a) = .ok a) : LawfulJson α where
+@[reducible, noinline, nospecialize] def LawfulJson.ofRetract {α β : Type} [LawfulJson β] (toB : α → β) (ofB : β → Except String α) (hinv : ∀ a, ofB (toB a) = .ok a) : LawfulJson α where
   toToJson := .ofEquiv toB; toFromJson := .ofRetract ofB; depthBound := LawfulJson.depthBound β; depth_toJson a := LawfulJson.depth_toJson (toB a)
   fromJson_toJson a := (congrArg (·.bind ofB) (LawfulJson.fromJson_toJson (toB a))).trans (hinv a)
 
@@ -61,9 +61,12 @@ instance [LawfulJson α] [LawfulJson β] : LawfulJson (Sum α β) where
 
 class NonNullJson (α : Type) [ToJson α] : Prop where toJson_ne_null : ∀ a : α, toJson a ≠ .null
 
-local macro "nonNull_prims" "[" ts:term,* "]" : command =>
-  return ⟨Lean.mkNullNode (← ts.getElems.mapM fun t => `(instance : NonNullJson $t := ⟨nofun⟩))⟩
-nonNull_prims [Unit, JsonNumber, Bool, String, Int, Nat]
+instance : NonNullJson Unit := ⟨nofun⟩
+instance : NonNullJson JsonNumber := ⟨nofun⟩
+instance : NonNullJson Bool := ⟨nofun⟩
+instance : NonNullJson String := ⟨nofun⟩
+instance : NonNullJson Int := ⟨nofun⟩
+instance : NonNullJson Nat := ⟨nofun⟩
 instance [ToJson α] : NonNullJson (List α) := ⟨nofun⟩
 instance [ToJson α] : NonNullJson (Array α) := ⟨nofun⟩
 instance [ToJson α] [ToJson β] : NonNullJson (α × β) := ⟨fun (_, _) => nofun⟩

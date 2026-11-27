@@ -107,7 +107,7 @@ private theorem viewKidsMatches_step (ep : ElemPar msg) (ks : List (View σ msg)
     have hbdC : a0.nextId + htmlNodeCount (View.render c s) < UInt32.size := Nat.lt_of_le_of_lt (Nat.add_le_add_left (Nat.le_add_right _ _) _) hbd'
     have ⟨hrootKst, hextMid, hvalMid, _, hchildSubMid⟩ := hydrateViewM_spec_of_matches ep.childNs f' c s child a0 lo' mid hcCl hbdC hcDep hchildDom (hView c hcMem f' child a0 lo' mid hcCl hbdC hcDep hchildDom)
     let aMid := (hydrateViewM (m := ArenaM msg) c s child a0).2; rcases hcont aMid hextMid hchildSubMid with ⟨hih, hpreMid, hparMid, hdomMid⟩
-    have ⟨_, hextR, _, _, _, _⟩ := hydrateDomKidsM_spec ep.childNs ep.parent ep.pns ep.ptag ep.pst ep.pmg (f' + 1) (View.renderEach rest s) false (pr ++ [child]) domRest mid hi' aMid
+    have ⟨_, hextR, _, _, _, _⟩ := hydrateDomKidsM_spec { ep with f := f' + 1 } (View.renderEach rest s) false (pr ++ [child]) domRest mid hi' aMid
       (by rw [View.renderEach_eq_map, List.length_map]; simp only [List.length_append, List.length_singleton]; simp only [List.length_cons] at hlen'; omega)
       (by rw [View.renderEach_eq_map]; exact hextMid.bound_sub hbd') (by rw [View.renderEach_eq_map]; exact hrestDep) (Nat.lt_of_lt_of_le hb.1 hloMid) hpreMid hparMid (by rw [View.renderEach_eq_map]; exact hdomMid)
     rw [show UInt32.ofNat (pr ++ [child]).length = UInt32.ofNat pr.length + 1 by rw [List.length_append, List.length_singleton, huNext]] at hih hextR

@@ -44,16 +44,16 @@ def unescape : Char → Option Char
   | '"' => some '"' | '\\' => some '\\' | '/' => some '/' | 'n' => some '\n'
   | 'r' => some '\r' | 't' => some '\t' | 'b' => some (Char.ofNat 8) | 'f' => some (Char.ofNat 12) | _ => none
 
-def parseStrAux (acc : String) : List Char → Except String (String × List Char)
+def parseStrAux (acc : List Char) : List Char → Except String (String × List Char)
   | [] => .error "unterminated string"
   | c :: rest =>
-      if c == '"' then .ok (acc, rest)
+      if c == '"' then .ok (String.ofList acc.reverse, rest)
       else if c == '\\' then match rest with
-        | 'u' :: a :: b :: c :: d :: r => (hex4 a b c d).elim (.error "invalid \\u escape") fun n => parseStrAux (acc.push (Char.ofNat n)) r
-        | e :: r => (unescape e).elim (.error "invalid escape") fun ch => parseStrAux (acc.push ch) r
+        | 'u' :: a :: b :: c :: d :: r => (hex4 a b c d).elim (.error "invalid \\u escape") fun n => parseStrAux (Char.ofNat n :: acc) r
+        | e :: r => (unescape e).elim (.error "invalid escape") fun ch => parseStrAux (ch :: acc) r
         | [] => .error "unterminated string"
-      else parseStrAux (acc.push c) rest
-def parseStr (cs : List Char) : Except String (String × List Char) := parseStrAux "" cs
+      else parseStrAux (c :: acc) rest
+def parseStr (cs : List Char) : Except String (String × List Char) := parseStrAux [] cs
 
 @[inline] def parseSigned (allowPlus : Bool) (cs : List Char) : Int × List Char × List Char :=
   let (sgn, cs1) : Int × List Char := match cs with
@@ -171,14 +171,20 @@ mutual
 end
 def renderFast (j : Json) : String := renderAcc "" j
 
-local macro "str_ext_simp" : tactic =>
-  `(tactic| (ext; simp only [String.toList_push, String.toList_append, String.toList_ofList, List.append_assoc, List.cons_append, List.nil_append, List.append_nil]))
+private theorem str_push_eq (a : String) (c : Char) : a.push c = a ++ String.ofList [c] :=
+  String.toList_injective (by simp only [String.toList_push, String.toList_append, String.toList_ofList])
+private theorem str_append_ofList (a : String) (xs ys : List Char) : (a ++ String.ofList xs) ++ String.ofList ys = a ++ String.ofList (xs ++ ys) :=
+  String.toList_injective (by simp only [String.toList_append, String.toList_ofList, List.append_assoc])
+private theorem str_push_ofList (a : String) (c : Char) (xs : List Char) : a.push c ++ String.ofList xs = a ++ String.ofList (c :: xs) :=
+  by rw [str_push_eq, str_append_ofList, List.singleton_append]
+private theorem str_wrap_ofList (a : String) (l r : Char) (xs : List Char) : ((a.push l) ++ String.ofList xs).push r = a ++ String.ofList (l :: (xs ++ [r])) :=
+  by rw [str_push_ofList, str_push_eq, str_append_ofList, List.cons_append]
 
 private theorem foldl_appendEscaped_eq : ∀ (cs : List Char) (acc : String), cs.foldl appendEscaped acc = acc ++ String.ofList (cs.flatMap escapeCharL)
   | [], _ => by simp only [List.foldl_nil, List.flatMap_nil, String.ofList_nil, String.append_empty]
   | c :: cs, acc => by
-      have ha : appendEscaped acc c = acc ++ String.ofList (escapeCharL c) := by unfold appendEscaped escapeCharL; split <;> first | rfl | (split <;> first | rfl | str_ext_simp)
-      simp only [List.foldl_cons, List.flatMap_cons, foldl_appendEscaped_eq cs, ha]; str_ext_simp
+      have ha : appendEscaped acc c = acc ++ String.ofList (escapeCharL c) := by unfold appendEscaped escapeCharL; split <;> first | rfl | (split <;> first | rfl | exact str_push_eq acc c)
+      simp only [List.foldl_cons, List.flatMap_cons, foldl_appendEscaped_eq cs, ha]; exact str_append_ofList ..
 
 private theorem flatMap_escapeCharL_of_none : ∀ cs : List Char, cs.any needsJsonEscape = false → cs.flatMap escapeCharL = cs
   | [], _ => rfl
@@ -197,33 +203,40 @@ private theorem hasJsonEscapeByte_eq (s : String) : hasAsciiByte s needsJsonEsca
 private theorem renderStrAcc_eq (s acc : String) : renderStrAcc s acc = acc ++ String.ofList (renderStrL s) := by
   unfold renderStrAcc renderStrL; dsimp only
   rw [show s.foldl appendEscaped (acc.push '"') = s.toList.foldl appendEscaped (acc.push '"') by rw [String.foldl_eq_foldl_toList], hasJsonEscapeByte_eq]
-  cases ha : s.toList.any needsJsonEscape <;> (simp only [Bool.not_false, Bool.not_true, Bool.false_eq_true, ↓reduceIte, flatMap_escapeCharL_of_none s.toList, ha, foldl_appendEscaped_eq]; str_ext_simp)
+  cases ha : s.toList.any needsJsonEscape
+  · simp only [Bool.not_false, ↓reduceIte, flatMap_escapeCharL_of_none s.toList ha]; rw [← String.ofList_toList (s := s), str_wrap_ofList, String.toList_ofList]
+  · simp only [Bool.not_true, Bool.false_eq_true, ↓reduceIte, foldl_appendEscaped_eq, str_wrap_ofList]
 
 private theorem renderNumAcc_eq (n : JsonNumber) (acc : String) : renderNumAcc n acc = acc ++ String.ofList (renderNumL n) := by
   let rec hfold : ∀ (cs : List Char) (a : String), cs.foldl String.push a = a ++ String.ofList cs
-    | [], _ => by simp only [List.foldl_nil, String.ofList_nil, String.append_empty] | c :: cs, a => by simp only [List.foldl_cons, hfold cs]; str_ext_simp
+    | [], _ => by simp only [List.foldl_nil, String.ofList_nil, String.append_empty] | c :: cs, a => by simp only [List.foldl_cons, hfold cs]; exact str_push_ofList ..
   have hnat (m : Nat) (a : String) : pushNatAcc m a = a ++ String.ofList (natDigitsAux m []) := by
     unfold pushNatAcc; split
-    · rename_i h10; rw [natDigitsAux, ite_eq_left h10, Nat.mod_eq_of_lt h10]; str_ext_simp
+    · rename_i h10; rw [natDigitsAux, ite_eq_left h10, Nat.mod_eq_of_lt h10]; exact str_push_eq ..
     · rename_i hge10; split
       · rename_i h100; have hd : m / 10 < 10 := by omega
-        rw [natDigitsAux, ite_eq_right hge10, natDigitsAux, ite_eq_left hd, Nat.mod_eq_of_lt hd]; str_ext_simp
+        rw [natDigitsAux, ite_eq_right hge10, natDigitsAux, ite_eq_left hd, Nat.mod_eq_of_lt hd, str_push_eq, str_push_ofList]
       · exact hfold _ a
-  have hint (i : Int) (a : String) : pushIntAcc i a = a ++ String.ofList (intCharsL i) := by unfold pushIntAcc intCharsL; split <;> (rw [hnat]; str_ext_simp)
-  unfold renderNumAcc renderNumL; split <;> (simp only [hint]; str_ext_simp)
+  have hint (i : Int) (a : String) : pushIntAcc i a = a ++ String.ofList (intCharsL i) := by
+    unfold pushIntAcc intCharsL; split <;> rw [hnat]
+    · exact str_push_ofList ..
+    · rfl
+  unfold renderNumAcc renderNumL; split <;> simp only [hint]
+  · rw [List.append_nil]
+  · rw [str_push_ofList, str_append_ofList]
 
 mutual
   private theorem renderAcc_eq (acc : String) : ∀ j, renderAcc acc j = acc ++ String.ofList (renderL j)
     | .null => rfl | .bool b => by cases b <;> rfl | .num n => renderNumAcc_eq n acc | .str s => renderStrAcc_eq s acc
-    | .arr es => by unfold renderAcc renderL; rw [renderElemsAcc_eq]; str_ext_simp
-    | .obj ms => by unfold renderAcc renderL; rw [renderMembersAcc_eq]; str_ext_simp
+    | .arr es => by unfold renderAcc renderL; rw [renderElemsAcc_eq]; exact str_wrap_ofList ..
+    | .obj ms => by unfold renderAcc renderL; rw [renderMembersAcc_eq]; exact str_wrap_ofList ..
   private theorem renderElemsAcc_eq (acc : String) : ∀ es, renderElemsAcc acc es = acc ++ String.ofList (renderElemsL es)
     | [] => by simp only [renderElemsAcc, renderElemsL, String.ofList_nil, String.append_empty] | [e] => renderAcc_eq acc e
-    | e :: x :: xs => by unfold renderElemsAcc renderElemsL; rw [renderElemsAcc_eq, renderAcc_eq]; str_ext_simp
+    | e :: x :: xs => by unfold renderElemsAcc renderElemsL; rw [renderElemsAcc_eq, renderAcc_eq, str_push_ofList, str_append_ofList]
   private theorem renderMembersAcc_eq (acc : String) : ∀ ms, renderMembersAcc acc ms = acc ++ String.ofList (renderMembersL ms)
     | [] => by simp only [renderMembersAcc, renderMembersL, String.ofList_nil, String.append_empty]
-    | [(k, v)] => by unfold renderMembersAcc renderMembersL; rw [renderAcc_eq, renderStrAcc_eq]; str_ext_simp
-    | (k, v) :: m :: ms => by unfold renderMembersAcc renderMembersL; rw [renderMembersAcc_eq, renderAcc_eq, renderStrAcc_eq]; str_ext_simp
+    | [(k, v)] => by unfold renderMembersAcc renderMembersL; rw [renderAcc_eq, renderStrAcc_eq, str_push_ofList, str_append_ofList]
+    | (k, v) :: m :: ms => by unfold renderMembersAcc renderMembersL; rw [renderMembersAcc_eq, renderAcc_eq, renderStrAcc_eq, str_push_ofList, str_push_ofList, str_append_ofList, str_append_ofList, List.cons_append]
 end
 @[csimp] theorem render_eq_renderFast : @Json.render = @Json.renderFast := by
   funext j; symm; unfold render renderFast; rw [renderAcc_eq, String.empty_append]
@@ -256,25 +269,35 @@ class FromJson (α : Type) where fromJson : Json → Except String α
 export ToJson (toJson)
 export FromJson (fromJson)
 
-local macro "defJson " "[" vs:ident,* "]" ty:term " : " enc:term " , " dec:term : command => do
-  let ids := vs.getElems
-  `(instance $[{$ids:ident : Type}]* $[[ToJson $ids]]* : ToJson $ty := ⟨$enc⟩
-    instance $[{$ids:ident : Type}]* $[[FromJson $ids]]* : FromJson $ty := ⟨$dec⟩)
-
-defJson [] Unit : (fun _ => .arr []), (fun | .arr [] => .ok () | _ => .error "expected []")
-defJson [] Json : id, .ok
-defJson [] JsonNumber : .num, (fun j => j.num?.elim (.error "expected a number") .ok)
-defJson [] Bool : .bool, (fun j => j.bool?.elim (.error "expected a boolean") .ok)
-defJson [] String : .str, (fun j => j.str?.elim (.error "expected a string") .ok)
-defJson [] Int : (fun i => .num ⟨i, 0⟩), (fun | .num n => n.toInt?.elim (.error "expected an integer") .ok | _ => .error "expected an integer")
-defJson [] Nat : (fun n => .num ⟨(n : Int), 0⟩), (fun | .num n => n.toInt?.elim (.error "expected an integer") fun m => if 0 ≤ m then .ok m.toNat else .error "expected a non-negative integer" | _ => .error "expected a natural number")
-defJson [] Float : (fun f => (Json.parse (toString f)).toOption.getD (.num ⟨0, 0⟩)), (fun | .num n => let mag := Float.ofScientific n.mantissa.natAbs (n.exponent < 0) n.exponent.natAbs; .ok (if n.mantissa < 0 then -mag else mag) | _ => .error "expected a number")
-defJson [α] (List α) : (fun xs => .arr (xs.map toJson)), (fun | .arr es => es.mapM fromJson | _ => .error "expected an array")
-defJson [α] (Array α) : (fun xs => .arr (xs.toList.map toJson)), (fun j => (fromJson j : Except String (List α)).map List.toArray)
-defJson [α] (Option α) : (fun a => a.elim .null toJson), (fun | .null => .ok none | j => (fromJson j : Except String α).map some)
-defJson [α, β] (α × β) : (fun (a, b) => .arr [toJson a, toJson b]), (fun | .arr [ja, jb] => (fromJson ja).bind fun a => (fromJson jb).map (a, ·) | _ => .error "expected a 2-element array")
-defJson [α, β] (Sum α β) : (fun | .inl a => .arr [.num ⟨0, 0⟩, toJson a] | .inr b => .arr [.num ⟨1, 0⟩, toJson b]),
-  (fun | .arr [.num ⟨0, 0⟩, ja] => (fromJson ja : Except String α).map .inl | .arr [.num ⟨1, 0⟩, jb] => (fromJson jb : Except String β).map .inr | _ => .error "expected a tagged sum array")
+instance : ToJson Unit := ⟨fun _ => .arr []⟩
+instance : FromJson Unit := ⟨fun | .arr [] => .ok () | _ => .error "expected []"⟩
+instance : ToJson Json := ⟨id⟩
+instance : FromJson Json := ⟨.ok⟩
+instance : ToJson JsonNumber := ⟨.num⟩
+instance : FromJson JsonNumber := ⟨fun j => j.num?.elim (.error "expected a number") .ok⟩
+instance : ToJson Bool := ⟨.bool⟩
+instance : FromJson Bool := ⟨fun j => j.bool?.elim (.error "expected a boolean") .ok⟩
+instance : ToJson String := ⟨.str⟩
+instance : FromJson String := ⟨fun j => j.str?.elim (.error "expected a string") .ok⟩
+instance : ToJson Int := ⟨fun i => .num ⟨i, 0⟩⟩
+instance : FromJson Int := ⟨fun | .num n => n.toInt?.elim (.error "expected an integer") .ok | _ => .error "expected an integer"⟩
+instance : ToJson Nat := ⟨fun n => .num ⟨(n : Int), 0⟩⟩
+instance : FromJson Nat := ⟨fun | .num n => n.toInt?.elim (.error "expected an integer") fun m => if 0 ≤ m then .ok m.toNat else .error "expected a non-negative integer" | _ => .error "expected a natural number"⟩
+instance : ToJson Float := ⟨fun f => (Json.parse (toString f)).toOption.getD (.num ⟨0, 0⟩)⟩
+instance : FromJson Float := ⟨fun | .num n => let mag := Float.ofScientific n.mantissa.natAbs (n.exponent < 0) n.exponent.natAbs; .ok (if n.mantissa < 0 then -mag else mag) | _ => .error "expected a number"⟩
+section
+variable {α β : Type}
+instance [ToJson α] : ToJson (List α) := ⟨fun xs => .arr (xs.map toJson)⟩
+instance [FromJson α] : FromJson (List α) := ⟨fun | .arr es => es.mapM fromJson | _ => .error "expected an array"⟩
+instance [ToJson α] : ToJson (Array α) := ⟨fun xs => .arr (xs.toList.map toJson)⟩
+instance [FromJson α] : FromJson (Array α) := ⟨fun j => (fromJson j : Except String (List α)).map List.toArray⟩
+instance [ToJson α] : ToJson (Option α) := ⟨fun a => a.elim .null toJson⟩
+instance [FromJson α] : FromJson (Option α) := ⟨fun | .null => .ok none | j => (fromJson j : Except String α).map some⟩
+instance [ToJson α] [ToJson β] : ToJson (α × β) := ⟨fun (a, b) => .arr [toJson a, toJson b]⟩
+instance [FromJson α] [FromJson β] : FromJson (α × β) := ⟨fun | .arr [ja, jb] => (fromJson ja).bind fun a => (fromJson jb).map (a, ·) | _ => .error "expected a 2-element array"⟩
+instance [ToJson α] [ToJson β] : ToJson (Sum α β) := ⟨fun | .inl a => .arr [.num ⟨0, 0⟩, toJson a] | .inr b => .arr [.num ⟨1, 0⟩, toJson b]⟩
+instance [FromJson α] [FromJson β] : FromJson (Sum α β) := ⟨fun | .arr [.num ⟨0, 0⟩, ja] => (fromJson ja : Except String α).map .inl | .arr [.num ⟨1, 0⟩, jb] => (fromJson jb : Except String β).map .inr | _ => .error "expected a tagged sum array"⟩
+end
 
 class FromJsonField (α : Type) where fromField : Json → String → Except String α
 export FromJsonField (fromField)
@@ -291,20 +314,25 @@ syntax "json_obj_codec% " (&"private ")? ident " [" jsonObjField,* "]" (" valida
 
 macro_rules
   | `(json_obj_codec% $[private%$p?]? $ty:ident [$fs:jsonObjField,*] $[validate $val?:term]?) => do
-      let items ← fs.getElems.mapM fun f => do
-        let `(jsonObjField| $id:ident $[:= $d?:term]?) := f | Lean.Macro.throwUnsupported
-        let k := Lean.Syntax.mkStrLit id.getId.eraseMacroScopes.toString
-        let decVal ← match d? with
-          | some d => `((← Qed.fromField (α := Option _) j $k).getD $d)
-          | none   => `(← Qed.fromField j $k)
-        return (← `(($k, Qed.toJson v.$id)), id, decVal)
-      let encItems := items.map (·.1); let decFields := items.map (·.2.1); let decVals := items.map (·.2.2)
+      let rec go : List (Lean.TSyntax `jsonObjField) → Array (Lean.TSyntax `term) → Array Lean.Ident → Array (Lean.TSyntax `term) →
+          Lean.MacroM (Array (Lean.TSyntax `term) × Array Lean.Ident × Array (Lean.TSyntax `term))
+        | [], es, ds, vs => pure (es, ds, vs)
+        | f :: rest, es, ds, vs => do
+            let `(jsonObjField| $id:ident $[:= $d?:term]?) := f | Lean.Macro.throwUnsupported
+            let k := Lean.Syntax.mkStrLit id.getId.eraseMacroScopes.toString
+            let decVal ← match d? with
+              | some d => `((← Qed.fromField (α := Option _) j $k).getD $d)
+              | none   => `(← Qed.fromField j $k)
+            go rest (es.push (← `(($k, Qed.toJson v.$id)))) (ds.push id) (vs.push decVal)
+      let (encItems, decFields, decVals) ← go fs.getElems.toList #[] #[] #[]
       let toBody ← `(fun (v : $ty) => Qed.Json.obj [$[$encItems:term],*])
+      let recExpr ← `(({ $[$decFields:ident := $decVals:term],* } : $ty))
       let fromBody ← match val? with
-        | some vfn => `(fun j => do let r : $ty := { $[$decFields:ident := $decVals:term],* }; let () ← ($vfn:term) r; return r)
-        | none     => `(fun j => do return ({ $[$decFields:ident := $decVals:term],* } : $ty))
-      match p? with
-      | some _ => return Lean.mkNullNode #[← `(command| private instance : Qed.ToJson $ty := ⟨$toBody⟩), ← `(command| private instance : Qed.FromJson $ty := ⟨$fromBody⟩)]
-      | none   => return Lean.mkNullNode #[← `(command| instance : Qed.ToJson $ty := ⟨$toBody⟩), ← `(command| instance : Qed.FromJson $ty := ⟨$fromBody⟩)]
+        | some vfn => `(fun j => do let r := $recExpr; let () ← ($vfn:term) r; return r)
+        | none     => `(fun j => do return $recExpr)
+      let mkInst (cls body : Lean.TSyntax `term) := match p? with
+        | some _ => `(command| private instance : $cls := ⟨$body⟩)
+        | none   => `(command| instance : $cls := ⟨$body⟩)
+      return Lean.mkNullNode #[← mkInst (← `(Qed.ToJson $ty)) toBody, ← mkInst (← `(Qed.FromJson $ty)) fromBody]
 
 end Qed

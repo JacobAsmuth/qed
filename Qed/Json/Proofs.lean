@@ -103,7 +103,7 @@ private theorem parseNum_render (n : JsonNumber) (rest : List Char) (hr : numDel
   rw [hne, ite_eq_right Bool.false_ne_true, htail.2.1]; dsimp only; rw [htail.2.2]
   simp only [List.append_nil, hd, List.length_nil, Except.ok.injEq, Prod.mk.injEq, JsonNumber.mk.injEq, and_true]; split <;> omega
 
-private theorem parseStrAux_escape (c : Char) (acc : String) (rest : List Char) : parseStrAux acc (escapeCharL c ++ rest) = parseStrAux (acc.push c) rest := by
+private theorem parseStrAux_escape (c : Char) (acc : List Char) (rest : List Char) : parseStrAux acc (escapeCharL c ++ rest) = parseStrAux (c :: acc) rest := by
   dsimp only [escapeCharL]; split <;> try rfl
   rename_i _ h1 h2 _ _ _; by_cases hlt : c.toNat < 0x20
   · simp only [ite_eq_left hlt, hexEscapeL, List.cons_append, List.nil_append]; rw [parseStrAux.eq_def]
@@ -111,13 +111,13 @@ private theorem parseStrAux_escape (c : Char) (acc : String) (rest : List Char) 
     rw [show ((c.toNat / 4096 % 16 * 16 + c.toNat / 256 % 16) * 16 + c.toNat / 16 % 16) * 16 + c.toNat % 16 = c.toNat by omega, Char.ofNat_toNat]
   · simp only [ite_eq_right hlt, List.cons_append, List.nil_append]; rw [parseStrAux.eq_def]; simp only [beq_eq_false_iff_ne.2 h1, beq_eq_false_iff_ne.2 h2, Bool.false_eq_true, ↓reduceIte]
 
-private theorem parseStrAux_flatMap : ∀ (cs : List Char) (acc : String) (rest : List Char),
-    parseStrAux acc (cs.flatMap escapeCharL ++ '"' :: rest) = .ok (acc ++ String.ofList cs, rest)
-  | [], _, _ => by rw [List.flatMap_nil, List.nil_append, parseStrAux.eq_def]; simp only [beq_self_eq_true, ↓reduceIte, String.ofList_nil, String.append_empty]
-  | c :: cs, _, _ => by rw [List.flatMap_cons, List.append_assoc, parseStrAux_escape, parseStrAux_flatMap cs]; congr 2; exact String.toList_injective (by simp only [String.toList_append, String.toList_push, String.toList_ofList, List.append_assoc, List.singleton_append])
+private theorem parseStrAux_flatMap : ∀ (cs acc rest : List Char),
+    parseStrAux acc (cs.flatMap escapeCharL ++ '"' :: rest) = .ok (String.ofList (acc.reverse ++ cs), rest)
+  | [], _, _ => by rw [List.flatMap_nil, List.nil_append, parseStrAux.eq_def]; simp only [beq_self_eq_true, ↓reduceIte, List.append_nil]
+  | c :: cs, _, _ => by rw [List.flatMap_cons, List.append_assoc, parseStrAux_escape, parseStrAux_flatMap cs, List.reverse_cons, List.append_assoc, List.singleton_append]
 
 private theorem parseStr_render (s : String) (rest : List Char) : parseStr (s.toList.flatMap escapeCharL ++ '"' :: rest) = .ok (s, rest) := by
-  rw [parseStr, parseStrAux_flatMap, String.empty_append, String.ofList_toList]
+  rw [parseStr, parseStrAux_flatMap, List.reverse_nil, List.nil_append, String.ofList_toList]
 
 private theorem renderL_head (j : Json) : ∃ c t, Json.renderL j = c :: t ∧ isWs c = false ∧ c ≠ ']' ∧ c ≠ '}' := by
   cases j with

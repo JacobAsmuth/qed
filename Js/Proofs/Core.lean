@@ -110,25 +110,26 @@ inductive DropsVar (p : Nat) : FnBody → Prop where
   | sproj_skip (x : VarId) (ty : IRType) (n off : Nat) (src : VarId) (cont : FnBody) (h : DropsVar p cont) : DropsVar p (.vdecl x ty (.sproj n off src) cont)
 theorem sizeOf_altBody_lt {tid : Name} {x : VarId} {ty : IRType} {alts : Array Alt} {arm : Alt} (h : arm ∈ alts.toList) : sizeOf (altBody arm) < sizeOf (FnBody.case tid x ty alts) := by
   have h1 := List.sizeOf_lt_of_mem h; have h2 : sizeOf (altBody arm) < sizeOf arm := by cases arm <;> simp only [altBody, Alt.ctor.sizeOf_spec, Alt.default.sizeOf_spec] <;> omega
-  cases alts; dsimp only at h1; simp; omega
-def NonArrConsistent (ρ : Nat → RcVal) : FnBody → Prop
-  | .vdecl x _ e b => (NonArrExpr e = true → ∃ v, ρ x.idx = .nonArr v) ∧ (∀ p, ProjSrcVar e = some p → ∃ v, ρ p = .nonArr v) ∧ NonArrConsistent ρ b
-  | .jdecl _ _ v b => NonArrConsistent ρ v ∧ NonArrConsistent ρ b | .case _ x _ alts => (∃ v, ρ x.idx = .nonArr v) ∧ ∀ arm ∈ alts.toList, NonArrConsistent ρ (altBody arm)
-  | .set _ _ _ b | .setTag _ _ b | .uset _ _ _ b | .sset _ _ _ _ _ b | .inc _ _ _ _ b | .dec _ _ _ _ b | .del _ b => NonArrConsistent ρ b
+  cases alts; dsimp only at h1; simp only [FnBody.case.sizeOf_spec, Array.mk.sizeOf_spec]; omega
+mutual
+def NonArrPred (Q : Nat → Prop) : FnBody → Prop
+  | .vdecl x _ e b => (NonArrExpr e = true → Q x.idx) ∧ (∀ p, ProjSrcVar e = some p → Q p) ∧ NonArrPred Q b
+  | .jdecl _ _ v b => NonArrPred Q v ∧ NonArrPred Q b | .case _ x _ ⟨alts⟩ => Q x.idx ∧ NonArrPredAlts Q alts
+  | .set _ _ _ b | .setTag _ _ b | .uset _ _ _ b | .sset _ _ _ _ _ b | .inc _ _ _ _ b | .dec _ _ _ _ b | .del _ b => NonArrPred Q b
   | .ret _ | .jmp _ _ | .unreachable => True
-termination_by b => sizeOf b
-decreasing_by all_goals first | exact sizeOf_altBody_lt ‹_› | (simp_wf; try omega)
-def jsArmBody : JsSwitchArm → List JsStmt | .caseArm _ b | .defaultArm b => b
-private theorem sizeOf_jsArmStmt_lt {scr : JsExpr} {arms : List JsSwitchArm} {arm : JsSwitchArm} {s : JsStmt} (ha : arm ∈ arms) (hs : s ∈ jsArmBody arm) : sizeOf s < sizeOf (JsStmt.switchStmt scr arms) := by
-  have h1 := List.sizeOf_lt_of_mem ha; have h2 := List.sizeOf_lt_of_mem hs
-  have h3 : sizeOf (jsArmBody arm) < sizeOf arm := by cases arm <;> simp only [jsArmBody, JsSwitchArm.caseArm.sizeOf_spec, JsSwitchArm.defaultArm.sizeOf_spec] <;> omega
-  simp only [JsStmt.switchStmt.sizeOf_spec]; omega
+def NonArrPredAlts (Q : Nat → Prop) : List Alt → Prop
+  | [] => True | .ctor _ b :: rest | .default b :: rest => NonArrPred Q b ∧ NonArrPredAlts Q rest
+end
+abbrev NonArrConsistent (ρ : Nat → RcVal) : FnBody → Prop := NonArrPred (fun k => ∃ v, ρ k = .nonArr v)
+mutual
 def stmtTailSafe (allowSelf : Bool) : JsStmt → Prop
-  | .tailContinue .. => allowSelf = true | .labeledBlock _ body => ∀ s ∈ body, stmtTailSafe allowSelf s
-  | .constArrow _ _ body => ∀ s ∈ body, stmtTailSafe false s | .switchStmt _ arms => ∀ arm ∈ arms, ∀ s ∈ jsArmBody arm, stmtTailSafe allowSelf s | _ => True
-termination_by s => sizeOf s
-decreasing_by all_goals first | exact sizeOf_jsArmStmt_lt ‹_› ‹_› | (have h1 := List.sizeOf_lt_of_mem ‹_›; simp_wf; omega)
-abbrev stmtsTailSafe (allowSelf : Bool) (ss : List JsStmt) : Prop := ∀ s ∈ ss, stmtTailSafe allowSelf s
+  | .tailContinue .. => allowSelf = true | .labeledBlock _ body => stmtsTailSafe allowSelf body
+  | .constArrow _ _ body => stmtsTailSafe false body | .switchStmt _ arms => armsTailSafe allowSelf arms | _ => True
+def stmtsTailSafe (allowSelf : Bool) : List JsStmt → Prop
+  | [] => True | s :: ss => stmtTailSafe allowSelf s ∧ stmtsTailSafe allowSelf ss
+def armsTailSafe (allowSelf : Bool) : List JsSwitchArm → Prop
+  | [] => True | .caseArm _ b :: rest | .defaultArm b :: rest => stmtsTailSafe allowSelf b ∧ armsTailSafe allowSelf rest
+end
 
 /-! ## 1. Digit/String Injectivity, Identifier Hygiene, `jsStr` Safety & `reach` Closure -/
 
@@ -319,48 +320,60 @@ theorem memo_thunk_obs_equiv {α : Type} (thunk : Unit → α) (defaultVal : α)
 theorem fnBody_ind (P : FnBody → Prop) (h : ∀ b, fnBodyStep P b → P b) : ∀ b, P b :=
   let rec go : ∀ (sz : Nat) (b : FnBody), sizeOf b ≤ sz → P b := fun sz => by
     induction sz using Nat.strongRecOn with | ind sz ih => intro b hsz; apply h; cases b with
-      | vdecl _ _ _ c | set _ _ _ c | setTag _ _ c | uset _ _ _ c | sset _ _ _ _ _ c | inc _ _ _ _ c | dec _ _ _ _ c | del _ c => exact ih (sizeOf c) (by simp at hsz; omega) c (Nat.le_refl _)
-      | jdecl _ _ v c => exact ⟨ih (sizeOf v) (by simp at hsz; omega) v (Nat.le_refl _), ih (sizeOf c) (by simp at hsz; omega) c (Nat.le_refl _)⟩
-      | case tid x ty alts => intro arm harm; exact ih (sizeOf (altBody arm)) (Nat.lt_of_lt_of_le (sizeOf_altBody_lt harm) hsz) (altBody arm) (Nat.le_refl _)
+      | vdecl _ _ _ c | set _ _ _ c | setTag _ _ c | uset _ _ _ c | sset _ _ _ _ _ c | inc _ _ _ _ c | dec _ _ _ _ c | del _ c =>
+          exact ih (sizeOf c) (by simp only [FnBody.vdecl.sizeOf_spec, FnBody.set.sizeOf_spec, FnBody.setTag.sizeOf_spec, FnBody.uset.sizeOf_spec, FnBody.sset.sizeOf_spec, FnBody.inc.sizeOf_spec, FnBody.dec.sizeOf_spec, FnBody.del.sizeOf_spec] at hsz; omega) c (Nat.le_refl _)
+      | jdecl _ _ v c => have : sizeOf v + sizeOf c < sz := by simp only [FnBody.jdecl.sizeOf_spec] at hsz; omega
+                         exact ⟨ih (sizeOf v) (by omega) v (Nat.le_refl _), ih (sizeOf c) (by omega) c (Nat.le_refl _)⟩
+      | case _ _ _ alts => intro arm harm; exact ih (sizeOf (altBody arm)) (Nat.lt_of_lt_of_le (sizeOf_altBody_lt harm) hsz) (altBody arm) (Nat.le_refl _)
       | ret _ | jmp _ _ | unreachable => trivial
   fun b => go (sizeOf b) b (Nat.le_refl _)
-private theorem alts_step_ind {α : Type} (I : α → Prop) (f : α → FnBody → α) (fAlts : α → List Alt → α)
-    (hnil : ∀ a, fAlts a [] = a) (hcons : ∀ a arm rest, fAlts a (arm :: rest) = fAlts (f a (altBody arm)) rest) :
-    ∀ ls a, (∀ arm ∈ ls, ∀ b, I b → I (f b (altBody arm))) → I a → I (fAlts a ls)
-  | [], _, _, ha => hnil _ ▸ ha | arm :: rest, a, hst, ha => hcons _ arm rest ▸ alts_step_ind I f fAlts hnil hcons rest _ (fun x hx => hst x (.tail _ hx)) (hst _ (.head _) a ha)
+private theorem collectNonArr_vdecl (acc : Std.HashSet Nat) (x : VarId) (ty : IRType) (e : IR.Expr) (b : FnBody) :
+    collectNonArr acc (.vdecl x ty e b) = collectNonArr (if NonArrExpr e then acc.insert x.idx else match ProjSrcVar e with | some p => acc.insert p | none => acc) b := by cases e <;> rfl
+mutual
+private theorem nonArrPred_true : ∀ b : FnBody, NonArrPred (fun _ => True) b
+  | .vdecl _ _ _ c => ⟨fun _ => trivial, fun _ _ => trivial, nonArrPred_true c⟩ | .jdecl _ _ v c => ⟨nonArrPred_true v, nonArrPred_true c⟩ | .case _ _ _ ⟨alts⟩ => ⟨trivial, nonArrPredAlts_true alts⟩
+  | .set _ _ _ c | .setTag _ _ c | .uset _ _ _ c | .sset _ _ _ _ _ c | .inc _ _ _ _ c | .dec _ _ _ _ c | .del _ c => nonArrPred_true c | .ret _ | .jmp _ _ | .unreachable => trivial
+private theorem nonArrPredAlts_true : ∀ ls : List Alt, NonArrPredAlts (fun _ => True) ls | [] => trivial | .ctor _ b :: r | .default b :: r => ⟨nonArrPred_true b, nonArrPredAlts_true r⟩
+end
+mutual
+private theorem collectNonArr_pres (Q : Nat → Prop) (I : Std.HashSet Nat → Prop) (hins : ∀ s m, I s → Q m → I (s.insert m)) :
+    ∀ (b : FnBody) (acc : Std.HashSet Nat), NonArrPred Q b → I acc → I (collectNonArr acc b)
+  | .vdecl x ty e c, acc, hc, ha => by rw [collectNonArr_vdecl]; refine collectNonArr_pres Q I hins c _ hc.2.2 ?_; split; exact hins _ _ ha (hc.1 ‹_›); cases hp : ProjSrcVar e; exact ha; exact hins _ _ ha (hc.2.1 _ hp)
+  | .jdecl _ _ v c, acc, hc, ha => collectNonArr_pres Q I hins c _ hc.2 (collectNonArr_pres Q I hins v acc hc.1 ha)
+  | .case _ x _ ⟨alts⟩, acc, hc, ha => collectNonArrAlts_pres Q I hins alts (acc.insert x.idx) hc.2 (hins acc x.idx ha hc.1)
+  | .set _ _ _ c, acc, hc, ha | .setTag _ _ c, acc, hc, ha | .uset _ _ _ c, acc, hc, ha | .sset _ _ _ _ _ c, acc, hc, ha | .inc _ _ _ _ c, acc, hc, ha | .dec _ _ _ _ c, acc, hc, ha | .del _ c, acc, hc, ha => collectNonArr_pres Q I hins c acc hc ha
+  | .ret _, _, _, ha | .jmp _ _, _, _, ha | .unreachable, _, _, ha => ha
+private theorem collectNonArrAlts_pres (Q : Nat → Prop) (I : Std.HashSet Nat → Prop) (hins : ∀ s m, I s → Q m → I (s.insert m)) :
+    ∀ (ls : List Alt) (acc : Std.HashSet Nat), NonArrPredAlts Q ls → I acc → I (collectNonArrAlts acc ls)
+  | [], _, _, ha => ha | .ctor _ b :: r, acc, hc, ha | .default b :: r, acc, hc, ha => collectNonArrAlts_pres Q I hins r _ hc.2 (collectNonArr_pres Q I hins b acc hc.1 ha)
+end
 theorem collectNonArr_mono (b : FnBody) (acc : Std.HashSet Nat) (k : Nat) (hk : k ∈ acc) : k ∈ collectNonArr acc b :=
-  fnBody_ind (fun b => ∀ acc, k ∈ acc → k ∈ collectNonArr acc b) (fun b hb acc hk => by cases b with
-    | vdecl _ _ e _ => refine hb _ ?_; cases e <;> first | exact hk | exact Std.HashSet.mem_insert.mpr (.inr hk)
-    | jdecl _ _ _ _ => exact hb.2 _ (hb.1 acc hk) | case _ _ _ alts => exact alts_step_ind (k ∈ ·) collectNonArr collectNonArrAlts (fun _ => rfl) (fun _ arm _ => by cases arm <;> rfl) alts.toList _ hb (Std.HashSet.mem_insert.mpr (.inr hk))
-    | ret _ | jmp _ _ | unreachable => exact hk | _ => exact hb acc hk) b acc hk
+  collectNonArr_pres (fun _ => True) (k ∈ ·) (fun _ _ h _ => Std.HashSet.mem_insert.mpr (.inr h)) b acc (nonArrPred_true b) hk
 theorem collectNonArrAlts_mono (alts : List Alt) (acc : Std.HashSet Nat) (k : Nat) (hk : k ∈ acc) : k ∈ collectNonArrAlts acc alts :=
-  alts_step_ind (k ∈ ·) collectNonArr collectNonArrAlts (fun _ => rfl) (fun _ arm _ => by cases arm <;> rfl) alts acc (fun arm _ b hb => collectNonArr_mono (altBody arm) b k hb) hk
-
+  collectNonArrAlts_pres (fun _ => True) (k ∈ ·) (fun _ _ h _ => Std.HashSet.mem_insert.mpr (.inr h)) alts acc (nonArrPredAlts_true alts) hk
 theorem collectNonArr_sound (body : FnBody) (ρ : Nat → RcVal) (hcon : NonArrConsistent ρ body) :
-    ∀ x : VarId, (collectNonArr {} body).contains x.idx = true → ∀ (h : CowHeap α) (n : Nat), h.rcInc (ρ x.idx) n = h ∧ h.rcDec (ρ x.idx) n = h := by
-  have hins {a : Std.HashSet Nat} {k : Nat} (ha : ∀ m ∈ a, ∃ v, ρ m = .nonArr v) (hk : ∃ v, ρ k = .nonArr v) : ∀ m ∈ a.insert k, ∃ v, ρ m = .nonArr v := fun m hm => (Std.HashSet.mem_insert.1 hm).elim (fun h => (beq_iff_eq.mp h) ▸ hk) (ha m)
-  have hgen : ∀ acc, (∀ k ∈ acc, ∃ v, ρ k = .nonArr v) → NonArrConsistent ρ body → ∀ k ∈ collectNonArr acc body, ∃ v, ρ k = .nonArr v :=
-    fnBody_ind (fun b => ∀ acc, (∀ k ∈ acc, ∃ v, ρ k = .nonArr v) → NonArrConsistent ρ b → ∀ k ∈ collectNonArr acc b, ∃ v, ρ k = .nonArr v) (fun b hb acc ha hc => by cases b with
-      | vdecl _ _ e _ => rw [NonArrConsistent] at hc; refine hb _ ?_ hc.2.2; cases e <;> first | exact ha | exact hins ha (hc.2.1 _ rfl) | exact hins ha (hc.1 rfl)
-      | jdecl _ _ _ _ => rw [NonArrConsistent] at hc; exact hb.2 _ (hb.1 acc ha hc.1) hc.2
-      | case _ _ _ alts => rw [NonArrConsistent] at hc; exact alts_step_ind (fun s => ∀ k ∈ s, ∃ v, ρ k = .nonArr v) collectNonArr collectNonArrAlts (fun _ => rfl) (fun _ arm _ => by cases arm <;> rfl) alts.toList _ (fun a hm s hs => hb a hm s hs (hc.2 a hm)) (hins ha hc.1)
-      | ret _ | jmp _ _ | unreachable => exact ha | _ => rw [NonArrConsistent] at hc; exact hb acc ha hc) body
-  intro x hx h n; rcases hgen {} (fun _ hk => absurd hk Std.HashSet.not_mem_empty) hcon x.idx (Std.HashSet.contains_iff_mem.1 hx) with ⟨v, hv⟩; rw [hv]; exact ⟨rfl, rfl⟩
-theorem collectProjSrc_subset_collectNonArr (body : FnBody) (x p : Nat) (hsrc : (collectProjSrc {} {} body).get? x = some p) : (collectNonArr {} body).contains p = true := by
-  have hgen : ∀ calls acc na, (∀ k q, acc.get? k = some q → q ∈ na) → ∀ k q, (collectProjSrc calls acc body).get? k = some q → q ∈ collectNonArr na body :=
-    fnBody_ind (fun b => ∀ calls acc na, (∀ k q, acc.get? k = some q → q ∈ na) → ∀ k q, (collectProjSrc calls acc b).get? k = some q → q ∈ collectNonArr na b) (fun b hb calls acc na hinv k q hres => by cases b with
-      | vdecl xv _ e _ =>
-          have hins (m : Nat) : ∀ k' q', acc.get? k' = some q' → q' ∈ na.insert m := fun k' q' h => Std.HashSet.mem_insert.mpr (.inr (hinv k' q' h))
-          cases e with
-          | fap _ _ | ap _ _ => exact hb (calls.insert xv.idx) acc na hinv k q hres | reset _ _ => exact hb calls acc na hinv k q hres
-          | proj _ src => refine hb calls _ (na.insert src.idx) (fun k' q' h => ?_) k q hres; split at h; (rw [Std.HashMap.get?_insert] at h; split at h; (cases h; exact Std.HashSet.mem_insert.mpr (.inl (beq_self_eq_true _))); exact hins src.idx k' q' h); exact hins src.idx k' q' h
-          | uproj _ src | sproj _ _ src => exact hb calls acc (na.insert src.idx) (hins src.idx) k q hres | _ => exact hb calls acc (na.insert xv.idx) (hins xv.idx) k q hres
-      | jdecl _ _ _ _ => exact hb.2 calls _ _ (hb.1 calls acc na hinv) k q hres
-      | case _ scr _ alts =>
-          exact alts_step_ind (fun p : Std.HashMap Nat Nat × Std.HashSet Nat => ∀ k q, p.1.get? k = some q → q ∈ p.2) (fun p b => (collectProjSrc calls p.1 b, collectNonArr p.2 b)) (fun p ls => (collectProjSrcAlts calls p.1 ls, collectNonArrAlts p.2 ls))
-            (fun _ => rfl) (fun _ arm _ => by cases arm <;> rfl) alts.toList (acc, na.insert scr.idx) (fun arm hm p hp => hb arm hm calls p.1 p.2 hp) (fun k' q' h => Std.HashSet.mem_insert.mpr (.inr (hinv k' q' h))) k q hres
-      | ret _ | jmp _ _ | unreachable => exact hinv k q hres | _ => exact hb calls acc na hinv k q hres) body
-  exact Std.HashSet.contains_iff_mem.2 (hgen {} {} {} (fun _ _ hk => by simp at hk) x p hsrc)
+    ∀ x : VarId, (collectNonArr {} body).contains x.idx = true → ∀ (h : CowHeap α) (n : Nat), h.rcInc (ρ x.idx) n = h ∧ h.rcDec (ρ x.idx) n = h := fun x hx h n => by
+  rcases collectNonArr_pres (fun k => ∃ v, ρ k = .nonArr v) (fun s => ∀ k ∈ s, ∃ v, ρ k = .nonArr v) (fun _ _ ha hk m hm => (Std.HashSet.mem_insert.1 hm).elim (fun h => beq_iff_eq.mp h ▸ hk) (ha m)) body {} hcon (fun _ hk => absurd hk Std.HashSet.not_mem_empty) x.idx (Std.HashSet.contains_iff_mem.1 hx) with ⟨v, hv⟩
+  rw [hv]; exact ⟨rfl, rfl⟩
+mutual
+private theorem collectProjSrc_sub : ∀ (b : FnBody) (calls : Std.HashSet Nat) (acc : Std.HashMap Nat Nat) (na : Std.HashSet Nat),
+    (∀ k q, acc.get? k = some q → q ∈ na) → ∀ k q, (collectProjSrc calls acc b).get? k = some q → q ∈ collectNonArr na b
+  | .vdecl xv _ e c, calls, acc, na, hinv, k, q, hres => by
+      have hins (m : Nat) : ∀ k' q', acc.get? k' = some q' → q' ∈ na.insert m := fun k' q' h => Std.HashSet.mem_insert.mpr (.inr (hinv k' q' h))
+      cases e with
+      | fap _ _ | ap _ _ => exact collectProjSrc_sub c (calls.insert xv.idx) acc na hinv k q hres | reset _ _ => exact collectProjSrc_sub c calls acc na hinv k q hres
+      | proj _ src => refine collectProjSrc_sub c calls _ (na.insert src.idx) (fun k' q' h => ?_) k q hres; split at h; (rw [Std.HashMap.get?_insert] at h; split at h; (cases h; exact Std.HashSet.mem_insert.mpr (.inl (beq_self_eq_true _))); exact hins src.idx k' q' h); exact hins src.idx k' q' h
+      | uproj _ src | sproj _ _ src => exact collectProjSrc_sub c calls acc (na.insert src.idx) (hins src.idx) k q hres | _ => exact collectProjSrc_sub c calls acc (na.insert xv.idx) (hins xv.idx) k q hres
+  | .jdecl _ _ v c, calls, acc, na, hinv, k, q, hres => collectProjSrc_sub c calls _ _ (collectProjSrc_sub v calls acc na hinv) k q hres
+  | .case _ scr _ ⟨alts⟩, calls, acc, na, hinv, k, q, hres => collectProjSrcAlts_sub alts calls acc (na.insert scr.idx) (fun k' q' h => Std.HashSet.mem_insert.mpr (.inr (hinv k' q' h))) k q hres
+  | .set _ _ _ c, calls, acc, na, hinv, k, q, hres | .setTag _ _ c, calls, acc, na, hinv, k, q, hres | .uset _ _ _ c, calls, acc, na, hinv, k, q, hres | .sset _ _ _ _ _ c, calls, acc, na, hinv, k, q, hres | .inc _ _ _ _ c, calls, acc, na, hinv, k, q, hres | .dec _ _ _ _ c, calls, acc, na, hinv, k, q, hres | .del _ c, calls, acc, na, hinv, k, q, hres => collectProjSrc_sub c calls acc na hinv k q hres
+  | .ret _, _, _, _, hinv, k, q, hres | .jmp _ _, _, _, _, hinv, k, q, hres | .unreachable, _, _, _, hinv, k, q, hres => hinv k q hres
+private theorem collectProjSrcAlts_sub : ∀ (ls : List Alt) (calls : Std.HashSet Nat) (acc : Std.HashMap Nat Nat) (na : Std.HashSet Nat),
+    (∀ k q, acc.get? k = some q → q ∈ na) → ∀ k q, (collectProjSrcAlts calls acc ls).get? k = some q → q ∈ collectNonArrAlts na ls
+  | [], _, _, _, hinv, k, q, hres => hinv k q hres | .ctor _ b :: r, calls, acc, na, hinv, k, q, hres | .default b :: r, calls, acc, na, hinv, k, q, hres => collectProjSrcAlts_sub r calls _ _ (collectProjSrc_sub b calls acc na hinv) k q hres
+end
+theorem collectProjSrc_subset_collectNonArr (body : FnBody) (x p : Nat) (hsrc : (collectProjSrc {} {} body).get? x = some p) : (collectNonArr {} body).contains p = true :=
+  Std.HashSet.contains_iff_mem.2 (collectProjSrc_sub body {} {} {} (fun _ _ hk => by simp at hk) x p hsrc)
 
 theorem hasDecOf_sound (p : Nat) (b : FnBody) (h : hasDecOf p b = true) : DropsVar p b := by
   cases b with
@@ -376,33 +389,32 @@ theorem projRefTransfer_cowHeap_equiv (h : CowHeap α) (id n : Nat) (hn : n ≥ 
     simp only [CowHeap.get_set_self]; rcases h.get k with ⟨el, rc, mk⟩; simp only [show rc + (n - 1) = rc + n - 1 by omega]
   · split <;> simp only [CowHeap.get_set_ne _ _ hkid]
 
-private theorem stmtsTailSafe_cons {a : Bool} {s : JsStmt} {ss : List JsStmt} (hs : stmtTailSafe a s) (hss : stmtsTailSafe a ss) : stmtsTailSafe a (s :: ss) := fun _ hm => (List.mem_cons.1 hm).elim (· ▸ hs) (hss _)
-private theorem stmtsTailSafe_single {a : Bool} {s : JsStmt} (hs : stmtTailSafe a s) : stmtsTailSafe a [s] := fun _ hm => (List.mem_singleton.1 hm) ▸ hs
-private theorem stmtsTailSafe_append {a : Bool} {s₁ s₂ : List JsStmt} (h1 : stmtsTailSafe a s₁) (h2 : stmtsTailSafe a s₂) : stmtsTailSafe a (s₁ ++ s₂) := fun _ hm => (List.mem_append.1 hm).elim (h1 _) (h2 _)
+private theorem stmtsTailSafe_append {a : Bool} : ∀ {s₁ s₂ : List JsStmt}, stmtsTailSafe a s₁ → stmtsTailSafe a s₂ → stmtsTailSafe a (s₁ ++ s₂)
+  | [], _, _, h2 => h2 | _ :: _, _, h1, h2 => ⟨h1.1, stmtsTailSafe_append h1.2 h2⟩
 private theorem noTailCont_aux (f : Name) (b : FnBody) :
     ∀ (c : Ctx) (active : Bool), (c.selfFn = none ∨ c.selfFn = some f) → hasSelfTailAux f true active b = false → stmtsTailSafe (!active) (lowerBody c b) :=
   fnBody_ind (fun b => ∀ c active, (c.selfFn = none ∨ c.selfFn = some f) → hasSelfTailAux f true active b = false → stmtsTailSafe (!active) (lowerBody c b)) (fun b hb c active hself h => by
-    have hopt {p : Bool} {s : JsStmt} (hs : stmtTailSafe (!active) s) : stmtsTailSafe (!active) (if p then [] else [s]) := by cases p; exact stmtsTailSafe_single hs; exact fun _ hm => nomatch hm
+    have hite {p : Bool} {s : JsStmt} {ss : List JsStmt} (hs : stmtTailSafe (!active) s) (hss : stmtsTailSafe (!active) ss) : stmtsTailSafe (!active) (if p then ss else s :: ss) := by cases p; exact ⟨hs, hss⟩; exact hss
     cases b with
     | vdecl x _ e cont => cases e with
         | fap g _ => cases active with
-            | false => simp only [hasSelfTailAux, Bool.false_and, Bool.false_or] at h; dsimp only [lowerBody]; split; (split <;> exact stmtsTailSafe_single (by unfold stmtTailSafe; first | rfl | trivial)); exact stmtsTailSafe_cons (by unfold stmtTailSafe; trivial) (hb c false hself h)
+            | false => dsimp only [lowerBody]; split; (split; exact ⟨rfl, trivial⟩; exact ⟨trivial, trivial⟩); exact ⟨trivial, hb c false hself h⟩
             | true => have ⟨h1, h2⟩ := Bool.or_eq_false_iff.1 h
                       have hns : (c.selfFn == some g && retsVar x cont) = false := by cases hfg : c.selfFn == some g; rfl; cases hr : retsVar x cont; rfl; rcases hself with h0 | h0; (rw [h0] at hfg; cases hfg); rw [h0] at hfg; cases Option.some.inj (eq_of_beq hfg); simp only [Bool.true_and, beq_self_eq_true, hr, Bool.true_eq_false] at h1
-                      dsimp only [lowerBody]; rw [hns]; exact stmtsTailSafe_cons (by unfold stmtTailSafe; trivial) (hb c true hself h2)
-        | _ => exact stmtsTailSafe_cons (by unfold stmtTailSafe; trivial) (hb c active hself h)
+                      dsimp only [lowerBody]; rw [hns]; exact ⟨trivial, hb c true hself h2⟩
+        | _ => exact ⟨trivial, hb c active hself h⟩
     | jdecl j xs val _ =>
         have ⟨h1, h2⟩ := Bool.or_eq_false_iff.1 h; dsimp only [lowerBody]; cases hj : hasJmpTo j val
-        · rw [hj, Bool.or_false] at h1; exact stmtsTailSafe_append (stmtsTailSafe_append (stmtsTailSafe_append (hopt (by unfold stmtTailSafe; trivial)) (stmtsTailSafe_single (by unfold stmtTailSafe; exact hb.2 { c with inlineJps := c.inlineJps.insert j.idx xs } active hself h2))) (hopt (by unfold stmtTailSafe; trivial))) (hb.1 c active hself h1)
-        · rw [hj, Bool.or_true] at h1; exact stmtsTailSafe_cons (by unfold stmtTailSafe; exact hb.1 c true hself h1) (hb.2 c active hself h2)
+        · rw [hj, Bool.or_false] at h1; exact stmtsTailSafe_append (stmtsTailSafe_append (stmtsTailSafe_append (hite trivial trivial) ⟨hb.2 { c with inlineJps := c.inlineJps.insert j.idx xs } active hself h2, trivial⟩) (hite trivial trivial)) (hb.1 c active hself h1)
+        · rw [hj, Bool.or_true] at h1; exact ⟨hb.1 c true hself h1, hb.2 c active hself h2⟩
     | case _ _ _ alts =>
-        let rec go : ∀ ls : List Alt, hasSelfTailAltsAux f true active ls = false → (∀ arm ∈ ls, hasSelfTailAux f true active (altBody arm) = false → stmtsTailSafe (!active) (lowerBody c (altBody arm))) → ∀ arm ∈ lowerAlts c ls, stmtsTailSafe (!active) (jsArmBody arm)
-          | [], _, _, _, hm => nomatch hm | arm :: rest, ha, hls, a, ha' => by cases arm <;> (have ⟨h1, h2⟩ := Bool.or_eq_false_iff.1 ha; exact (List.mem_cons.1 ha').elim (· ▸ hls _ (.head _) h1) (go rest h2 (fun x hx => hls x (.tail _ hx)) a))
-        exact stmtsTailSafe_single (by unfold stmtTailSafe; exact go alts.toList h fun arm harm => hb arm harm c active hself)
-    | inc _ _ _ _ _ | dec _ _ _ _ _ | del _ _ => dsimp only [lowerBody]; repeat (split <;> first | exact hb c active hself h | exact stmtsTailSafe_cons (by unfold stmtTailSafe; trivial) (hb c active hself h) | skip)
-    | set _ _ _ _ | setTag _ _ _ | uset _ _ _ _ | sset _ _ _ _ _ _ => exact stmtsTailSafe_cons (by unfold stmtTailSafe; trivial) (hb c active hself h)
-    | ret _ | unreachable => exact stmtsTailSafe_single (by unfold stmtTailSafe; trivial)
-    | jmp j _ => dsimp only [lowerBody]; cases c.inlineJps.get? j.idx <;> exact stmtsTailSafe_single (by unfold stmtTailSafe; trivial)) b
+        let rec go : ∀ ls : List Alt, hasSelfTailAltsAux f true active ls = false → (∀ arm ∈ ls, hasSelfTailAux f true active (altBody arm) = false → stmtsTailSafe (!active) (lowerBody c (altBody arm))) → armsTailSafe (!active) (lowerAlts c ls)
+          | [], _, _ => trivial | arm :: rest, ha, hls => by cases arm <;> (have ⟨h1, h2⟩ := Bool.or_eq_false_iff.1 ha; exact ⟨hls _ (.head _) h1, go rest h2 fun x hx => hls x (.tail _ hx)⟩)
+        exact ⟨go alts.toList h fun arm harm => hb arm harm c active hself, trivial⟩
+    | dec _ _ _ _ _ | del _ _ | inc _ _ _ _ _ => exact hite trivial (hb c active hself h)
+    | set _ _ _ _ | setTag _ _ _ | uset _ _ _ _ | sset _ _ _ _ _ _ => exact ⟨trivial, hb c active hself h⟩
+    | ret _ | unreachable => exact ⟨trivial, trivial⟩
+    | jmp j _ => dsimp only [lowerBody]; cases c.inlineJps.get? j.idx <;> exact ⟨trivial, trivial⟩) b
 theorem noTailCont_of_hasJpSelfTail_false (f : Name) (b : FnBody) (c : Ctx) (hself : c.selfFn = none ∨ c.selfFn = some f) :
     (hasSelfTailAux f true true b = false → stmtsTailSafe false (lowerBody c b)) ∧ (hasSelfTailAux f true false b = false → stmtsTailSafe true (lowerBody c b)) :=
   ⟨noTailCont_aux f b c true hself, noTailCont_aux f b c false hself⟩

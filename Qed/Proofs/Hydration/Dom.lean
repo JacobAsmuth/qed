@@ -78,37 +78,36 @@ theorem HydratableDomList_frame (f : Nat) (ns : String) (ds : List (Html msg)) (
     (hle : a.nextId ≤ a'.nextId) (hfr : ∀ m : Dom.Node, lo ≤ m.toNat → m.toNat < hi → a'.get m = a.get m) (h : HydratableDomList f ns ds a lo hi ns') : HydratableDomList f ns ds a' lo hi ns' :=
   HydratableDomListAux.imp hle (fun _ _ _ _ => HydratableDom_frame hle) hfr h
 
-private abbrev TextSlotAllocOut (a : DomArena msg) (parent : Dom.Node) (inTextRun : Bool) (s : String) (moreInRun : Unit → Bool) (pns ptag : String) (pst : SpecElemState msg) (pmg : List String) (pre suf : List Dom.Node) : Prop :=
-  let tn := UInt32.ofNat a.nextId; let ((outNode, outRun), a') := (hydrateTextSlotM (m := ArenaM msg) parent (UInt32.ofNat pre.length) inTextRun s moreInRun).run a
-  outNode = tn ∧ outRun = inTextRun ∧ a'.nextId = a.nextId + 1 ∧ a'.get tn = .text s ∧ a'.get parent = .element pns ptag pst pmg (pre ++ tn :: suf) ∧ (∀ m : Dom.Node, m ≠ parent → m ≠ tn → a'.get m = a.get m)
-theorem hydrateTextSlotM_alloc_spec (a : DomArena msg) (parent : Dom.Node) (inTextRun : Bool) (s : String) (hcond : s = "" ∨ inTextRun = true)
-    (moreInRun : Unit → Bool) (pns ptag : String) (pst : SpecElemState msg) (pmg : List String) (pre suf : List Dom.Node)
-    (hnot : UInt32.ofNat a.nextId ∉ pre ++ suf) (hdisj : ∀ r ∈ suf, r ∉ pre) (hpreLen : pre.length < UInt32.size) (hparNe : parent ≠ UInt32.ofNat a.nextId)
-    (hpar : a.get parent = .element pns ptag pst pmg (pre ++ suf)) : TextSlotAllocOut a parent inTextRun s moreInRun pns ptag pst pmg pre suf := by
+private abbrev TextSlotAllocOut (a : DomArena msg) (ep : ElemPar msg) (inTextRun : Bool) (s : String) (moreInRun : Unit → Bool) (pre suf : List Dom.Node) : Prop :=
+  let tn := UInt32.ofNat a.nextId; let ((outNode, outRun), a') := (hydrateTextSlotM (m := ArenaM msg) ep.parent (UInt32.ofNat pre.length) inTextRun s moreInRun).run a
+  outNode = tn ∧ outRun = inTextRun ∧ a'.nextId = a.nextId + 1 ∧ a'.get tn = .text s ∧ a'.get ep.parent = ep.entry (pre ++ tn :: suf) ∧ (∀ m : Dom.Node, m ≠ ep.parent → m ≠ tn → a'.get m = a.get m)
+theorem hydrateTextSlotM_alloc_spec (a : DomArena msg) (ep : ElemPar msg) (inTextRun : Bool) (s : String) (hcond : s = "" ∨ inTextRun = true)
+    (moreInRun : Unit → Bool) (pre suf : List Dom.Node) (hnot : UInt32.ofNat a.nextId ∉ pre ++ suf) (hdisj : ∀ r ∈ suf, r ∉ pre)
+    (hpreLen : pre.length < UInt32.size) (hparNe : ep.parent ≠ UInt32.ofNat a.nextId) (hpar : a.get ep.parent = ep.entry (pre ++ suf)) :
+    TextSlotAllocOut a ep inTextRun s moreInRun pre suf := by
   have hins : w3cInsertBefore (pre ++ suf) (UInt32.ofNat pre.length).toNat (UInt32.ofNat a.nextId) = pre ++ UInt32.ofNat a.nextId :: suf := by rw [uint32_toNat_ofNat_lt pre.length hpreLen]; exact w3cInsertBefore_fresh_append pre suf _ hnot hdisj
-  have hallocPar : (DomArena.mk (a.nextId + 1) (fun m => if m == UInt32.ofNat a.nextId then .text s else a.store m) a.signals a.sigEvents a.tmpls a.rowEvs).get parent = .element pns ptag pst pmg (pre ++ suf) := by simp [DomArena.get, hparNe]; exact hpar
+  have hallocPar : (DomArena.mk (a.nextId + 1) (fun m => if m == UInt32.ofNat a.nextId then .text s else a.store m) a.signals a.sigEvents a.tmpls a.rowEvs).get ep.parent = ep.entry (pre ++ suf) := by simp [DomArena.get, hparNe]; exact hpar
   dsimp only [TextSlotAllocOut, hydrateTextSlotM]
   by_cases hs : (s == "") = true <;> (
     first | (cases beq_iff_eq.1 hs; rw [ite_eq_left hs]) | (cases hcond.resolve_left (fun h => hs (by rw [h]; rfl)); rw [ite_eq_right hs, ite_eq_left rfl])
     dsimp only [StateT.run, bind, StateT.bind, pure, MonadDom.createText, DomArena.alloc, MonadDom.insertBeforeNode, DomArena.modifyChildren, DomArena.modify]
-    rw [hallocPar]; dsimp only; exact ⟨rfl, rfl, rfl, by simp [DomArena.get, DomArena.set, hparNe.symm], by rw [DomArena.get_set_self, hins], fun m hm1 hm2 => by simp [DomArena.get, DomArena.set, hm1, hm2]⟩)
-theorem hydrateTextSlotM_empty_spec (a : DomArena msg) (parent : Dom.Node) (inTextRun : Bool) (moreInRun : Unit → Bool) (pns ptag : String) (pst : SpecElemState msg) (pmg : List String)
-    (pre suf : List Dom.Node) (_hlt : a.nextId < UInt32.size) (hnot : UInt32.ofNat a.nextId ∉ pre ++ suf) (hdisj : ∀ r ∈ suf, r ∉ pre) (hpreLen : pre.length < UInt32.size)
-    (hparNe : parent ≠ UInt32.ofNat a.nextId) (hpar : a.get parent = .element pns ptag pst pmg (pre ++ suf)) : TextSlotAllocOut a parent inTextRun "" moreInRun pns ptag pst pmg pre suf :=
-  hydrateTextSlotM_alloc_spec a parent inTextRun "" (.inl rfl) moreInRun pns ptag pst pmg pre suf hnot hdisj hpreLen hparNe hpar
-theorem hydrateTextSlotM_split_spec (a : DomArena msg) (parent : Dom.Node) (s : String) (_hs : s ≠ "") (moreInRun : Unit → Bool) (pns ptag : String) (pst : SpecElemState msg) (pmg : List String)
-    (pre suf : List Dom.Node) (_hlt : a.nextId < UInt32.size) (hnot : UInt32.ofNat a.nextId ∉ pre ++ suf) (hdisj : ∀ r ∈ suf, r ∉ pre) (hpreLen : pre.length < UInt32.size)
-    (hparNe : parent ≠ UInt32.ofNat a.nextId) (hpar : a.get parent = .element pns ptag pst pmg (pre ++ suf)) : TextSlotAllocOut a parent true s moreInRun pns ptag pst pmg pre suf :=
-  hydrateTextSlotM_alloc_spec a parent true s (.inr rfl) moreInRun pns ptag pst pmg pre suf hnot hdisj hpreLen hparNe hpar
-theorem hydrateTextSlotM_head_spec (a : DomArena msg) (parent tn : Dom.Node) (s rawTail : String) (hs : s ≠ "") (more : Bool) (hmore : more = false → rawTail = "")
-    (pns ptag : String) (pst : SpecElemState msg) (pmg : List String) (pre domRest : List Dom.Node) (hpreLen : pre.length < UInt32.size)
-    (hpar : a.get parent = .element pns ptag pst pmg (pre ++ tn :: domRest)) (htn : a.get tn = .text (s ++ rawTail)) :
-    let ((outNode, outRun), a') := (hydrateTextSlotM (m := ArenaM msg) parent (UInt32.ofNat pre.length) false s (fun () => more)).run a
+    rw [hallocPar]; dsimp only [ElemPar.entry]; exact ⟨rfl, rfl, rfl, by simp [DomArena.get, DomArena.set, hparNe.symm], by rw [DomArena.get_set_self, hins], fun m hm1 hm2 => by simp [DomArena.get, DomArena.set, hm1, hm2]⟩)
+theorem hydrateTextSlotM_empty_spec (a : DomArena msg) (ep : ElemPar msg) (inTextRun : Bool) (moreInRun : Unit → Bool) (pre suf : List Dom.Node)
+    (_hlt : a.nextId < UInt32.size) (hnot : UInt32.ofNat a.nextId ∉ pre ++ suf) (hdisj : ∀ r ∈ suf, r ∉ pre) (hpreLen : pre.length < UInt32.size)
+    (hparNe : ep.parent ≠ UInt32.ofNat a.nextId) (hpar : a.get ep.parent = ep.entry (pre ++ suf)) : TextSlotAllocOut a ep inTextRun "" moreInRun pre suf :=
+  hydrateTextSlotM_alloc_spec a ep inTextRun "" (.inl rfl) moreInRun pre suf hnot hdisj hpreLen hparNe hpar
+theorem hydrateTextSlotM_split_spec (a : DomArena msg) (ep : ElemPar msg) (s : String) (_hs : s ≠ "") (moreInRun : Unit → Bool) (pre suf : List Dom.Node)
+    (_hlt : a.nextId < UInt32.size) (hnot : UInt32.ofNat a.nextId ∉ pre ++ suf) (hdisj : ∀ r ∈ suf, r ∉ pre) (hpreLen : pre.length < UInt32.size)
+    (hparNe : ep.parent ≠ UInt32.ofNat a.nextId) (hpar : a.get ep.parent = ep.entry (pre ++ suf)) : TextSlotAllocOut a ep true s moreInRun pre suf :=
+  hydrateTextSlotM_alloc_spec a ep true s (.inr rfl) moreInRun pre suf hnot hdisj hpreLen hparNe hpar
+theorem hydrateTextSlotM_head_spec (a : DomArena msg) (ep : ElemPar msg) (tn : Dom.Node) (s rawTail : String) (hs : s ≠ "") (more : Bool) (hmore : more = false → rawTail = "")
+    (pre domRest : List Dom.Node) (hpreLen : pre.length < UInt32.size) (hpar : a.get ep.parent = ep.entry (pre ++ tn :: domRest)) (htn : a.get tn = .text (s ++ rawTail)) :
+    let ((outNode, outRun), a') := (hydrateTextSlotM (m := ArenaM msg) ep.parent (UInt32.ofNat pre.length) false s (fun () => more)).run a
     outNode = tn ∧ outRun = true ∧ a'.nextId = a.nextId ∧ a'.get tn = .text s ∧ (∀ m : Dom.Node, m ≠ tn → a'.get m = a.get m) := by
   unfold hydrateTextSlotM; rw [beq_eq_false_iff_ne.2 hs]; cases more
-  · simp only [Bool.false_eq_true, ↓reduceIte, StateT.run, bind, StateT.bind, pure, StateT.pure, MonadDom.childAt, hpar, uint32_toNat_ofNat_lt pre.length hpreLen, getD_append_right, true_and]
+  · simp only [Bool.false_eq_true, ↓reduceIte, StateT.run, bind, StateT.bind, pure, StateT.pure, MonadDom.childAt, hpar, ElemPar.entry, uint32_toNat_ofNat_lt pre.length hpreLen, getD_append_right, true_and]
     exact ⟨by simpa [hmore rfl] using htn, fun _ _ => trivial⟩
-  · simp only [Bool.false_eq_true, ↓reduceIte, StateT.run, bind, StateT.bind, pure, StateT.pure, MonadDom.childAt, MonadDom.setText, DomArena.modify, hpar, uint32_toNat_ofNat_lt pre.length hpreLen, getD_append_right, true_and]
+  · simp only [Bool.false_eq_true, ↓reduceIte, StateT.run, bind, StateT.bind, pure, StateT.pure, MonadDom.childAt, MonadDom.setText, DomArena.modify, hpar, ElemPar.entry, uint32_toNat_ofNat_lt pre.length hpreLen, getD_append_right, true_and]
     rw [htn]; exact ⟨rfl, DomArena.get_set_self .., fun m hm => DomArena.get_set_ne _ _ hm⟩
 
 private theorem HydratableDom.text_inv : ∀ {f : Nat} {ns s : String} {a : DomArena msg} {lo hi : Nat} {n : Dom.Node}, HydratableDom f ns (.text s) a lo hi n → lo ≤ n.toNat ∧ n.toNat < hi ∧ hi ≤ a.nextId ∧ a.get n = .text s
@@ -212,7 +211,7 @@ theorem hydrateKids_ind {α msg : Type} (ep : ElemPar msg) (toHtml : α → Html
             have hnotIn : tn ∉ pre ++ domCs := fun hm => (List.mem_append.1 hm).elim
               (fun hp => let ⟨_, hSx, hsub⟩ := hpreSub _ hp; (hSx _ (SubtreeInSet_root_mem hposF hsub)).elim (fun h1 => Nat.not_lt.2 (Nat.le_trans hloHi hhiNext) (htnNat ▸ h1.2)) (fun h2 => Nat.lt_irrefl _ (htnNat ▸ h2.2)))
               (fun hd => Nat.not_lt.2 hhiNext (htnNat ▸ (HydratableDomList_nodes_lt ep.f ep.childNs _ a lo hi domCs hdom _ hd).2))
-            have ⟨hOut1, hOut2, haMidNext, hgetTn, hparM, hfrM⟩ := hydrateTextSlotM_alloc_spec a ep.parent inTextRun s halloc (fun () => hasMoreText (rest.map toHtml)) ep.pns ep.ptag ep.pst ep.pmg pre domCs hnotIn hdisjDom (Nat.lt_of_le_of_lt (Nat.le_add_right _ _) hlen) hparNeTn hpar
+            have ⟨hOut1, hOut2, haMidNext, hgetTn, hparM, hfrM⟩ := hydrateTextSlotM_alloc_spec a ep inTextRun s halloc (fun () => hasMoreText (rest.map toHtml)) pre domCs hnotIn hdisjDom (Nat.lt_of_le_of_lt (Nat.le_add_right _ _) hlen) hparNeTn hpar
             exact hTextStep tn inTextRun lo domCs _ (· = a.nextId) (Nat.le_refl _) hparNeTn (Prod.ext (Prod.ext hOut1 hOut2) rfl) hgetTn (List.append_assoc .. ▸ hparM)
               ⟨haMidNext ▸ Nat.le_succ _, haMidNext ▸ Nat.le_refl _, fun m hm hne => hfrM m (node_ne_of_toNat_ne fun e => hne (.inl e)) (node_ne_of_toNat_ne fun e => Nat.ne_of_lt hm (htnNat ▸ e))⟩
               htnNat (fun _ hk => .inr ⟨hk ▸ Nat.le_refl _, hk ▸ haMidNext ▸ Nat.lt_succ_self _⟩) (fun _ hk => ⟨.inr (hk ▸ hhiNext), hk ▸ haMidNext ▸ Nat.lt_succ_self _⟩) hdom'
@@ -220,7 +219,7 @@ theorem hydrateKids_ind {α msg : Type} (ep : ElemPar msg) (toHtml : α → Html
             have hdomCoal : HydratableDomList ep.f ep.childNs (.text (s ++ restOfTextRun (rest.map toHtml)) :: dropCurrentTextRun (rest.map toHtml)) a lo hi domCs := by simpa only [List.map_cons, hcEq, coalesceTextRun, Html.textOf?, beq_eq_false_iff_ne.2 hsEmpty, Bool.false_eq_true, ↓reduceIte] using hdom
             cases domCs with | nil => exact hdomCoal.elim | cons tn domRest =>
             rcases HydratableDomList_cons_bounds hdomCoal with ⟨mid, hloMid, hmidHi, hiNext, htnDom, hrestDom⟩; rcases HydratableDom.text_inv htnDom with ⟨htnLo, htnMid, _, hgetTn⟩
-            have ⟨hOut1, hOut2, haMidNext, hgetTn', hfrM⟩ := hydrateTextSlotM_head_spec a ep.parent tn s (restOfTextRun (rest.map toHtml)) hsEmpty (hasMoreText (rest.map toHtml)) (hasMoreText_false_restOfTextRun (rest.map toHtml)) ep.pns ep.ptag ep.pst ep.pmg pre domRest (Nat.lt_of_le_of_lt (Nat.le_add_right _ _) hlen) hpar hgetTn
+            have ⟨hOut1, hOut2, haMidNext, hgetTn', hfrM⟩ := hydrateTextSlotM_head_spec a ep tn s (restOfTextRun (rest.map toHtml)) hsEmpty (hasMoreText (rest.map toHtml)) (hasMoreText_false_restOfTextRun (rest.map toHtml)) pre domRest (Nat.lt_of_le_of_lt (Nat.le_add_right _ _) hlen) hpar hgetTn
             have hparNeTn : ep.parent ≠ tn := node_ne_of_toNat_ne (Nat.ne_of_lt (Nat.lt_of_lt_of_le hparLo htnLo))
             exact hTextStep tn true mid domRest _ (HydRange lo mid) hloMid hparNeTn (Prod.ext (Prod.ext hOut1 hOut2) rfl) hgetTn' ((hfrM ep.parent hparNeTn).trans (by rw [hpar, List.append_assoc, List.singleton_append]))
               ⟨haMidNext ▸ Nat.le_refl _, haMidNext ▸ Nat.le_succ _, fun m _ hne => hfrM m fun e => hne (.inr (e ▸ ⟨htnLo, htnMid⟩))⟩
@@ -340,12 +339,10 @@ theorem hydrateDomM_spec (ns : String) (f : Nat) (h : Html msg) (root : Dom.Node
                              exact ⟨.inl ⟨hlo, hhi⟩, hown, hc.1, st', _, hydratedCs, hgetOut, ⟨hm', fun k hk' => (SlotVal.optStr.inj (ha2Eqv (.attr k))).trans ((ElemClean_evalSpecAttrs hc.1).2 k hk')⟩,
                                ha2Eqv, fun _ => List.contains_iff_mem.2, CleanDomChildren_mono hSubMap (hcleanKids hc.2)⟩⟩
 
-theorem hydrateDomKidsM_spec (childNs : String) (parent : Dom.Node) (pns ptag : String) (pst : SpecElemState msg) (pmg : List String)
-    (f : Nat) (target : List (Html msg)) (inTextRun : Bool) (pre domCs : List Dom.Node) (lo hi : Nat) (a : DomArena msg)
-    (hlen : pre.length + target.length < UInt32.size) (hbound : a.nextId + htmlListNodeCount target < UInt32.size) (hdep : htmlListDepth target ≤ f) (hparLo : parent.toNat < lo)
-    (hpreSub : PreSub ⟨f, childNs, parent, pns, ptag, pst, pmg⟩ lo hi a pre)
-    (hpar : a.get parent = .element pns ptag pst pmg (pre ++ domCs)) (hdom : HydratableDomList f childNs (if inTextRun then dropCurrentTextRun target else coalesceTextRun target) a lo hi domCs) :
-    KidsHydrateOut ⟨f, childNs, parent, pns, ptag, pst, pmg⟩ target pre lo hi a ((hydrateDomKidsM (m := ArenaM msg) parent (UInt32.ofNat pre.length) inTextRun target).run a).2 :=
-  hydrateDomKidsM_spec_step ⟨f, childNs, parent, pns, ptag, pst, pmg⟩ (fun f' _ => hydrateDomM_spec (f := f')) target inTextRun pre domCs lo hi a hlen hbound hdep hparLo hpreSub hpar hdom
+theorem hydrateDomKidsM_spec (ep : ElemPar msg) (target : List (Html msg)) (inTextRun : Bool) (pre domCs : List Dom.Node) (lo hi : Nat) (a : DomArena msg)
+    (hlen : pre.length + target.length < UInt32.size) (hbound : a.nextId + htmlListNodeCount target < UInt32.size) (hdep : htmlListDepth target ≤ ep.f) (hparLo : ep.parent.toNat < lo)
+    (hpreSub : PreSub ep lo hi a pre) (hpar : a.get ep.parent = ep.entry (pre ++ domCs)) (hdom : HydratableDomList ep.f ep.childNs (if inTextRun then dropCurrentTextRun target else coalesceTextRun target) a lo hi domCs) :
+    KidsHydrateOut ep target pre lo hi a ((hydrateDomKidsM (m := ArenaM msg) ep.parent (UInt32.ofNat pre.length) inTextRun target).run a).2 :=
+  hydrateDomKidsM_spec_step ep (fun f' _ => hydrateDomM_spec (f := f')) target inTextRun pre domCs lo hi a hlen hbound hdep hparLo hpreSub hpar hdom
 
 end Qed

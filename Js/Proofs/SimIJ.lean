@@ -19,9 +19,9 @@ private theorem eval_sim_ij_body_step (fSub : Nat) (hcallSub : CallSimIJ E fSub)
   | set _ _ _ cont | setTag _ _ cont | uset _ _ _ cont | sset _ _ _ _ _ cont | dec _ _ _ _ cont | del _ cont | inc _ _ _ _ cont =>
       have ⟨hwfc, hL⟩ := lockstep_stmt (E := E) hwf hsm rfl; exact ExitMatchIJE.ofLockstep rfl hL (fun _ _ => hb bc _ _ irO irSt1 hctx hwfc) hev
   | case tid x xType alts =>
-      rw [SimEnv.wf, BodyWfE] at hwf; exact evalIrAlts_sim_ij tid x xType hsm.env_eq alts.toList hwf (fun arm hm hwfa ha => hb arm hm bc irSt jsSt irO irSt1 hctx hwfa hsm ha) hev
+      exact evalIrAlts_sim_ij tid x xType hsm.env_eq alts.toList hwf (fun arm hm hwfa ha => hb arm hm bc irSt jsSt irO irSt1 hctx hwfa hsm ha) hev
   | jmp j ys =>
-      rw [SimEnv.wf, BodyWfE] at hwf; rcases hwf with hin | hrec
+      rcases hwf with hin | hrec
       · obtain ⟨hnotInM, hjsStep, hok⟩ := inlineJmp_step (E := E) hsm hin; rw [evalIrBody_jmp_inline (E := E) _ _ j ys hnotInM] at hev; cases hev; exact ⟨0, _, hjsStep 0, hok⟩
       · obtain ⟨hnone, hnotIn⟩ := hsm.recJp_not_inline hrec
         cases fSub with | zero => dsimp only [SimEnv.irBody, evalIrBody, evalIrBodyStep] at hev; rw [ite_eq_right hnotIn] at hev; cases hev | succ f' =>
@@ -34,7 +34,7 @@ private theorem eval_sim_ij_body_step (fSub : Nat) (hcallSub : CallSimIJ E fSub)
         · obtain ⟨hbcDL, hbcATC⟩ := directLoop_false_of_recTail (hcvATC ▸ halV); rw [hcvDL, hbcDL] at hjsVal
           right; exact ⟨hbcATC, fJsVal + 1, { jsSt with heap := jsStVal.heap, memos := jsStVal.memos }, sf, na, m0, fIr', Nat.le_succ_of_le hle', hcvSF ▸ hsf, hna', by rw [hbcDL, evalJsStmts_lower_recJmp_call (E := E) fJsVal hsm.env_eq ys hnone hjjs, hjsVal]; rfl, hm0, hm0n, hrc⟩
   | jdecl j xs val cont =>
-      rw [SimEnv.wf, BodyWfE] at hwf; rcases hwf with ⟨hnd, hnotIn, hnotRec, hcNone, hrec⟩; by_cases hjmp : (!hasJmpTo j val) = true
+      rcases hwf with ⟨hnd, hnotIn, hnotRec, hcNone, hrec⟩; by_cases hjmp : (!hasJmpTo j val) = true
       · simp only [hjmp, ↓reduceIte] at hrec; rw [evalIrBody_inlineJdecl (E := E) _ _ j xs val cont hjmp] at hev
         have hlower := fun fJs st => evalJsStmts_lower_inlineJdecl (E := E) (bc := bc) (jsSt := st) fJs j xs val cont hjmp
         obtain ⟨⟨irOC, irStC⟩, hirC, hev⟩ := bind_eq_some hev
@@ -61,63 +61,44 @@ private theorem eval_sim_ij_body_step (fSub : Nat) (hcallSub : CallSimIJ E fSub)
             · obtain ⟨fJs1, jsSt1, hjsc, hpost⟩ := hcallSub irSt.heap irSt.memos f (ys.toList.map (evalIrArg irSt.env)) jsSt val h' m' hdom hsm.heap_eq hsm.memos_eq hsm.memos_noTc (evalIrArgs_noTc hsm.env_noTc ys) hsm.fns_only_jp hirc
               exact ExitMatchIJE.rwJsMono (f₁ := fJs1) (fun fJs hf => by rw [evalJsStmts_lower_fap_call (E := E) fJs hsm.env_eq x ty f ys cont (Bool.eq_false_iff.2 htc) hlow hne, evalJsCall_mono hf hjsc]; rfl) (hb bc _ _ irO irSt1 hctx hwfc (hsm.updCallPost x (fun hm => (hprog.nonArr_call bc.c.nonArr fSub irSt.heap irSt.memos f _ val h' m' x.idx hm).1 hirc) hpost) hev)
       | ap y ys =>
-          rw [SimEnv.wf, BodyWfE] at hwf; dsimp only [SimEnv.irBody, evalIrBody, evalIrBodyStep] at hev; obtain ⟨⟨val, h', m'⟩, hirc, hev⟩ := bind_eq_some hev
+          dsimp only [SimEnv.irBody, evalIrBody, evalIrBodyStep] at hev; obtain ⟨⟨val, h', m'⟩, hirc, hev⟩ := bind_eq_some hev
           obtain ⟨fJs1, jsSt1, hjsc, hpost⟩ := happSub irSt.heap irSt.memos (irSt.env y.idx) (ys.toList.map (evalIrArg irSt.env)) jsSt val h' m' (hsm.env_noTc y.idx) hsm.heap_eq hsm.memos_eq hsm.memos_noTc (evalIrArgs_noTc hsm.env_noTc ys) hsm.fns_only_jp hirc
           exact ExitMatchIJE.rwJsMono (f₁ := fJs1) (fun fJs hf => by rw [evalJsStmts_lower_ap (E := E) fJs hsm.env_eq x ty y ys cont, evalJsApp_mono hf hjsc]; rfl) (hb bc _ _ irO irSt1 hctx hwf.1 (hsm.updCallPost x (fun hm => (hprog.nonArr_call bc.c.nonArr fSub irSt.heap irSt.memos default _ val h' m' x.idx hm).2 (irSt.env y.idx) hirc) hpost) hev)
       | _ => have ⟨hwfc, hL⟩ := lockstep_vdecl hprog hctx hwf hsm trivial; exact ExitMatchIJE.ofLockstep rfl hL (fun _ _ => hb bc _ _ irO irSt1 hctx hwfc) hev
 
 private theorem eval_sim_ij_call_step (f' : Nat) (ihCall : ∀ k < f' + 1, CallSimIJ E k) (ihBody : BodySimIJ E f') : CallSimIJ E (f' + 1) := by
   intro h mIr f args jsSt v1 h1 m1 hf hhp hmEq hmNo hargs hfns hirc
-  cases hpf : E.prog f with | none => exact absurd hpf hf | some d => cases d with
-  | extern _ _ _ _ => exact False.elim (hprog.findEnv_ok f _ hpf).2.1
-  | fdecl fnm xs ty b info =>
-      have hfnm := hprog.fdecl_name f fnm xs ty b info hpf; subst fnm
-      have hfnsNone := fdecl_fns_none hprog hpf hfns; have hjsD := hprog.js_at_fdecl f xs ty b info hpf; have hdwf := hprog.decl_wf f xs ty b info hpf; dsimp only at hdwf
-      by_cases hemp : xs.isEmpty = true
-      · rw [evalIrCall_fdecl_memo (E := E) f' hpf hemp] at hirc; simp only [hemp, ↓reduceIte] at hdwf; have hcOk : (mIr f).ok = (jsSt.memos (E.c0.js f)).ok := by rw [hmEq f hf]
-        by_cases hmok : (mIr f).ok = true
-        · rw [ite_eq_left hmok] at hirc; cases hirc; exact ⟨1, jsSt, by rw [evalJsCall_lower_memo (E := E) f xs ty b info args 0 hfnsNone hjsD hemp, ← hmEq f hf, ite_eq_left hmok], CallPost.refl (memoVal_noTc hmNo f) hhp hmEq hmNo⟩
-        · have hmokJs : (jsSt.memos (E.c0.js f)).ok = false := by rw [← hcOk, Bool.eq_false_iff.2 hmok]
-          rw [ite_eq_right hmok] at hirc; cases hini : getInitFnNameFor? E.c0.env f with
-          | some initFn =>
-              rw [hini] at hirc; simp only [hini] at hdwf; rcases hdwf with ⟨_, _, _, _, hiniDom, _⟩
-              obtain ⟨⟨v0, h0, m0⟩, hirI, hirc⟩ := bind_eq_some hirc; cases hirc
-              obtain ⟨fJsI, stI, hjsI, _, hvnt, hh1, _, _, hm1Eq, hm1No⟩ := ihCall f' (Nat.lt_succ_self f') h mIr initFn [] jsSt v1 h1 m0 (by rw [hiniDom]; simp only [ne_eq, reduceCtorEq, not_false_eq_true]) hhp hmEq hmNo (fun _ h => nomatch h) hfns hirI
-              exact ⟨fJsI + 1, _, by rw [evalJsCall_lower_memo (E := E) f xs ty b info args fJsI hfnsNone hjsD hemp, ite_eq_right_false hmokJs, hini]; dsimp only; rw [hjsI]; rfl, CallPost.memoUpd hprog hf hvnt hh1 hm1Eq hm1No⟩
-          | none =>
-              rw [hini] at hirc; simp only [hini] at hdwf; obtain ⟨rv, irSt1, hirB, hirc⟩ := optIrRet_eq_some hirc; cases hirc
-              obtain ⟨fJsB, jsSt1, hjsB, hvnt, hh1, hm1Eq, hm1No⟩ := (ihBody ⟨E.baseCtx b, [], [], false⟩ b _ _ (.returned v1) irSt1 (base_ctx_ok hprog b) hdwf (fdecl_initCall hprog (E.baseCtx b) false jsSt h mIr #[] [] hhp hmEq hmNo List.nodup_nil fun _ h => nomatch h) hirB).of_false_ret
-              exact ⟨fJsB + 1, _, by rw [evalJsCall_lower_memo (E := E) f xs ty b info args fJsB hfnsNone hjsD hemp, ite_eq_right_false hmokJs, hini]; dsimp only [bindMany, List.map, List.zip, List.zipWith] at hjsB ⊢; rw [hjsB]; rfl, CallPost.memoUpd hprog hf hvnt hh1 hm1Eq hm1No⟩
-      · have hempF : xs.isEmpty = false := Bool.eq_false_iff.2 hemp; rw [evalIrCall_fdecl_nonempty (E := E) f' hpf hempF] at hirc; simp only [hempF, Bool.false_eq_true, ↓reduceIte] at hdwf; rcases hdwf with ⟨hnd, hwfBody⟩
-        obtain ⟨rv, irSt1, hirB, hirc⟩ := optIrRet_eq_some hirc; cases hirc
-        by_cases hst : hasSelfTail f b = true
-        · let dl := !hasJpSelfTail f b; let cL := { E.baseCtx b with selfFn := some f, selfParams := xs, directLoop := dl }
-          obtain ⟨hxsPos, _, hcLwf, hjsL⟩ := fdecl_selfTail_setup hprog hpf hempF hst
-          rcases ihBody ⟨cL, [], [], true⟩ b _ _ (.returned v1) irSt1 (selfTail_ctx_ok hf hxsPos hnd) hcLwf (fdecl_initCall hprog cL true jsSt h mIr xs args hhp hmEq hmNo hnd hargs) hirB with
-            ⟨fJsB, jsSt1, hjsB, hok⟩ | ⟨_, fJsB, jsSt1, sf, na, m0, fIr', hle', hsf, hna', hjsB, hm0, hm0n, hrc⟩
-          · exact ⟨fJsB + 1, _, (evalJsCall_selfTail (E := E) dl f _ (lowerBody cL b) args fJsB hfnsNone hjsL hjsB).1 v1 hok.1 rfl, CallPost.ofRet hok⟩
-          · cases hsf; obtain ⟨fJsRec, st2, hjRec, hpost⟩ := ihCall fIr' (Nat.lt_succ_of_le hle') jsSt1.heap m0 f na { jsSt with heap := jsSt1.heap, memos := jsSt1.memos } v1 irSt1.heap irSt1.memos hf rfl hm0 hm0n hna' hfns hrc
-            exact ⟨max fJsB fJsRec + 1, st2, by rw [(evalJsCall_selfTail (E := E) dl f _ (lowerBody cL b) args fJsB hfnsNone hjsL hjsB).2 na rfl (max fJsB fJsRec) (Nat.le_max_left _ _)]; exact evalJsCall_mono (Nat.le_max_right _ _) hjRec, hpost⟩
-        · have hstF : hasSelfTail f b = false := Bool.eq_false_iff.2 hst; simp only [hstF, Bool.false_eq_true, ↓reduceIte] at hwfBody
-          obtain ⟨fJsB, jsSt1, hjsB, hok⟩ := (ihBody ⟨E.baseCtx b, [], [], false⟩ b _ _ (.returned v1) irSt1 (base_ctx_ok hprog b) hwfBody (fdecl_initCall hprog (E.baseCtx b) false jsSt h mIr xs args hhp hmEq hmNo hnd hargs) hirB).of_false_ret
-          exact ⟨fJsB + 1, _, by rw [evalJsCall_lower_plain (E := E) f xs ty b info args fJsB hfnsNone hjsD hempF hstF, hjsB]; rfl, CallPost.ofRet hok⟩
+  refine fdecl_cases hprog hf hhp hmEq hmNo hargs hfns ?_ ?_ ?_ ?_ ?_
+  · intro hIr hJs; rw [hIr] at hirc; cases hirc; exact ⟨1, jsSt, hJs 0, CallPost.refl (memoVal_noTc hmNo f) hhp hmEq hmNo⟩
+  · intro ini hDom hIr hJs; rw [hIr] at hirc; obtain ⟨⟨v0, h0, m0⟩, hirI, hirc⟩ := bind_eq_some hirc; cases hirc
+    obtain ⟨fJsI, stI, hjsI, _, hvnt, hh1, _, _, hm1Eq, hm1No⟩ := ihCall f' (Nat.lt_succ_self f') h mIr ini [] jsSt v1 h1 m0 hDom hhp hmEq hmNo (fun _ h => nomatch h) hfns hirI
+    exact ⟨fJsI + 1, _, by rw [hJs fJsI, hjsI]; rfl, CallPost.memoUpd hprog hf hvnt hh1 hm1Eq hm1No⟩
+  · intro b hctx hwf hsm hIr hJs; rw [hIr] at hirc; obtain ⟨rv, irSt1, hirB, hirc⟩ := optIrRet_eq_some hirc; cases hirc
+    obtain ⟨fJsB, jsSt1, hjsB, hvnt, hh1, hm1Eq, hm1No⟩ := (ihBody ⟨E.baseCtx b, [], [], false⟩ b _ _ (.returned v1) irSt1 hctx hwf hsm hirB).of_false_ret
+    exact ⟨fJsB + 1, _, by rw [hJs fJsB, hjsB]; rfl, CallPost.memoUpd hprog hf hvnt hh1 hm1Eq hm1No⟩
+  · intro xs b dl cL hfnsN hjsL hctx hwf hsm hIr; rw [hIr] at hirc; obtain ⟨rv, irSt1, hirB, hirc⟩ := optIrRet_eq_some hirc; cases hirc
+    rcases ihBody ⟨cL, [], [], true⟩ b _ _ (.returned v1) irSt1 hctx hwf hsm hirB with
+      ⟨fJsB, jsSt1, hjsB, hok⟩ | ⟨_, fJsB, jsSt1, sf, na, m0, fIr', hle', hsf, hna', hjsB, hm0, hm0n, hrc⟩
+    · exact ⟨fJsB + 1, _, (evalJsCall_selfTail (E := E) dl f _ _ args fJsB hfnsN hjsL hjsB).1 v1 hok.1 rfl, CallPost.ofRet hok⟩
+    · cases hsf; obtain ⟨fJsRec, st2, hjRec, hpost⟩ := ihCall fIr' (Nat.lt_succ_of_le hle') jsSt1.heap m0 f na { jsSt with heap := jsSt1.heap, memos := jsSt1.memos } v1 irSt1.heap irSt1.memos hf rfl hm0 hm0n hna' hfns hrc
+      exact ⟨max fJsB fJsRec + 1, st2, by rw [(evalJsCall_selfTail (E := E) dl f _ _ args fJsB hfnsN hjsL hjsB).2 na rfl (max fJsB fJsRec) (Nat.le_max_left _ _)]; exact evalJsCall_mono (Nat.le_max_right _ _) hjRec, hpost⟩
+  · intro xs b hctx hwf hsm hIr hJs; rw [hIr] at hirc; obtain ⟨rv, irSt1, hirB, hirc⟩ := optIrRet_eq_some hirc; cases hirc
+    obtain ⟨fJsB, jsSt1, hjsB, hok⟩ := (ihBody ⟨E.baseCtx b, [], [], false⟩ b _ _ (.returned v1) irSt1 hctx hwf hsm hirB).of_false_ret
+    exact ⟨fJsB + 1, _, by rw [hJs fJsB, hjsB]; rfl, CallPost.ofRet hok⟩
 
 private theorem eval_sim_ij_app_step (f' : Nat) (ihCall : CallSimIJ E (f' + 1)) (ihApp : AppSimIJ E f') : AppSimIJ E (f' + 1) := by
-  intro h mIr fnVal args jsSt v1 h1 m1 hfnNT hhp hmEq hmNo hargs hfns happ; rw [SimEnv.irApp, evalIrApp_succ] at happ; dsimp only [evalIrAppStep] at happ; cases fnVal with
-  | pap fnStr arity acc =>
-      unfold JsVal.noTc at hfnNT; rcases hfnNT with ⟨hfnNotJp, haccNT⟩; dsimp only at happ; by_cases hlt : args.length < arity - acc.length
-      · rw [ite_eq_left hlt] at happ; cases happ; exact ⟨1, jsSt, by rw [evalJsApp_succ]; dsimp only [evalJsAppStep]; rw [ite_eq_left hlt], CallPost.refl (by unfold JsVal.noTc; exact ⟨hfnNotJp, noTc_append haccNT hargs⟩) hhp hmEq hmNo⟩
-      · rw [ite_eq_right hlt] at happ; obtain ⟨fnName, hrev, happ⟩ := bind_eq_some happ; obtain ⟨hfnDom, hc0fn⟩ := hprog.rev_none fnStr fnName hrev
-        by_cases heq : args.length == arity - acc.length
-        · rw [ite_eq_left heq] at happ; obtain ⟨fJs, st2, hjsc, hpost⟩ := ihCall h mIr fnName (acc ++ args) jsSt v1 h1 m1 hfnDom hhp hmEq hmNo (noTc_append haccNT hargs) hfns happ
-          obtain ⟨k, rfl⟩ : ∃ k, fJs = k + 1 := by cases fJs with | zero => cases hjsc | succ k => exact ⟨k, rfl⟩
-          exact ⟨k + 1, st2, by rw [evalJsApp_succ]; dsimp only [evalJsAppStep]; rw [ite_eq_right hlt, ite_eq_left heq, ← hc0fn]; exact hjsc, hpost⟩
-        · rw [ite_eq_right heq] at happ; by_cases hrem : arity - acc.length == 0; · rw [ite_eq_left hrem] at happ; cases happ
-          rw [ite_eq_right hrem] at happ; obtain ⟨⟨res, h0, m0⟩, hirc, happ⟩ := bind_eq_some happ
-          obtain ⟨fJs1, st1, hjsc1, hp1⟩ := ihCall h mIr fnName (acc ++ args.take (arity - acc.length)) jsSt res h0 m0 hfnDom hhp hmEq hmNo (noTc_append haccNT fun a ht => hargs a (List.mem_of_mem_take ht)) hfns hirc
-          obtain ⟨fJs2, st2, hjsc2, hp2⟩ := ihApp h0 m0 res (args.drop (arity - acc.length)) st1 v1 h1 m1 hp1.2.1 hp1.2.2.1 hp1.2.2.2.2.2.1 hp1.2.2.2.2.2.2 (fun a ha => hargs a (List.mem_of_mem_drop ha)) (fun s hs => hfns s (hp1.2.2.2.2.1 ▸ hs)) happ
-          exact ⟨max fJs1 fJs2 + 1, st2, by rw [evalJsApp_succ]; dsimp only [evalJsAppStep]; rw [ite_eq_right hlt, ite_eq_right heq, ite_eq_right hrem, ← hc0fn, evalJsCall_mono (Nat.le_succ_of_le (Nat.le_max_left fJs1 fJs2)) hjsc1, Option.bind_some]; exact evalJsApp_mono (Nat.le_max_right fJs1 fJs2) hjsc2, hp1.transState hp2⟩
-  | tc _ => exact False.elim (by unfold JsVal.noTc at hfnNT; exact hfnNT) | _ => cases happ; exact ⟨1, jsSt, rfl, CallPost.refl hfnNT hhp hmEq hmNo⟩
+  intro h mIr fnVal args jsSt v1 h1 m1 hfnNT hhp hmEq hmNo hargs hfns happ
+  refine app_cases (h := h) (mIr := mIr) hprog hfnNT hargs hfns ?_ ?_ ?_ ?_
+  · intro v hv hIr hJs; rw [hIr] at happ; cases happ; exact ⟨1, jsSt, hJs 0, CallPost.refl hv hhp hmEq hmNo⟩
+  · intro hIr _; rw [hIr] at happ; cases happ
+  · intro fnName args' hDom haNT hIr hJs; rw [hIr] at happ
+    obtain ⟨fJs, st2, hjsc, hpost⟩ := ihCall h mIr fnName args' jsSt v1 h1 m1 hDom hhp hmEq hmNo haNT hfns happ
+    obtain ⟨k, rfl⟩ : ∃ k, fJs = k + 1 := by cases fJs with | zero => cases hjsc | succ k => exact ⟨k, rfl⟩
+    exact ⟨k + 1, st2, by rw [hJs k]; exact hjsc, hpost⟩
+  · intro fnName a1 a2 hDom ha1 ha2 hIr hJs; rw [hIr] at happ; obtain ⟨⟨res, h0, m0⟩, hirc, happ⟩ := bind_eq_some happ
+    obtain ⟨fJs1, st1, hjsc1, hp1⟩ := ihCall h mIr fnName a1 jsSt res h0 m0 hDom hhp hmEq hmNo ha1 hfns hirc
+    obtain ⟨fJs2, st2, hjsc2, hp2⟩ := ihApp h0 m0 res a2 st1 v1 h1 m1 hp1.2.1 hp1.2.2.1 hp1.2.2.2.2.2.1 hp1.2.2.2.2.2.2 ha2 (fun s hs => hfns s (hp1.2.2.2.2.1 ▸ hs)) happ
+    exact ⟨max fJs1 fJs2 + 1, st2, by rw [hJs (max fJs1 fJs2), evalJsCall_mono (Nat.le_succ_of_le (Nat.le_max_left fJs1 fJs2)) hjsc1, Option.bind_some]; exact evalJsApp_mono (Nat.le_max_right fJs1 fJs2) hjsc2, hp1.transState hp2⟩
 
 theorem eval_sim_ir_to_js : ∀ fuel : Nat, CallSimIJ E fuel ∧ AppSimIJ E fuel ∧ BodySimIJ E fuel := fun fuel => by
   induction fuel using Nat.strongRecOn with | ind fuel ih =>

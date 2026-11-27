@@ -14,6 +14,24 @@ structure ElemPar (msg : Type) where
 abbrev ElemPar.entry (ep : ElemPar msg) (cs : List Dom.Node) : ArenaEntry msg := .element ep.pns ep.ptag ep.pst ep.pmg cs
 abbrev ElemPar.childNsOk (ep : ElemPar msg) : Prop := ep.childNs = if ep.pns == Dom.svgNs && ep.ptag != "foreignObject" then Dom.svgNs else ""
 
+structure ParentSlot (ep : ElemPar msg) (node : Dom.Node) (pre suf : List Dom.Node) (Sold : Nat → Prop) (a : DomArena msg) : Prop where
+  hchildNs  : ep.childNsOk
+  hpreLen   : pre.length + 1 + suf.length < UInt32.size
+  hparLt    : ep.parent.toNat < a.nextId
+  hpos      : 0 < a.nextId
+  hpar      : a.get ep.parent = ep.entry (pre ++ node :: suf)
+  hnd       : (pre ++ node :: suf).Nodup
+  hparOut   : ¬Sold ep.parent.toNat
+  hSoldLt   : ∀ k, Sold k → k < a.nextId
+  hparNodes : ∀ r ∈ pre ++ node :: suf, r.toNat < a.nextId
+
+structure ParentListCtx (ep : ElemPar msg) (domCs : List Dom.Node) (Srem : Nat → Prop) (a : DomArena msg) : Prop where
+  hchildNs : ep.childNsOk
+  hparLt   : ep.parent.toNat < a.nextId
+  hposId   : 0 < a.nextId
+  hpar     : a.get ep.parent = ep.entry domCs
+  hSrem    : ∀ k, Srem k → k ≠ ep.parent.toNat ∧ k < a.nextId
+
 /-! ## Pure Diff & W3C `insertBefore` Keyed/Positional Reconciler Equivalence -/
 
 theorem insertBeforeRef_split {child ref : Dom.Node} :
@@ -78,15 +96,15 @@ theorem w3cReconcileKeyed_eq (live targets : List Dom.Node) (hlive : live.Nodup)
 
 /-! ## Child Reconciliation & Full Subtree Patching on `DomArena` -/
 
-theorem snapshotChildrenM_spec (a : DomArena msg) (node : Dom.Node) (pns ptag : String) (pst : SpecElemState msg) (pmg : List String) (cs : List Dom.Node) (hsize : cs.length < UInt32.size) :
+theorem snapshotChildrenM_spec (a : DomArena msg) (ep : ElemPar msg) (cs : List Dom.Node) (hsize : cs.length < UInt32.size) :
     ∀ (i rem : Nat) (acc : Array Dom.Node), i + rem = cs.length →
-      (snapshotChildrenM (m := ArenaM msg) node i acc rem).run (a.set node (.element pns ptag pst pmg cs)) = (⟨acc.toList ++ cs.drop i⟩, a.set node (.element pns ptag pst pmg cs))
+      (snapshotChildrenM (m := ArenaM msg) ep.parent i acc rem).run (a.set ep.parent (ep.entry cs)) = (⟨acc.toList ++ cs.drop i⟩, a.set ep.parent (ep.entry cs))
   | i, 0, ⟨_⟩, hsum => by cases (show i = cs.length by omega); simp [snapshotChildrenM, StateT.run, pure, StateT.pure]
   | i, r + 1, acc, hsum => by
       have hlt : i < cs.length := by omega
-      have hca : MonadDom.childAt (m := ArenaM msg) node (UInt32.ofNat i) (a.set node (.element pns ptag pst pmg cs)) = (cs[i], a.set node (.element pns ptag pst pmg cs)) := by simp [MonadDom.childAt, DomArena.get_set_self, uint32_toNat_ofNat_lt i (by omega), List.getElem?_eq_getElem hlt]
+      have hca : MonadDom.childAt (m := ArenaM msg) ep.parent (UInt32.ofNat i) (a.set ep.parent (ep.entry cs)) = (cs[i], a.set ep.parent (ep.entry cs)) := by simp [MonadDom.childAt, DomArena.get_set_self, ElemPar.entry, uint32_toNat_ofNat_lt i (by omega), List.getElem?_eq_getElem hlt]
       dsimp only [snapshotChildrenM, StateT.run]; rw [stateM_bind_step hca]
-      exact (snapshotChildrenM_spec a node pns ptag pst pmg cs hsize (i + 1) r (acc.push cs[i]) (by omega)).trans (by simp only [Array.toList_push, List.append_assoc, List.singleton_append, List.drop_eq_getElem_cons hlt])
+      exact (snapshotChildrenM_spec a ep cs hsize (i + 1) r (acc.push cs[i]) (by omega)).trans (by simp only [Array.toList_push, List.append_assoc, List.singleton_append, List.drop_eq_getElem_cons hlt])
 theorem list_length_le_htmlListNodeCount : ∀ (cs : List (Html msg)), cs.length ≤ htmlListNodeCount cs
   | [] => Nat.le_refl 0 | c :: cs => by have : 1 ≤ htmlNodeCount c := (by cases c <;> simp [htmlNodeCount]); have := list_length_le_htmlListNodeCount cs; simp only [List.length_cons, htmlListNodeCount]; omega
 theorem nodup_lt_length_le : ∀ (n : Nat) (xs : List Nat), xs.Nodup → (∀ x ∈ xs, x < n) → xs.length ≤ n

@@ -386,6 +386,7 @@ private abbrev MinM := StateM MinSt
 @[noinline] private def internShort (avoid : Std.HashSet String) (p : Std.HashMap String String × Nat) (k : String) : String × (Std.HashMap String String × Nat) :=
   match p.1.get? k with | some s => (s, p) | none => let (s, i') := nextShortIdent avoid p.2; (s, p.1.insert k s, i')
 @[noinline] private def mapVarM (name : String) : MinM String := modifyGet fun st => let (s, v) := internShort st.avoid st.vars name; (s, { st with vars := v })
+@[noinline] private def mapVarsM (ns : List String) : MinM (List String) := ns.mapM mapVarM
 @[noinline] private def mapLblM (lbl : String) : MinM String := modifyGet fun st => let (s, l) := internShort jsMinReservedSet st.lbls lbl; (s, { st with lbls := l })
 mutual
 @[noinline] private def renameExpr : JsExpr → MinM JsExpr
@@ -395,29 +396,29 @@ mutual
   | .call fn args => do let fn' ← (if (← get).localArrows.contains fn then mapVarM fn else pure fn); return .call fn' (← renameExprs args)
   | .pap fn ar args => return .pap fn ar (← renameExprs args) | .app fn args => return .app (← renameExpr fn) (← renameExprs args)
   | .tc args => return .tc (← renameExprs args) | e => return e
-private def renameExprs : List JsExpr → MinM (List JsExpr) | [] => return [] | e :: es => return (← renameExpr e) :: (← renameExprs es)
+@[noinline] private def renameExprs : List JsExpr → MinM (List JsExpr) | [] => return [] | e :: es => return (← renameExpr e) :: (← renameExprs es)
 end
 @[noinline] private def renamePairs (ps : List (String × JsExpr)) : MinM (List (String × JsExpr)) := ps.mapM fun (k, e) => return (← mapVarM k, ← renameExpr e)
 mutual
 @[noinline] private def renameStmt : JsStmt → MinM JsStmt
   | .letVar x v => do let v' ← renameExpr v; return .letVar (← mapVarM x) v'
-  | .letDecls ns => return .letDecls (← ns.mapM mapVarM) | .letBinds bs => return .letBinds (← renamePairs bs)
+  | .letDecls ns => return .letDecls (← mapVarsM ns) | .letBinds bs => return .letBinds (← renamePairs bs)
   | .labeledBlock l b => return .labeledBlock (← mapLblM l) (← renameStmts b)
-  | .constArrow n ps b => return .constArrow (← mapVarM n) (← ps.mapM mapVarM) (← renameStmts b)
+  | .constArrow n ps b => return .constArrow (← mapVarM n) (← mapVarsM ps) (← renameStmts b)
   | .setField x i v => return .setField (← mapVarM x) i (← renameExpr v) | .setTag x c => return .setTag (← mapVarM x) c
   | .setU x i v => return .setU (← mapVarM x) i (← renameExpr v) | .setS x n o v => return .setS (← mapVarM x) n o (← renameExpr v)
   | .incRef x n => return .incRef (← mapVarM x) n | .decRef x n => return .decRef (← mapVarM x) n | .ret v => return .ret (← renameExpr v)
-  | .tailContinue ps as => do let as' ← renameExprs as; return .tailContinue (← ps.mapM mapVarM) as'
+  | .tailContinue ps as => do let as' ← renameExprs as; return .tailContinue (← mapVarsM ps) as'
   | .breakLabel bs l => return .breakLabel (← renamePairs bs) (← mapLblM l) | .throwUnreachable => return .throwUnreachable
   | .switchStmt scr arms => return .switchStmt (← renameExpr scr) (← renameArms arms)
-private def renameStmts : List JsStmt → MinM (List JsStmt) | [] => return [] | s :: ss => return (← renameStmt s) :: (← renameStmts ss)
-private def renameArms : List JsSwitchArm → MinM (List JsSwitchArm)
+@[noinline] private def renameStmts : List JsStmt → MinM (List JsStmt) | [] => return [] | s :: ss => return (← renameStmt s) :: (← renameStmts ss)
+@[noinline] private def renameArms : List JsSwitchArm → MinM (List JsSwitchArm)
   | [] => return [] | .caseArm c b :: rs => return .caseArm c (← renameStmts b) :: (← renameArms rs) | .defaultArm b :: rs => return .defaultArm (← renameStmts b) :: (← renameArms rs)
 end
-private def minifyFnBody (name : String) (params : List String) (body : List JsStmt) : List String × List JsStmt :=
+@[noinline] private def minifyFnBody (name : String) (params : List String) (body : List JsStmt) : List String × List JsStmt :=
   let sc := scanMinStmts { avoid := jsMinReservedSet.insert name } body
   let avoid := sc.called.fold (fun a fn => if sc.localArrows.contains fn then a else a.insert fn) sc.avoid
-  ((do return (← params.mapM mapVarM, ← renameStmts body)).run { avoid, localArrows := sc.localArrows }).1
+  ((do return (← mapVarsM params, ← renameStmts body)).run { avoid, localArrows := sc.localArrows }).1
 def minifyDecl : JsDecl → JsDecl
   | d@(.memoInit ..) => d | .memoThunk n b => .memoThunk n (minifyFnBody n [] b).2
   | .fnPlain n o ps b => let (ps, b) := minifyFnBody n ps b; .fnPlain n o ps b

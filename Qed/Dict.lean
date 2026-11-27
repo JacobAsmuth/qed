@@ -1,3 +1,4 @@
+import Qed.Collection
 import Qed.Json.Lawful
 import Qed.Proto.Lawful
 
@@ -102,4 +103,13 @@ qed_equiv_codec% jsonLow [K, V] (Dict K V, Dict.entriesList, Dict.mk, fun ⟨_�
 qed_equiv_codec% proto   [K, V] (Dict K V, Dict.entriesList, Dict.mk, fun ⟨_⟩ => rfl)
 
 end Dict
+
+namespace Lang
+@[inline] instance {K V : Type} [BEq K] : QedMem K (Qed.Dict K V) := ⟨fun k d => d.contains k⟩
+@[simp] theorem QedMem.mem_dict {K V : Type} [BEq K] (k : K) (d : Qed.Dict K V) : QedMem.mem k d = d.contains k := rfl
+@[reducible] instance {K V : Type} [BEq K] : QedMemProp K (Qed.Dict K V) := ⟨fun k d => d.contains k = true⟩
+@[simp] theorem QedMemProp.memProp_dict {K V : Type} [BEq K] (k : K) (d : Qed.Dict K V) : QedMemProp.memProp k d = (d.contains k = true) := rfl
+instance {K V : Type} [BEq K] (k : K) (d : Qed.Dict K V) : Decidable (QedMemProp.memProp k d) := inferInstanceAs (Decidable (d.contains k = true))
+end Lang
+
 end Qed

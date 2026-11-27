@@ -2,6 +2,7 @@ import Lean
 import Qed.Lang
 import Qed.Diag
 import Qed.Collection
+import Qed.Html
 
 namespace Qed
 
@@ -103,8 +104,73 @@ def resolveCompUpdateUnfolds (idStx : Syntax) : CoreM (Array Name) := do
   return extras.foldl (init := base) fun acc aux =>
     if env.contains aux && !acc.contains aux then acc.push aux else acc
 
+@[noinline, nospecialize] def withFreshHeartbeatsT {α : Type} (k : TacticM α) : TacticM α := Core.withCurrHeartbeats k
+@[noinline, nospecialize] def withFreshHeartbeatsM {α : Type} (k : MetaM α) : MetaM α := Core.withCurrHeartbeats k
+@[noinline] def isPropSafe (ty : Expr) : MetaM Bool := try isProp ty catch _ => pure false
+
+@[noinline] private def getUserLCtxDecls (includeLet : Bool) : MetaM (Array LocalDecl) := do
+  return (← getLCtx).foldl (init := #[]) fun acc d =>
+    if !d.isImplementationDetail && (includeLet || !d.isLet) then acc.push d else acc
+
+@[noinline, nospecialize] def collectLCtxDecls {α : Type} (f : LocalDecl → MetaM (Option α)) (includeLet : Bool := true) : MetaM (Array α) := do
+  let rec go (acc : Array α) : List LocalDecl → MetaM (Array α)
+    | [] => pure acc
+    | d :: ds => do
+        match ← f d with
+        | some x => go (acc.push x) ds
+        | none   => go acc ds
+  go #[] (← getUserLCtxDecls includeLet).toList
+
+@[noinline, nospecialize] def findLCtxDecl? {α : Type} (f : LocalDecl → MetaM (Option α)) (includeLet : Bool := true) : MetaM (Option α) := do
+  let rec go : List LocalDecl → MetaM (Option α)
+    | [] => pure none
+    | d :: ds => do
+        match ← f d with
+        | some x => pure (some x)
+        | none   => go ds
+  go (← getUserLCtxDecls includeLet).toList
+
+/-- Synthesize `rfl` projection simp lemmas `(_reconcileHoisted ... sOld res)[.1].<f> = res[.1].<f>`
+    for non-`_sub_*` state fields when `goalConsts` references no `_sub_*` projection. -/
+@[noinline] def mkReconcileProjLemmas (reconName : Name) (goalConsts : Std.HashSet Name) :
+    MetaM (Option (Array (Name × Expr))) := do
+  let env ← getEnv
+  let some ci := env.find? reconName | return none
+  forallTelescope ci.type fun args retTy => do
+    if args.size < 2 then return none
+    let isPair := retTy.isAppOfArity ``Prod 2
+    let stateTy := if isPair then retTy.appFn!.appArg! else retTy
+    let some stateName := stateTy.getAppFn.constName? | return none
+    if goalConsts.any fun c => c.getPrefix == stateName && c.getString!.startsWith "_sub_" then return none
+    let fields := Lean.getStructureFields env stateName
+    if fields.isEmpty then return none
+    let reconApp := mkAppN (mkConst reconName) args
+    let resArg := args.back!
+    let lhsBase ← if isPair then mkAppM ``Prod.fst #[reconApp] else pure reconApp
+    let rhsBase ← if isPair then mkAppM ``Prod.fst #[resArg] else pure resArg
+    let mut out : Array (Name × Expr) := #[]
+    for f in fields do
+      unless f.toString.startsWith "_sub_" do
+        let projName := stateName ++ f
+        if env.contains projName then
+          if let some lhs ← try some <$> mkAppM projName #[lhsBase] catch _ => pure none then
+            if let some rhs ← try some <$> mkAppM projName #[rhsBase] catch _ => pure none then
+              if ← isDefEq lhs rhs then
+                let eqTy ← mkEq lhs rhs
+                let pf ← mkLambdaFVars args (mkApp2 (mkConst ``id [Level.zero]) eqTy (← mkEqRefl rhs))
+                out := out.push (reconName ++ f, pf)
+    return if out.isEmpty then none else some out
+
+@[noinline] def addReconcileProjLemmas (st : SimpTheorems) (reconName : Name) (goalConsts : Std.HashSet Name) :
+    MetaM (Option SimpTheorems) := do
+  let some lems ← mkReconcileProjLemmas reconName goalConsts | return none
+  let mut st' := st
+  for (nm, pf) in lems do
+    st' ← st'.add (.other nm) #[] pf
+  return some st'
+
 elab "qedWithFreshHeartbeats" tac:tacticSeq : tactic =>
-  Core.withCurrHeartbeats (evalTactic tac)
+  withFreshHeartbeatsT (evalTactic tac)
 
 private def mkSimpCtx (cfg : Simp.Config) (thms : Array SimpTheorems) : MetaM Simp.Context := do
   Simp.mkContext { cfg with failIfUnchanged := false } thms (← getSimpCongrTheorems)
@@ -129,8 +195,7 @@ def mkSimpCtxWithBase (extraNames : Array Name := #[]) (cfg : Simp.Config := {})
       | none   => pure #[← addSimpNamesWithEqns base extraNames false withEqns]
   mkSimpCtx cfg thms
 
-@[noinline, nospecialize]
-def tryRestoreM {m : Type → Type} {s α : Type} [Monad m] [MonadBacktrack s m] [MonadExcept Exception m]
+@[noinline, nospecialize] def tryRestoreM {m : Type → Type} {s α : Type} [Monad m] [MonadBacktrack s m] [MonadExcept Exception m]
     (fail : α) (ok : α → Bool) (k : m α) : m α := do
   let st ← saveState
   try
@@ -148,7 +213,7 @@ def simpGoalOnly (g : MVarId) (ctx : Simp.Context) (simprocs : Simp.SimprocsArra
     return (← simpGoal g ctx simprocs none simplifyTarget fvarIds).1.map Prod.snd
 
 def simpGoalAllHyps (g : MVarId) (ctx : Simp.Context) (simprocs : Simp.SimprocsArray := #[]) (dsimpOnly : Bool := false) : MetaM (Option MVarId) := do
-  let fvs ← g.withContext do return (← getLCtx).foldl (init := #[]) fun acc d => if d.isImplementationDetail then acc else acc.push d.fvarId
+  let fvs ← g.withContext <| collectLCtxDecls fun d => pure (some d.fvarId)
   simpGoalOnly g ctx simprocs fvs true dsimpOnly
 
 def trySimpAll (g : MVarId) (ctx : Simp.Context) (sp : Simp.SimprocsArray := #[]) : MetaM (Option MVarId) :=
@@ -183,7 +248,8 @@ def extractForEachColl? (tgt : Expr) : Option Expr :=
 def collectGoalConsts (g : MVarId) (includeLCtx : Bool := false) : MetaM (Std.HashSet Name) := g.withContext do
   let mut s := (← instantiateMVars (← g.getType)).getUsedConstants.foldl (·.insert ·) {}
   if includeLCtx then
-    for d in (← getLCtx) do if !d.isImplementationDetail then s := (← instantiateMVars d.type).getUsedConstants.foldl (·.insert ·) s
+    for ty in (← collectLCtxDecls fun d => some <$> instantiateMVars d.type) do
+      s := ty.getUsedConstants.foldl (·.insert ·) s
   return s
 
 def assertFacts (g0 : MVarId) (pfx : String) (facts : Array Expr) : MetaM (MVarId × Array FVarId) := do
@@ -269,16 +335,19 @@ private structure FactScanState where
     stRef.modify fun s => { s with factSet := s.factSet.insert p, facts := s.facts.push p, nextScan := match pTy? with | some t => s.nextScan.push t | none => s.nextScan }
   let mut scanExprs : Array Expr := #[]; let mut forallHyps : Array Expr := #[]
   if cfg.scanLCtx then
-    for decl in (← getLCtx) do
-      if !decl.isImplementationDetail then
-        let dty ← instantiateMVars decl.type
-        if cfg.includeMacroPropHyps && !decl.isLet && decl.userName.hasMacroScopes then
-          if (← try isProp dty catch _ => pure false) then addFact decl.toExpr
-        unless cfg.skipDecl decl dty do
-          if cfg.scanLCtxValues then
-            scanExprs := scanExprs.push decl.toExpr; if let some val := decl.value? then scanExprs := scanExprs.push val
-          else scanExprs := scanExprs.push dty
-        if cfg.includeCollectionRules && dty.isForall then forallHyps := forallHyps.push decl.toExpr
+    let entries ← collectLCtxDecls fun decl => do
+      let dty ← instantiateMVars decl.type
+      if cfg.includeMacroPropHyps && !decl.isLet && decl.userName.hasMacroScopes then
+        if ← isPropSafe dty then addFact decl.toExpr
+      let mut es : Array Expr := #[]
+      unless cfg.skipDecl decl dty do
+        if cfg.scanLCtxValues then
+          es := es.push decl.toExpr; if let some val := decl.value? then es := es.push val
+        else es := es.push dty
+      return some (es, if cfg.includeCollectionRules && dty.isForall then some decl.toExpr else none)
+    for (es, fh?) in entries do
+      scanExprs := scanExprs ++ es
+      if let some fh := fh? then forallHyps := forallHyps.push fh
   for e in extraExprs do scanExprs := scanExprs.push (← instantiateMVars e)
   for _ in [0:cfg.rounds] do
     if scanExprs.isEmpty then break
@@ -302,7 +371,8 @@ def tryCloseTrivial (g : MVarId) (skipTarget : Expr → Bool := fun _ => false) 
   if reducibleOnly then
     return ← g.withContext <| withTransparency .reducible do
       if let some (_, lhs, rhs) := tgtC.eq? then if ← isDefEq lhs rhs then g.assign (← mkEqRefl lhs); return true
-      for d in (← getLCtx) do if !d.isImplementationDetail then if ← isDefEq d.type tgtC then g.assign (mkFVar d.fvarId); return true
+      if let some fv ← findLCtxDecl? fun d => do if ← isDefEq d.type tgtC then pure (some d.fvarId) else pure none then
+        g.assign (mkFVar fv); return true
       return false
   if tgtC.isAppOfArity ``Eq 3 then if ← tryReflGoal g then return true
   if (tgtC.isAppOfArity ``LE.le 4 || tgtC.isAppOfArity ``GE.ge 4) && tgtC.getAppArgs[2]! == tgtC.getAppArgs[3]! then
@@ -326,46 +396,56 @@ def tryDirectOmega (g : MVarId) : MetaM Bool := tryRestoreM false id do
   let some g' ← g.falseOrByContra | return true
   g'.withContext do Omega.omega ((← getPropHyps).toList.map mkFVar) g' {}; return true
 
-@[noinline]
-private partial def proveGroundKernelProp (env : Environment) (e : Expr) : TacticM (Option Expr) := do
+@[noinline] private partial def buildGroundKernelProof (check : Bool) (e : Expr) : MetaM (Option Expr) := do
+  let isKDefEq (a b : Expr) : MetaM Bool := do
+    return match Kernel.isDefEq (← getEnv) (← getLCtx) a b with | .ok true => true | _ => false
   let e := e.consumeMData
   match e with
-  | .letE _ _ v b _ => proveGroundKernelProp env (b.instantiate1 v)
+  | .letE n ty v b nondep =>
+      withLetDecl n ty v (nondep := nondep) fun fv => do
+        let some pf ← buildGroundKernelProof check (b.instantiate1 fv) | return none
+        return some (Expr.letE n ty v (pf.abstract #[fv]) nondep)
   | _ =>
       if e.isConstOf ``True then return some (mkConst ``True.intro)
       if e.isAppOfArity ``And 2 then
         let a := e.getAppArgs[0]!; let b := e.getAppArgs[1]!
-        if let some pa ← proveGroundKernelProp env a then
-          if let some pb ← proveGroundKernelProp env b then
-            return some (mkApp4 (mkConst ``And.intro) a b pa pb)
-        return none
+        let some pa ← buildGroundKernelProof check a | return none
+        let some pb ← buildGroundKernelProof check b | return none
+        return some (mkApp4 (mkConst ``And.intro) a b pa pb)
       if let some (ty, lhs, rhs) := e.eq? then
-        if (match Kernel.isDefEq env {} lhs rhs with | .ok true => true | _ => false) then
+        if !check then
           return some (mkApp2 (mkConst ``Eq.refl [← getLevel ty]) ty lhs)
-      let mv ← mkFreshExprMVar e
-      let saved ← getGoals; setGoals [mv.mvarId!]
-      let ok ← tryTac (requireClosed := true) `(tactic| decide +kernel)
-      setGoals saved
-      if ok then return some (← instantiateMVars mv)
-      return none
+        if ← isKDefEq lhs rhs then
+          return some (mkApp2 (mkConst ``Eq.refl [← getLevel ty]) ty lhs)
+      match ← trySynthInstance (mkApp (mkConst ``Decidable) e) with
+      | .some decInst =>
+          let reflTrue ← mkEqRefl (mkConst ``Bool.true)
+          if !check then
+            return some (mkApp3 (mkConst ``of_decide_eq_true) e decInst reflTrue)
+          if ← isKDefEq (mkApp2 (mkConst ``Decidable.decide) e decInst) (mkConst ``Bool.true) then
+            return some (mkApp3 (mkConst ``of_decide_eq_true) e decInst reflTrue)
+          return none
+      | _ => return none
 
 /-- Close a ground goal quickly without blowing elaborator `maxRecDepth`: reducible-only trivial check
-first, then kernel `Kernel.isDefEq` (handles `let`, `And`, `True`, and `Eq` on types without `DecidableEq`,
-e.g. `Except`/`Json`) and `decide +kernel` for closed decidable propositions. -/
-def tryCloseGroundKernel (g : MVarId) : TacticM Bool := do
+first, then `let`-preserving proof construction (checked via `Kernel.isDefEq` when `check := true`,
+or delegated directly to `addDeclCore` with zero `toKernelEnv` sync stall when `check := false`). -/
+def tryCloseGroundKernel (g : MVarId) (check : Bool := true) : MetaM Bool := do
   if ← tryCloseTrivial g (reducibleOnly := true) then return true
   let tgt ← g.withContext do instantiateMVars (← g.getType)
   if !tgt.hasFVar && !tgt.hasMVar && !tgt.hasLevelMVar then
-    let env ← getEnv
-    if let some pf ← g.withContext (proveGroundKernelProp env tgt) then
+    if let some pf ← withLCtx {} {} (buildGroundKernelProof check tgt) then
       g.assign pf
       return true
   return false
 
 elab "qedCloseGround" : tactic => do
-  let g ← getMainGoal
-  if ← tryCloseGroundKernel g then replaceMainGoal []
+  if ← tryCloseGroundKernel (← getMainGoal) (check := true) then replaceMainGoal []
   else throwError "qedCloseGround failed"
+
+elab "qedCloseGroundKernel" : tactic => do
+  if ← tryCloseGroundKernel (← getMainGoal) (check := false) then replaceMainGoal []
+  else throwError "qedCloseGroundKernel failed"
 
 def tryCloseBasic (g : MVarId) (skipTarget : Expr → Bool := fun _ => false) (reducibleOnly : Bool := false) : MetaM Bool := do
   if ← tryCloseTrivial g skipTarget reducibleOnly then return true
@@ -376,15 +456,13 @@ def splitAndHypsGoal (g0 : MVarId) (existsOnly : Bool := false) (maxIters : Nat 
   let isMatchTy (t : Expr) := t.isAppOfArity ``Exists 2 || (!existsOnly && (t.isAppOfArity ``And 2 || t.isAppOfArity ``Qed.Lang.QedAndProp 2))
   let mut g := g0; let mut didSplit := false
   for _ in [0:maxIters] do
-    let mut nextG? : Option MVarId := none
-    for decl in (← g.withContext getLCtx) do
-      if nextG?.isNone && !decl.isImplementationDetail && !decl.isLet then
-        let tC := decl.type.consumeMData
-        if isMatchTy tC || match tC.getAppFn with | .const c _ => !nonRefinedHeads.contains c | _ => true then
-          if let some g' ← tryRestoreM none Option.isSome do
-              if isMatchTy (← g.withContext (whnf tC)) then return ((← g.cases decl.fvarId)[0]?).map (·.mvarId) else return none then
-            nextG? := some g'; didSplit := true
-    match nextG? with | some g' => g := g' | none => break
+    let nextG? ← g.withContext <| findLCtxDecl? (includeLet := false) fun decl => do
+      let tC := decl.type.consumeMData
+      if isMatchTy tC || match tC.getAppFn with | .const c _ => !nonRefinedHeads.contains c | _ => true then
+        tryRestoreM none Option.isSome do
+          if isMatchTy (← whnf tC) then return ((← g.cases decl.fvarId)[0]?).map (·.mvarId) else return none
+      else return none
+    match nextG? with | some g' => g := g'; didSplit := true | none => break
   return (g, didSplit)
 
 def splitGoalAnds (g0 : MVarId) (maxIters : Nat := 64) : MetaM (List MVarId) := do
@@ -408,9 +486,8 @@ structure CloseFallbackConfig where
     if ← tryRestoreM false id do
       let stWithHyps ← g.withContext do
         let mut st ← getSimpTheorems
-        for d in (← getLCtx) do
-          if !d.isImplementationDetail && !d.isLet then
-            if ← try isProp d.type catch _ => pure false then st ← try st.add (.fvar d.fvarId) #[] d.toExpr catch _ => pure st
+        for (fv, e) in (← collectLCtxDecls (includeLet := false) fun d => do if ← isPropSafe d.type then pure (some (d.fvarId, d.toExpr)) else pure none) do
+          st ← try st.add (.fvar fv) #[] e catch _ => pure st
         return st
       match ← simpGoalOnly g (← mkSimpCtx cfg.simpAllCfg #[stWithHyps]) with | none => return true | some g' => tryDirectOmega g'
     then return true
@@ -477,8 +554,7 @@ def relevantAppLemmas (env : Environment) (cs : Std.HashSet Name) : Array Name :
     (#[`Qed.Cached.activate, `Qed.Cached.all, `Qed.Cached.markRefetch, `Qed.Cached.invalidateAll],
      #[`Qed.Cached.activate, `Qed.Cached.all_empty, `Qed.Cached.all_markRefetch, `Qed.Cached.all_invalidateAll])]
 
-@[noinline]
-def runUnfoldPresent (extra : Array Term) (skip : Array Name := #[]) : TacticM Unit := do
+@[noinline] def runUnfoldPresent (extra : Array Term) (skip : Array Name := #[]) : TacticM Unit := do
   let g :: _ ← getGoals | return
   let cs ← collectGoalConsts g true
   let fixedL := (← namesToSimpLemmas (relevantAppLemmas (← getEnv) cs ++ relevantBoundaryLemmas cs)) ++ (← termsToSimpLemmas extra)
@@ -519,8 +595,7 @@ def fmtBlindTarget (t : ParsedBlindTarget) : String :=
   else if t.fields.size == 1 then s!"{t.paramId.getId}.{t.fields[0]!.getId}"
   else s!"{t.paramId.getId}.\{" ++ String.intercalate ", " (t.fields.toList.map (·.getId.toString)) ++ "}"
 
-@[noinline]
-def buildBlindToArgs (targets : Array ParsedBlindTarget) (validParamNames : Array Name)
+@[noinline] def buildBlindToArgs (targets : Array ParsedBlindTarget) (validParamNames : Array Name)
     (binderIds : Array Ident) (binderTys : Array Term) (fnErrCtx? : Option String := none) :
     Command.CommandElabM (Array (Ident × Option Term) × Array Term × Array Term) := do
   let mut paramBlinds : Array (Name × Bool × Array Ident) := #[]
@@ -556,8 +631,7 @@ def buildBlindToArgs (targets : Array ParsedBlindTarget) (validParamNames : Arra
         lhsArgs := lhsArgs.push (← `({ $bId with $[$updIds:ident := $updVals:term],* }))
   return (freshVars, lhsArgs, rhsArgs)
 
-@[noinline]
-def mkBlindToEqProp (freshVars : Array (Ident × Option Term)) (lhsCall rhsCall : Term) : Command.CommandElabM Term := do
+@[noinline] def mkBlindToEqProp (freshVars : Array (Ident × Option Term)) (lhsCall rhsCall : Term) : Command.CommandElabM Term := do
   freshVars.foldrM (init := ← `($lhsCall = $rhsCall)) fun (fv, ty?) acc => match ty? with
     | some ty => `(∀ ($fv:ident : $ty), $acc)
     | none    => `(∀ $fv:ident, $acc)

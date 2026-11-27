@@ -111,8 +111,32 @@ theorem managedAuthTargets_prod_never_localDev (providers : List String) : (mana
 def isDnsAlpha (c : Char) : Bool := 'a' ≤ c && c ≤ 'z'
 def isDnsAlnum (c : Char) : Bool := isDnsAlpha c || ('0' ≤ c && c ≤ '9')
 def isDnsLabelChar (c : Char) : Bool := isDnsAlnum c || c == '-'
+def isAsciiAlpha (c : Char) : Bool := ('A' ≤ c && c ≤ 'Z') || ('a' ≤ c && c ≤ 'z')
+def isAsciiAlnum (c : Char) : Bool := isAsciiAlpha c || ('0' ≤ c && c ≤ '9')
 def asciiToLower (c : Char) : Char := if 'A' ≤ c && c ≤ 'Z' then Char.ofNat (c.toNat + 32) else c
 private def isAsciiDigit (c : Char) : Bool := '0' ≤ c && c ≤ '9'
+
+/-- Validate a bounded ASCII identifier with head/body character predicates and optional tail guard. -/
+def checkAsciiIdent (minLen maxLen : Nat) (headOk bodyOk : Char → Bool)
+    (tailOk : Char → Bool := fun _ => true) (s : String) : Bool :=
+  match s.toList with
+  | [] => false
+  | c :: rest =>
+      let cs := c :: rest
+      minLen ≤ cs.length && cs.length ≤ maxLen && headOk c && cs.all bodyOk &&
+      match cs.getLast? with | some last => tailOk last | none => false
+
+/-- True if `s` contains ASCII control chars (`< 0x20` or `0x7F`), whitespace (when `forbidWs`), or any char in `extra`. -/
+def Env.hasCtrlOrWs (s : String) (extra : String := "") (forbidWs : Bool := true) : Bool :=
+  let extraCs := extra.toList
+  s.toList.any fun c =>
+    c.toNat < 0x20 || c.toNat == 0x7F || (forbidWs && (c.toNat == 0x20 || c.isWhitespace)) || extraCs.contains c
+
+/-- Strip a single trailing `'/'` if present. -/
+def trimTrailingSlash (s : String) : String :=
+  match s.toList.reverse with
+  | '/' :: rest => String.ofList rest.reverse
+  | _ => s
 
 /-- Pure, kernel-reducible character splitter on `List Char`. -/
 def splitCharAux (sep : Char) : List Char → List Char → List (List Char)
@@ -254,5 +278,28 @@ def isStrictLoopbackUrl (u : String) : Bool :=
         let ecs := exp.toList
         trimmed == ecs || (trimmed.take ecs.length == ecs && match trimmed.drop ecs.length with | ':' :: pc => (parsePort? pc).isSome | _ => false)
   | _ => false
+
+/-- Parse an `https://<host>[:<port>]` authority (rejecting paths, credentials, queries, fragments,
+    wildcards, control chars, whitespace, and non-canonical ports). Returns `(host, port?)`. -/
+def parseHttpsHostPort? (raw : String) (allowTrailingSlash : Bool := false)
+    (lowercaseHost : Bool := true) : Option (String × Option Nat) :=
+  match raw.toList with
+  | 'h' :: 't' :: 't' :: 'p' :: 's' :: ':' :: '/' :: '/' :: rest =>
+      let auth := if allowTrailingSlash then match rest.reverse with | '/' :: r => r.reverse | _ => rest else rest
+      if auth.isEmpty || auth.any (fun c => c == '/' || c == '?' || c == '#' || c == '@' || c == '\\' || c == '*' ||
+          c.toNat ≤ 32 || c.toNat == 127 || c.isWhitespace) then none
+      else
+        let checkHost (hc : List Char) : Option String :=
+          let h := String.ofList (if lowercaseHost then hc.map asciiToLower else hc)
+          if isValidHostname h then some h else none
+        match splitCharAux ':' auth [] with
+        | [hc] => (checkHost hc).map (·, none)
+        | [hc, pc] =>
+            if pc.head? == some '0' then none
+            else match checkHost hc, parsePort? pc with
+              | some h, some p => some (h, some p)
+              | _, _ => none
+        | _ => none
+  | _ => none
 
 end Qed.Cloud

@@ -243,6 +243,26 @@ def main (args : List String) : IO Unit := do
     if mods.isEmpty || entryArgs.isEmpty then fail "usage: qedjs --check-externs <rt.mjs> <module>… -- <decl>[:<export>]…"
     let (_, externs) ← orThrow (Js.collectProgramExterns (← loadEnv mods) (entryArgs.map (parseEntry · |>.1)))
     orThrow (Js.checkRtExterns (Js.rtExports (← IO.FS.readFile rtPath)) externs)
+  | "--check-leak-each" :: rest =>
+    let (mod, decls) ← match rest with
+      | m :: "--" :: ds => pure (m, ds)
+      | m :: ds => pure (m, ds)
+      | [] => fail "usage: qedjs --check-leak-each <module> <decl1> [<decl2> ...]"
+    if decls.isEmpty then fail "usage: qedjs --check-leak-each <module> <decl1> [<decl2> ...]"
+    let env ← loadEnv [mod]
+    let mut failed := 0
+    for decl in decls do
+      match Js.collectProgramExterns env [(parseEntry decl).1] with
+      | .error err =>
+          let cleanErr := err.replace "\n" " "
+          if err.contains "client bundle leak gate" then
+            IO.println s!"PASS\t{decl}\t{cleanErr}"
+          else
+            IO.println s!"FAIL\t{decl}\t{cleanErr}"; failed := failed + 1
+      | .ok _ =>
+          IO.println s!"FAIL\t{decl}\tallowed in client bundle (not blocked by client bundle leak gate)"
+          failed := failed + 1
+    if failed > 0 then fail s!"leak gate check failed for {failed}/{decls.length} declaration(s) in `{mod}`"
   | _ =>
     let (flags, cleanArgs) ← orThrow (parseJsFlags args {})
     match splitDashes cleanArgs with

@@ -162,6 +162,15 @@ theorem formRowCons_validIn {msg : Type} (ctxInForm inForm wrapLabel bad : Bool)
     Html.validListIn ⟨.normal, false, false, ctxInForm⟩ (formFieldRow inForm wrapLabel bad label err ctrl ++ rest) = true := by
   rw [Html.validListIn_append, formFieldRow_validListIn ctxInForm inForm wrapLabel bad label err ctrl hctrl, hrest]; rfl
 
+def renderFieldRow {α msg : Type} (c : Codec α) (raw : String) (parsedIsNone : Bool) (label err : String) (set : String → msg) : List (Html msg) :=
+  formFieldRow c.inForm c.wrapLabel (raw != "" && parsedIsNone) label err (c.render raw set)
+
+theorem renderFieldRowCons_validIn {α msg : Type} (ctxInForm : Bool) (c : Codec α) (raw : String) (parsedIsNone : Bool)
+    (label err : String) (set : String → msg) (rest : List (Html msg))
+    (hrest : Html.validListIn ⟨.normal, false, false, ctxInForm⟩ rest = true) :
+    Html.validListIn ⟨.normal, false, false, ctxInForm⟩ (c.renderFieldRow raw parsedIsNone label err set ++ rest) = true :=
+  formRowCons_validIn ctxInForm c.inForm c.wrapLabel (raw != "" && parsedIsNone) label err (c.render raw set) rest (c.render_valid ctxInForm raw set) hrest
+
 def submitBtn {msg α : Type} (o : Option α) (submit : α → msg) : Html msg :=
   match o with | some p => el "button" [onClick (submit p)] "Submit" | none => el "button" [disabled true] "Submit"
 
@@ -189,5 +198,72 @@ end Codec
 @[reducible] instance {α : Type} {p : α → Prop} [DefaultCodec α] [DecidablePred p] : DefaultCodec (Field p) :=
   ⟨Codec.ofField DefaultCodec.codec p⟩
 @[reducible] instance (priority := low) {α : Type} [ToJson α] [FromJson α] : DefaultCodec α := ⟨Codec.json α⟩
+
+/-! ## Pure Codec Bundles (`UnitEnumCodec`, `StructBeqCodec`) -/
+
+/-- Pure wire-codec bundle for nullary `enum` types; eliminates per-enum instance/proof boilerplate. -/
+structure UnitEnumCodec (α : Type) where
+  typeName : String
+  toStr    : α → String
+  ofStr    : String → Except String α
+  rtStr    : ∀ x : α, ofStr (toStr x) = .ok x
+  toTag    : α → Nat
+  ofTag    : Nat → Except String α
+  rtTag    : ∀ x : α, ofTag (toTag x) = .ok x
+
+namespace UnitEnumCodec
+variable {α : Type} (c : UnitEnumCodec α)
+
+@[reducible] def instToString : ToString α := ⟨c.toStr⟩
+@[reducible] def instStringEnum : StringEnum α := ⟨c.toStr, c.ofStr⟩
+@[reducible] def instRouteParam : RouteParam α where
+  toSeg := c.toStr
+  fromSeg s := (c.ofStr s).toOption
+  round_trip x := by simp only [c.rtStr, Except.toOption]
+@[reducible] def instLawfulKey : LawfulKey α := @LawfulKey.ofRouteParam α c.instRouteParam
+
+def toJson (x : α) : Json := .str (c.toStr x)
+def fromJson : Json → Except String α
+  | .str s => c.ofStr s
+  | _ => .error s!"expected {c.typeName} string"
+def encode (x : α) : String := Json.render (c.toJson x)
+def decode (s : String) (maxDepth : Nat := 64) : Except String α := (Json.parse s maxDepth).bind c.fromJson
+
+@[reducible] def instToJson : ToJson α := ⟨c.toJson⟩
+@[reducible] def instFromJson : FromJson α := ⟨c.fromJson⟩
+theorem instNonNullJson : @NonNullJson α c.instToJson := @NonNullJson.mk α c.instToJson (fun _ => nofun)
+@[reducible] def instLawfulJson : LawfulJson α where
+  toToJson := c.instToJson
+  toFromJson := c.instFromJson
+  depthBound := 0
+  depth_toJson _ := Nat.le_refl 0
+  fromJson_toJson := c.rtStr
+
+@[reducible] def instToProto : ToProto α where
+  toProtoVal x := .varint (c.toTag x)
+@[reducible] def instFromProto : FromProto α where
+  fromProtoVal
+    | .varint n => c.ofTag n
+    | _ => .error s!"protobuf: expected varint for {c.typeName}"
+@[reducible] def instLawfulProto : LawfulProto α :=
+  @LawfulProto.ofScalar α c.instToProto c.instFromProto c.rtTag (fun _ => rfl) (fun _ => rfl)
+
+def encodeBytes (x : α) : Bytes := @Proto.encode α c.instToProto x
+def decodeBytes (b : Bytes) : Except String α := @Proto.decode α c.instFromProto b
+end UnitEnumCodec
+
+/-- Pure equality bundle deriving `BEq`, `LawfulBEq`, and `DecidableEq` from a single witness record. -/
+structure StructBeqCodec (α : Type) where
+  beq       : α → α → Bool
+  eq_of_beq : ∀ {a b : α}, beq a b = true → a = b
+  beq_rfl   : ∀ {a : α}, beq a a = true
+
+namespace StructBeqCodec
+variable {α : Type} (c : StructBeqCodec α)
+@[reducible] def instBEq : BEq α := ⟨c.beq⟩
+theorem instLawfulBEq : @LawfulBEq α c.instBEq :=
+  @LawfulBEq.mk α c.instBEq (@ReflBEq.mk α c.instBEq fun {a} => c.beq_rfl (a := a)) (fun h => c.eq_of_beq h)
+@[reducible] def instDecidableEq : DecidableEq α := @decidableEqOfLawfulBEq α c.instBEq c.instLawfulBEq
+end StructBeqCodec
 
 end Qed

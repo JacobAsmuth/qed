@@ -1,3 +1,4 @@
+import Qed.Collection
 import Qed.Html
 import Qed.Router.Basic
 import Qed.Json.Lawful
@@ -15,6 +16,8 @@ structure Field {α : Type} (p : α → Prop) where
 section FieldInstances
 variable {α : Type} {p : α → Prop}
 @[reducible] instance : CoeOut (Field p) α := ⟨Field.val⟩
+@[reducible, inline] instance : Qed.Lang.QedVal (Field p) α := ⟨Field.val⟩
+@[simp] theorem QedVal.val_field (f : Field p) : Qed.Lang.QedVal.val f = f.val := rfl
 @[reducible] instance {msg : Type} [Coe α (Html msg)] : CoeHTCT (Field p) (Html msg) := ⟨fun f => (f.val : Html msg)⟩
 @[reducible] instance : CoeHTCT (Option (Field p)) (Option α) := ⟨Option.map Field.val⟩
 instance [ToString α] : ToString (Field p) := ⟨fun f => toString f.val⟩

@@ -26,18 +26,22 @@ private theorem everyElementL_eq_fold (p : String → List (Attr msg) → Bool) 
     everyElementL p cs = Html.foldList (fun _ => true) (fun t a _ r => p t a && r) true (· && ·) cs :=
   Html.fold_eq_list (everyElement p) (everyElementL p) _ _ _ _ (fun _ => rfl) (fun _ _ _ => rfl) rfl (fun _ _ => rfl) cs
 
+private abbrev countStyles (styles : List Style) (cs : List String) : Nat := (cs.filter fun c => (styles.map (·.className)).contains c).length
+private abbrev matchRole (r : String) (p : List String → Bool) : Html msg → Bool := everyElement fun _ a => !(attrRole a == some r) || p (attrClasses a)
+private abbrev matchTag (tag : String) (p : List String → Bool) : Html msg → Bool := everyElement fun t a => !(t == tag) || p (attrClasses a)
+
 def hasRole (r : String) (h : Html msg) : Bool := !everyElement (fun _ a => !(attrRole a == some r)) h
 def hasTag (tag : String) (h : Html msg) : Bool := !everyElement (fun t _ => !(t == tag)) h
-def hasOneClass (styles : List Style) (a : List (Attr msg)) : Bool := ((attrClasses a).filter (fun c => (styles.map (·.className)).contains c)).length == 1
-def roleHasOneOf (r : String) (styles : List Style) : Html msg → Bool := everyElement (fun _ a => !(attrRole a == some r) || hasOneClass styles a)
-def tagHasOneOf (tag : String) (styles : List Style) : Html msg → Bool := everyElement (fun t a => !(t == tag) || hasOneClass styles a)
-def roleHas (r : String) (s : Style) (h : Html msg) : Bool := hasRole r h && everyElement (fun _ a => !(attrRole a == some r) || (attrClasses a).contains s.className) h
+def hasOneClass (styles : List Style) (a : List (Attr msg)) : Bool := countStyles styles (attrClasses a) == 1
+def roleHasOneOf (r : String) (styles : List Style) : Html msg → Bool := matchRole r (countStyles styles · == 1)
+def tagHasOneOf (tag : String) (styles : List Style) : Html msg → Bool := matchTag tag (countStyles styles · == 1)
+def roleHas (r : String) (s : Style) (h : Html msg) : Bool := hasRole r h && matchRole r (·.contains s.className) h
 def roleHasOnly (r : String) (chosen excluded : Style) (h : Html msg) : Bool := roleHas r chosen h && roleHasOneOf r [chosen, excluded] h
-def roleLacks (r : String) (s : Style) : Html msg → Bool := everyElement (fun _ a => !(attrRole a == some r) || !(attrClasses a).contains s.className)
-def tagLacks (tag : String) (s : Style) : Html msg → Bool := everyElement (fun t a => !(t == tag) || !(attrClasses a).contains s.className)
-def roleHasAll (r : String) (styles : List Style) (h : Html msg) : Bool := hasRole r h && everyElement (fun _ a => !(attrRole a == some r) || styles.all (fun s => (attrClasses a).contains s.className)) h
-def tagHas (tag : String) (s : Style) (h : Html msg) : Bool := hasTag tag h && everyElement (fun t a => !(t == tag) || (attrClasses a).contains s.className) h
-def noConflictingStyles (styles : List Style) : Html msg → Bool := everyElement (fun _ a => ((attrClasses a).filter (fun c => (styles.map (·.className)).contains c)).length ≤ 1)
+def roleLacks (r : String) (s : Style) : Html msg → Bool := matchRole r (!·.contains s.className)
+def tagLacks (tag : String) (s : Style) : Html msg → Bool := matchTag tag (!·.contains s.className)
+def roleHasAll (r : String) (styles : List Style) (h : Html msg) : Bool := hasRole r h && matchRole r (fun cs => styles.all fun s => cs.contains s.className) h
+def tagHas (tag : String) (s : Style) (h : Html msg) : Bool := hasTag tag h && matchTag tag (·.contains s.className) h
+def noConflictingStyles (styles : List Style) : Html msg → Bool := everyElement fun _ a => countStyles styles (attrClasses a) ≤ 1
 def both (p q : Html msg → Bool) : Html msg → Bool := fun h => p h && q h
 def either (p q : Html msg → Bool) : Html msg → Bool := fun h => p h || q h
 def exactlyOne (roleA roleB : String) (on off : Style) : Html msg → Bool :=
@@ -65,6 +69,9 @@ theorem everyElement_map {α β} (f : α → β) {pα : String → List (Attr α
 theorem everyElementL_mapList {α β} (p) (g : β → Html α) (l : List β) :
     everyElementL p (l.map g) = true ↔ ∀ x ∈ l, everyElement p (g x) = true := by
   simp only [everyElementL_eq_fold, everyElement_eq_fold]; exact Html.foldList_all_mapList _ _ g l
+
+theorem everyElementL_mapList_of {α β} {p} {g : β → Html α} {l : List β} (h : ∀ x ∈ l, everyElement p (g x) = true) :
+    everyElementL p (l.map g) = true := (everyElementL_mapList p g l).2 h
 
 @[simp] theorem roleLacks_map {α β} (f : α → β) (r s) (h : Html α) : roleLacks r s (h.map f) = roleLacks r s h :=
   everyElement_map f (fun _ _ => by simp [attrClasses_map]) h
@@ -98,33 +105,28 @@ private theorem everyElement_attr_canonical (p : String → Option String → Li
   everyElement_canonical (fun _ _ => by simp)
     (fun a ha => by rw [show attrRole a = none from attrValue_of_onlySignalBind "data-role" a ha, attrClasses_of_onlySignalBind a ha, hspan]) h
 
+private theorem matchRole_canonical (r : String) (p : List String → Bool) (h : Html msg) : matchRole r p (Html.canonical h) = matchRole r p h :=
+  everyElement_attr_canonical (fun _ role cs => !(role == some r) || p cs) rfl h
+private theorem matchTag_canonical (tag : String) (p : List String → Bool) (h : Html msg) (hspan : (!("span" == tag) || p []) = true) :
+    matchTag tag p (Html.canonical h) = matchTag tag p h :=
+  everyElement_attr_canonical (fun t _ cs => !(t == tag) || p cs) hspan h
+
 private theorem not_span_beq {tag : String} (ht : tag ≠ "span") : (!("span" == tag)) = true := congrArg Bool.not (beq_false_of_ne ht.symm)
 private theorem not_span_beq_or {tag : String} (ht : tag ≠ "span") (b : Bool) : (!("span" == tag) || b) = true := (congrArg (· || b) (not_span_beq ht)).trans (Bool.true_or b)
 private theorem and_congr_eq {a₁ a₂ b₁ b₂ : Bool} (ha : a₁ = a₂) (hb : b₁ = b₂) : (a₁ && b₁) = (a₂ && b₂) := ha ▸ hb ▸ rfl
 
-@[simp] theorem hasRole_canonical (r : String) (h : Html msg) : hasRole r (Html.canonical h) = hasRole r h :=
-  congrArg Bool.not (everyElement_attr_canonical (fun _ role _ => !(role == some r)) rfl h)
-theorem hasTag_canonical (tag : String) (h : Html msg) (ht : tag ≠ "span") : hasTag tag (Html.canonical h) = hasTag tag h :=
-  congrArg Bool.not (everyElement_attr_canonical (fun t _ _ => !(t == tag)) (not_span_beq ht) h)
-@[simp] theorem roleHasOneOf_canonical (r : String) (styles : List Style) (h : Html msg) : roleHasOneOf r styles (Html.canonical h) = roleHasOneOf r styles h :=
-  everyElement_attr_canonical (fun _ role cs => !(role == some r) || (cs.filter (fun c => (styles.map (·.className)).contains c)).length == 1) rfl h
-@[simp] theorem roleLacks_canonical (r : String) (s : Style) (h : Html msg) : roleLacks r s (Html.canonical h) = roleLacks r s h :=
-  everyElement_attr_canonical (fun _ role cs => !(role == some r) || !cs.contains s.className) rfl h
-@[simp] theorem tagLacks_canonical (tag : String) (s : Style) (h : Html msg) : tagLacks tag s (Html.canonical h) = tagLacks tag s h :=
-  everyElement_attr_canonical (fun t _ cs => !(t == tag) || !cs.contains s.className) (Bool.or_true _) h
-@[simp] theorem roleHasAll_canonical (r : String) (styles : List Style) (h : Html msg) : roleHasAll r styles (Html.canonical h) = roleHasAll r styles h :=
-  and_congr_eq (hasRole_canonical r h) (everyElement_attr_canonical (fun _ role cs => !(role == some r) || styles.all (cs.contains ·.className)) rfl h)
-theorem tagHas_canonical (tag : String) (s : Style) (h : Html msg) (ht : tag ≠ "span") : tagHas tag s (Html.canonical h) = tagHas tag s h :=
-  and_congr_eq (hasTag_canonical tag h ht) (everyElement_attr_canonical (fun t _ cs => !(t == tag) || cs.contains s.className) (not_span_beq_or ht _) h)
-@[simp] theorem noConflictingStyles_canonical (styles : List Style) (h : Html msg) : noConflictingStyles styles (Html.canonical h) = noConflictingStyles styles h :=
-  everyElement_attr_canonical (fun _ _ cs => (cs.filter (fun c => (styles.map (·.className)).contains c)).length ≤ 1) rfl h
-theorem tagHasOneOf_canonical (tag : String) (styles : List Style) (h : Html msg) (ht : tag ≠ "span") : tagHasOneOf tag styles (Html.canonical h) = tagHasOneOf tag styles h :=
-  everyElement_attr_canonical (fun t _ cs => !(t == tag) || (cs.filter (fun c => (styles.map (·.className)).contains c)).length == 1) (not_span_beq_or ht _) h
-@[simp] theorem roleHas_canonical (r : String) (s : Style) (h : Html msg) : roleHas r s (Html.canonical h) = roleHas r s h :=
-  and_congr_eq (hasRole_canonical r h) (everyElement_attr_canonical (fun _ role cs => !(role == some r) || cs.contains s.className) rfl h)
+@[simp] theorem hasRole_canonical (r : String) (h : Html msg) : hasRole r (Html.canonical h) = hasRole r h := congrArg Bool.not (everyElement_attr_canonical (fun _ role _ => !(role == some r)) rfl h)
+theorem hasTag_canonical (tag : String) (h : Html msg) (ht : tag ≠ "span") : hasTag tag (Html.canonical h) = hasTag tag h := congrArg Bool.not (everyElement_attr_canonical (fun t _ _ => !(t == tag)) (not_span_beq ht) h)
+@[simp] theorem roleHasOneOf_canonical (r : String) (styles : List Style) (h : Html msg) : roleHasOneOf r styles (Html.canonical h) = roleHasOneOf r styles h := matchRole_canonical r (countStyles styles · == 1) h
+@[simp] theorem roleLacks_canonical (r : String) (s : Style) (h : Html msg) : roleLacks r s (Html.canonical h) = roleLacks r s h := matchRole_canonical r (!·.contains s.className) h
+@[simp] theorem tagLacks_canonical (tag : String) (s : Style) (h : Html msg) : tagLacks tag s (Html.canonical h) = tagLacks tag s h := matchTag_canonical tag (!·.contains s.className) h (Bool.or_true _)
+@[simp] theorem roleHasAll_canonical (r : String) (styles : List Style) (h : Html msg) : roleHasAll r styles (Html.canonical h) = roleHasAll r styles h := and_congr_eq (hasRole_canonical r h) (matchRole_canonical r _ h)
+theorem tagHas_canonical (tag : String) (s : Style) (h : Html msg) (ht : tag ≠ "span") : tagHas tag s (Html.canonical h) = tagHas tag s h := and_congr_eq (hasTag_canonical tag h ht) (matchTag_canonical tag _ h (not_span_beq_or ht _))
+@[simp] theorem noConflictingStyles_canonical (styles : List Style) (h : Html msg) : noConflictingStyles styles (Html.canonical h) = noConflictingStyles styles h := everyElement_attr_canonical (fun _ _ cs => countStyles styles cs ≤ 1) rfl h
+theorem tagHasOneOf_canonical (tag : String) (styles : List Style) (h : Html msg) (ht : tag ≠ "span") : tagHasOneOf tag styles (Html.canonical h) = tagHasOneOf tag styles h := matchTag_canonical tag (countStyles styles · == 1) h (not_span_beq_or ht _)
+@[simp] theorem roleHas_canonical (r : String) (s : Style) (h : Html msg) : roleHas r s (Html.canonical h) = roleHas r s h := and_congr_eq (hasRole_canonical r h) (matchRole_canonical r _ h)
 @[simp] theorem roleHasOnly_canonical (r : String) (chosen excluded : Style) (h : Html msg) : roleHasOnly r chosen excluded (Html.canonical h) = roleHasOnly r chosen excluded h := by simp [roleHasOnly]
-@[simp] theorem allRolesOff_canonical (roles : List String) (on off : Style) (h : Html msg) : allRolesOff roles on off (Html.canonical h) = allRolesOff roles on off h := by
-  induction roles with | nil => rfl | cons _ _ ih => simp [allRolesOff, ih]
+@[simp] theorem allRolesOff_canonical (roles : List String) (on off : Style) (h : Html msg) : allRolesOff roles on off (Html.canonical h) = allRolesOff roles on off h := by induction roles with | nil => rfl | cons _ _ ih => simp [allRolesOff, ih]
 @[simp] theorem exactlyOne_canonical (rA rB : String) (on off : Style) (h : Html msg) : exactlyOne rA rB on off (Html.canonical h) = exactlyOne rA rB on off h := by simp [exactlyOne, both, either]
 @[simp] theorem exactlyOneOf_canonical (roles : List String) (on off : Style) (h : Html msg) : exactlyOneOf roles on off (Html.canonical h) = exactlyOneOf roles on off h := by
   let rec go (before : List String) : ∀ rest, exactlyOneOf.go on off (Html.canonical h) before rest = exactlyOneOf.go on off h before rest

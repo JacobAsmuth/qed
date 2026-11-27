@@ -5,11 +5,9 @@ import Qed.Style.Syntax
 import Lean
 
 namespace Qed.Internal
-
 open Lean Elab Term Meta
 
 private def isFrameworkRoot (env : Environment) (n : Name) : Bool := Qed.Diag.isToolchainRoot (Qed.Diag.modRootOf env n n) (includeQed := true)
-
 private def isStyleConstructorFn (env : Environment) (fn : Name) : Bool :=
   fn == ``Qed.Style.mk || fn == ``Qed.Theme.asStyle || fn == ``Qed.Keyframes.asStyle ||
   match env.find? fn with | some (.defnInfo d) => d.type.getForallBody.isConstOf ``Qed.Style && !d.type.isConstOf ``Qed.Style | _ => false
@@ -26,19 +24,23 @@ private def isStyleConstructorFn (env : Environment) (fn : Name) : Bool :=
   | .letE _ _ v b _ => collectInlineStylesFromExpr env b (← collectInlineStylesFromExpr env v acc)
   | _ => return acc
 
-@[noinline] private def walkAppDefs (value : Expr) (onMount : Name → MetaM Unit) (onDef : Name → DefinitionVal → MetaM Bool) : MetaM Unit := do
-  let env ← getEnv; let mut pending := value.getUsedConstants.toList; let mut seen : NameSet := {}
-  while !pending.isEmpty do
-    let n :: rest := pending | break
-    pending := rest
-    unless seen.contains n do
-      seen := seen.insert n
-      let isMount := match n with | .str _ s => s == "_qed_mount" || s == "_qed_mountWithOpt" | _ => false
-      let reg := n.getPrefix ++ `regs
-      if isMount && env.contains reg then
-        onMount reg; let compView := n.getPrefix ++ `view; if env.contains compView then pending := compView :: pending
-      else if let some (.defnInfo d) := env.find? n then
-        if (← onDef n d) && !isFrameworkRoot env n then pending := d.value.getUsedConstants.toList ++ pending
+@[noinline] private partial def walkAppDefs (value : Expr) (onMount : Name → MetaM Unit) (onDef : Name → DefinitionVal → MetaM Bool) : MetaM Unit := do
+  let env ← getEnv
+  let rec go (seen : NameSet) : List Name → MetaM Unit
+    | [] => pure ()
+    | n :: rest => do
+        if seen.contains n then return ← go seen rest
+        let seen' := seen.insert n
+        let isMount := match n with | .str _ s => s == "_qed_mount" || s == "_qed_mountWithOpt" | _ => false
+        let reg := n.getPrefix ++ `regs
+        if isMount && env.contains reg then
+          onMount reg; let compView := n.getPrefix ++ `view
+          go seen' (if env.contains compView then compView :: rest else rest)
+        else if let some (.defnInfo d) := env.find? n then
+          let ok ← onDef n d
+          go seen' (if ok && !isFrameworkRoot env n then d.value.getUsedConstants.toList ++ rest else rest)
+        else go seen' rest
+  go {} value.getUsedConstants.toList
 
 @[noinline] private def discoverRegistrations (value : Expr) : TermElabM Expr := do
   let regsRef ← IO.mkRef (#[] : Array Expr)
@@ -54,37 +56,29 @@ private def isStyleConstructorFn (env : Environment) (fn : Name) : Bool :=
   let addThemeStyle (thNm : Name) : MetaM Unit := do
     let (styles, themeStyles, seen, inlines) ← stRef.get
     if seen.contains thNm then return
-    let themeStyles := match themeMetaMap.find? thNm with
-      | some thInfo => if env.contains thInfo.styleConst then themeStyles.push (Lean.mkConst thInfo.styleConst) else themeStyles
-      | none => themeStyles
+    let themeStyles := match themeMetaMap.find? thNm with | some thInfo => if env.contains thInfo.styleConst then themeStyles.push (Lean.mkConst thInfo.styleConst) else themeStyles | none => themeStyles
     stRef.set (styles, themeStyles, seen.insert thNm, inlines)
   walkAppDefs value (fun _ => pure ()) fun n d => do
     if d.type.isConstOf ``Qed.Style then
       stRef.modify fun (s, t, sn, i) => (s.push (Lean.mkConst n), t, sn, i)
-      if let some sm := styleMetaMap.find? n then for thNm in sm.themes do addThemeStyle thNm
+      if let some sm := styleMetaMap.find? n then sm.themes.forM addThemeStyle
       return false
     else if d.type.isConstOf ``Qed.Theme then
       if env.contains (n.getPrefix ++ `style) then addThemeStyle n.getPrefix
       else stRef.modify fun (s, t, sn, i) => (s, t.push (Lean.mkApp (Lean.mkConst ``Qed.Theme.asStyle) (Lean.mkConst n)), sn, i)
       return false
-    else if d.type.isConstOf ``Qed.Keyframes then
-      stRef.modify fun (s, t, sn, i) => (s, t.push (Lean.mkApp (Lean.mkConst ``Qed.Keyframes.asStyle) (Lean.mkConst n)), sn, i); return false
+    else if d.type.isConstOf ``Qed.Keyframes then stRef.modify fun (s, t, sn, i) => (s, t.push (Lean.mkApp (Lean.mkConst ``Qed.Keyframes.asStyle) (Lean.mkConst n)), sn, i); return false
     else if let some tm := tokMetaMap.find? n then
       if let some thNm := tm.themeName? then addThemeStyle thNm
       return false
-    else if !isFrameworkRoot env n then
-      let (s, t, sn, i) ← stRef.get; stRef.set (s, t, sn, ← collectInlineStylesFromExpr env d.value i); return true
+    else if !isFrameworkRoot env n then let (s, t, sn, i) ← stRef.get; stRef.set (s, t, sn, ← collectInlineStylesFromExpr env d.value i); return true
     else return false
   let (styles, themeStyles, _, inlines) ← stRef.get
   mkListLit (Lean.mkConst ``Qed.Style) ((styles ++ inlines).foldl (init := themeStyles) fun acc s => if acc.contains s then acc else acc.push s).toList
 
 syntax (name := registrationsTerm) "qedInternalLocalRegistrations% " term:max : term
 syntax (name := stylesTerm) "qedInternalStyles% " term:max : term
-
-private def elabValueThen (f : Expr → TermElabM Expr) : TermElab := fun stx _ => do
-  let value ← elabTerm stx[1] none; synthesizeSyntheticMVarsNoPostponing; f (← instantiateMVars value)
-
+private def elabValueThen (f : Expr → TermElabM Expr) : TermElab := fun stx _ => do let value ← elabTerm stx[1] none; synthesizeSyntheticMVarsNoPostponing; f (← instantiateMVars value)
 @[term_elab registrationsTerm] def elabRegistrations : TermElab := elabValueThen discoverRegistrations
 @[term_elab stylesTerm] def elabStyles : TermElab := elabValueThen discoverStyles
-
 end Qed.Internal

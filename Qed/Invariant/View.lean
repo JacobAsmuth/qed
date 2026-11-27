@@ -2,46 +2,45 @@ import Qed.Invariant.Predicates
 import Qed.Runtime.Verify
 
 namespace Qed
-
 open Lean Elab Tactic Qed.Verify.Core
 
-@[noinline]
-private def runUnfoldViewHelpers : TacticM Unit :=
+@[noinline] private def runUnfoldViewHelpers : TacticM Unit :=
   qedUnfoldHelperLoop 6 fun env n =>
     if !qedIsHelper env n || (n.getString! == "view" && env.contains (n.getPrefix ++ `keyOf)) then return false
     else return (← getProjectionFnInfo? n).isNone
 
-@[noinline]
-private def runCloseExhaustiveEnum : TacticM Unit := withMainContext do
-  for d in (← getLCtx) do
-    if d.isImplementationDetail then continue
-    let inner := match ← instantiateMVars d.type with | .app (.const ``Not _) t => t | t => t
-    let lhs? : Option Expr := match inner with
-      | .app (.app (.app (.const ``Eq _) _) (.app (.app (.app (.app (.const ``BEq.beq _) _) _) lhs) _)) _
-      | .app (.app (.app (.const ``Eq _) _) lhs) _ => some lhs
-      | _ => none
-    if let some lhs := lhs? then
-      if ← tryTac (requireClosed := true) (do `(tactic| (generalize $(← PrettyPrinter.delab lhs):term = _qed_enum_x at *; cases _qed_enum_x <;> first | contradiction | decide | (simp_all; try decide)))) then return
+@[noinline] private def generalizeAndCases (g : MVarId) (e : Expr) : MetaM (Option (List MVarId)) :=
+  tryRestoreM none Option.isSome <| g.withContext do
+    if e.isFVar then return some ((← g.cases e.fvarId!).toList.map (·.mvarId))
+    let (fvs, g1) ← g.generalize #[{ expr := e, xName? := some `_qed_enum_x }]
+    match fvs[0]? with | some fv => return some ((← g1.cases fv).toList.map (·.mvarId)) | none => return none
 
-private def isSmallNullaryEnum (env : Environment) (ty : Expr) (allowBool : Bool := false) : Bool :=
-  match ty.getAppFn with
-  | .const nm _ =>
-      if nm == ``Unit || nm == ``PUnit || (!allowBool && nm == ``Bool) then false
-      else match nullaryEnumCtorCount? env ty with
-        | some k => 2 ≤ k && k ≤ 8
-        | none => false
-  | _ => false
+@[noinline] private def runCloseExhaustiveEnum (g : MVarId) : MetaM Bool := do
+  let lhsList ← g.withContext <| collectLCtxDecls fun d => do
+    let inner := match ← instantiateMVars d.type with | .app (.const ``Not _) t => t | t => t
+    return match inner with
+      | .app (.app (.app (.const ``Eq _) _) (.app (.app (.app (.app (.const ``BEq.beq _) _) _) lhs) _)) _
+      | .app (.app (.app (.const ``Eq _) _) lhs) _ => some lhs | _ => none
+  lhsList.toList.anyM fun lhs => tryRestoreM false id do
+    let some sub ← generalizeAndCases g lhs | return false
+    sub.allM fun sg => do
+      if ← sg.contradictionCore {} then return true
+      if ← tryDirectDecide sg then return true
+      match ← trySimpAll sg (← mkSimpCtxWithBase) with | none => return true | some sg' => tryDirectDecide sg'
 
 private partial def findFiniteEnumExpr (env : Environment) (e : Expr) : MetaM (Option Expr) := do
   if e.hasLooseBVars then return none
   if !e.isConst && !(e.getAppFn.constName?.any env.isConstructor) then
-    if isSmallNullaryEnum env (← Meta.inferType e) e.isFVar then return some e
+    let ty ← Meta.inferType e
+    if let .const nm _ := ty.getAppFn then
+      if nm != ``Unit && nm != ``PUnit && (e.isFVar || nm != ``Bool) then
+        if let some k := nullaryEnumCtorCount? env ty then if 2 ≤ k && k ≤ 8 then return some e
   match e with
   | .app f a => (← findFiniteEnumExpr env a).elim (findFiniteEnumExpr env f) (pure ∘ some)
   | .letE _ _ v b _ => (← findFiniteEnumExpr env v).elim (if !b.hasLooseBVars then findFiniteEnumExpr env b else pure none) (pure ∘ some)
   | _ => return none
 
-private def evalGroundBoolGoal (g : MVarId) (tgt : Expr) : TacticM (Option (List MVarId)) := g.withContext do
+private def evalGroundBoolGoal (g : MVarId) (tgt : Expr) : MetaM (Option (List MVarId)) := g.withContext do
   if let some (_, lhs, rhs) := tgt.eq? then
     if rhs.isConstOf ``Bool.true then
       let v ← try Meta.whnf lhs catch _ => pure lhs
@@ -50,48 +49,49 @@ private def evalGroundBoolGoal (g : MVarId) (tgt : Expr) : TacticM (Option (List
         let gf ← Meta.mkFreshExprSyntheticOpaqueMVar (mkConst ``False)
         g.assign (mkApp2 (mkConst ``False.elim [Level.zero]) tgt gf); return some [gf.mvarId!]
       return none
-  if ← tryReflGoal g then return some []
-  return none
+  if ← tryReflGoal g then return some [] else return none
 
-@[noinline]
-private def runSplitFiniteEnums : TacticM Unit := do
-  let mut checked : Std.HashSet MVarId := {}
-  let evalGroundPass (gs : List MVarId) (chk : Std.HashSet MVarId) : TacticM (List MVarId × Std.HashSet MVarId × Bool) := do
-    let mut chk := chk; let mut prog := false; let mut out := []
-    for g in gs do
+@[noinline] private def evalGroundGoals (chk : Std.HashSet MVarId) (prog : Bool) (acc : List MVarId) :
+    List MVarId → MetaM (List MVarId × Std.HashSet MVarId × Bool)
+  | [] => pure (acc.reverse, chk, prog)
+  | g :: rest => do
       let tgt ← g.withContext do instantiateMVars (← g.getType)
       if !tgt.isFalse && !tgt.hasFVar && !chk.contains g then
-        chk := chk.insert g
-        if let some gs' ← evalGroundBoolGoal g tgt then prog := true; out := out ++ gs'; continue
-      out := out ++ [g]
-    return (out, chk, prog)
-  for _ in [0:2] do
-    if (← getGoals).isEmpty then return
-    let (gs, chk', prog0) ← evalGroundPass (← getGoals) checked
-    checked := chk'; let mut prog := prog0; let mut next := []
-    for g in gs do
-      let tgt ← g.withContext do instantiateMVars (← g.getType)
-      let splitRes? ← if tgt.isFalse then pure none else g.withContext do
-        let some e ← findFiniteEnumExpr (← getEnv) tgt | return none
-        try
-          if e.isFVar then return some ((← g.cases e.fvarId!).toList.map (·.mvarId))
-          setGoals [g]; evalTactic (← `(tactic| (generalize $(← PrettyPrinter.delab e):term = _qed_enum_x at *; cases _qed_enum_x)))
-          return some (← getGoals)
-        catch _ => return none
-      match splitRes? with | some gs' => prog := true; next := next ++ gs' | none => next := next ++ [g]
-    setGoals next; if !prog then break
-  setGoals (← evalGroundPass (← getGoals) checked).1
+        match ← evalGroundBoolGoal g tgt with
+        | some gs' => evalGroundGoals (chk.insert g) true (gs'.reverse ++ acc) rest
+        | none => evalGroundGoals (chk.insert g) prog (g :: acc) rest
+      else evalGroundGoals chk prog (g :: acc) rest
+
+@[noinline] private def runSplitFiniteEnums : TacticM Unit := do
+  let splitOne (g : MVarId) : MetaM (Option (List MVarId)) := g.withContext do
+    let tgt ← instantiateMVars (← g.getType)
+    if tgt.isFalse then return none
+    match ← findFiniteEnumExpr (← getEnv) tgt with | some e => generalizeAndCases g e | none => pure none
+  let rec rounds (chk : Std.HashSet MVarId) : Nat → TacticM (Std.HashSet MVarId)
+    | 0 => pure chk
+    | n + 1 => do
+        if (← getGoals).isEmpty then return chk
+        let (gs, chk', prog0) ← evalGroundGoals chk false [] (← getGoals)
+        let (next, prog) ← (gs.foldlM (init := ([], prog0)) fun (acc, p) g => do
+          match ← splitOne g with | some gs' => pure (gs'.reverse ++ acc, true) | none => pure (g :: acc, p) : MetaM _)
+        setGoals next.reverse; if prog then rounds chk' n else pure chk'
+  let chk ← rounds {} 2
+  setGoals (← evalGroundGoals chk false [] (← getGoals)).1
+
+@[noinline] private def splitTargetsRec : Nat → List MVarId → MetaM (List MVarId)
+  | 0, gs => pure gs | _, [] => pure []
+  | fuel + 1, g :: rest => do match ← trySplitTarget g with | some sub => splitTargetsRec fuel (sub ++ rest) | none => return g :: (← splitTargetsRec fuel rest)
 
 private def a11yReduceNames : Array Name := #[
-  ``Qed.Html.a11yValid, ``Qed.Html.imgsHaveAlt, ``Qed.Html.imgsHaveAltList, ``Qed.Html.buttonsAccessible, ``Qed.Html.buttonsAccessibleList,
-  ``Qed.Html.elemHasAccessibleName, ``Qed.Html.hasAccessibleNameChild, ``Qed.Html.hasAccessibleNameChildren, ``Qed.Html.validAriaRoles,
-  ``Qed.Html.validAriaRolesList, ``Qed.attrsValidAriaRoles, ``Qed.Html.labelsAssociated, ``Qed.Html.labelsAssociatedList,
-  ``Qed.Html.containsFormControl, ``Qed.Html.containsFormControlList, ``Qed.isFormControlTag, ``Qed.Html.noDuplicateIds,
-  ``Qed.Html.collectIds, ``Qed.Html.collectIdsList, ``Qed.Html.headingsOrdered, ``Qed.Html.collectHeadings, ``Qed.Html.collectHeadingsList,
-  ``Qed.Html.htmlHasLang, ``Qed.Html.htmlHasLangList, ``Qed.attrValue, ``Qed.hasAttr, ``Qed.hasNonBlankAttr]
+  ``Qed.Html.fold, ``Qed.Html.foldList, ``Qed.Html.a11yValid, ``Qed.Html.imgsHaveAlt, ``Qed.Html.imgsHaveAltList,
+  ``Qed.Html.buttonsAccessible, ``Qed.Html.buttonsAccessibleList, ``Qed.Html.elemHasAccessibleName, ``Qed.Html.hasAccessibleNameChild,
+  ``Qed.Html.hasAccessibleNameChildren, ``Qed.Html.validAriaRoles, ``Qed.Html.validAriaRolesList, ``Qed.attrsValidAriaRoles,
+  ``Qed.Html.labelsAssociated, ``Qed.Html.labelsAssociatedList, ``Qed.Html.containsFormControl, ``Qed.Html.containsFormControlList,
+  ``Qed.isFormControlTag, ``Qed.Html.noDuplicateIds, ``Qed.Html.collectIds, ``Qed.Html.collectIdsList, ``Qed.Html.headingsOrdered,
+  ``Qed.Html.collectHeadings, ``Qed.Html.collectHeadingsList, ``Qed.Html.htmlHasLang, ``Qed.Html.htmlHasLangList,
+  ``Qed.attrValue, ``Qed.hasAttr, ``Qed.hasNonBlankAttr]
 
 private def styleLeafCoreNames : Array Name := #[``Qed.everyElement, ``Qed.everyElementL, ``Qed.attrClasses, ``Qed.attrRole, ``Qed.hasOneClass]
-
 private def styleReduceCoreNames : Array Name := #[
   ``Qed.roleHasOneOf, ``Qed.tagHasOneOf, ``Qed.roleHas, ``Qed.roleHasOnly, ``Qed.roleLacks, ``Qed.tagLacks, ``Qed.roleHasAll, ``Qed.tagHas,
   ``Qed.noConflictingStyles, ``Qed.hasRole, ``Qed.hasTag, ``Qed.both, ``Qed.either, ``Qed.exactlyOne, ``Qed.allRolesOff, ``Qed.exactlyOneOf,
@@ -101,11 +101,9 @@ private def styleReduceCoreNames : Array Name := #[
   ``Qed.Html.map, ``Qed.Html.mapChildren, ``Qed.Html.mapAttrs, ``Qed.Html.mapAttrsList, ``Qed.Attr.map, ``Qed.Lang.QedVal.val_id,
   ``Qed.Lang.QedSeqLit.ofList_array, ``Qed.Lang.QedSeqLit.ofList_list, ``Qed.Lang.QedMem.mem_array, ``Qed.Lang.QedMem.mem_list,
   ``Qed.Lang.QedMem.mem_string, ``Qed.Lang.QedMemProp.memProp_array, ``Qed.Lang.QedMemProp.memProp_list, ``Qed.Lang.QedMemProp.memProp_string]
-
 private def styleReduceOptNames : Array Name := Qed.viewCoreUnfolds ++ #[
   `Qed.View.mapScope, `Qed.View.mapScopeEach, `Qed.VAttr.mapScope, `Qed.View.memo,
   `Qed.Attr.empty, `Qed.Html.ofOption, `Qed.toString_string, `Qed.withKey, `Qed.ToHref.toHref] ++ Qed.qedForEachHelperNames ++ Qed.qedHtmlHelperNames
-
 private def styleLeafFastNames : Array Name := styleLeafCoreNames ++ boolConstSimpNames ++ #[
   ``Bool.and_eq_true, ``Bool.or_eq_true, ``Bool.false_eq_true, ``List.all_cons, ``List.all_nil, ``List.any_cons, ``List.any_nil, ``beq_self_eq_true, ``eq_self, ``decide_true, ``decide_false]
 
@@ -113,11 +111,9 @@ private def isUnprovableFalseGoal (g : MVarId) : MetaM Bool := g.withContext do
   let tgt := (← instantiateMVars (← g.getType)).consumeMData
   let isFalseEq := tgt.isFalse || match tgt.eq? with | some (_, l, r) => l.consumeMData.isConstOf ``Bool.false && r.consumeMData.isConstOf ``Bool.true | none => false
   if !isFalseEq then return false
-  for d in (← getLCtx) do if !d.isImplementationDetail then if ← Meta.isProp d.type then return false
-  return true
+  return (← findLCtxDecl? fun d => do if ← isPropSafe d.type then pure (some ()) else pure none).isNone
 
-@[noinline]
-private def runStyleLeafClose (g : MVarId) : TacticM (List MVarId) := do
+@[noinline] private def runStyleLeafClose (g : MVarId) : MetaM (List MVarId) := do
   if ← tryReflGoal g then return []
   let some g1 ← trySimpAll g (← mkCachedSimpCtx "styleLeafFast" styleLeafFastNames).1 | return []
   if ← tryReflGoal g1 then return []
@@ -125,60 +121,71 @@ private def runStyleLeafClose (g : MVarId) : TacticM (List MVarId) := do
   let some g2 ← trySimpAll g1 (← mkSimpCtxWithBase (styleLeafCoreNames ++ a11yReduceNames) (cacheKey? := some "styleLeafFull")) #[← Meta.Simp.getSimprocs] | return []
   if ← tryDirectDecide g2 then return []
   if ← tryDirectOmega g2 then return []
-  setGoals [g2]; try runCloseExhaustiveEnum catch _ => pure ()
-  (← getGoals).filterM fun g3 => return !(← tryDirectDecide g3)
+  if ← runCloseExhaustiveEnum g2 then return []
+  return [g2]
 
-@[noinline]
-private def runStyleReduce (view : Ident) : TacticM Unit := do
+@[noinline] private def reduceOneStyleGoal (g1 : MVarId) : TacticM Unit := do
+  if (← g1.withContext (instantiateMVars (← g1.getType))).isFalse then return
+  runUnfoldViewHelpers
+  if let [g] ← getGoals then
+    if ← tryReflGoal g then setGoals []; return
+    if ← tryRestoreM false id ((do (← splitTargetsRec 32 [g]).allM tryReflGoal) : MetaM Bool) then setGoals []; return
+  if let g :: rest ← getGoals then
+    try
+      let env ← getEnv; let used ← collectGoalConsts g false
+      let ctx ← mkDynamicSimpCtx (styleReduceOptNames.filter fun n => env.contains n && used.contains n) (some ("styleReduceCore", styleReduceCoreNames)) (withEqns := false)
+      setGoals (match ← simpGoalOnly g ctx with | none => rest | some g' => g' :: rest)
+    catch _ => pure ()
+  if !(← getGoals).isEmpty then setGoals (← ((← splitTargetsRec 32 (← getGoals)).mapM runStyleLeafClose : MetaM _)).flatten
+
+@[noinline] def runStyleReduce (view : Ident) : TacticM Unit := do
+  let viewCtx? ← try some <$> mkDynamicSimpCtx #[← realizeGlobalConstNoOverload view] none (withEqns := false) catch _ => pure none
   runSplitFiniteEnums
   forEachGoal fun g0 => do
     if (← g0.withContext (instantiateMVars (← g0.getType))).isFalse then return
-    discard <| tryTac `(tactic| simp only [$view:ident]); runSplitFiniteEnums
-    forEachGoal fun g1 => do
-      if (← g1.withContext (instantiateMVars (← g1.getType))).isFalse then return
-      runUnfoldViewHelpers; discard <| tryTac `(tactic| first | rfl | ((repeat' split); all_goals rfl; done) | skip)
-      if (← getGoals).isEmpty then return
-      try
-        if let g :: rest ← getGoals then
-          let env ← getEnv; let used ← collectGoalConsts g false
-          let ctx ← mkDynamicSimpCtx (styleReduceOptNames.filter fun n => env.contains n && used.contains n) (some ("styleReduceCore", styleReduceCoreNames)) (withEqns := false)
-          setGoals (match ← simpGoalOnly g ctx with | none => rest | some g' => g' :: rest)
-      catch _ => pure ()
-      if (← getGoals).isEmpty then return
-      discard <| tryTac `(tactic| repeat' split)
-      setGoals <| (← (← getGoals).mapM runStyleLeafClose).flatten
+    if let some vCtx := viewCtx? then
+      match ← simpGoalOnly g0 vCtx with | none => setGoals []; return | some g1 => setGoals [g1]
+    runSplitFiniteEnums; forEachGoal reduceOneStyleGoal
 
-private def a11yDiagTable : Array (String × (Name → String)) := #[
-  ("imgsHaveAlt",       fun v => s!"An `<img>` element in `{v}` is missing an `alt` attribute. Add `alt=\"...\"` (or `alt=\"\"` for decorative images)."),
-  ("buttonsAccessible", fun v => s!"A `<button>` or `<a>` element in `{v}` has no accessible name in some branch. Provide non-empty text, `aria-label`, `aria-labelledby`, `title`, or a child `<img>` with non-empty `alt`."),
-  ("validAriaRoles",    fun v => s!"An element in `{v}` has an unrecognized WAI-ARIA `role` attribute. Use a valid WAI-ARIA 1.2 role name."),
-  ("labelsAssociated",  fun v => s!"A `<label>` element in `{v}` neither has a non-empty `for` attribute nor wraps a form control (`<input>`, `<select>`, `<textarea>`)."),
-  ("noDuplicateIds",    fun v => s!"Two elements in `{v}` share the same `id` attribute in some branch. Ensure every non-empty `id` is unique."),
-  ("headingsOrdered",   fun v => s!"Headings in `{v}` skip a level (e.g. `<h1>` directly to `<h3>`). Use sequential heading levels."),
-  ("htmlHasLang",       fun v => s!"An `<html>` element in `{v}` is missing a non-empty `lang` attribute (e.g. `<html lang=\"en\">`)."),
-  ("a11yValid",         fun v => s!"An accessibility check failed in `{v}` (check `<img alt>`, `<button>`/`<a>` accessible names, WAI-ARIA `role`, `<label>` association, unique `id`s, heading order, and `<html lang>`).")]
+@[noinline] private def hasSub (s sub : String) : Bool := s.contains sub
+
+private def a11yDiagTable : Array (String × String) := #[
+  ("imgsHaveAlt", "An `<img>` element in `{v}` is missing an `alt` attribute. Add `alt=\"...\"` (or `alt=\"\"` for decorative images)."),
+  ("buttonsAccessible", "A `<button>` or `<a>` element in `{v}` has no accessible name in some branch. Provide non-empty text, `aria-label`, `aria-labelledby`, `title`, or a child `<img>` with non-empty `alt`."),
+  ("validAriaRoles", "An element in `{v}` has an unrecognized WAI-ARIA `role` attribute. Use a valid WAI-ARIA 1.2 role name."),
+  ("labelsAssociated", "A `<label>` element in `{v}` neither has a non-empty `for` attribute nor wraps a form control (`<input>`, `<select>`, `<textarea>`)."),
+  ("noDuplicateIds", "Two elements in `{v}` share the same `id` attribute in some branch. Ensure every non-empty `id` is unique."),
+  ("headingsOrdered", "Headings in `{v}` skip a level (e.g. `<h1>` directly to `<h3>`). Use sequential heading levels."),
+  ("htmlHasLang", "An `<html>` element in `{v}` is missing a non-empty `lang` attribute (e.g. `<html lang=\"en\">`)."),
+  ("a11yValid", "An accessibility check failed in `{v}` (check `<img alt>`, `<button>`/`<a>` accessible names, WAI-ARIA `role`, `<label>` association, unique `id`s, heading order, and `<html lang>`).")]
 
 private def diagnoseStyling (predStr : String) (vName : Name) : String × String :=
-  match a11yDiagTable.find? (fun (k, _) => predStr.contains k) with
-  | some (_, mk) => ("Accessibility invariant", mk vName)
+  match a11yDiagTable.find? (fun (k, _) => hasSub predStr k) with
+  | some (_, tmpl) => ("Accessibility invariant", tmpl.replace "{v}" vName.toString)
   | none => ("Styling invariant",
-      if predStr.contains "roleLacks" || predStr.contains "tagLacks" then s!"A matching element in `{vName}` carries a forbidden style class in some branch. Remove that style from the matching element or guard it so it cannot apply there."
-      else if predStr.contains "exactlyOne" then s!"In some branch of `{vName}`, either none or more than one of the listed roles carries the active style, a role is missing the inactive style, or one of the roles is not rendered."
-      else if (predStr.contains "hasRole" || predStr.contains "hasTag") && !(predStr.contains "roleHas" || predStr.contains "tagHas") then s!"No element with the required `role`/tag is rendered in some branch of `{vName}`. Check every conditional branch of `{vName}`."
+      if hasSub predStr "roleLacks" || hasSub predStr "tagLacks" then s!"A matching element in `{vName}` carries a forbidden style class in some branch. Remove that style from the matching element or guard it so it cannot apply there."
+      else if hasSub predStr "exactlyOne" then s!"In some branch of `{vName}`, either none or more than one of the listed roles carries the active style, a role is missing the inactive style, or one of the roles is not rendered."
+      else if (hasSub predStr "hasRole" || hasSub predStr "hasTag") && !(hasSub predStr "roleHas" || hasSub predStr "tagHas") then s!"No element with the required `role`/tag is rendered in some branch of `{vName}`. Check every conditional branch of `{vName}`."
       else s!"Check that the matching `role`/tag is rendered and receives exactly one allowed style in every branch of `{vName}`.")
 
-@[noinline]
-private def runDischargeStyling (view nm : Ident) (predLit : StrLit) : TacticM Unit := do
-  evalTactic (← `(tactic| (intro m; try intro _qed_h_assume)))
-  withMainContext do
-    for d in (← getLCtx) do
-      if d.userName == `_qed_h_assume then if let .const c _ := (← instantiateMVars d.type).getAppFn then discard <| tryTac `(tactic| simp only [$(mkIdent c):ident] at *)
-    if let some (_, lhs, _) := (← instantiateMVars (← getMainTarget)).eq? then
-      let (fn, args) := (lhs.getAppFn, lhs.getAppArgs)
-      if (fn.isConstOf ``Qed.roleHasOneOf || fn.isConstOf ``Qed.tagHasOneOf) && args.size == 4 then
-        let chk := mkIdent (if fn.isConstOf ``Qed.roleHasOneOf then ``Qed.hasRole else ``Qed.hasTag)
-        evalTactic (← `(tactic| (suffices $chk $(← PrettyPrinter.delab args[1]!) ($view m) = true ∧ _ from this.2; constructor)))
-  withOptions (fun o => maxRecDepth.set o (max (maxRecDepth.get o) 16384)) do forEachGoal fun _ => Core.withCurrHeartbeats (runStyleReduce view)
+@[noinline] private def runDischargeStyling (view nm : Ident) (predLit : StrLit) : TacticM Unit := do
+  let (_, g1) ← (← getMainGoal).intro `m
+  let g2 ← if (← g1.withContext (Meta.whnf (← g1.getType))).isForall then pure (← g1.intro `_qed_h_assume).2 else pure g1
+  let g3? ← g2.withContext do
+    if let some c ← findLCtxDecl? fun d => do if d.userName == `_qed_h_assume then return (← instantiateMVars d.type).getAppFn.constName? else return none then
+      simpGoalAllHyps g2 (← mkDynamicSimpCtx #[c] none (withEqns := false))
+    else pure (some g2)
+  setGoals <| ← match g3? with
+    | none => pure []
+    | some g3 => g3.withContext do
+        let tgt ← instantiateMVars (← g3.getType)
+        if let some (_, lhs, _) := tgt.eq? then
+          let (fn, args) := (lhs.getAppFn, lhs.getAppArgs)
+          if (fn.isConstOf ``Qed.roleHasOneOf || fn.isConstOf ``Qed.tagHasOneOf) && args.size == 4 then
+            let gHas ← Meta.mkFreshExprSyntheticOpaqueMVar (← Meta.mkEq (← Meta.mkAppM (if fn.isConstOf ``Qed.roleHasOneOf then ``Qed.hasRole else ``Qed.hasTag) #[args[1]!, args[3]!]) (mkConst ``Bool.true))
+            let gMain ← Meta.mkFreshExprSyntheticOpaqueMVar tgt; g3.assign gMain; return [gHas.mvarId!, gMain.mvarId!]
+        return [g3]
+  withOptions (fun o => maxRecDepth.set o (max (maxRecDepth.get o) 16384)) do forEachGoal fun _ => withFreshHeartbeatsT (runStyleReduce view)
   let predStr := predLit.getString; let (label, diagnosis) := diagnoseStyling predStr view.getId
   Qed.Diag.throwUnsolvedGoals m!"{label} `{nm.getId}` failed in `{view.getId}`:\n  • `{predStr}` does not hold in every state"
     m!"\n\nHint: {diagnosis}" (ref? := some nm)
@@ -187,34 +194,32 @@ private def runDischargeStyling (view nm : Ident) (predLit : StrLit) : TacticM U
       return if s == "False" || s == "false = true" then none else some s!"  • view must satisfy:  {s}")
 
 elab "qedStyleReduce " view:ident : tactic => runStyleReduce view
-elab "qedDischargeStyling" view:ident nm:ident predLit:str : tactic => Core.withCurrHeartbeats (runDischargeStyling view nm predLit)
-
+elab "qedDischargeStyling" view:ident nm:ident predLit:str : tactic => withFreshHeartbeatsT (runDischargeStyling view nm predLit)
 syntax (name := invariantView) "invariant " ident " : " qedExpr,+ " holds_in " ident (" assuming " qedExpr)? (" := " term)? : command
 
 section InvariantViewElab
 open Lean Elab Command
-
-@[noinline]
-private def elabInvariantViewCmd (name view : Ident) (rawPreds : Array (TSyntax `qedExpr))
+@[noinline] private def elabInvariantViewCmd (name view : Ident) (rawPreds : Array (TSyntax `qedExpr))
     (assumeE : Option (TSyntax `qedExpr)) (pf : Option Term) : CommandElabM Unit := do
-  let p :: ps := (← rawPreds.mapM fun p => liftMacroM (Qed.Lang.lowerSimpleQedExpr .val p)).toList | throwErrorAt name "empty view invariant"
-  let pred ← ps.foldlM (init := p) fun acc q => `(Qed.both $acc $q)
+  let p :: ps := (← rawPreds.toList.mapM fun p => liftMacroM (Qed.Lang.lowerSimpleQedExpr .val p.raw)) | throwErrorAt name "empty view invariant"
   let predStr := String.intercalate ", " (rawPreds.toList.map fun p => (p.raw.reprint.getD "this rule").trimmed)
-  let prop ← match assumeE with
+  let assumeP? ← match assumeE with
+    | none => pure none
     | some a =>
         let uA := Qed.Lang.unwrapParens1 a.raw
-        let aT ← liftMacroM (Qed.Lang.lowerSimpleQedExpr (if uA.getKind == ``Qed.Lang.qedLam1 || uA.getKind == ``Qed.Lang.qedLamN then .propInv else .val) a)
-        let P ← if aT.raw.isIdent then try liftTermElabM (extractInvPred ⟨aT.raw⟩) catch _ => pure aT else pure aT
-        `(∀ m, ($P) m → ($pred) ($view m) = true)
-    | none => `(∀ m, ($pred) ($view m) = true)
-  match pf with
-  | some p => elabCommand (← `(theorem $name:ident : $prop := $p))
-  | none   => elabCommand (← `(set_option linter.unusedSimpArgs false in theorem $name:ident : $prop := by qedDischargeStyling $view $name $(Syntax.mkStrLit predStr)))
+        let aT ← liftMacroM (Qed.Lang.lowerSimpleQedExpr (if uA.getKind == ``Qed.Lang.qedLam1 || uA.getKind == ``Qed.Lang.qedLamN then .propInv else .val) a.raw)
+        some <$> if aT.raw.isIdent then try liftTermElabM (extractInvPred ⟨aT.raw⟩) catch _ => pure aT else pure aT
+  let cmd ← liftMacroM <| Qed.Lang.runPureQuot do
+    let pred ← ps.foldlM (init := p) fun acc q => `(Qed.both $acc $q)
+    let prop ← match assumeP? with
+      | some P => `(∀ m, ($P) m → ($pred) ($view m) = true) | none => `(∀ m, ($pred) ($view m) = true)
+    match pf with
+    | some pfT => `(theorem $name:ident : $prop := $pfT)
+    | none => `(set_option linter.unusedSimpArgs false in theorem $name:ident : $prop := by qedDischargeStyling $view $name $(Syntax.mkStrLit predStr))
+  elabCommand cmd
 
 elab_rules : command
   | `(invariant $name:ident : $preds:qedExpr,* holds_in $view:ident $[assuming $assumeE:qedExpr]? $[ := $pf:term]?) =>
     elabInvariantViewCmd name view preds.getElems assumeE pf
-
 end InvariantViewElab
-
 end Qed

@@ -2,10 +2,6 @@ import Qed.Style.Core
 
 namespace Qed
 
-/-! ## Exact Integer WCAG 2.1 Relative Luminance & Contrast Ratio Proofs -/
-
-/-- Exact WCAG 2.1 sRGB channel linearization (`c ∈ 0..255` → `linear(c/255) × 1_000_000`).
-    2-level `c / 16` + `c % 16` dispatch reduces in ≤ 16 steps inside Lean's kernel (`decide`/`rfl`). -/
 def srgbLinearX1M (c : Nat) : Nat :=
   match c / 16 with
   |  0 => match c % 16 with | 0 => 0 | 1 => 304 | 2 => 607 | 3 => 911 | 4 => 1214 | 5 => 1518 | 6 => 1821 | 7 => 2125 | 8 => 2428 | 9 => 2732 | 10 => 3035 | 11 => 3347 | 12 => 3677 | 13 => 4025 | 14 => 4391 | _ => 4777
@@ -26,20 +22,11 @@ def srgbLinearX1M (c : Nat) : Nat :=
   | 15 => match c % 16 with | 0 => 871367 | 1 => 879622 | 2 => 887923 | 3 => 896269 | 4 => 904661 | 5 => 913099 | 6 => 921582 | 7 => 930111 | 8 => 938686 | 9 => 947307 | 10 => 955973 | 11 => 964686 | 12 => 973445 | 13 => 982251 | 14 => 991102 | _ => 1000000
   | _  => 1000000
 
-def relLuminanceX1M (r g b : Nat) : Nat :=
-  (2126 * srgbLinearX1M r + 7152 * srgbLinearX1M g + 722 * srgbLinearX1M b) / 10000
-
+def relLuminanceX1M (r g b : Nat) : Nat := (2126 * srgbLinearX1M r + 7152 * srgbLinearX1M g + 722 * srgbLinearX1M b) / 10000
 def rgbContrastX100 (c1 c2 : Nat × Nat × Nat) : Nat :=
-  let l1 := relLuminanceX1M c1.1 c1.2.1 c1.2.2; let l2 := relLuminanceX1M c2.1 c2.2.1 c2.2.2
-  ((max l1 l2 + 50000) * 100) / (min l1 l2 + 50000)
-
-def Color.contrastX100 (fg bg : Color) : Nat :=
-  match fg.rgb?, bg.rgb? with | some c1, some c2 => rgbContrastX100 c1 c2 | _, _ => 0
-
-def formatContrastX100 (ratio : Nat) : String :=
-  let frac := ratio % 100
-  s!"{ratio / 100}.{if frac < 10 then "0" else ""}{frac}:1"
-
+  let l1 := relLuminanceX1M c1.1 c1.2.1 c1.2.2; let l2 := relLuminanceX1M c2.1 c2.2.1 c2.2.2; ((max l1 l2 + 50000) * 100) / (min l1 l2 + 50000)
+def Color.contrastX100 (fg bg : Color) : Nat := match fg.rgb?, bg.rgb? with | some c1, some c2 => rgbContrastX100 c1 c2 | _, _ => 0
+def formatContrastX100 (ratio : Nat) : String := let frac := ratio % 100; s!"{ratio / 100}.{if frac < 10 then "0" else ""}{frac}:1"
 def wcagContrastAtLeast (fg bg : Color) (minX100 : Nat) : Bool := decide (Color.contrastX100 fg bg ≥ minX100)
 def wcagAA (fg bg : Color) : Bool := wcagContrastAtLeast fg bg 450
 def wcagAALarge (fg bg : Color) : Bool := wcagContrastAtLeast fg bg 300
@@ -47,44 +34,48 @@ def wcagAAA (fg bg : Color) : Bool := wcagContrastAtLeast fg bg 700
 
 def TypedToken.wcagCheck (fg bg : TypedToken Color) (minX100 : Nat) : Bool :=
   let chk (a b : Option Color) := match a, b with | some f, some bg => wcagContrastAtLeast f bg minX100 | _, _ => false
-  chk fg.lightVal bg.lightVal &&
-    ((fg.darkVal.isNone && bg.darkVal.isNone) ||
-      chk (fg.darkVal.orElse fun _ => fg.lightVal) (bg.darkVal.orElse fun _ => bg.lightVal))
-
+  chk fg.lightVal bg.lightVal && ((fg.darkVal.isNone && bg.darkVal.isNone) || chk (fg.darkVal.orElse fun _ => fg.lightVal) (bg.darkVal.orElse fun _ => bg.lightVal))
 def TypedToken.wcagAA (fg bg : TypedToken Color) : Bool := TypedToken.wcagCheck fg bg 450
 def TypedToken.wcagAALarge (fg bg : TypedToken Color) : Bool := TypedToken.wcagCheck fg bg 300
 def TypedToken.wcagAAA (fg bg : TypedToken Color) : Bool := TypedToken.wcagCheck fg bg 700
 
-/-! ## WCAG Contrast Theorems -/
-
-theorem rgbContrastX100_symm (c1 c2 : Nat × Nat × Nat) : rgbContrastX100 c1 c2 = rgbContrastX100 c2 c1 := by
-  simp only [rgbContrastX100, Nat.max_comm, Nat.min_comm]
-
+theorem rgbContrastX100_symm (c1 c2 : Nat × Nat × Nat) : rgbContrastX100 c1 c2 = rgbContrastX100 c2 c1 := by simp only [rgbContrastX100, Nat.max_comm, Nat.min_comm]
 theorem Color.contrastX100_symm (fg bg : Color) : Color.contrastX100 fg bg = Color.contrastX100 bg fg := by
   unfold Color.contrastX100; cases fg.rgb? <;> cases bg.rgb? <;> first | exact rgbContrastX100_symm _ _ | rfl
-
 theorem rgbContrastX100_self (c : Nat × Nat × Nat) : rgbContrastX100 c c = 100 := by
   unfold rgbContrastX100; simp only [Nat.max_self, Nat.min_self]; exact Nat.mul_div_right 100 (Nat.add_pos_right _ (by decide))
-
 theorem Color.contrastX100_self (c : Color) (h : c.rgb?.isSome = true) : Color.contrastX100 c c = 100 := by
   unfold Color.contrastX100; cases hr : c.rgb? with | none => simp [hr] at h | some rgb => exact rgbContrastX100_self rgb
-
-private theorem wcagContrastAtLeast_mono {fg bg : Color} {m n : Nat} (hmn : m ≤ n)
-    (h : wcagContrastAtLeast fg bg n = true) : wcagContrastAtLeast fg bg m = true := by
+private theorem wcagContrastAtLeast_mono {fg bg : Color} {m n : Nat} (hmn : m ≤ n) (h : wcagContrastAtLeast fg bg n = true) : wcagContrastAtLeast fg bg m = true := by
   simp only [wcagContrastAtLeast, decide_eq_true_eq] at *; omega
+theorem wcagAAA_implies_wcagAA (fg bg : Color) (h : wcagAAA fg bg = true) : wcagAA fg bg = true := wcagContrastAtLeast_mono (by decide) h
+theorem wcagAA_implies_wcagAALarge (fg bg : Color) (h : wcagAA fg bg = true) : wcagAALarge fg bg = true := wcagContrastAtLeast_mono (by decide) h
 
-theorem wcagAAA_implies_wcagAA (fg bg : Color) (h : wcagAAA fg bg = true) : wcagAA fg bg = true :=
-  wcagContrastAtLeast_mono (by decide) h
+def parseNumberWithUnit (tok : String) : Option (String × String) :=
+  let (sign, r0) := match tok.toList with | '-' :: r => ("-", r) | '+' :: r => ("", r) | r => ("", r)
+  let (d1, r1) := r0.span Char.isDigit
+  let (numCs, unitCs) := match r1 with | '.' :: r2 => let (d2, u) := r2.span Char.isDigit; if d2.isEmpty then (d1, '.' :: r2) else (d1 ++ '.' :: d2, u) | _ => (d1, r1)
+  if numCs.isEmpty then none else some (sign ++ String.ofList numCs, String.ofList unitCs)
+def isNumericString (s : String) : Bool := (parseNumberWithUnit s).any (·.2.isEmpty)
 
-theorem wcagAA_implies_wcagAALarge (fg bg : Color) (h : wcagAA fg bg = true) : wcagAALarge fg bg = true :=
-  wcagContrastAtLeast_mono (by decide) h
+def splitTopLevel (sep : Char) (s : String) : List String :=
+  let flush (cur : List Char) (acc : List String) := let t := (String.ofList cur.reverse).trimmed; if t.isEmpty then acc else t :: acc
+  let rec go : List Char → Nat → Bool → Char → List Char → List String → List String
+    | [], _, _, _, cur, acc => (flush cur acc).reverse
+    | c :: rest, d, true, q, cur, acc => go rest d (c != q) q (c :: cur) acc
+    | c :: rest, d, false, q, cur, acc =>
+        if c == '"' || c == '\'' then go rest d true c (c :: cur) acc
+        else if c == '(' then go rest (d + 1) false q (c :: cur) acc
+        else if c == ')' then go rest (d - 1) false q (c :: cur) acc
+        else if d == 0 && (if sep == ' ' then c.isWhitespace else c == sep) then go rest 0 false q [] (flush cur acc)
+        else go rest d false q (c :: cur) acc
+  go s.toList 0 false '"' [] []
 
-/-! ## Style & Stylesheet Contrast Verification (Fast Kernel-Reducible) -/
-
-private def isSimpleNumericStr (s : String) : Bool :=
-  let cs := match s.toList with | '-' :: r | '+' :: r => r | r => r
-  let (d1, r1) := cs.span Char.isDigit
-  !d1.isEmpty && match r1 with | [] => true | '.' :: r2 => !r2.isEmpty && r2.all Char.isDigit | _ => false
+def parseFuncCall? (tok : String) : Option (String × String) :=
+  let (fnCs, rest) := tok.toList.span fun c => c.isAlphanum || c == '-' || c == '_'
+  match fnCs, rest with
+  | _ :: _, '(' :: inner => match inner.reverse with | ')' :: revArgs => some (String.ofList fnCs, (String.ofList revArgs.reverse).trimmed) | _ => none
+  | _, _ => none
 
 def parseRgbArgs (fnName argsStr : String) (parts : List String) : Except String (Option (Nat × Nat × Nat)) := do
   let parseCh (p : String) : Except String (Option Nat) := do
@@ -92,161 +83,81 @@ def parseRgbArgs (fnName argsStr : String) (parts : List String) : Except String
     let some n := p.toNat? | throw s!"`{fnName}({argsStr})`: expected integer channel 0..255, got `{p}`"
     if n > 255 then throw s!"`{fnName}({argsStr})`: channel value `{n}` is out of range (must be 0..255)"
     return some n
-  let (rS, gS, bS, a?) ← match parts with
-    | [r, g, b] => pure (r, g, b, none) | [r, g, b, a] => pure (r, g, b, some a)
-    | _ => throw s!"`{fnName}({argsStr})` expects {if fnName == "rgba" then 4 else 3} arguments"
+  let (rS, gS, bS, a?) ← match parts with | [r, g, b] => pure (r, g, b, none) | [r, g, b, a] => pure (r, g, b, some a) | _ => throw s!"`{fnName}({argsStr})` expects {if fnName == "rgba" then 4 else 3} arguments"
   let some r ← parseCh rS | return none
   let some g ← parseCh gS | return none
   let some b ← parseCh bS | return none
   if let some aS := a? then
     if aS.startsWith "var(" then return none
-    if !isSimpleNumericStr aS && !(aS.endsWith "%" && isSimpleNumericStr (String.ofList aS.toList.dropLast)) then
-      throw s!"`{fnName}({argsStr})`: invalid alpha value `{aS}`"
+    if !isNumericString aS && !(aS.endsWith "%" && isNumericString (String.ofList aS.toList.dropLast)) then throw s!"`{fnName}({argsStr})`: invalid alpha value `{aS}`"
     if aS != "1" && aS != "1.0" && aS != "100%" then return none
   return some (r, g, b)
 
+def validateRgbArgs (fnName argsStr : String) : Except String (Option (Nat × Nat × Nat)) :=
+  let byComma := splitTopLevel ',' argsStr
+  parseRgbArgs fnName argsStr (if byComma.length > 1 then byComma else splitTopLevel ' ' (argsStr.replace "/" " "))
+
 def parseCssColorRgb? (raw : String) : Option (Nat × Nat × Nat) :=
   let t := raw.trimmed
-  if t.startsWith "#" then parseHexRgb? t
-  else if t == "white" then some (255, 255, 255)
-  else if t == "black" then some (0, 0, 0)
-  else if (t.startsWith "rgb(" || t.startsWith "rgba(") && t.endsWith ")" then
-    let argsStr := String.ofList ((t.toList.drop (if t.startsWith "rgba(" then 5 else 4)).dropLast)
-    let parts :=
-      if argsStr.contains ',' then (argsStr.splitOn ",").map String.trimmed
-      else ((argsStr.replace "/" " ").splitOn " ").map String.trimmed |>.filter (!·.isEmpty)
-    match parseRgbArgs "rgb" argsStr parts with | .ok res => res | .error _ => none
-  else none
+  if t.startsWith "#" then parseHexRgb? t else if t == "white" then some (255, 255, 255) else if t == "black" then some (0, 0, 0)
+  else match parseFuncCall? t with | some ("rgb", args) | some ("rgba", args) => (validateRgbArgs "rgb" args).toOption.join | _ => none
 
 def unwrapCssVarName? (raw : String) : Option String :=
-  let t := raw.trimmed
-  if t.startsWith "var(--" && t.endsWith ")" then
-    let inner := (String.ofList ((t.toList.drop 6).dropLast)).trimmed
-    match inner.splitOn "," with
-    | tok :: _ => let clean := tok.trimmed; if clean.isEmpty then none else some clean
-    | [] => none
-  else none
+  match parseFuncCall? raw.trimmed with
+  | some ("var", inner) => match inner.toList with
+      | '-' :: '-' :: rest => match (String.ofList rest).splitOn "," with | tok :: _ => let clean := tok.trimmed; if clean.isEmpty then none else some clean | [] => none
+      | _ => none
+  | _ => none
 
-private def lastDeclValue (prop : String) (items : List Item) : Option String :=
-  items.foldl (fun acc it => match it with | .decl p v => if p == prop then some v else acc | .nest _ _ => acc) none
-
-private def isDarkSelector (sel : String) : Bool :=
-  sel.contains "prefers-color-scheme: dark" || sel.contains "data-theme=\"dark\""
-
+private def lastDeclValue (prop : String) (items : List Item) : Option String := items.foldl (fun acc it => match it with | .decl p v => if p == prop then some v else acc | .nest _ _ => acc) none
+private def isDarkSelector (sel : String) : Bool := sel.contains "prefers-color-scheme: dark" || sel.contains "data-theme=\"dark\""
 private def mkStyleColorCheck (scope : String) (forcedDark : Bool) (fgCss bgCss : String) : StyleColorCheck :=
-  { scope, fgCss, bgCss
-    fgRgb? := parseCssColorRgb? fgCss, bgRgb? := if bgCss.isEmpty then none else parseCssColorRgb? bgCss
-    fgTok? := unwrapCssVarName? fgCss, bgTok? := if bgCss.isEmpty then none else unwrapCssVarName? bgCss
-    forcedDark }
+  { scope, fgCss, bgCss, fgRgb? := parseCssColorRgb? fgCss, bgRgb? := if bgCss.isEmpty then none else parseCssColorRgb? bgCss,
+    fgTok? := unwrapCssVarName? fgCss, bgTok? := if bgCss.isEmpty then none else unwrapCssVarName? bgCss, forcedDark }
 
 mutual
-  def collectStyleColorChecks (outerFg outerBg : Option String) (dark : Bool) (scope : String)
-      (items : List Item) : List StyleColorCheck :=
-    let localFg := lastDeclValue "color" items
-    let localBg := lastDeclValue "background-color" items
-    let fg? := localFg.orElse fun _ => outerFg
-    let bg? := localBg.orElse fun _ => outerBg
-    let here :=
-      if localFg.isSome || localBg.isSome then
-        match fg? with
-        | some fg => [mkStyleColorCheck scope dark fg (bg?.getD "")]
-        | none => []
-      else []
+  def collectStyleColorChecks (outerFg outerBg : Option String) (dark : Bool) (scope : String) (items : List Item) : List StyleColorCheck :=
+    let (localFg, localBg) := (lastDeclValue "color" items, lastDeclValue "background-color" items)
+    let (fg?, bg?) := (localFg.orElse fun _ => outerFg, localBg.orElse fun _ => outerBg)
+    let here := if localFg.isSome || localBg.isSome then match fg? with | some fg => [mkStyleColorCheck scope dark fg (bg?.getD "")] | none => [] else []
     here ++ collectNestedColorChecks fg? bg? dark scope items
   termination_by (sizeOf items, 1)
   decreasing_by exact Prod.Lex.right _ (Nat.zero_lt_one)
-
-  def collectNestedColorChecks (fg? bg? : Option String) (dark : Bool) (scope : String) :
-      List Item → List StyleColorCheck
-    | [] => []
-    | .decl _ _ :: rest => collectNestedColorChecks fg? bg? dark scope rest
-    | .nest sel sub :: rest =>
-        let nextScope := if scope.isEmpty then sel else scope ++ " " ++ sel
-        collectStyleColorChecks fg? bg? (dark || isDarkSelector sel) nextScope sub ++
-          collectNestedColorChecks fg? bg? dark scope rest
+  def collectNestedColorChecks (fg? bg? : Option String) (dark : Bool) (scope : String) : List Item → List StyleColorCheck
+    | [] => [] | .decl _ _ :: rest => collectNestedColorChecks fg? bg? dark scope rest
+    | .nest sel sub :: rest => collectStyleColorChecks fg? bg? (dark || isDarkSelector sel) (if scope.isEmpty then sel else scope ++ " " ++ sel) sub ++ collectNestedColorChecks fg? bg? dark scope rest
   termination_by xs => (sizeOf xs, 0)
   decreasing_by all_goals (apply Prod.Lex.left; simp_wf; omega)
 end
 
-structure ContrastFallbackBg where mk ::
-  (css : String) (rgb? : Option (Nat × Nat × Nat) := none) (tok? : Option String := none)
-deriving Inhabited, BEq, Repr
+structure ContrastFallbackBg where mk :: (css : String) (rgb? : Option (Nat × Nat × Nat) := none) (tok? : Option String := none) deriving Inhabited, BEq, Repr
+structure ContrastViolation where (styleName scope fgCss bgCss : String) (ratioX100 : Nat) deriving Inhabited, BEq, Repr
 
-structure ContrastViolation where
-  styleName : String
-  scope     : String
-  fgCss     : String
-  bgCss     : String
-  ratioX100 : Nat
-deriving Inhabited, BEq, Repr
+private def resolveCheckColor (palette : List ThemeColorEntry) (dark : Bool) (rgb? : Option (Nat × Nat × Nat)) (tok? : Option String) : Option (Nat × Nat × Nat) :=
+  rgb?.orElse fun _ => tok?.bind fun tok => (palette.find? (·.cssName == tok)).map fun e => if dark then e.darkRgb?.getD e.lightRgb else e.lightRgb
 
-private def lookupPaletteRgb (palette : List ThemeColorEntry) (dark : Bool) (tok : String) : Option (Nat × Nat × Nat) :=
-  match palette.find? (fun e => e.cssName == tok) with
-  | some e => if dark then e.darkRgb?.orElse fun _ => some e.lightRgb else some e.lightRgb
-  | none => none
-
-private def paletteHasDark (palette : List ThemeColorEntry) : Bool :=
-  palette.any (fun e => e.darkRgb?.isSome)
-
-private def resolveCheckColor (palette : List ThemeColorEntry) (dark : Bool)
-    (rgb? : Option (Nat × Nat × Nat)) (tok? : Option String) : Option (Nat × Nat × Nat) :=
-  match rgb? with
-  | some c => some c
-  | none => match tok? with | some tok => lookupPaletteRgb palette dark tok | none => none
-
-private def checkOneColorCheck (styleName : String) (minX100 : Nat) (palette : List ThemeColorEntry)
-    (fallbackBg? : Option ContrastFallbackBg) (chk : StyleColorCheck) : List ContrastViolation :=
-  let (bgCss, bgRgb?, bgTok?) :=
-    if !chk.bgCss.isEmpty then (chk.bgCss, chk.bgRgb?, chk.bgTok?)
-    else match fallbackBg? with
-      | some fb => (fb.css, fb.rgb?, fb.tok?)
-      | none => ("", none, none)
-  if bgCss.isEmpty then []
-  else
+private def checkOneColorCheck (styleName : String) (minX100 : Nat) (palette : List ThemeColorEntry) (fallbackBg? : Option ContrastFallbackBg) (chk : StyleColorCheck) : List ContrastViolation :=
+  let (bgCss, bgRgb?, bgTok?) := if !chk.bgCss.isEmpty then (chk.bgCss, chk.bgRgb?, chk.bgTok?) else match fallbackBg? with | some fb => (fb.css, fb.rgb?, fb.tok?) | none => ("", none, none)
+  if bgCss.isEmpty then [] else
     let runMode (modeLabel : String) (dark : Bool) : List ContrastViolation :=
       match resolveCheckColor palette dark chk.fgRgb? chk.fgTok?, resolveCheckColor palette dark bgRgb? bgTok? with
-      | some fgRgb, some bgRgb =>
-          let r := rgbContrastX100 fgRgb bgRgb
-          if r < minX100 then [{ styleName, scope := modeLabel, fgCss := chk.fgCss, bgCss, ratioX100 := r }] else []
+      | some fgRgb, some bgRgb => let r := rgbContrastX100 fgRgb bgRgb; if r < minX100 then [{ styleName, scope := modeLabel, fgCss := chk.fgCss, bgCss, ratioX100 := r }] else []
       | _, _ => []
-    if chk.forcedDark then
-      runMode (if chk.scope.isEmpty then "dark" else chk.scope) true
+    if chk.forcedDark then runMode (if chk.scope.isEmpty then "dark" else chk.scope) true
     else
-      let lightLbl := if chk.scope.isEmpty then "light" else chk.scope ++ " (light)"
-      let lightRes := runMode lightLbl false
-      let darkRes :=
-        if paletteHasDark palette && (chk.fgTok?.isSome || bgTok?.isSome) then
-          let darkLbl := if chk.scope.isEmpty then "dark" else chk.scope ++ " (dark)"
-          runMode darkLbl true
-        else []
+      let lightRes := runMode (if chk.scope.isEmpty then "light" else chk.scope ++ " (light)") false
+      let darkRes := if palette.any (·.darkRgb?.isSome) && (chk.fgTok?.isSome || bgTok?.isSome) then runMode (if chk.scope.isEmpty then "dark" else chk.scope ++ " (dark)") true else []
       lightRes ++ darkRes
 
-def Style.contrastViolations (minX100 : Nat) (palette : List ThemeColorEntry)
-    (fallbackBg? : Option ContrastFallbackBg := none) (s : Style) : List ContrastViolation :=
-  if s.isGlobal then []
-  else s.colorChecks.flatMap (checkOneColorCheck s.className minX100 palette fallbackBg?)
-
-def Style.hasContrastPair (fallbackBg? : Option ContrastFallbackBg := none) (s : Style) : Bool :=
-  s.colorChecks.any fun chk => !chk.bgCss.isEmpty || fallbackBg?.isSome
-
-def Style.checkContrast (minX100 : Nat) (palette : List ThemeColorEntry)
-    (fallbackBg? : Option ContrastFallbackBg := none) (s : Style) : Bool :=
-  (s.contrastViolations minX100 palette fallbackBg?).isEmpty
-
-def findStylesContrastViolations (minX100 : Nat) (extraPalette : List ThemeColorEntry)
-    (fallbackBg? : Option ContrastFallbackBg := none) (styles : List Style) : List ContrastViolation :=
-  let palette := styles.flatMap (·.themePalette) ++ extraPalette
-  styles.flatMap (Style.contrastViolations minX100 palette fallbackBg?)
-
-def checkStylesContrast (minX100 : Nat) (extraPalette : List ThemeColorEntry)
-    (fallbackBg? : Option ContrastFallbackBg := none) (styles : List Style) : Bool :=
+def Style.contrastViolations (minX100 : Nat) (palette : List ThemeColorEntry) (fallbackBg? : Option ContrastFallbackBg := none) (s : Style) : List ContrastViolation :=
+  if s.isGlobal then [] else s.colorChecks.flatMap (checkOneColorCheck s.className minX100 palette fallbackBg?)
+def Style.hasContrastPair (fallbackBg? : Option ContrastFallbackBg := none) (s : Style) : Bool := s.colorChecks.any fun chk => !chk.bgCss.isEmpty || fallbackBg?.isSome
+def Style.checkContrast (minX100 : Nat) (palette : List ThemeColorEntry) (fallbackBg? : Option ContrastFallbackBg := none) (s : Style) : Bool := (s.contrastViolations minX100 palette fallbackBg?).isEmpty
+def findStylesContrastViolations (minX100 : Nat) (extraPalette : List ThemeColorEntry) (fallbackBg? : Option ContrastFallbackBg := none) (styles : List Style) : List ContrastViolation :=
+  let palette := styles.flatMap (·.themePalette) ++ extraPalette; styles.flatMap (Style.contrastViolations minX100 palette fallbackBg?)
+def checkStylesContrast (minX100 : Nat) (extraPalette : List ThemeColorEntry) (fallbackBg? : Option ContrastFallbackBg := none) (styles : List Style) : Bool :=
   (findStylesContrastViolations minX100 extraPalette fallbackBg? styles).isEmpty
-
 def formatContrastViolations (minX100 : Nat) (vs : List ContrastViolation) : String :=
-  if vs.isEmpty then ""
-  else
-    let lines := vs.map fun v =>
-      s!"  • style `{v.styleName}` ({v.scope}): color `{v.fgCss}` on background-color `{v.bgCss}` is {formatContrastX100 v.ratioX100}"
-    s!"WCAG contrast check failed (required >= {formatContrastX100 minX100}):\n" ++ String.intercalate "\n" lines
-
+  if vs.isEmpty then "" else s!"WCAG contrast check failed (required >= {formatContrastX100 minX100}):\n" ++
+    String.intercalate "\n" (vs.map fun v => s!"  • style `{v.styleName}` ({v.scope}): color `{v.fgCss}` on background-color `{v.bgCss}` is {formatContrastX100 v.ratioX100}")
 end Qed

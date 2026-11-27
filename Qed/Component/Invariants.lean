@@ -9,6 +9,14 @@ open Lean Elab Command Qed.Lang
 def resolveInvIdent (invStx : Syntax) (compId : Name) : Ident :=
   let idStx := (invStx.getArg 1).getArg 0; mkIdentFrom idStx (compId ++ idStx.getId)
 
+/-- Elaborate a generated component verification theorem with an isolated heartbeat budget
+    so large component definitions do not starve their `invariant` or `example` clauses. -/
+def elabIsolatedTheorem (cmd : CmdStx) : CommandElabM Unit := do
+  let saved ← IO.getNumHeartbeats
+  IO.setNumHeartbeats 0
+  try elabCommand cmd
+  finally IO.setNumHeartbeats saved
+
 /-! ## Inline Invariant Elaboration -/
 
 def mkViewPredAndStr (invStx : Syntax) (rawClauses : Array Syntax) (clauses : Array Term) (emptyMsg : String) : CommandElabM (Term × String) := do
@@ -40,10 +48,10 @@ private def elabForEachInlineInv (spec : ComponentSpec) (invStx : Syntax) (isSty
         pure (← liftTermElabM (if isStyled then extractViewInvPred cid else extractInvPred cid), cid)
   if isStyled then
     let rhs ← pf?.getDM `(by qedDischargeStyledForEach $(spec.viewId) $colField $childInv $invId $predToEmit)
-    elabCommand (← `(command| set_option linter.unusedSimpArgs false in theorem $invId:ident : ∀ m, ($predToEmit) ($(spec.viewId) m) = true := $rhs))
+    elabIsolatedTheorem (← `(command| set_option linter.unusedSimpArgs false in theorem $invId:ident : ∀ m, ($predToEmit) ($(spec.viewId) m) = true := $rhs))
     return none
   let rhs ← pf?.getDM `(by qedDischargeForEach $(spec.updateId) $childInv $invId $predToEmit)
-  elabCommand (← `(command| theorem $invId:ident : ∀ m msg, (∀ c ∈ m.$colField, ($predToEmit) c) → (∀ c ∈ (InvTarget.proj ($(spec.updateId) m msg)).$colField, ($predToEmit) c) := $rhs))
+  elabIsolatedTheorem (← `(command| theorem $invId:ident : ∀ m msg, (∀ c ∈ m.$colField, ($predToEmit) c) → (∀ c ∈ (InvTarget.proj ($(spec.updateId) m msg)).$colField, ($predToEmit) c) := $rhs))
   try return some (← liftTermElabM (extractInvPred invId)) catch _ => return none
 
 private def elabViewInlineInv (spec : ComponentSpec) (invStx : Syntax) (invId : Ident)
@@ -51,12 +59,12 @@ private def elabViewInlineInv (spec : ComponentSpec) (invStx : Syntax) (invId : 
   let (vPred, predStr) ← mkViewPredAndStr invStx rawClauses clauses "empty view styling invariant"
   if spec.hasProps then
     let rhs ← pf?.getDM `(by let _qed_hv := $(spec.viewId) p; change ∀ m, ($vPred) (_qed_hv m) = true; qedDischargeStyling _qed_hv $invId $(Syntax.mkStrLit predStr))
-    elabCommand (← `(command| set_option linter.unusedSimpArgs false in theorem $invId:ident (p : $(spec.propsId)) : ∀ m, ($vPred) ($(spec.viewId) p m) = true := $rhs))
+    elabIsolatedTheorem (← `(command| set_option linter.unusedSimpArgs false in theorem $invId:ident (p : $(spec.propsId)) : ∀ m, ($vPred) ($(spec.viewId) p m) = true := $rhs))
   else
     let assumePred? ← assume?.mapM fun a => if a.raw.isIdent then try liftTermElabM (extractInvPred ⟨a.raw⟩) catch _ => pure a else pure a
     let prop ← match assumePred? with | some P => `(∀ m, ($P) m → ($vPred) ($(spec.viewId) m) = true) | none => `(∀ m, ($vPred) ($(spec.viewId) m) = true)
     let rhs ← pf?.getDM `(by qedDischargeStyling $(spec.viewId) $invId $(Syntax.mkStrLit predStr))
-    elabCommand (← `(command| set_option linter.unusedSimpArgs false in theorem $invId:ident : $prop := $rhs))
+    elabIsolatedTheorem (← `(command| set_option linter.unusedSimpArgs false in theorem $invId:ident : $prop := $rhs))
     let compFull := (← liftCoreM (resolveGlobalConstNoOverload spec.viewId)).getPrefix
     let appViewEqName := compFull ++ `app_view_eq
     if (← getEnv).contains appViewEqName then
@@ -69,7 +77,7 @@ private def elabViewInlineInv (spec : ComponentSpec) (invStx : Syntax) (invId : 
         let (appProp, appPf) ← match assumePred? with
           | some P => pure (← `(∀ m, ($P) $stateOfM → ($vPred) ($appViewFn $appId m) = true), ← `(fun m ha => ($congr).trans ($invId $stateOfM ha)))
           | none   => pure (← `(∀ m, ($vPred) ($appViewFn $appId m) = true), ← `(fun m => ($congr).trans ($invId $stateOfM)))
-        elabCommand (← `(command| set_option linter.unusedSimpArgs false in theorem $(mkIdentFrom invId (invId.getId.appendAfter "_app")) : $appProp := $appPf))
+        elabIsolatedTheorem (← `(command| set_option linter.unusedSimpArgs false in theorem $(mkIdentFrom invId (invId.getId.appendAfter "_app")) : $appProp := $appPf))
       catch _ => set saved
 
 private def parseProveCases (optNode : Syntax) : CommandElabM (Option (Array (TSyntax ``Qed.qedProveCase))) := do
@@ -92,9 +100,9 @@ private def elabStateInlineInv (spec : ComponentSpec) (invId : Ident) (clauses :
     | none,    none     => `(by qedDischargePreserved [$[$usingL],*] $updT $invId ($pred))
   if spec.hasProps then
     if spec.mountable then
-      elabCommand (← `(theorem $(mkIdentFrom invId (invId.getId.appendAfter "_init")):ident : ($pred) $(spec.initId) := by qedDischargeInit [$[$usingL],*] $(spec.initId) $invId ($pred)))
+      elabIsolatedTheorem (← `(theorem $(mkIdentFrom invId (invId.getId.appendAfter "_init")):ident : ($pred) $(spec.initId) := by qedDischargeInit [$[$usingL],*] $(spec.initId) $invId ($pred)))
     let rhs ← pf?.getDM (mkPresTac (← `(($(spec.updateId) p))))
-    elabCommand (← `(theorem $invId:ident (p : $(spec.propsId)) : ∀ m msg, ($pred) m → ($pred) (InvTarget.proj ($(spec.updateId) p m msg)) := $rhs))
+    elabIsolatedTheorem (← `(theorem $invId:ident (p : $(spec.propsId)) : ∀ m msg, ($pred) m → ($pred) (InvTarget.proj ($(spec.updateId) p m msg)) := $rhs))
   else
     let presProp ← `(∀ m msg, ($pred) m → ($pred) (InvTarget.proj ($(spec.updateId) m msg)))
     let (prop, rhs) ← if spec.mountable then
@@ -103,7 +111,7 @@ private def elabStateInlineInv (spec : ComponentSpec) (invId : Ident) (clauses :
           | none    => mkPresTac spec.updateId (some spec.initId)
         pure (← `(($pred) ($(spec.initId)) ∧ $presProp), r)
       else pure (presProp, ← pf?.getDM (mkPresTac spec.updateId))
-    elabCommand (← `(command| theorem $invId:ident : $prop := $rhs))
+    elabIsolatedTheorem (← `(command| theorem $invId:ident : $prop := $rhs))
   return pred
 
 def elabInlineInvariantsPhase (spec : ComponentSpec) (wantView : Bool) : CommandElabM (Array (Term × Option Ident)) := do
@@ -161,9 +169,9 @@ def elabCompReachableAndWitnesses (spec : ComponentSpec) : CommandElabM Unit := 
       let pred ← `(fun (s : $(spec.stateId)) => $(← bindMentionedFields spec (fun nm => !paramNames.contains nm && mentionsIdent goalTerm.raw nm) goalTerm))
       let lbl := Syntax.mkStrLit (let s := stxSnippet rawGoal; if s.isEmpty then "target" else s)
       let allBinders := paramBinders ++ whereBinders
-      let pf ← if (cl.getArg 8).getNumArgs == 3 then let tacSeq : TSyntax `Lean.Parser.Tactic.tacticSeq := ⟨(cl.getArg 8).getArg 2⟩; `(by $tacSeq)
+      let pf ← if (cl.getArg 8).getNumArgs == 3 then let tacSeq : TSyntax `Lean.Parser.Tactic.tacticSeq := ⟨(cl.getArg 8).getArg 2⟩; `(by qedWithFreshHeartbeats $tacSeq)
                else `(by qedDischargeReachable $(spec.updateId) $(spec.initId) $thmId $lbl)
-      elabCommand (← `(command| theorem $thmId:ident $[$allBinders:bracketedBinder]* : Qed.Reachable $(spec.updateId) $(spec.initId) ($pred) := Qed.reachable_of_trace $(spec.updateId) $(spec.initId) ($pred) $traceTerm $pf))
+      elabIsolatedTheorem (← `(command| theorem $thmId:ident $[$allBinders:bracketedBinder]* : Qed.Reachable $(spec.updateId) $(spec.initId) ($pred) := Qed.reachable_of_trace $(spec.updateId) $(spec.initId) ($pred) $traceTerm $pf))
 
 end CompElab
 end Qed

@@ -173,7 +173,7 @@ private def runDischargeStyling (view nm : Ident) (predLit : StrLit) : TacticM U
       if (fn.isConstOf ``Qed.roleHasOneOf || fn.isConstOf ``Qed.tagHasOneOf) && args.size == 4 then
         let chk := mkIdent (if fn.isConstOf ``Qed.roleHasOneOf then ``Qed.hasRole else ``Qed.hasTag)
         evalTactic (← `(tactic| (suffices $chk $(← PrettyPrinter.delab args[1]!) ($view m) = true ∧ _ from this.2; constructor)))
-  withOptions (fun o => maxRecDepth.set o (max (maxRecDepth.get o) 16384)) do forEachGoal fun _ => runStyleReduce view
+  withOptions (fun o => maxRecDepth.set o (max (maxRecDepth.get o) 16384)) do forEachGoal fun _ => Core.withCurrHeartbeats (runStyleReduce view)
   let predStr := predLit.getString; let (label, diagnosis) := diagnoseStyling predStr view.getId
   Qed.Diag.throwUnsolvedGoals m!"{label} `{nm.getId}` failed in `{view.getId}`:\n  • `{predStr}` does not hold in every state"
     m!"\n\nHint: {diagnosis}" (ref? := some nm)
@@ -182,7 +182,7 @@ private def runDischargeStyling (view nm : Ident) (predLit : StrLit) : TacticM U
       return if s == "False" || s == "false = true" then none else some s!"  • view must satisfy:  {s}")
 
 elab "qedStyleReduce " view:ident : tactic => runStyleReduce view
-elab "qedDischargeStyling" view:ident nm:ident predLit:str : tactic => runDischargeStyling view nm predLit
+elab "qedDischargeStyling" view:ident nm:ident predLit:str : tactic => Core.withCurrHeartbeats (runDischargeStyling view nm predLit)
 
 syntax (name := invariantView) "invariant " ident " : " qedExpr,+ " holds_in " ident (" assuming " qedExpr)? (" := " term)? : command
 

@@ -175,4 +175,85 @@ server BadDictCap:
   invariant capped: scores.size <= 100
   rpc recordUnsafe(name: String, pts: Nat) -> Unit: scores[name] = pts
 
+/-! ## 6. Multi-Child Hoisted Component Verification & Flat Reconcile -/
+component HoistedPane:
+  port ping : String
+  session user
+  prop title : String = ""
+  state ticks : Nat = 0
+  event onPicked(label : String)
+  start ping.send("boot")
+  action tick: ticks += 1
+  action pick: onPicked.emit(title)
+  view: <div><span>{title}</span><button onClick={.tick}>{ticks}</button><button onClick={.pick}>Pick</button></div>
+
+inductive DashTab where | t0 | t1 | t2 | t3 | t4 | t5 | t6 | t7 | t8 | t9 deriving BEq, DecidableEq
+
+component HoistedDashboard:
+  port audit : String
+  session user
+  state tab : DashTab = .t0
+  state modalOpen : Bool = false
+  state upgradePrompt : String? = none
+  state lastPick : String = ""
+  state sortCol : String = ""
+  state sortAsc : Bool = true
+  state count : Nat = 0
+  state k0 : String = "a"
+  state k1 : String = "b"
+  action toggleModal: modalOpen = not modalOpen
+  action promptUpgrade(feat : String): upgradePrompt = some(feat)
+  action dismissUpgrade: upgradePrompt = none
+  action setTab(t : DashTab): tab = t
+  action onPick(v : String): lastPick = v; audit.send(v)
+  action bump: if count < 10: count += 1
+  action sortBy(col : String):
+    if sortCol == col:
+      sortAsc = not sortAsc
+    else:
+      sortCol = col
+      sortAsc = true
+  invariant countBounded: count <= 10
+  example toggleModalEx: .toggleModal -> modalOpen == true
+  example toggleModalRfl: .toggleModal -> modalOpen == true := by rfl
+  example upgradeRoundtrip(feat : String): .promptUpgrade(feat), .dismissUpgrade -> upgradePrompt == none
+  example upgradeRoundtripRfl(feat : String): .promptUpgrade(feat), .dismissUpgrade -> upgradePrompt == none := by rfl
+  example sortFlip(col : String) where col != "": .sortBy(col), .sortBy(col) -> sortAsc == false
+  example sortTracksCol(col : String): .sortBy(col), .sortBy(col) -> sortCol == col
+  view:
+    <div>
+      {match tab:
+        case .t0: <HoistedPane key={k0} title={k0} onPicked={.onPick}/>
+        case .t1: <HoistedPane key={k1} title={k1} onPicked={.onPick}/>
+        case .t2: <HoistedPane key={k0} title={k0} onPicked={.onPick}/>
+        case .t3: <HoistedPane key={k1} title={k1} onPicked={.onPick}/>
+        case .t4: <HoistedPane key={k0} title={k0} onPicked={.onPick}/>
+        case .t5: <HoistedPane key={k1} title={k1} onPicked={.onPick}/>
+        case .t6: <HoistedPane key={k0} title={k0} onPicked={.onPick}/>
+        case .t7: <HoistedPane key={k1} title={k1} onPicked={.onPick}/>
+        case .t8: <HoistedPane key={sortCol} title={sortCol} onPicked={.onPick}/>
+        case .t9: <HoistedPane key={lastPick} title={lastPick} onPicked={.onPick}/>}
+    </div>
+
+component HoistedEmitter:
+  state showPane : Bool = true
+  event done(ok : Bool)
+  action finish: done.emit(true)
+  action hide: showPane = false
+  view: <div>{<HoistedPane key="p" title="P"/> if showPane else <span/>}</div>
+
+#guard
+  let (s0, _) := HoistedDashboard.update HoistedDashboard.init (._onSession (some "alice"))
+  let (s1, c1) := HoistedDashboard.update s0 (._sub_0 .tick)
+  let (s2, c2) := HoistedDashboard.update s1 (.setTab .t1)
+  let (s3, _) := HoistedDashboard.update s2 (._sub_1 .pick)
+  let hasStart (c : Cmd HoistedDashboard.Msg) : Bool := match c with | .batch [.none, .port "ping" "\"boot\""] => true | _ => false
+  let (e1, eo1, _) := HoistedEmitter.update HoistedEmitter.init .finish
+  let (e2, eo2, _) := HoistedEmitter.update e1 .hide
+  s1._sub_0.ticks == 1 && (match c1 with | .none => true | _ => false) &&
+  s2._sub_0.ticks == 0 && s2._sub_1.user == some "alice" && hasStart c2 &&
+  s3.lastPick == "b" &&
+  (match eo1 with | some (.done true) => true | _ => false) &&
+  eo2.isNone && e2.showPane == false
+
 end VerificationChecks

@@ -57,7 +57,7 @@ private def elabPureComponent (spec : ComponentSpec) (body' : Term) : CommandEla
     let vCall ← if needsProps then `($(spec.viewId) p) else `(($(spec.viewId) : Html $msgV))
     let pf? : Option Term := if (invStx.getArg 6).getNumArgs == 2 then some ⟨(invStx.getArg 6).getArg 1⟩ else none
     let rhs ← pf?.getDM `(by let _qed_hv := fun (_ : Unit) => $vCall; suffices ∀ u, ($vPred) (_qed_hv u) = true from this (); qedDischargeStyling _qed_hv $invId $(Syntax.mkStrLit predStr))
-    elabCommand (← `(command| set_option linter.unusedSimpArgs false in theorem $invId:ident $[$viewBinders:bracketedBinder]* : ($vPred) $vCall = true := $rhs))
+    elabIsolatedTheorem (← `(command| set_option linter.unusedSimpArgs false in theorem $invId:ident $[$viewBinders:bracketedBinder]* : ($vPred) $vCall = true := $rhs))
   let info ← mkBaseCompInfo spec .pureView needsProps
   modifyEnv fun env => componentRegistry.addEntry env info
 

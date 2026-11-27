@@ -39,18 +39,11 @@ fn wait_with_coalesce(timeout_ms: u32, mut mask: u32, mut poll_once: impl FnMut(
     let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
     while mask == 0 {
         let Some(rem) = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) else { return 0 };
-        match poll_once(rem) {
-            Err(()) => return CHANGE_ERROR,
-            Ok(None) => return 0,
-            Ok(Some(m)) => mask |= m,
-        }
+        match poll_once(rem) { Err(()) => return CHANGE_ERROR, Ok(None) => return 0, Ok(Some(m)) => mask |= m }
     }
     let cap = Instant::now() + Duration::from_millis(120);
     while let Some(rem) = cap.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) {
-        match poll_once(rem.min(Duration::from_millis(35))) {
-            Ok(Some(m)) => mask |= m,
-            Ok(None) | Err(()) => break,
-        }
+        match poll_once(rem.min(Duration::from_millis(35))) { Ok(Some(m)) => mask |= m, _ => break }
     }
     mask
 }
@@ -186,16 +179,6 @@ static SSE_HUBS: HandleTable<Arc<SseHub>> = HandleTable::new();
 
 // ---- Lightweight Localhost Dev-Event SSE Push Server ----
 
-fn write_nonblock_all(s: &mut TcpStream, mut data: &[u8]) -> bool {
-    while !data.is_empty() {
-        match s.write(data) {
-            Ok(0) => return false, Ok(n) => data = &data[n..],
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue, Err(_) => return false,
-        }
-    }
-    true
-}
-
 struct SseHub { closed: AtomicBool, wake: WakeFd, last_frame: Mutex<Option<Vec<u8>>>, clients: Mutex<Vec<TcpStream>> }
 impl SseHub {
     fn new(clients: Vec<TcpStream>) -> Self { Self { closed: AtomicBool::new(false), wake: WakeFd::new(), last_frame: Mutex::new(None), clients: Mutex::new(clients) } }
@@ -205,17 +188,27 @@ impl SseHub {
         for line in payload.trim().lines() { out.extend_from_slice(line.as_bytes()); }
         out.extend_from_slice(b"\n\n"); out
     }
-    fn broadcast(&self, frame: &[u8]) { lock_unpoison(&self.clients).retain_mut(|s| write_nonblock_all(s, frame)); }
+    fn write_all(s: &mut TcpStream, mut data: &[u8]) -> bool {
+        while !data.is_empty() {
+            match s.write(data) {
+                Ok(n @ 1..) => data = &data[n..],
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                _ => return false,
+            }
+        }
+        true
+    }
+    fn broadcast(&self, frame: &[u8]) { lock_unpoison(&self.clients).retain_mut(|s| Self::write_all(s, frame)); }
     fn publish(&self, payload: &str) {
         let frame = Self::format_frame(payload);
         *lock_unpoison(&self.last_frame) = Some(frame.clone());
         self.broadcast(&frame);
     }
+    fn clear(&self) { lock_unpoison(&self.clients).clear(); }
 }
 
 fn handle_sse_connection(mut stream: TcpStream, hub: &Arc<SseHub>) {
-    let _ = (stream.set_nonblocking(false), stream.set_nodelay(true),
-             stream.set_read_timeout(Some(Duration::from_millis(500))), stream.set_write_timeout(Some(Duration::from_millis(250))));
+    let _ = (stream.set_nonblocking(false), stream.set_nodelay(true), stream.set_read_timeout(Some(Duration::from_millis(500))), stream.set_write_timeout(Some(Duration::from_millis(250))));
     let mut req_buf = [0u8; 2048];
     let Ok(n @ 1..) = stream.read(&mut req_buf) else { return };
     if req_buf[..n].starts_with(b"OPTIONS ") {
@@ -223,7 +216,8 @@ fn handle_sse_connection(mut stream: TcpStream, hub: &Arc<SseHub>) {
         return;
     }
     const HDR: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nCache-Control: no-cache, no-store\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\nX-Accel-Buffering: no\r\n\r\nretry: 500\n\n";
-    let ok = match lock_unpoison(&hub.last_frame).clone() { Some(f) => stream.write_all(&[HDR, &f].concat()), None => stream.write_all(HDR) }.is_ok();
+    let last = lock_unpoison(&hub.last_frame).clone();
+    let ok = stream.write_all(HDR).is_ok() && last.as_deref().is_none_or(|f| stream.write_all(f).is_ok());
     if !ok || stream.set_nonblocking(true).is_err() { return; }
     let mut clients = lock_unpoison(&hub.clients);
     if !hub.closed.load(Ordering::Acquire) && clients.len() < 64 { clients.push(stream); }
@@ -238,7 +232,8 @@ ffi_export! {
         qed_lean_io_mk_ok(qed_lean_box_u32(WATCHERS.get(handle).map_or(CHANGE_ERROR, |w| lock_unpoison(&w).wait(timeout_ms))));
     qed_watch_close(handle: u64) => { WATCHERS.remove(handle); mk_io_unit() };
     qed_dev_sse_start(port: u16) => mk_io_except(bind_loopback_nonblock(port).map(|(listener, actual_port)| {
-        let (hub, hub_bg) = { let h = Arc::new(SseHub::new(Vec::new())); (h.clone(), h) };
+        let hub = Arc::new(SseHub::new(Vec::new()));
+        let hub_bg = hub.clone();
         std::thread::spawn(move || {
             let (lfd, wfd, mut last_ping) = (listener.as_raw_fd(), hub_bg.wake.read_fd(), Instant::now());
             while !hub_bg.closed.load(Ordering::Acquire) {
@@ -256,13 +251,13 @@ ffi_export! {
                 let nfds: libc::nfds_t = if wfd >= 0 { 2 } else { 1 };
                 if unsafe { libc::poll(pfds.as_mut_ptr(), nfds, rem) } > 0 && nfds == 2 && (pfds[1].revents & libc::POLLIN) != 0 { hub_bg.wake.drain(); }
             }
-            lock_unpoison(&hub_bg.clients).clear();
+            hub_bg.clear();
         });
         (SSE_HUBS.insert(hub), actual_port)
     }), |(id, p)| qed_lean_mk_prod(qed_lean_box_u64(id), qed_lean_box(p as usize)));
     qed_dev_sse_publish(handle: u64, payload: *mut LeanObj) => { if let Some(h) = SSE_HUBS.get(handle) { h.publish(str_slice(payload)); } mk_io_unit() };
     qed_dev_sse_stop(handle: u64) => {
-        if let Some(h) = SSE_HUBS.remove(handle) { h.closed.store(true, Ordering::Release); h.wake.wake(); lock_unpoison(&h.clients).clear(); }
+        if let Some(h) = SSE_HUBS.remove(handle) { h.closed.store(true, Ordering::Release); h.wake.wake(); h.clear(); }
         mk_io_unit()
     };
 }
@@ -270,6 +265,7 @@ ffi_export! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::TempDir;
 
     #[test]
     fn sse_hub_format_and_drops_stalled_peer() {
@@ -278,13 +274,9 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let pair = || { let (c, s) = (TcpStream::connect(addr).unwrap(), listener.accept().unwrap().0); s.set_nonblocking(true).unwrap(); (c, s) };
         let ((mut healthy_cli, healthy_srv), (stalled_cli, mut stalled_srv)) = (pair(), pair());
-        unsafe {
-            crate::set_sockopt(stalled_srv.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, 4096);
-            crate::set_sockopt(stalled_cli.as_raw_fd(), libc::SOL_SOCKET, libc::SO_RCVBUF, 4096);
-        }
+        unsafe { crate::set_sockopt(stalled_srv.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, 4096); crate::set_sockopt(stalled_cli.as_raw_fd(), libc::SOL_SOCKET, libc::SO_RCVBUF, 4096); }
         assert!((0..4096).any(|_| match stalled_srv.write(&[b'x'; 4096]) {
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => true,
-            Ok(0) | Err(_) => panic!("unexpected write error before saturation"), Ok(_) => false,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => true, Ok(0) | Err(_) => panic!("unexpected write error before saturation"), Ok(_) => false,
         }), "failed to saturate loopback send buffer");
         let hub = SseHub::new(vec![stalled_srv, healthy_srv]);
         hub.publish("{\"status\":\"ok\"}");
@@ -298,35 +290,20 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn os_watcher_coalesces_split_write_without_stale_followup() {
-        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        let base = std::env::temp_dir().join(format!("qed-watch-test-{}-{nanos}", std::process::id()));
-        let (proj, rt) = (base.join("proj"), base.join("rt"));
-        std::fs::create_dir_all(proj.join(".lake")).unwrap();
-        std::fs::create_dir_all(&rt).unwrap();
+        let tmp = TempDir::new("watch");
+        let (proj, rt) = (tmp.0.join("proj"), tmp.0.join("rt"));
+        for d in [proj.join(".lake"), rt.clone()] { std::fs::create_dir_all(d).unwrap(); }
         let (lean_p, css_p, rt_p) = (proj.join("Demo.lean"), proj.join("site.css"), rt.join("qed_dev.mjs"));
-        for (p, b) in [(&lean_p, b"def x := 1\n".as_slice()), (&css_p, b"body{}\n"), (&rt_p, b"// v1\n")] { std::fs::write(p, b).unwrap(); }
-        let skip = [".lake".to_string()].into_iter().collect();
-        let watcher = Arc::new(Mutex::new(os_watch::OsWatcher::open(proj.to_str().unwrap(), rt.to_str().unwrap(), skip).unwrap()));
+        for (p, b) in [(&lean_p, &b"def x := 1\n"[..]), (&css_p, b"body{}\n"), (&rt_p, b"// v1\n")] { std::fs::write(p, b).unwrap(); }
+        let watcher = Arc::new(Mutex::new(os_watch::OsWatcher::open(proj.to_str().unwrap(), rt.to_str().unwrap(), [".lake".into()].into()).unwrap()));
         let wait_bg = || { let w = watcher.clone(); std::thread::spawn(move || lock_unpoison(&w).wait(1500)) };
-
-        // Split open(O_TRUNC), write(), and close() to verify coalescing leaves no stale event behind.
         let t = wait_bg();
         std::thread::sleep(Duration::from_millis(20));
-        {
-            let mut f = std::fs::File::create(&lean_p).unwrap();
-            std::thread::sleep(Duration::from_millis(10));
-            f.write_all(b"def x := 2\n").unwrap();
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert_eq!(t.join().unwrap(), CHANGE_LEAN);
-        assert_eq!(lock_unpoison(&watcher).wait(60), 0);
-
-        for (path, bytes, want) in [(&css_p, b"body{color:red}\n".as_slice(), CHANGE_CSS), (&rt_p, b"// v2\n", CHANGE_RUNTIME)] {
-            let tn = wait_bg();
-            std::thread::sleep(Duration::from_millis(20));
-            std::fs::write(path, bytes).unwrap();
+        { let mut f = std::fs::File::create(&lean_p).unwrap(); std::thread::sleep(Duration::from_millis(10)); f.write_all(b"def x := 2\n").unwrap(); std::thread::sleep(Duration::from_millis(10)); }
+        assert_eq!((t.join().unwrap(), lock_unpoison(&watcher).wait(60)), (CHANGE_LEAN, 0));
+        for (path, bytes, want) in [(&css_p, &b"body{color:red}\n"[..], CHANGE_CSS), (&rt_p, b"// v2\n", CHANGE_RUNTIME)] {
+            let tn = wait_bg(); std::thread::sleep(Duration::from_millis(20)); std::fs::write(path, bytes).unwrap();
             assert_eq!(tn.join().unwrap(), want);
         }
-        let _ = std::fs::remove_dir_all(&base);
     }
 }

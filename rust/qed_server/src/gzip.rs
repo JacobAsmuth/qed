@@ -182,46 +182,41 @@ mod tests {
         let (mut stdin, payload) = (child.stdin.take().unwrap(), gz.to_vec());
         let w = std::thread::spawn(move || { let _ = stdin.write_all(&payload); });
         let out = child.wait_with_output().expect("wait gzip -dc"); w.join().unwrap();
-        assert!(out.status.success(), "gzip -dc failed: {}", String::from_utf8_lossy(&out.stderr));
-        out.stdout
+        assert!(out.status.success(), "gzip -dc failed: {}", String::from_utf8_lossy(&out.stderr)); out.stdout
     }
-    fn crc32_ref(data: &[u8]) -> u32 {
-        !data.iter().fold(!0u32, |mut c, &b| { c ^= b as u32; for _ in 0..8 { c = (c >> 1) ^ (0xEDB8_8320 & (c & 1).wrapping_neg()); } c })
-    }
-    fn mk_repetitive_40k(rows: u32, modulo: u32) -> Vec<u8> {
-        (0..rows).flat_map(|i| format!("<div class=\"row\" data-id=\"{i}\">item-{}-payload</div>\n", i % modulo).into_bytes()).collect()
+    fn mk_repetitive_40k(rows: u32, m: u32) -> Vec<u8> {
+        (0..rows).flat_map(|i| format!("<div class=\"row\" data-id=\"{i}\">item-{}-payload</div>\n", i % m).into_bytes()).collect()
     }
 
     #[test]
     fn crc32_vectors_and_alignments() {
-        assert_eq!((crc32(b""), crc32(b"123456789")), (0x0000_0000, 0xCBF4_3926));
+        let crc_ref = |d: &[u8]| !d.iter().fold(!0u32, |mut c, &b| { c ^= b as u32; for _ in 0..8 { c = (c >> 1) ^ (0xEDB8_8320 & (c & 1).wrapping_neg()); } c });
+        assert_eq!((crc32(b""), crc32(b"123456789")), (0, 0xCBF4_3926));
         let buf: Vec<u8> = (0..64u8).map(|i| i.wrapping_mul(37).wrapping_add(13)).collect();
-        for start in 0..8 { for len in 0..=33 { let s = &buf[start..start + len]; assert_eq!(crc32(s), crc32_ref(s), "mismatch at start={start}, len={len}"); } }
+        for s in 0..8 { for l in 0..=33 { assert_eq!(crc32(&buf[s..s + l]), crc_ref(&buf[s..s + l]), "s={s}, l={l}"); } }
     }
 
     #[test]
     fn gzip_roundtrip_table() {
         let mut rng = 0x9E37_79B9_7F4A_7C15u64;
-        let random_16k: Vec<u8> = (0..16384).map(|_| { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; (rng >> 24) as u8 }).collect();
+        let rnd16k: Vec<u8> = (0..16384).map(|_| { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; (rng >> 24) as u8 }).collect();
         for (name, input) in [
             ("empty", Vec::new()), ("1B", vec![b'z']), ("3B", b"abc".to_vec()), ("258B_max_match", vec![b'A'; 258]),
-            ("40KiB_window_wrap", mk_repetitive_40k(700, 53)), ("16KiB_random", random_16k), ("8KiB_repetitive", b"hello-qed-gzip-runtime!".repeat(360)),
-        ] { assert_eq!(&gunzip(&gzip_compress(&input, |b| b.to_vec())), &input, "round-trip failed for `{name}`"); }
+            ("40KiB_window_wrap", mk_repetitive_40k(700, 53)), ("16KiB_random", rnd16k), ("8KiB_repetitive", b"hello-qed-gzip-runtime!".repeat(360)),
+        ] { assert_eq!(gunzip(&gzip_compress(&input, |b| b.to_vec())), input, "case `{name}`"); }
     }
 
     #[test]
     fn gzip_base_epoch_wrap_equivalence() {
         let (payload, mut fresh, mut dirty) = (mk_repetitive_40k(750, 41), GzipScratch::new(), GzipScratch::new());
         fresh.compress_into(&payload);
-        let expected = fresh.out.clone();
         dirty.compress_into(&b"seed-different-data-for-hash-tables-1234567890".repeat(900));
         dirty.base = u32::MAX - 10; dirty.compress_into(&payload);
-        assert_eq!(dirty.out, expected, "epoch wrap must match fresh scratch byte-for-byte");
+        assert_eq!(dirty.out, fresh.out, "epoch wrap must match fresh scratch byte-for-byte");
         let small = b"{\"status\":\"ok\",\"items\":[1,2,3,4,5,1,2,3,4,5]}";
         fresh.compress_into(small);
         dirty.base = u32::MAX - (small.len() as u32 + 1); dirty.compress_into(small);
         assert_eq!((&dirty.out, dirty.base), (&fresh.out, u32::MAX));
-        dirty.compress_into(small);
-        assert_eq!(dirty.out, fresh.out);
+        dirty.compress_into(small); assert_eq!(dirty.out, fresh.out);
     }
 }

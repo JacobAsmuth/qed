@@ -1,16 +1,6 @@
-use std::collections::HashMap;
-use std::net::TcpListener;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
-use std::time::Instant;
+use std::{collections::HashMap, net::TcpListener, sync::{atomic::{AtomicU64, Ordering}, Condvar, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard}, time::Instant};
 
-mod crypto;
-mod gzip;
-mod lean_ffi;
-mod outbound;
-mod server;
-mod sqlite;
-mod watch;
+mod crypto; mod gzip; mod lean_ffi; mod outbound; mod server; mod sqlite; mod watch;
 
 pub(crate) fn last_errno() -> i32 { std::io::Error::last_os_error().raw_os_error().unwrap_or(0) }
 pub(crate) fn is_wouldblock(e: i32) -> bool { e == libc::EAGAIN || e == libc::EWOULDBLOCK }
@@ -101,8 +91,17 @@ pub(crate) fn parse_pem_blocks(pem: &str, label: &str) -> Vec<Vec<u8>> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use std::{path::PathBuf, time::{SystemTime, UNIX_EPOCH}};
+
+    pub(crate) struct TempDir(pub PathBuf);
+    impl TempDir {
+        pub(crate) fn new(tag: &str) -> Self {
+            Self(std::env::temp_dir().join(format!("qed_{tag}_{}_{}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos())))
+        }
+    }
+    impl Drop for TempDir { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
 
     #[test]
     fn handle_table_sharded_crud() {
@@ -111,7 +110,7 @@ mod tests {
         for (i, &id) in ids.iter().enumerate() { assert_eq!(tbl.get(id), Some((i as u64) * 10)); }
         tbl.insert_at(ids[3], 999);
         assert_eq!(tbl.get(ids[3]), Some(999));
-        for &id in &ids { assert!(tbl.remove(id).is_some()); assert_eq!(tbl.get(id), None); }
+        for &id in &ids { assert!(tbl.remove(id).is_some() && tbl.get(id).is_none()); }
     }
 
     #[test]

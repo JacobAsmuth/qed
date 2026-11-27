@@ -1,6 +1,5 @@
-use std::{collections::{HashMap, HashSet, VecDeque}, io::{self, Write}, net::{IpAddr, Ipv4Addr, Ipv6Addr}, str::FromStr};
+use std::{collections::{HashMap, HashSet, VecDeque}, io::{self, Write}, net::{IpAddr, Ipv4Addr, Ipv6Addr}, str::FromStr, thread, time::{Duration, Instant}};
 use std::sync::{atomic::{AtomicBool, AtomicUsize, Ordering}, Arc, Condvar, Mutex, OnceLock, RwLock};
-use std::{thread, time::{Duration, Instant}};
 
 use crate::lean_ffi::*;
 use crate::{WakeFd, close_fd, is_wouldblock, last_errno, lock_unpoison, read_unpoison, set_sockopt, wait_unpoison, write_unpoison};
@@ -14,13 +13,8 @@ const TOKEN_LISTEN: u64 = 1;
 const TOKEN_WAKE: u64 = 2;
 const RL_SHARDS: usize = 16;
 const RL_MAX_ENTRIES_PER_SHARD: usize = 4096;
-const RESP_503_WIRE: &[u8] =
-    b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 19\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\nserver overloaded\r\n";
 
 fn env_parse<T: FromStr>(k: &str) -> Option<T> { std::env::var(k).ok().and_then(|s| s.trim().parse().ok()) }
-fn fmt_stack<'a>(buf: &'a mut [u8], args: std::fmt::Arguments<'_>) -> &'a [u8] {
-    let mut c = io::Cursor::new(&mut buf[..]); let _ = c.write_fmt(args); let n = c.position() as usize; &buf[..n]
-}
 
 // ---- Sharded Per-IP Token-Bucket Rate Limiter ----
 
@@ -64,13 +58,12 @@ extern "C" fn handle_stop_signal(_: libc::c_int) { STOP.store(true, Ordering::Se
 
 // ---- Cursor-Based RX Byte Queue & Incremental Header Scanner ----
 
+#[derive(Default)]
 struct ByteQueue { buf: Vec<u8>, pos: usize }
 impl ByteQueue {
-    fn new() -> Self { Self { buf: Vec::new(), pos: 0 } }
     #[inline] fn as_slice(&self) -> &[u8] { &self.buf[self.pos..] }
     #[inline] fn len(&self) -> usize { self.buf.len() - self.pos }
     #[inline] fn is_empty(&self) -> bool { self.pos >= self.buf.len() }
-
     fn write_spare(&mut self, want: usize, max_len: usize, f: impl FnOnce(*mut u8, usize) -> isize) -> (isize, usize) {
         if self.pos >= self.buf.len() { self.buf.clear(); self.pos = 0; }
         let cap = want.min(max_len.saturating_sub(self.len()));
@@ -116,7 +109,6 @@ impl<T> ConnSlab<T> {
     #[inline] fn encode(i: usize, g: u64) -> u64 { (g << 16) | (i as u64) }
     #[inline] fn decode(t: u64) -> Option<(usize, u64)> { let g = t >> 16; (g != 0).then_some(((t & 0xFFFF) as usize, g)) }
     #[inline] fn next_gen(g: u64) -> u64 { (g.wrapping_add(1) & 0x0000_FFFF_FFFF_FFFF).max(1) }
-
     fn alloc_slot(&mut self) -> (u32, u64) {
         if let Some(i) = self.free.pop() { (i, Self::encode(i as usize, self.slots[i as usize].gen)) } else {
             let i = self.slots.len() as u32; debug_assert!(i <= 0xFFFF);
@@ -148,10 +140,7 @@ enum DoneEvent {
     WsStep { token: u64, ws_ctx: LeanRef, consumed: usize, out_wire: Option<LeanRef>, close: bool, new_frag: Option<LeanRef>, ops: Vec<SubOp> },
 }
 
-struct WorkerInbox {
-    done: Mutex<VecDeque<DoneEvent>>, bcast: Mutex<VecDeque<Arc<BcastMsg>>>,
-    wake_fd: WakeFd, wake_pending: AtomicBool, ws_subs: AtomicUsize,
-}
+struct WorkerInbox { done: Mutex<VecDeque<DoneEvent>>, bcast: Mutex<VecDeque<Arc<BcastMsg>>>, wake_fd: WakeFd, wake_pending: AtomicBool, ws_subs: AtomicUsize }
 impl WorkerInbox {
     fn new() -> Self { Self { done: Mutex::new(VecDeque::new()), bcast: Mutex::new(VecDeque::new()), wake_fd: WakeFd::new(), wake_pending: AtomicBool::new(false), ws_subs: AtomicUsize::new(0) } }
     fn push_done(&self, ev: DoneEvent) { lock_unpoison(&self.done).push_back(ev); self.wake(); }
@@ -170,25 +159,23 @@ enum PoolJob {
     WsLeave { ws_ctx: LeanRef, channel: String, params: Vec<u8> },
 }
 
-struct PoolQueue { jobs: VecDeque<PoolJob>, idle: usize, closed: bool }
-struct BlockingPool { queue: Mutex<PoolQueue>, cv: Condvar, idle_hint: AtomicUsize, handles: Mutex<Vec<thread::JoinHandle<()>>> }
+struct BlockingPool { queue: Mutex<(VecDeque<PoolJob>, usize, bool)>, cv: Condvar, idle_hint: AtomicUsize, handles: Mutex<Vec<thread::JoinHandle<()>>> }
 impl BlockingPool {
     fn new(num_threads: usize, cbs: Arc<Callbacks>) -> Arc<Self> {
-        let pool = Arc::new(Self { queue: Mutex::new(PoolQueue { jobs: VecDeque::new(), idle: 0, closed: false }), cv: Condvar::new(), idle_hint: AtomicUsize::new(0), handles: Mutex::new(Vec::new()) });
+        let pool = Arc::new(Self { queue: Mutex::new((VecDeque::new(), 0, false)), cv: Condvar::new(), idle_hint: AtomicUsize::new(0), handles: Mutex::new(Vec::new()) });
         *lock_unpoison(&pool.handles) = (0..num_threads).map(|_| {
             let (p, c) = (pool.clone(), cbs.clone());
             thread::spawn(move || {
                 unsafe { lean_initialize_thread() };
                 loop {
                     let mut q = lock_unpoison(&p.queue);
-                    while q.jobs.is_empty() && !q.closed {
-                        q.idle += 1; p.idle_hint.store(q.idle, Ordering::Relaxed);
+                    while q.0.is_empty() && !q.2 {
+                        q.1 += 1; p.idle_hint.store(q.1, Ordering::Relaxed);
                         q = wait_unpoison(&p.cv, q);
-                        q.idle -= 1; p.idle_hint.store(q.idle, Ordering::Relaxed);
+                        q.1 -= 1; p.idle_hint.store(q.1, Ordering::Relaxed);
                     }
-                    let Some(job) = q.jobs.pop_front() else { break };
-                    drop(q);
-                    exec_pool_job(&c, job);
+                    let Some(job) = q.0.pop_front() else { break };
+                    drop(q); exec_pool_job(&c, job);
                 }
                 unsafe { lean_finalize_thread() };
             })
@@ -197,24 +184,21 @@ impl BlockingPool {
     }
     fn try_push(&self, job: PoolJob, bounded: bool, idle_only: bool) -> Result<(), PoolJob> {
         let mut q = lock_unpoison(&self.queue);
-        if q.closed || if idle_only { q.idle == 0 || !q.jobs.is_empty() } else { bounded && q.jobs.len() >= 8192 } { return Err(job); }
-        let notify = q.idle > 0; q.jobs.push_back(job); drop(q);
-        if notify { self.cv.notify_one(); }
-        Ok(())
+        if q.2 || if idle_only { q.1 == 0 || !q.0.is_empty() } else { bounded && q.0.len() >= 8192 } { return Err(job); }
+        let notify = q.1 > 0; q.0.push_back(job); drop(q);
+        if notify { self.cv.notify_one(); } Ok(())
     }
     fn shutdown(&self) {
-        { lock_unpoison(&self.queue).closed = true; self.cv.notify_all(); }
+        { lock_unpoison(&self.queue).2 = true; self.cv.notify_all(); }
         for h in std::mem::take(&mut *lock_unpoison(&self.handles)) { let _ = h.join(); }
     }
 }
 
 fn submit_pool_job(pools: &[Arc<BlockingPool>], idx: usize, mut job: PoolJob, bounded: bool) -> bool {
-    if pools[idx].idle_hint.load(Ordering::Relaxed) == 0 && pools.len() > 1 {
+    if pools[idx].idle_hint.load(Ordering::Relaxed) == 0 {
         for off in 1..pools.len() {
             let peer = &pools[(idx + off) % pools.len()];
-            if peer.idle_hint.load(Ordering::Relaxed) > 0 {
-                match peer.try_push(job, false, true) { Ok(()) => return true, Err(j) => job = j }
-            }
+            if peer.idle_hint.load(Ordering::Relaxed) > 0 { match peer.try_push(job, false, true) { Ok(()) => return true, Err(j) => job = j } }
         }
     }
     pools[idx].try_push(job, bounded, false).is_ok()
@@ -223,8 +207,8 @@ fn submit_pool_job(pools: &[Arc<BlockingPool>], idx: usize, mut job: PoolJob, bo
 #[inline] unsafe fn mk_ba_mt(data: &[u8]) -> LeanRef { let ba = mk_ba(data); if !data.is_empty() { lean_mark_mt(ba); } LeanRef(ba) }
 unsafe fn mk_ip_lean(ip: IpAddr) -> LeanRef {
     let mut buf = [0u8; 64];
-    let obj = mk_str(std::str::from_utf8_unchecked(fmt_stack(&mut buf, format_args!("{ip}"))));
-    lean_mark_mt(obj); LeanRef(obj)
+    let n = { let mut c = io::Cursor::new(&mut buf[..]); let _ = write!(c, "{ip}"); c.position() as usize };
+    let obj = mk_str(std::str::from_utf8_unchecked(&buf[..n])); lean_mark_mt(obj); LeanRef(obj)
 }
 unsafe fn build_subs_arr(subs: &[WsSub]) -> LeanRef {
     let mut arr = qed_lean_array_with_cap(subs.len());
@@ -327,11 +311,9 @@ impl Poller {
 
 fn parse_bind_ip(host: &str) -> io::Result<IpAddr> {
     let t = host.trim();
-    if t.is_empty() { Ok(IpAddr::V4(Ipv4Addr::UNSPECIFIED)) } else {
-        IpAddr::from_str(t.strip_prefix('[').and_then(|s| s.strip_suffix(']')).unwrap_or(t)).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, format!("invalid bind IP `{host}`")))
-    }
+    if t.is_empty() { return Ok(IpAddr::V4(Ipv4Addr::UNSPECIFIED)); }
+    IpAddr::from_str(t.strip_prefix('[').and_then(|s| s.strip_suffix(']')).unwrap_or(t)).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, format!("invalid bind IP `{host}`")))
 }
-
 fn create_listener(bind_ip: IpAddr, port: u16, allow_reuseport: bool) -> io::Result<libc::c_int> {
     unsafe {
         #[cfg(target_os = "linux")] let ty = libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC;
@@ -350,19 +332,13 @@ fn create_listener(bind_ip: IpAddr, port: u16, allow_reuseport: bool) -> io::Res
         Ok(fd)
     }
 }
-
-fn bound_port(fd: libc::c_int) -> u16 {
-    std::mem::ManuallyDrop::new(unsafe { <std::net::TcpListener as std::os::fd::FromRawFd>::from_raw_fd(fd) }).local_addr().map_or(0, |a| a.port())
-}
-
+fn bound_port(fd: libc::c_int) -> u16 { std::mem::ManuallyDrop::new(unsafe { <std::net::TcpListener as std::os::fd::FromRawFd>::from_raw_fd(fd) }).local_addr().map_or(0, |a| a.port()) }
 fn peer_ip_addr(st: &libc::sockaddr_storage) -> IpAddr {
-    unsafe {
-        match st.ss_family as libc::c_int {
-            libc::AF_INET => IpAddr::V4(Ipv4Addr::from((&*(st as *const _ as *const libc::sockaddr_in)).sin_addr.s_addr.to_ne_bytes())),
-            libc::AF_INET6 => { let v6 = Ipv6Addr::from((&*(st as *const _ as *const libc::sockaddr_in6)).sin6_addr.s6_addr); v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4) }
-            _ => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-        }
-    }
+    unsafe { match st.ss_family as libc::c_int {
+        libc::AF_INET => IpAddr::V4(Ipv4Addr::from((&*(st as *const _ as *const libc::sockaddr_in)).sin_addr.s_addr.to_ne_bytes())),
+        libc::AF_INET6 => { let v6 = Ipv6Addr::from((&*(st as *const _ as *const libc::sockaddr_in6)).sin6_addr.s6_addr); v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4) }
+        _ => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+    }}
 }
 
 #[cfg(target_os = "linux")] const SEND_FLAGS: libc::c_int = libc::MSG_NOSIGNAL;
@@ -374,10 +350,10 @@ fn send_iovs(fd: libc::c_int, iovs: &[libc::iovec]) -> SendRes {
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     (msg.msg_iov, msg.msg_iovlen) = (iovs.as_ptr() as *mut _, iovs.len() as _);
     loop {
-        let n = unsafe { libc::sendmsg(fd, &msg, SEND_FLAGS) };
-        if n > 0 { return SendRes::Done(n as usize); }
-        if n == 0 { return SendRes::Err; }
-        match last_errno() { libc::EINTR => continue, e if is_wouldblock(e) => return SendRes::WouldBlock, _ => return SendRes::Err }
+        match unsafe { libc::sendmsg(fd, &msg, SEND_FLAGS) } {
+            n if n > 0 => return SendRes::Done(n as usize), 0 => return SendRes::Err,
+            _ => match last_errno() { libc::EINTR => continue, e if is_wouldblock(e) => return SendRes::WouldBlock, _ => return SendRes::Err },
+        }
     }
 }
 
@@ -389,7 +365,6 @@ impl TxChunk {
     #[inline] fn as_slice(&self) -> &[u8] { let s = match &self.buf { TxBuf::Wire(w) => w.as_bytes(), TxBuf::Owned(v) => v }; &s[self.off..] }
     #[inline] fn len(&self) -> usize { self.as_slice().len() }
 }
-
 struct WsSub { sub_id: u32, topic: String, channel: String, params: Vec<u8> }
 struct PendingBody { content_len: usize, keep_alive: bool, req: LeanRef, inline: bool }
 #[derive(Copy, Clone, Eq, PartialEq)] enum ConnStep { Continue, Done, Close }
@@ -401,10 +376,8 @@ struct Conn {
     is_ws: bool, ws_ctx: Option<LeanRef>, frag: Option<LeanRef>, subs: Vec<WsSub>, subs_arr: Option<LeanRef>,
     last_active: Instant, last_ping: Instant,
 }
-
 impl Conn {
     #[inline] fn consume_rx(&mut self, n: usize) { self.rx.consume(n); self.rx_hdr_scanned = 0; }
-
     #[inline] fn send_parts(&mut self, poller: &Poller, a: &[u8], b: &[u8], make: impl FnOnce(usize) -> TxChunk) -> bool {
         let total = a.len() + b.len();
         if total == 0 { return true; }
@@ -414,26 +387,21 @@ impl Conn {
                 let (s1, s2) = if off < a.len() { (&a[off..], b) } else { (&b[off - a.len()..], &[][..]) };
                 match send_iovs(self.fd, &[iov(s1), iov(s2)][..1 + usize::from(!s2.is_empty())]) {
                     SendRes::Done(n) => { off += n; if off >= total { return true; } }
-                    SendRes::WouldBlock => break,
-                    SendRes::Err => return false,
+                    SendRes::WouldBlock => break, SendRes::Err => return false,
                 }
             }
             off
         } else if self.tx_bytes.saturating_add(total) > MAX_TX_BUF_BYTES { return false; } else { 0 };
-        let chunk = make(off);
-        self.tx_bytes += chunk.len();
-        self.tx.push_back(chunk);
+        let chunk = make(off); self.tx_bytes += chunk.len(); self.tx.push_back(chunk);
         if !self.tx_armed { poller.set_write(self.fd, self.token, true); self.tx_armed = true; }
         true
     }
-
     fn send_wire(&mut self, poller: &Poller, wire: LeanRef) -> bool { self.send_parts(poller, unsafe { ba_slice(wire.0) }, &[], |off| TxChunk { buf: TxBuf::Wire(wire), off }) }
     /// Inline ST fast path: sends from borrowed Lean ByteArray without `mark_mt` unless queueing in `self.tx`.
     unsafe fn send_borrowed_ba(&mut self, poller: &Poller, ba: *mut LeanObj) -> bool { self.send_parts(poller, ba_slice(ba), &[], |off| TxChunk { buf: TxBuf::Wire(LeanRef::clone_mt(ba)), off }) }
     fn send_slice(&mut self, poller: &Poller, data: &[u8]) -> bool { self.send_parts(poller, data, &[], |off| TxChunk { buf: TxBuf::Owned(data[off..].to_vec()), off: 0 }) }
     fn send_ws_event(&mut self, poller: &Poller, sub_id: u32, payload: &[u8]) -> bool {
-        let (total, mut hdr) = (5 + payload.len(), [0u8; 15]);
-        hdr[0] = 0x82;
+        let (total, mut hdr) = (5 + payload.len(), [0x82u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         let hlen = match total {
             0..=125 => { hdr[1] = total as u8; 2 }
             126..=65535 => { hdr[1] = 126; hdr[2..4].copy_from_slice(&(total as u16).to_be_bytes()); 4 }
@@ -446,7 +414,6 @@ impl Conn {
             TxChunk { buf: TxBuf::Owned([rh, rp].concat()), off: 0 }
         })
     }
-
     fn flush_tx(&mut self, poller: &Poller) -> bool {
         for _ in 0..MAX_TX_SEND_ITERS {
             let (mut iovs, mut count): ([libc::iovec; 16], usize) = (unsafe { std::mem::zeroed() }, 0);
@@ -457,8 +424,7 @@ impl Conn {
                     self.tx_bytes = self.tx_bytes.saturating_sub(sent);
                     while sent > 0 { let fl = self.tx[0].len(); if sent >= fl { sent -= fl; self.tx.pop_front(); } else { self.tx[0].off += sent; sent = 0; } }
                 }
-                SendRes::WouldBlock => break,
-                SendRes::Err => return false,
+                SendRes::WouldBlock => break, SendRes::Err => return false,
             }
         }
         if self.tx.is_empty() && self.tx_armed { poller.set_write(self.fd, self.token, false); self.tx_armed = false; }
@@ -469,7 +435,15 @@ impl Conn {
         !self.in_flight && self.tx.is_empty() && (self.close_after_tx || ((self.peer_eof || hangup) && (self.rx.is_empty() || self.is_ws)))
     }
     fn close_step(&mut self, sent: bool) -> ConnStep { self.close_after_tx = true; if !sent || self.tx.is_empty() { ConnStep::Close } else { ConnStep::Done } }
-    fn send_and_close(&mut self, poller: &Poller, data: &[u8]) -> ConnStep { let s = self.send_slice(poller, data); self.close_step(s) }
+    fn send_error_close(&mut self, poller: &Poller, status: &str, retry: Option<u64>, body: &str) -> ConnStep {
+        let mut buf = [0u8; 256];
+        let mut c = io::Cursor::new(&mut buf[..]);
+        let _ = write!(c, "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\n", body.len());
+        if let Some(ra) = retry { let _ = write!(c, "Retry-After: {ra}\r\n"); }
+        let _ = write!(c, "X-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n{body}");
+        let n = c.position() as usize;
+        let s = self.send_slice(poller, &buf[..n]); self.close_step(s)
+    }
     fn finish_write(&mut self, sent: bool, keep_open: bool, can_cont: bool) -> ConnStep {
         if !sent || !keep_open { self.close_step(sent) } else if self.ready_to_close(false) { ConnStep::Close }
         else if can_cont && !self.rx.is_empty() { ConnStep::Continue } else { ConnStep::Done }
@@ -479,7 +453,6 @@ impl Conn {
         (self.is_ws, self.ws_ctx, self.frag, self.subs_arr, self.last_active, self.last_ping) = (true, Some(ws_ctx), Some(init_frag.clone()), None, now, now);
         if self.rx.is_empty() { ConnStep::Done } else { ConnStep::Continue }
     }
-
     /// Returns `None` iff `on_head` returned tag 7 (`DeferHead` for OIDC WS upgrades).
     fn eval_head_inline(&mut self, poller: &Poller, cbs: &Callbacks, head_end: usize, consume: usize, now: Instant) -> Option<ConnStep> {
         unsafe {
@@ -529,6 +502,23 @@ fn topic_remove_from(topics: &mut HashMap<String, HashSet<(u64, u32)>>, inbox: &
     }
 }
 
+fn apply_ws_sub_ops(topics: &mut HashMap<String, HashSet<(u64, u32)>>, inbox: &WorkerInbox, widx: usize, use_bm: bool, token: u64, conn: &mut Conn, ops: Vec<SubOp>) {
+    if ops.is_empty() { return; }
+    for op in ops {
+        let sid = match &op { SubOp::Add(s, ..) | SubOp::Remove(s) => *s };
+        if let Some(i) = conn.subs.iter().position(|s| s.sub_id == sid) {
+            let ot = conn.subs.swap_remove(i).topic; topic_remove_from(topics, inbox, widx, use_bm, &ot, token, sid);
+        }
+        if let SubOp::Add(sid, topic, channel, params) = op {
+            conn.subs.push(WsSub { sub_id: sid, topic: topic.clone(), channel, params });
+            let set = topics.entry(topic.clone()).or_default(); let first = set.is_empty();
+            if set.insert((token, sid)) { inbox.ws_subs.fetch_add(1, Ordering::Release); }
+            if first && use_bm { *write_unpoison(topic_workers()).entry(topic).or_insert(0) |= 1u64 << widx; }
+        }
+    }
+    conn.subs_arr = None;
+}
+
 impl Worker {
     fn spawn_and_run(listen_fd: libc::c_int, inbox: Arc<WorkerInbox>, idx: usize, pools: Arc<Vec<Arc<BlockingPool>>>, cbs: Arc<Callbacks>, rate_limiter: Option<Arc<RateLimiter>>) {
         let Ok(poller) = Poller::new() else { eprintln!("✗ failed to initialize poller"); close_fd(listen_fd); return; };
@@ -536,7 +526,6 @@ impl Worker {
         if inbox.wake_fd.read_fd() >= 0 { poller.add_read(inbox.wake_fd.read_fd(), TOKEN_WAKE); }
         Self { poller, listen_fd, inbox, idx, pools, cbs, rate_limiter, conns: ConnSlab::new(), topics: HashMap::new(), done_buf: VecDeque::new(), bcast_buf: VecDeque::new(), now: Instant::now() }.run();
     }
-
     fn accept_all(&mut self) {
         loop {
             let (mut st, mut len): (libc::sockaddr_storage, _) = (unsafe { std::mem::zeroed() }, std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t);
@@ -551,13 +540,12 @@ impl Worker {
             if !self.poller.add_read(fd, token) { self.conns.cancel_slot(slot_idx); close_fd(fd); continue; }
             let (ip_addr, now) = (peer_ip_addr(&st), self.now);
             self.conns.insert_at(slot_idx, Conn {
-                token, fd, ip_addr, ip_lean: unsafe { mk_ip_lean(ip_addr) }, rx: ByteQueue::new(), rx_hdr_scanned: 0,
+                token, fd, ip_addr, ip_lean: unsafe { mk_ip_lean(ip_addr) }, rx: ByteQueue::default(), rx_hdr_scanned: 0,
                 tx: VecDeque::new(), tx_bytes: 0, tx_armed: false, peer_eof: false, close_after_tx: false, in_flight: false,
                 pending_body: None, is_ws: false, ws_ctx: None, frag: None, subs: Vec::new(), subs_arr: None, last_active: now, last_ping: now,
             });
         }
     }
-
     fn close_conn(&mut self, token: u64) {
         let Some(conn) = self.conns.remove(token) else { return };
         self.poller.remove(conn.fd); close_fd(conn.fd);
@@ -569,42 +557,35 @@ impl Worker {
             }
         }
     }
-
     fn drain_inbox(&mut self) {
         self.inbox.drain_wake();
         let mut done = swap_queue(&mut self.done_buf, &self.inbox.done);
         for ev in done.drain(..) { self.handle_done_event(ev); }
         restore_queue(&mut self.done_buf, done);
-
         let (mut bcast, mut to_close) = (swap_queue(&mut self.bcast_buf, &self.inbox.bcast), Vec::new());
         for msg in bcast.drain(..) {
             for &(token, sid) in self.topics.get(&msg.topic).into_iter().flatten() {
-                if let Some(c) = self.conns.get_mut(token) {
-                    if !c.is_ws || c.close_after_tx { continue; }
-                    let sent = if let Some(proj_fn) = &self.cbs.on_ws_project {
+                let Some(c) = self.conns.get_mut(token).filter(|c| c.is_ws && !c.close_after_tx) else { continue };
+                let sent = match &self.cbs.on_ws_project {
+                    Some(proj_fn) => {
                         let (Some(ws_ctx), Some(sub)) = (c.ws_ctx.as_ref(), c.subs.iter().find(|s| s.sub_id == sid)) else { continue };
                         unsafe {
                             let out = lean_apply_4(proj_fn.clone_ptr(), ws_ctx.clone_ptr(), mk_str(&sub.channel), mk_ba(&sub.params), mk_ba(&msg.payload));
-                            let ok = if qed_lean_obj_tag(out) == 0 {
-                                c.send_ws_event(&self.poller, sid, &msg.payload)
-                            } else {
-                                let inner = qed_lean_ctor_get(out, 0);
-                                if qed_lean_obj_tag(inner) == 1 { c.send_ws_event(&self.poller, sid, ba_slice(qed_lean_ctor_get(inner, 0))) } else { true }
+                            let ok = match qed_lean_obj_tag(out) {
+                                0 => c.send_ws_event(&self.poller, sid, &msg.payload),
+                                _ => { let inner = qed_lean_ctor_get(out, 0); qed_lean_obj_tag(inner) != 1 || c.send_ws_event(&self.poller, sid, ba_slice(qed_lean_ctor_get(inner, 0))) }
                             };
-                            qed_lean_dec(out);
-                            ok
+                            qed_lean_dec(out); ok
                         }
-                    } else {
-                        c.send_ws_event(&self.poller, sid, &msg.payload)
-                    };
-                    if !sent { c.close_after_tx = true; to_close.push(token); }
-                }
+                    }
+                    None => c.send_ws_event(&self.poller, sid, &msg.payload),
+                };
+                if !sent { c.close_after_tx = true; to_close.push(token); }
             }
         }
         restore_queue(&mut self.bcast_buf, bcast);
         for t in to_close { self.close_conn(t); }
     }
-
     fn handle_done_event(&mut self, ev: DoneEvent) {
         let (token, step) = match ev {
             DoneEvent::Http { token, resp, keep_alive } => (token, self.conns.get_mut(token).map_or(ConnStep::Done, |c| {
@@ -616,28 +597,13 @@ impl Worker {
             })),
             DoneEvent::WsStep { token, ws_ctx, consumed, out_wire, close, new_frag, ops } => {
                 let Worker { conns, topics, inbox, poller, idx, pools, now, .. } = self;
-                let use_bm = pools.len() <= 64;
-                let step = if let Some(conn) = conns.get_mut(token) {
-                    if !ops.is_empty() {
-                        for op in ops {
-                            let sid = match &op { SubOp::Add(s, ..) | SubOp::Remove(s) => *s };
-                            if let Some(i) = conn.subs.iter().position(|s| s.sub_id == sid) {
-                                let ot = conn.subs.swap_remove(i).topic; topic_remove_from(topics, inbox, *idx, use_bm, &ot, token, sid);
-                            }
-                            if let SubOp::Add(sid, topic, channel, params) = op {
-                                conn.subs.push(WsSub { sub_id: sid, topic: topic.clone(), channel, params });
-                                let set = topics.entry(topic.clone()).or_default(); let first = set.is_empty();
-                                if set.insert((token, sid)) { inbox.ws_subs.fetch_add(1, Ordering::Release); }
-                                if first && use_bm { *write_unpoison(topic_workers()).entry(topic).or_insert(0) |= 1u64 << *idx; }
-                            }
-                        }
-                        conn.subs_arr = None;
-                    }
-                    conn.in_flight = false;
-                    if consumed > 0 { conn.consume_rx(consumed); conn.last_active = *now; }
-                    if let Some(f) = new_frag { conn.frag = Some(f); }
-                    let sent = out_wire.is_none_or(|w| conn.send_wire(poller, w));
-                    conn.finish_write(sent, !close, consumed > 0)
+                let step = if let Some(c) = conns.get_mut(token) {
+                    apply_ws_sub_ops(topics, inbox, *idx, pools.len() <= 64, token, c, ops);
+                    c.in_flight = false;
+                    if consumed > 0 { c.consume_rx(consumed); c.last_active = *now; }
+                    if let Some(f) = new_frag { c.frag = Some(f); }
+                    let sent = out_wire.is_none_or(|w| c.send_wire(poller, w));
+                    c.finish_write(sent, !close, consumed > 0)
                 } else {
                     for op in ops { if let SubOp::Add(_, _, channel, params) = op { let _ = pools[*idx].try_push(PoolJob::WsLeave { ws_ctx: ws_ctx.clone(), channel, params }, false, false); } }
                     ConnStep::Done
@@ -647,76 +613,59 @@ impl Worker {
         };
         self.drive_step(token, step);
     }
-
     fn sweep_idle(&mut self, now: Instant) {
         let mut to_close = Vec::new();
-        for (token, c) in self.conns.iter_mut() {
-            if c.in_flight { continue; }
-            if c.is_ws {
-                if now.duration_since(c.last_active) > Duration::from_secs(75) { to_close.push(token); }
-                else if !c.close_after_tx && now.duration_since(c.last_ping) >= Duration::from_secs(25) {
-                    c.last_ping = now; if !c.send_slice(&self.poller, &[0x89, 0x00]) { to_close.push(token); }
-                }
-            } else if now.duration_since(c.last_active) > Duration::from_secs(30) { to_close.push(token); }
+        for (token, c) in self.conns.iter_mut().filter(|(_, c)| !c.in_flight) {
+            if now.duration_since(c.last_active) > Duration::from_secs(if c.is_ws { 75 } else { 30 })
+                || (c.is_ws && !c.close_after_tx && now.duration_since(c.last_ping) >= Duration::from_secs(25)
+                    && { c.last_ping = now; !c.send_slice(&self.poller, &[0x89, 0x00]) })
+            { to_close.push(token); }
         }
         for t in to_close { self.close_conn(t); }
     }
-
     fn step_rx(&mut self, token: u64) -> ConnStep {
         let Worker { poller, inbox, idx, pools, cbs, rate_limiter, conns, now, .. } = self;
-        let Some(conn) = conns.get_mut(token) else { return ConnStep::Done };
-        if conn.close_after_tx || conn.in_flight { return ConnStep::Done; }
+        let Some(conn) = conns.get_mut(token).filter(|c| !c.close_after_tx && !c.in_flight) else { return ConnStep::Done };
         let dispatch = |c: &mut Conn, job: PoolJob, send_503: bool| {
             c.in_flight = true;
-            if submit_pool_job(pools, *idx, job, true) { ConnStep::Done }
-            else { c.in_flight = false; if send_503 { c.send_and_close(poller, RESP_503_WIRE) } else { ConnStep::Close } }
+            if submit_pool_job(pools, *idx, job, true) { ConnStep::Done } else {
+                c.in_flight = false;
+                if send_503 { c.send_error_close(poller, "503 Service Unavailable", None, "server overloaded\r\n") } else { ConnStep::Close }
+            }
         };
-
         if conn.is_ws {
             if conn.rx.is_empty() { return ConnStep::Done; }
             let (Some(ws_ctx), Some(frag)) = (conn.ws_ctx.clone(), conn.frag.clone()) else { return ConnStep::Close };
-            let rx = conn.rx.as_slice();
-            let (rx_len, rx_ba) = (rx.len(), unsafe { mk_ba_mt(rx) });
+            let (rx_len, rx_ba) = (conn.rx.len(), unsafe { mk_ba_mt(conn.rx.as_slice()) });
             let subs_arr = conn.subs_arr.get_or_insert_with(|| unsafe { build_subs_arr(&conn.subs) }).clone();
             return dispatch(conn, PoolJob::WsStep { token, ws_ctx, rx_ba, rx_len, frag, subs_arr, inbox: inbox.clone() }, false);
         }
         if let Some(pb) = &conn.pending_body {
             if conn.rx.len() < pb.content_len { return if conn.peer_eof { ConnStep::Close } else { ConnStep::Done }; }
             let pb = conn.pending_body.take().unwrap();
-            if pb.inline {
-                let sent = unsafe {
-                    let body = mk_ba(&conn.rx.as_slice()[..pb.content_len]); conn.consume_rx(pb.content_len);
-                    call_on_body(cbs, pb.req.into_raw(), body, conn.ip_lean.clone_ptr(), |v| conn.send_borrowed_ba(poller, v)).unwrap_or(false)
-                };
-                return conn.finish_write(sent, pb.keep_alive, true);
-            }
-            let body = unsafe { mk_ba_mt(&conn.rx.as_slice()[..pb.content_len]) };
+            let body = unsafe { if pb.inline { LeanRef(mk_ba(&conn.rx.as_slice()[..pb.content_len])) } else { mk_ba_mt(&conn.rx.as_slice()[..pb.content_len]) } };
             if pb.content_len > 0 { conn.consume_rx(pb.content_len); }
-            let ip = conn.ip_lean.clone();
-            return dispatch(conn, PoolJob::Body { token, req: pb.req, body, ip, keep_alive: pb.keep_alive, inbox: inbox.clone() }, true);
+            return if pb.inline {
+                let sent = unsafe { call_on_body(cbs, pb.req.into_raw(), body.into_raw(), conn.ip_lean.clone_ptr(), |v| conn.send_borrowed_ba(poller, v)).unwrap_or(false) };
+                conn.finish_write(sent, pb.keep_alive, true)
+            } else { dispatch(conn, PoolJob::Body { token, req: pb.req, body, ip: conn.ip_lean.clone(), keep_alive: pb.keep_alive, inbox: inbox.clone() }, true) };
         }
-
         let (head_end, consume_len) = match find_header_end(conn.rx.as_slice(), &mut conn.rx_hdr_scanned) {
             Some(p) => (p, p + 4),
             None if conn.rx.len() > MAX_REQ_HDR_BYTES => (MAX_REQ_HDR_BYTES + 1, conn.rx.len()),
             None => return if conn.peer_eof { ConnStep::Close } else { ConnStep::Done },
         };
         if let Some(rl) = rate_limiter.as_ref().filter(|_| !conn.rx.as_slice()[..head_end].starts_with(b"GET /_qed/health ")) {
-            if let Err(ra) = rl.check(conn.ip_addr) {
-                let mut buf = [0u8; 256];
-                return conn.send_and_close(poller, fmt_stack(&mut buf, format_args!("HTTP/1.1 429 Too Many Requests\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 19\r\nRetry-After: {ra}\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\ntoo many requests\r\n")));
-            }
+            if let Err(ra) = rl.check(conn.ip_addr) { return conn.send_error_close(poller, "429 Too Many Requests", Some(ra), "too many requests\r\n"); }
         }
         if let Some(step) = conn.eval_head_inline(poller, cbs, head_end, consume_len, *now) { return step; }
         let (head_ba, ip) = (unsafe { mk_ba_mt(&conn.rx.as_slice()[..head_end]) }, conn.ip_lean.clone());
         conn.consume_rx(consume_len);
         dispatch(conn, PoolJob::Head { token, head_ba, ip, inbox: inbox.clone() }, true)
     }
-
     fn drive_step(&mut self, token: u64, mut step: ConnStep) {
         loop { match step { ConnStep::Continue => step = self.step_rx(token), ConnStep::Close => { self.close_conn(token); return; } ConnStep::Done => return } }
     }
-
     fn handle_readable(&mut self, token: u64, hangup: bool) {
         let (mut closed, mut got_bytes, mut want, now) = (false, false, 4096usize, self.now);
         let Some(c) = self.conns.get_mut(token) else { return };
@@ -732,16 +681,13 @@ impl Worker {
         if got_bytes { self.drive_step(token, ConnStep::Continue); }
         if self.conns.get(token).is_some_and(|c| c.ready_to_close(hangup)) { self.close_conn(token); }
     }
-
     fn run(mut self) {
         let (mut events, mut last_sweep) = (Vec::with_capacity(128), self.now);
         while !STOP.load(Ordering::Relaxed) {
-            self.poller.wait(&mut events, 250);
-            self.now = Instant::now();
+            self.poller.wait(&mut events, 250); self.now = Instant::now();
             for ev in events.drain(..) {
                 match ev.token {
-                    TOKEN_LISTEN => self.accept_all(),
-                    TOKEN_WAKE => self.drain_inbox(),
+                    TOKEN_LISTEN => self.accept_all(), TOKEN_WAKE => self.drain_inbox(),
                     t => {
                         if ev.readable || ev.hangup { self.handle_readable(t, ev.hangup); }
                         if ev.writable && self.conns.get_mut(t).is_some_and(|c| !c.flush_tx(&self.poller) || c.ready_to_close(false)) { self.close_conn(t); }
@@ -775,11 +721,9 @@ ffi_export! {
         init_frag: *mut LeanObj, on_head: *mut LeanObj, on_body: *mut LeanObj, on_ws_bytes: *mut LeanObj, on_ws_leave: *mut LeanObj, on_ws_project_opt: *mut LeanObj,
     ) => {
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
-        let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = handle_stop_signal as *const () as usize;
+        let mut sa: libc::sigaction = std::mem::zeroed(); sa.sa_sigaction = handle_stop_signal as *const () as usize;
         for sig in [libc::SIGINT, libc::SIGTERM] { libc::sigaction(sig, &sa, std::ptr::null_mut()); }
         STOP.store(false, Ordering::SeqCst);
-
         let num_workers = if num_workers_in == 0 { thread::available_parallelism().map_or(2, |n| n.get()).clamp(1, 16) as u32 } else { num_workers_in };
         let (bind_ip, first_fd) = match parse_bind_ip(str_slice(host_obj)).map_err(|e| e.to_string()).and_then(|ip| {
             create_listener(ip, port_in, cfg!(target_os = "linux") && num_workers > 1).map(|fd| (ip, fd)).map_err(|e| format!("failed to bind {ip}:{port_in}: {e}"))
@@ -791,48 +735,33 @@ ffi_export! {
                 return qed_lean_io_mk_ok(qed_lean_box_u32(1));
             }
         };
-
-        let per_worker_threads = env_parse::<usize>("QED_BLOCKING_THREADS").map(|n| n.clamp(1, 256).div_ceil(num_workers as usize).max(1))
+        let per_w = env_parse::<usize>("QED_BLOCKING_THREADS").map(|n| n.clamp(1, 256).div_ceil(num_workers as usize).max(1))
             .unwrap_or_else(|| (64usize / (num_workers as usize).max(1)).clamp(2, 4));
-        let on_ws_project = (qed_lean_obj_tag(on_ws_project_opt) == 1).then(|| {
-            let f = qed_lean_ctor_get(on_ws_project_opt, 0);
-            qed_lean_inc(f);
-            LeanRef::new_persistent(f)
-        });
+        let on_ws_project = (qed_lean_obj_tag(on_ws_project_opt) == 1).then(|| { let f = qed_lean_ctor_get(on_ws_project_opt, 0); qed_lean_inc(f); LeanRef::new_persistent(f) });
         qed_lean_dec(on_ws_project_opt);
-        let cbs = Arc::new(Callbacks {
-            init_frag: LeanRef::new_persistent(init_frag), on_head: LeanRef::new_persistent(on_head),
-            on_body: LeanRef::new_persistent(on_body), on_ws_bytes: LeanRef::new_persistent(on_ws_bytes),
-            on_ws_leave: LeanRef::new_persistent(on_ws_leave), on_ws_project,
-        });
-        let port = if port_in == 0 { bound_port(first_fd) } else { port_in };
-        let inboxes: Vec<Arc<WorkerInbox>> = (0..num_workers).map(|_| Arc::new(WorkerInbox::new())).collect();
+        let [init_frag, on_head, on_body, on_ws_bytes, on_ws_leave] = [init_frag, on_head, on_body, on_ws_bytes, on_ws_leave].map(|p| LeanRef::new_persistent(p));
+        let (cbs, port) = (Arc::new(Callbacks { init_frag, on_head, on_body, on_ws_bytes, on_ws_leave, on_ws_project }), if port_in == 0 { bound_port(first_fd) } else { port_in });
+        let inboxes: Vec<_> = (0..num_workers).map(|_| Arc::new(WorkerInbox::new())).collect();
         *write_unpoison(&INBOXES) = inboxes.clone();
-        let pools = Arc::new((0..num_workers).map(|_| BlockingPool::new(per_worker_threads, cbs.clone())).collect::<Vec<_>>());
-        let display_host = match bind_ip { IpAddr::V4(v4) => v4.to_string(), IpAddr::V6(v6) => format!("[{v6}]") };
-        println!("▸ qed native server listening on http://{display_host}:{port} ({num_workers} I/O worker{}, {} handler threads)",
-            if num_workers == 1 { "" } else { "s" }, per_worker_threads * (num_workers as usize));
+        let pools = Arc::new((0..num_workers).map(|_| BlockingPool::new(per_w, cbs.clone())).collect::<Vec<_>>());
+        println!("▸ qed native server listening on http://{}:{port} ({num_workers} I/O worker{}, {} handler threads)",
+            match bind_ip { IpAddr::V4(v4) => v4.to_string(), IpAddr::V6(v6) => format!("[{v6}]") }, if num_workers == 1 { "" } else { "s" }, per_w * (num_workers as usize));
         let _ = io::stdout().flush();
-
-        let rate_limiter = RateLimiter::from_env();
+        let rl = RateLimiter::from_env();
         let handles: Vec<_> = (1..num_workers as usize).map(|idx| {
-            let (inbox, ps, cbs_c, rl_c) = (inboxes[idx].clone(), pools.clone(), cbs.clone(), rate_limiter.clone());
-            #[cfg(not(target_os = "linux"))] let shared_fd = libc::dup(first_fd);
+            let (inbox, ps, cbs_c, rl_c) = (inboxes[idx].clone(), pools.clone(), cbs.clone(), rl.clone());
+            #[cfg(not(target_os = "linux"))] let dup_fd = libc::dup(first_fd);
             thread::spawn(move || {
                 unsafe { lean_initialize_thread() };
-                #[cfg(target_os = "linux")] match create_listener(bind_ip, port, true) {
-                    Ok(lfd) => Worker::spawn_and_run(lfd, inbox, idx, ps, cbs_c, rl_c),
-                    Err(e) => eprintln!("✗ worker {idx} failed to bind {bind_ip}:{port}: {e}"),
-                }
-                #[cfg(not(target_os = "linux"))] if shared_fd >= 0 { Worker::spawn_and_run(shared_fd, inbox, idx, ps, cbs_c, rl_c); }
-                    else { eprintln!("✗ worker {idx} failed to dup listener socket"); }
+                #[cfg(target_os = "linux")] let fd = create_listener(bind_ip, port, true).map_err(|e| format!("bind {bind_ip}:{port}: {e}"));
+                #[cfg(not(target_os = "linux"))] let fd = if dup_fd >= 0 { Ok(dup_fd) } else { Err("dup listener socket".into()) };
+                match fd { Ok(lfd) => Worker::spawn_and_run(lfd, inbox, idx, ps, cbs_c, rl_c), Err(e) => eprintln!("✗ worker {idx} failed to {e}") }
                 unsafe { lean_finalize_thread() };
             })
         }).collect();
-
-        Worker::spawn_and_run(first_fd, inboxes[0].clone(), 0, pools.clone(), cbs.clone(), rate_limiter);
+        Worker::spawn_and_run(first_fd, inboxes[0].clone(), 0, pools.clone(), cbs.clone(), rl);
         STOP.store(true, Ordering::SeqCst);
-        for inbox in &inboxes { inbox.wake_fd.wake(); }
+        for inb in &inboxes { inb.wake_fd.wake(); }
         for h in handles { let _ = h.join(); }
         for p in pools.iter() { p.shutdown(); }
         write_unpoison(&INBOXES).clear(); write_unpoison(topic_workers()).clear();
@@ -847,58 +776,47 @@ mod tests {
     fn push_via_spare(bq: &mut ByteQueue, data: &[u8], max_len: usize) -> isize {
         bq.write_spare(data.len(), max_len, |ptr, cap| { let n = data.len().min(cap); unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, n); } n as isize }).0
     }
-
     #[test]
     fn byte_queue_direct_append_compact_and_shrink() {
-        let (mut q, big) = (ByteQueue::new(), vec![0xABu8; COMPACT_THRESHOLD + 4096]);
+        let (mut q, big) = (ByteQueue::default(), vec![0xABu8; COMPACT_THRESHOLD + 4096]);
         assert_eq!((push_via_spare(&mut q, &big, MAX_RX_BUF_BYTES) as usize, q.len()), (big.len(), big.len()));
         q.consume(COMPACT_THRESHOLD);
         assert_eq!((q.pos, q.as_slice()), (0, &[0xABu8; 4096][..]));
         assert_eq!((push_via_spare(&mut q, &[1, 2, 3, 4], 4098), q.len()), (2, 4098));
-        q.consume(4098);
-        assert!(q.is_empty() && q.buf.capacity() <= 4096);
+        q.consume(4098); assert!(q.is_empty() && q.buf.capacity() <= 4096);
     }
-
     #[test]
     fn conn_slab_insert_aba_and_token_range() {
         let mut slab: ConnSlab<u32> = ConnSlab::new();
         let ins = |s: &mut ConnSlab<u32>, v| { let (i, t) = s.alloc_slot(); s.insert_at(i, v); (i, t) };
         let ((i1, t1), (_, t2)) = (ins(&mut slab, 100), ins(&mut slab, 200));
-        assert!(t1 >= 16 && t2 >= 16 && t2 != t1);
-        assert_eq!((slab.len(), slab.get(t1).copied()), (2, Some(100)));
-        assert_eq!((slab.remove(t1), slab.get(t1).copied()), (Some(100), None));
+        assert!(t1 >= 16 && t2 >= 16 && t2 != t1 && slab.len() == 2 && slab.get(t1) == Some(&100));
+        assert_eq!((slab.remove(t1), slab.get(t1)), (Some(100), None));
         let (i3, t3) = ins(&mut slab, 300);
-        assert!(i3 == i1 && t3 != t1);
-        assert_eq!((slab.get(t1).copied(), slab.remove(t1), slab.get(t3).copied()), (None, None, Some(300)));
+        assert!(i3 == i1 && t3 != t1 && (slab.get(t1).copied(), slab.remove(t1), slab.get(t3).copied()) == (None, None, Some(300)));
         let (ic, tc) = slab.alloc_slot(); slab.cancel_slot(ic);
-        assert_eq!((slab.get(tc).copied(), slab.len()), (None, 2));
+        assert_eq!((slab.get(tc), slab.len()), (None, 2));
     }
-
     #[test]
     fn rate_limiter_burst_429_refill_and_eviction() {
         let rl = RateLimiter::new(10, 2);
         for ip in [IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1))] {
-            assert_eq!((rl.check_at(ip, 0), rl.check_at(ip, 0), rl.check_at(ip, 0).is_err()), (Ok(()), Ok(()), true));
-            assert_eq!((rl.check_at(ip, 100), rl.check_at(ip, 100).is_err()), (Ok(()), true));
+            assert_eq!((rl.check_at(ip, 0), rl.check_at(ip, 0), rl.check_at(ip, 0).is_err(), rl.check_at(ip, 100), rl.check_at(ip, 100).is_err()), (Ok(()), Ok(()), true, Ok(()), true));
         }
         let rl_ev = RateLimiter::new(100, 1);
-        for (hit, ip) in (1u32..).map(|n| IpAddr::V4(Ipv4Addr::from(0x0A00_0000 | n)))
-            .filter(|&ip| RateLimiter::shard_idx(ip) == 0).take(RL_MAX_ENTRIES_PER_SHARD + 9).enumerate()
-        { assert_eq!(rl_ev.check_at(ip, hit as u64), Ok(())); }
+        for (hit, ip) in (1u32..).map(|n| IpAddr::V4(Ipv4Addr::from(0x0A00_0000 | n))).filter(|&ip| RateLimiter::shard_idx(ip) == 0).take(RL_MAX_ENTRIES_PER_SHARD + 9).enumerate() {
+            assert_eq!(rl_ev.check_at(ip, hit as u64), Ok(()));
+        }
         assert!(lock_unpoison(&rl_ev.shards[0]).len() <= RL_MAX_ENTRIES_PER_SHARD);
     }
-
     #[test]
     fn find_header_end_incremental_and_pipelined() {
         let reqs = b"GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: y\r\r\n\r\n";
         let (mut buf, mut scanned, mut found1) = (Vec::new(), 0usize, None);
         for &b in &reqs[..28] { buf.push(b); found1 = find_header_end(&buf, &mut scanned); }
-        assert_eq!((found1, scanned), (Some(24), 0));
-        let mut q = ByteQueue::new();
-        push_via_spare(&mut q, reqs, MAX_RX_BUF_BYTES);
-        let p1 = find_header_end(q.as_slice(), &mut scanned).unwrap();
-        assert_eq!(p1, 24); q.consume(p1 + 4);
+        let mut q = ByteQueue::default(); push_via_spare(&mut q, reqs, MAX_RX_BUF_BYTES);
+        let p1 = find_header_end(q.as_slice(), &mut scanned).unwrap(); q.consume(p1 + 4);
         let p2 = find_header_end(q.as_slice(), &mut scanned).unwrap();
-        assert_eq!((p2, &q.as_slice()[..p2]), (25, &b"GET /b HTTP/1.1\r\nHost: y\r"[..]));
+        assert_eq!((found1, p1, p2, &q.as_slice()[..p2]), (Some(24), 24, 25, &b"GET /b HTTP/1.1\r\nHost: y\r"[..]));
     }
 }

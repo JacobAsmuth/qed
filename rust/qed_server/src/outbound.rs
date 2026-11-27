@@ -1,13 +1,12 @@
 use std::{cell::RefCell, collections::HashMap, io::{self, Read, Write}, net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs}, os::fd::AsRawFd, sync::{Arc, Mutex, OnceLock}, time::{Duration, Instant}};
-use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, RootCertStore, SignatureScheme, StreamOwned};
+use rustls::{client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier}, pki_types::{CertificateDer, ServerName, UnixTime}, ClientConfig, ClientConnection, DigitallySignedStruct, RootCertStore, SignatureScheme, StreamOwned};
 
 use crate::lean_ffi::*;
 use crate::{HandleTable, bind_loopback_nonblock, is_wouldblock, last_errno, lock_unpoison, rem_timeout_ms};
 
 const POOL_TTL: Duration = Duration::from_secs(30);
 const READ_BUF_CAP: usize = 65536;
+const BAD_HANDLE: &str = "invalid outbound connection handle";
 
 #[derive(Debug)]
 struct NoVerify;
@@ -130,7 +129,7 @@ unsafe fn check_ssrf_lean(addrs: &[SocketAddr], is_blocked_fn: *mut LeanObj) -> 
     Ok(())
 }
 fn with_active<T>(handle: u64, f: impl FnOnce(&mut OutStream) -> Result<T, String>) -> Result<T, String> {
-    ACTIVE_CONNS.get(handle).ok_or_else(|| "invalid outbound connection handle".to_owned()).and_then(|arc| f(&mut lock_unpoison(&arc).stream))
+    ACTIVE_CONNS.get(handle).ok_or_else(|| BAD_HANDLE.to_owned()).and_then(|arc| f(&mut lock_unpoison(&arc).stream))
 }
 
 ffi_export! {
@@ -159,54 +158,45 @@ ffi_export! {
         })();
         mk_io_except(res, |(id, reused)| qed_lean_mk_prod(qed_lean_usize_to_nat(id as usize), qed_lean_usize_to_nat(reused)))
     };
-    qed_server_outbound_write_all(handle: u64, data_obj: *mut LeanObj) => {
-        let data = ba_slice(data_obj);
-        mk_io_except_unit(with_active(handle, |s| s.write_all(data).map_err(|e| format!("write failed: {e}"))))
-    };
+    qed_server_outbound_write_all(handle: u64, data_obj: *mut LeanObj) =>
+        mk_io_except_unit(with_active(handle, |s| s.write_all(ba_slice(data_obj)).map_err(|e| format!("write failed: {e}"))));
     qed_server_outbound_read_some(handle: u64, max_bytes: u32) => {
         let want = (max_bytes as usize).clamp(1, READ_BUF_CAP);
         READ_SCRATCH.with(|cell| {
             let mut buf = cell.borrow_mut();
             if buf.len() < want { buf.resize(READ_BUF_CAP, 0); }
-            let res = with_active(handle, |s| s.read_some(&mut buf[..want]).map_err(|e| format!("read failed: {e}")));
-            mk_io_except(res, |n| mk_ba(&buf[..n]))
+            mk_io_except(with_active(handle, |s| s.read_some(&mut buf[..want]).map_err(|e| format!("read failed: {e}"))), |n| mk_ba(&buf[..n]))
         })
     };
-    qed_server_outbound_upgrade_tls(handle: u64, host_obj: *mut LeanObj) => {
-        let host = str_slice(host_obj);
-        mk_io_except_unit((|| -> Result<(), String> {
-            let OutConn { mut key, peer_addr, stream } = remove_active(handle).ok_or_else(|| "invalid outbound connection handle".to_owned())?;
-            let stream = match stream { OutStream::Plain(sock) => { key.0 = true; wrap_tls(sock, host, "STARTTLS")? } tls => tls };
-            ACTIVE_CONNS.insert_at(handle, Arc::new(Mutex::new(OutConn { key, peer_addr, stream })));
-            Ok(())
-        })())
-    };
+    qed_server_outbound_upgrade_tls(handle: u64, host_obj: *mut LeanObj) => mk_io_except_unit((|| -> Result<(), String> {
+        let OutConn { mut key, peer_addr, stream } = remove_active(handle).ok_or_else(|| BAD_HANDLE.to_owned())?;
+        let stream = match stream { OutStream::Plain(sock) => { key.0 = true; wrap_tls(sock, str_slice(host_obj), "STARTTLS")? } tls => tls };
+        ACTIVE_CONNS.insert_at(handle, Arc::new(Mutex::new(OutConn { key, peer_addr, stream }))); Ok(())
+    })());
     qed_server_outbound_is_alive(handle: u64) =>
         mk_io_bool(ACTIVE_CONNS.get(handle).is_some_and(|arc| socket_is_alive(lock_unpoison(&arc).stream.raw_fd())));
     qed_server_outbound_release(handle: u64, keep_alive: u8) => {
-        if let Some(conn) = remove_active(handle) { if keep_alive != 0 { lock_unpoison(global_pool()).push(conn, Instant::now()); } }
-        mk_io_unit()
+        if let Some(conn) = remove_active(handle) { if keep_alive != 0 { lock_unpoison(global_pool()).push(conn, Instant::now()); } } mk_io_unit()
     };
     qed_server_free_port() => qed_lean_io_mk_ok(qed_lean_box(bind_loopback_nonblock(0).map_or(0, |(_, p)| p) as usize));
     qed_server_tcp_listen(port: u16) =>
         mk_io_except(bind_loopback_nonblock(port).map(|(l, p)| (LISTENERS.insert(Arc::new(l)), p)), |(id, p)| qed_lean_mk_prod(qed_lean_box_u64(id), qed_lean_box(p as usize)));
     qed_server_tcp_accept(listener_id: u64, timeout_ms: u32) => {
         let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
-        let res = loop {
-            let Some(listener) = LISTENERS.get(listener_id) else { break Err("closed".to_owned()); };
-            match listener.accept() {
+        mk_io_except(loop {
+            let Some(l) = LISTENERS.get(listener_id) else { break Err("closed".to_owned()) };
+            match l.accept() {
                 Ok((sock, peer)) => {
                     let _ = sock.set_nonblocking(false); configure_sock(&sock);
                     break Ok(insert_active(OutConn { key: (false, peer.ip().to_string(), peer.port(), false), peer_addr: peer, stream: OutStream::Plain(sock) }));
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    let Some(rem) = rem_timeout_ms(deadline, 1) else { break Err("timeout".to_owned()); };
-                    if crate::poll_in(listener.as_raw_fd(), rem) < 0 && last_errno() != libc::EINTR { break Err(format!("tcp accept failed: {}", io::Error::last_os_error())); }
+                    let Some(rem) = rem_timeout_ms(deadline, 1) else { break Err("timeout".to_owned()) };
+                    if crate::poll_in(l.as_raw_fd(), rem) < 0 && last_errno() != libc::EINTR { break Err(format!("tcp accept failed: {}", io::Error::last_os_error())); }
                 }
                 Err(e) => break Err(format!("tcp accept failed: {e}")),
             }
-        };
-        mk_io_except(res, |id| qed_lean_box_u64(id))
+        }, |id| qed_lean_box_u64(id))
     };
     qed_server_tcp_close_listener(listener_id: u64) => { LISTENERS.remove(listener_id); mk_io_unit() };
 }
@@ -219,27 +209,19 @@ mod tests {
     fn outbound_pool_lifo_caps_ttl_and_ssrf_isolation() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let (addr, mut accepted, t0, mut pool) = (listener.local_addr().unwrap(), Vec::new(), Instant::now(), OutboundPool::new(2, 3));
-        let mut mk = |host: &str, port: u16, ssrf: bool| {
-            let cli = TcpStream::connect(addr).unwrap();
-            accepted.push(listener.accept().unwrap().0);
+        let mut mk = |k: &PoolKey| {
+            let cli = TcpStream::connect(addr).unwrap(); accepted.push(listener.accept().unwrap().0);
             let lp = cli.local_addr().unwrap().port();
-            (OutConn { key: (false, host.to_owned(), port, ssrf), peer_addr: addr, stream: OutStream::Plain(cli) }, lp)
+            (OutConn { key: k.clone(), peer_addr: addr, stream: OutStream::Plain(cli) }, lp)
         };
-        let at = |s| t0 + Duration::from_secs(s);
-        let pop_port = |p: &mut OutboundPool, k: &PoolKey, t| p.pop_entry(k, t).map(|c| match &c.stream {
-            OutStream::Plain(s) => s.local_addr().unwrap().port(), OutStream::Tls(s) => s.sock.local_addr().unwrap().port(),
-        });
-        let (k_a_u, k_a_g, k_b) = ((false, "a.test".into(), 80, false), (false, "a.test".into(), 80, true), (false, "b.test".into(), 80, false));
-
-        let ((c1, _), (c2, p2), (c3, p3)) = (mk("a.test", 80, false), mk("a.test", 80, false), mk("a.test", 80, false));
+        let (at, pop) = (|s| t0 + Duration::from_secs(s), |p: &mut OutboundPool, k: &PoolKey, t| p.pop_entry(k, t).map(|c| match &c.stream { OutStream::Plain(s) => s.local_addr().unwrap().port(), OutStream::Tls(s) => s.sock.local_addr().unwrap().port() }));
+        let (k_u, k_g, k_b) = ((false, "a.test".into(), 80, false), (false, "a.test".into(), 80, true), (false, "b.test".into(), 80, false));
+        let ((c1, _), (c2, p2), (c3, p3)) = (mk(&k_u), mk(&k_u), mk(&k_u));
         for (c, s) in [(c1, 0), (c2, 1), (c3, 2)] { pool.push(c, at(s)); }
-        assert_eq!((pool.total, pop_port(&mut pool, &k_a_g, at(2))), (2, None));
-        assert_eq!((pop_port(&mut pool, &k_a_u, at(2)), pop_port(&mut pool, &k_a_u, at(2)), pop_port(&mut pool, &k_a_u, at(2)), pool.total), (Some(p3), Some(p2), None, 0));
-
-        let ((g1, _), (g2, gp2), (b1, _), (b2, bp2)) = (mk("a.test", 80, true), mk("a.test", 80, true), mk("b.test", 80, false), mk("b.test", 80, false));
+        assert_eq!((pool.total, pop(&mut pool, &k_g, at(2)), pop(&mut pool, &k_u, at(2)), pop(&mut pool, &k_u, at(2)), pop(&mut pool, &k_u, at(2)), pool.total), (2, None, Some(p3), Some(p2), None, 0));
+        let ((g1, _), (g2, gp2), (b1, _), (b2, bp2)) = (mk(&k_g), mk(&k_g), mk(&k_b), mk(&k_b));
         for (c, s) in [(g1, 0), (g2, 1), (b1, 2), (b2, 3)] { pool.push(c, at(s)); }
-        assert_eq!((pool.total, pop_port(&mut pool, &k_a_u, at(3))), (3, None));
-        assert_eq!((pop_port(&mut pool, &k_a_g, at(3)), pop_port(&mut pool, &k_a_g, at(3))), (Some(gp2), None));
-        assert_eq!((pop_port(&mut pool, &k_b, at(3)), pop_port(&mut pool, &k_b, t0 + POOL_TTL + Duration::from_secs(10)), pool.total), (Some(bp2), None, 0));
+        assert_eq!((pool.total, pop(&mut pool, &k_u, at(3)), pop(&mut pool, &k_g, at(3)), pop(&mut pool, &k_g, at(3))), (3, None, Some(gp2), None));
+        assert_eq!((pop(&mut pool, &k_b, at(3)), pop(&mut pool, &k_b, t0 + POOL_TTL + Duration::from_secs(10)), pool.total), (Some(bp2), None, 0));
     }
 }

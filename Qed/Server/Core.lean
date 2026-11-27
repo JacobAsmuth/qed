@@ -89,6 +89,22 @@ def sanitizeHeader (s : String) : String := String.ofList (s.toList.filter isSaf
 def defaultCsp : String :=
   "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
 
+private def reservedEnvNames : List String := [
+  "QED_DEPLOY_ENV", "PORT", "HOST", "PATH", "GOOGLE_APPLICATION_CREDENTIALS", "QED_INSECURE_SKIP_TLS_VERIFY",
+  "QED_CA_CERT_FILE", "QED_GCP_TOKEN_URL", "QED_CSP", "QED_RPC_ALLOWED_ORIGINS", "QED_WS_ALLOWED_ORIGINS",
+  "QED_AUTH_SECRET", "QED_AUTH_SECRET_PREV", "QED_AUTH_REQUIRE_EXP", "QED_HOST", "QED_WORKERS",
+  "QED_BLOCKING_THREADS", "QED_RATE_LIMIT_RPS", "QED_RATE_LIMIT_BURST"]
+
+private def isReservedEnvVarName (s : String) : Bool :=
+  let u := s.toUpper
+  reservedEnvNames.contains u || ["K_", "LD_", "SSL_CERT_", "CLOUD_RUN_", "QED_EXT_"].any (u.startsWith ·)
+
+def isValidEnvVarName (s : String) : Bool :=
+  let isA (c : Char) := ('A' ≤ c && c ≤ 'Z') || ('a' ≤ c && c ≤ 'z') || c == '_'
+  match s.toList with
+  | [] => false
+  | first :: rest => s.length <= 128 && isA first && rest.all (fun c => isA c || ('0' ≤ c && c ≤ '9')) && !isReservedEnvVarName s
+
 private abbrev NoCrlf (s : String) : Prop := ∀ c ∈ s.toList, c ≠ '\r' ∧ c ≠ '\n' ∧ c ≠ '\x00'
 private theorem filter_no_crlf (p : Char → Bool) (hp : p '\r' = false ∧ p '\n' = false ∧ p '\x00' = false) (s : String) :
     NoCrlf (String.ofList (s.toList.filter p)) := by

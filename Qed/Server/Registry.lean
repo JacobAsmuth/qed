@@ -190,22 +190,6 @@ deriving Inhabited
 
 initialize externalRegistry : Lean.SimplePersistentEnvExtension ExternalServiceInfo (Lean.NameMap ExternalServiceInfo) ← Qed.Diag.mkNameMapExt (·.serviceName)
 
-private def reservedEnvNames : List String := [
-  "QED_DEPLOY_ENV", "PORT", "HOST", "PATH", "GOOGLE_APPLICATION_CREDENTIALS", "QED_INSECURE_SKIP_TLS_VERIFY",
-  "QED_CA_CERT_FILE", "QED_GCP_TOKEN_URL", "QED_CSP", "QED_RPC_ALLOWED_ORIGINS", "QED_WS_ALLOWED_ORIGINS",
-  "QED_AUTH_SECRET", "QED_AUTH_SECRET_PREV", "QED_AUTH_REQUIRE_EXP", "QED_HOST", "QED_WORKERS",
-  "QED_BLOCKING_THREADS", "QED_RATE_LIMIT_RPS", "QED_RATE_LIMIT_BURST"]
-
-private def isReservedEnvVarName (s : String) : Bool :=
-  let u := s.toUpper
-  reservedEnvNames.contains u || ["K_", "LD_", "SSL_CERT_", "CLOUD_RUN_", "QED_EXT_"].any (u.startsWith ·)
-
-def isValidEnvVarName (s : String) : Bool :=
-  let isA (c : Char) := ('A' ≤ c && c ≤ 'Z') || ('a' ≤ c && c ≤ 'z') || c == '_'
-  match s.toList with
-  | [] => false
-  | first :: rest => s.length <= 128 && isA first && rest.all (fun c => isA c || ('0' ≤ c && c ≤ '9')) && !isReservedEnvVarName s
-
 def exprCallsOld (stx : Lean.Syntax) : Bool :=
   Qed.Lang.stxAny (fun s => s.getKind == ``Qed.Lang.qedCall && (s.getArg 0).getKind == ``Qed.Lang.qedIdent && ((s.getArg 0).getArg 0).getId.eraseMacroScopes == `old) stx
 

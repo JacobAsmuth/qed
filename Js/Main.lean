@@ -158,6 +158,47 @@ private def resolveDeployServer (env : Environment) (deploy? : Option Qed.Cloud.
     fun _ => (Qed.serverRegistry.getState env).toList.findSome? fun (n, si) =>
       if n.toString == d.appName || si.serverName.toString == d.appName then some si.serverName else none
 
+private def toDeployDbManifest (di : Qed.Server.DatabaseInfo) : Qed.Deploy.DeployDbManifest := {
+  shortName := di.shortName, secrets := di.secrets.toList, hasDevFallback := di.hasDevFallback,
+  isManaged := di.isManaged, envSpecs := di.envSpecs,
+  tables := di.tables.toList.map fun t => {
+    tableName := t.tableName, hasReadPolicy := t.hasReadPolicy, hasInsertPolicy := t.hasInsertPolicy,
+    hasUpdatePolicy := t.hasUpdatePolicy, hasDeletePolicy := t.hasDeletePolicy, hasTransInv := t.hasTransInv,
+    columns := t.columns.toList.map fun c => {
+      name := c.name, isPrimaryKey := c.isPrimaryKey, isImmutable := c.isImmutable,
+      isUnique := c.isUnique, isNullable := c.isNullable, refs? := c.refs? } } }
+
+private def toDeployServerManifest (si : Qed.ServerInfo) : Qed.Deploy.DeployServerManifest := {
+  name := si.serverName.toString, shortName := si.shortName, hasState := si.hasState,
+  ownSecrets := si.ownSecrets.toList, hasHttpRoutes := si.hasHttpRoutes,
+  methods := si.methods.toList.map fun mt => { name := mt.name, isReadOnly := mt.isReadOnly, requiresAuth := mt.requiresAuth },
+  channels := si.channels.toList, jobs := si.jobs.toList }
+
+private def extractFromEnv (env : Environment) (rootMod : String)
+    (targetServer? : Option Name := none) (explicitTarget : Bool := false) : Qed.Deploy.DeployManifest :=
+  let (srvReg, dbReg, authReg, extReg) :=
+    (Qed.serverRegistry.getState env, Qed.Server.databaseRegistry.getState env, Qed.Server.authRegistry.getState env, Qed.Server.externalRegistry.getState env)
+  let modIdx? := env.getModuleIdx? rootMod.toName
+  let inRootMod (c : Name) : Bool := match modIdx?, env.getModuleIdxFor? c with
+    | some ri, some di => ri == di | _, _ => rootMod.isEmpty || c.toString == rootMod || c.toString.startsWith (rootMod ++ ".")
+  let server? : Option Qed.ServerInfo := match targetServer? with
+    | some srvName => srvReg.find? srvName
+    | none => if explicitTarget then none else (srvReg.toList.find? fun (_, si) => inRootMod (si.serverName ++ `dispatchM)).map Prod.snd
+  let databases : List Qed.Server.DatabaseInfo := match server? with
+    | some si => dbReg.toList.filterMap fun (_, di) => if si.databases.contains di.configConst then some di else none
+    | none => if explicitTarget then [] else dbReg.toList.filterMap fun (_, di) => if inRootMod di.configConst then some di else none
+  let authInfo? : Option Qed.Server.AuthInfo := match server? with
+    | some si => si.authName?.bind authReg.find?
+    | none => if explicitTarget then none else (authReg.toList.find? fun (_, ai) => inRootMod ai.configConst).map Prod.snd
+  let rawEgress : List String := match server? with
+    | some si => si.externalServices.toList.map Prod.snd
+    | none => if explicitTarget then [] else extReg.toList.filterMap fun (_, ei) => if inRootMod (ei.serviceName ++ `_qed_external_marker) then some ei.baseOrigin else none
+  { version := 1, rootModule := rootMod, mode := if server?.isSome then "fullstack" else "standalone",
+    secrets := ((server?.map (·.secrets.toList)).getD [] ++ databases.flatMap (·.secrets.toList) ++ (authInfo?.map (·.secrets.toList)).getD []).eraseDups,
+    envVars := (server?.map (·.envVars.toList)).getD [],
+    egress := (rawEgress.filter fun o => !o.isEmpty && Qed.Deploy.isValidEgressOrigin o).eraseDups,
+    databases := databases.map toDeployDbManifest, auth? := authInfo?.map (·.spec), server? := server?.map toDeployServerManifest }
+
 private def prepareDeployManifest (rootMod : String) (rest : List String) :
     IO (Qed.Deploy.DeployManifest × Option Qed.Cloud.DeploySpec) := do
   let (flags, mods) ← orThrow (parseJsFlags rest {}); let targetMods := if mods.isEmpty then [rootMod] else mods
@@ -169,7 +210,7 @@ private def prepareDeployManifest (rootMod : String) (rest : List String) :
       let rd ← IO.FS.realPath dir; return ((← scanDeployAssetsRec rd rd "" #[]).qsort (·.path < ·.path)).toList
   let deploy? ← orThrow (findDeploySpec env rootMod flags.deployName?)
   let manifest : Qed.Deploy.DeployManifest := {
-    Qed.Deploy.extractFromEnv env rootMod (resolveDeployServer env deploy?) (explicitTarget := deploy?.isSome) with deploy?, assets
+    extractFromEnv env rootMod (resolveDeployServer env deploy?) (explicitTarget := deploy?.isSome) with deploy?, assets
   }
   orThrow manifest.validate; return (manifest, deploy?)
 

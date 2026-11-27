@@ -230,11 +230,11 @@ private def handleMockGcp (stRef : IO.Ref MockGcpState) (portRef : IO.Ref UInt16
   return jsonErrResp 404 s!"unhandled mock route {method} {target}"
 
 private def mkTestPlan (key : DeployKey) (buildHash : String) (regions : List GcpRegion) (egress secrets dbs assets : List String) (previewProtection : PreviewProtection := .pub) : GcpPlan :=
-  let dbInfos : List Qed.Server.DatabaseInfo := dbs.map fun nm =>
-    { dbName := nm.toName, shortName := nm, configConst := nm.toName ++ `config, ensureSchemaConst := nm.toName ++ `ensureSchema, secrets := #[], tables := #[], isManaged := true, envSpecs := managedPostgresTargets nm }
+  let dbInfos : List Qed.Deploy.DeployDbManifest := dbs.map fun nm =>
+    { shortName := nm, isManaged := true, envSpecs := managedPostgresTargets nm }
   compileInfra key buildHash { name := "Demo", appName := "DemoApp", regions, compute := .performance, preview := { protection := previewProtection } } {
     rootModule := "Demo", mode := "fullstack", secrets, egress, databases := dbInfos,
-    server? := some { serverName := `DemoApi, shortName := "DemoApi", hasState := false, secrets := secrets.toArray, ownSecrets := secrets.toArray, envVars := #[], externalServices := #[], databases := (dbInfos.map (·.configConst)).toArray, methods := #[] },
+    server? := some { name := "DemoApi", shortName := "DemoApi", ownSecrets := secrets },
     assets := assets.map fun p => { path := p, mime := assetMimeType p, bytes := 16 } }
 
 private def denyKeyFor (projId denyId : String) : String :=

@@ -84,8 +84,7 @@ deploy CronDeploy:
   app CronApi
 def multiEnvManifest : Qed.Deploy.DeployManifest := {
   version := 1, auth? := some ManagedAuth.config, databases := [{
-    dbName := `ByoDb, shortName := "ByoDb", configConst := `ByoDb.config, ensureSchemaConst := `ByoDb.ensureSchema,
-    secrets := #["PROD_DB_URL", "STAGING_DB_URL", "PREVIEW_DB_URL"], tables := #[],
+    shortName := "ByoDb", secrets := ["PROD_DB_URL", "STAGING_DB_URL", "PREVIEW_DB_URL"],
     envSpecs := { dev := .byoSqlite ".qed/dev.db", preview := .byoPostgres { envVar := "PREVIEW_DB_URL", scope := .pinned .preview },
                   staging := .byoPostgres { envVar := "STAGING_DB_URL", scope := .pinned .staging }, prod := .byoPostgres { envVar := "PROD_DB_URL", scope := .pinned .prod } } }] }
 example : (

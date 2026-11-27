@@ -1,10 +1,7 @@
-import Lean
-import Qed.Json
-import Qed.Cloud.Env
+import Qed.Json.Basic
 import Qed.Cloud.Gcp
 import Qed.Auth.Core
 import Qed.Server.Core
-import Qed.Server.Registry
 
 namespace Qed.Deploy
 
@@ -18,6 +15,51 @@ structure DeployAssetManifest where
   bytes : Nat := 0
 deriving Inhabited, DecidableEq, Repr
 
+structure DeployColumnManifest where
+  name         : String
+  isPrimaryKey : Bool := false
+  isImmutable  : Bool := false
+  isUnique     : Bool := false
+  isNullable   : Bool := false
+  refs?        : Option (String × String) := none
+deriving Inhabited
+
+structure DeployTableManifest where
+  tableName       : String
+  columns         : List DeployColumnManifest := []
+  hasReadPolicy   : Bool := false
+  hasInsertPolicy : Bool := false
+  hasUpdatePolicy : Bool := false
+  hasDeletePolicy : Bool := false
+  hasTransInv     : Bool := false
+deriving Inhabited
+
+structure DeployDbManifest where
+  shortName      : String
+  secrets        : List String := []
+  hasDevFallback : Bool := false
+  isManaged      : Bool := false
+  envSpecs       : Qed.Cloud.EnvMap Qed.Cloud.DbEnvSpec := Qed.Cloud.EnvMap.ofDefault (.byoSqlite "")
+  tables         : List DeployTableManifest := []
+deriving Inhabited
+
+structure DeployMethodManifest where
+  name         : String
+  isReadOnly   : Bool := false
+  requiresAuth : Bool := false
+deriving Inhabited
+
+structure DeployServerManifest where
+  name          : String
+  shortName     : String
+  hasState      : Bool := false
+  ownSecrets    : List String := []
+  hasHttpRoutes : Bool := false
+  methods       : List DeployMethodManifest := []
+  channels      : List String := []
+  jobs          : List String := []
+deriving Inhabited
+
 structure DeployManifest where
   version    : Nat := 1
   rootModule : String := ""
@@ -25,9 +67,9 @@ structure DeployManifest where
   secrets    : List String := []
   envVars    : List (String × String × Option String) := []
   egress     : List String := []
-  databases  : List Qed.Server.DatabaseInfo := []
+  databases  : List DeployDbManifest := []
   auth?      : Option DeployAuthManifest := none
-  server?    : Option Qed.ServerInfo := none
+  server?    : Option DeployServerManifest := none
   deploy?    : Option Qed.Cloud.DeploySpec := none
   assets     : List DeployAssetManifest := []
   csp        : String := Qed.Server.defaultCsp
@@ -47,7 +89,7 @@ private def dedupSecretsByEnvVar (xs : List Qed.Cloud.SecretRef) : List Qed.Clou
 def DeployManifest.footprintFor (m : DeployManifest) (env : Qed.Cloud.DeployEnv) : EnvFootprint :=
   let dbSpecs := m.databases.map fun db => (db.shortName, db.envSpecs.get env)
   let dbSecrets := dbSpecs.flatMap fun (_, sp) => sp.secrets.filter (·.allowedIn env)
-  let srvSecrets : List Qed.Cloud.SecretRef := ((m.server?.map (·.ownSecrets.toList)).getD []).map fun k => { envVar := k, scope := .envScoped }
+  let srvSecrets : List Qed.Cloud.SecretRef := ((m.server?.map (·.ownSecrets)).getD []).map fun k => { envVar := k, scope := .envScoped }
   let authSecrets : List Qed.Cloud.SecretRef := match m.auth? with
     | some a => if a.isManaged && (env == .dev || env == .preview) then []
                 else (a.clientSecretEnv?.map fun s => [{ envVar := s, scope := .envScoped }]).getD []
@@ -165,10 +207,10 @@ def DeployManifest.toJson (m : DeployManifest) : Json := Json.obj [
   ("egress", ToJson.toJson m.egress),
   ("databases", .arr <| m.databases.map fun db => Json.obj [
     ("name", .str db.shortName), ("isManaged", .bool db.isManaged), ("hasDevFallback", .bool db.hasDevFallback), ("secrets", ToJson.toJson db.secrets),
-    ("tables", .arr <| db.tables.toList.map fun t => Json.obj [
+    ("tables", .arr <| db.tables.map fun t => Json.obj [
       ("name", .str t.tableName), ("hasReadPolicy", .bool t.hasReadPolicy), ("hasInsertPolicy", .bool t.hasInsertPolicy),
       ("hasUpdatePolicy", .bool t.hasUpdatePolicy), ("hasDeletePolicy", .bool t.hasDeletePolicy), ("hasTransInv", .bool t.hasTransInv),
-      ("columns", .arr <| t.columns.toList.map fun c => Json.obj [
+      ("columns", .arr <| t.columns.map fun c => Json.obj [
         ("name", .str c.name), ("primaryKey", .bool c.isPrimaryKey), ("immutable", .bool c.isImmutable),
         ("unique", .bool c.isUnique), ("nullable", .bool c.isNullable),
         ("references", ToJson.toJson (c.refs?.map fun (rt, rc) => s!"{rt}({rc})"))])])]),
@@ -180,8 +222,8 @@ def DeployManifest.toJson (m : DeployManifest) : Json := Json.obj [
     ("logoutPath", .str a.logoutPath), ("mePath", .str a.mePath),
     ("claims", .arr <| a.claims.map fun c => Json.obj [("name", .str c.name), ("type", .str c.typeName), ("default", .str c.defaultValue)])]),
   ("server", optJson m.server? fun s => Json.obj [
-    ("name", .str s.serverName.toString), ("shortName", .str s.shortName), ("hasState", .bool s.hasState), ("hasHttpRoutes", .bool s.hasHttpRoutes),
-    ("methods", .arr <| s.methods.toList.map fun mt => Json.obj [("name", .str mt.name), ("readOnly", .bool mt.isReadOnly), ("requiresAuth", .bool mt.requiresAuth)]),
+    ("name", .str s.name), ("shortName", .str s.shortName), ("hasState", .bool s.hasState), ("hasHttpRoutes", .bool s.hasHttpRoutes),
+    ("methods", .arr <| s.methods.map fun mt => Json.obj [("name", .str mt.name), ("readOnly", .bool mt.isReadOnly), ("requiresAuth", .bool mt.requiresAuth)]),
     ("channels", ToJson.toJson s.channels), ("jobs", ToJson.toJson s.jobs)]),
   ("deploy", optJson m.deploy? fun d => Json.obj [
     ("name", .str d.name), ("appName", .str d.appName), ("regions", ToJson.toJson (d.regions.map Qed.Cloud.GcpRegion.toString)),
@@ -195,32 +237,5 @@ def DeployManifest.toJson (m : DeployManifest) : Json := Json.obj [
   ("csp", .str m.csp)]
 
 def DeployManifest.render (m : DeployManifest) : String := Json.render m.toJson
-
-/-! ### Compile-Time Environment Extraction (Meta Infrastructure) -/
-
-def extractFromEnv (env : Lean.Environment) (rootMod : String)
-    (targetServer? : Option Lean.Name := none) (explicitTarget : Bool := false) : DeployManifest :=
-  let (srvReg, dbReg, authReg, extReg) :=
-    (Qed.serverRegistry.getState env, Qed.Server.databaseRegistry.getState env, Qed.Server.authRegistry.getState env, Qed.Server.externalRegistry.getState env)
-  let modIdx? := env.getModuleIdx? rootMod.toName
-  let inRootMod (c : Lean.Name) : Bool := match modIdx?, env.getModuleIdxFor? c with
-    | some ri, some di => ri == di | _, _ => rootMod.isEmpty || c.toString == rootMod || c.toString.startsWith (rootMod ++ ".")
-  let server? : Option Qed.ServerInfo := match targetServer? with
-    | some srvName => srvReg.find? srvName
-    | none => if explicitTarget then none else (srvReg.toList.find? fun (_, si) => inRootMod (si.serverName ++ `dispatchM)).map Prod.snd
-  let databases := match server? with
-    | some si => dbReg.toList.filterMap fun (_, di) => if si.databases.contains di.configConst then some di else none
-    | none => if explicitTarget then [] else dbReg.toList.filterMap fun (_, di) => if inRootMod di.configConst then some di else none
-  let authInfo? : Option Qed.Server.AuthInfo := match server? with
-    | some si => si.authName?.bind authReg.find?
-    | none => if explicitTarget then none else (authReg.toList.find? fun (_, ai) => inRootMod ai.configConst).map Prod.snd
-  let rawEgress : List String := match server? with
-    | some si => si.externalServices.toList.map Prod.snd
-    | none => if explicitTarget then [] else extReg.toList.filterMap fun (_, ei) => if inRootMod (ei.serviceName ++ `_qed_external_marker) then some ei.baseOrigin else none
-  { version := 1, rootModule := rootMod, mode := if server?.isSome then "fullstack" else "standalone",
-    secrets := ((server?.map (·.secrets.toList)).getD [] ++ databases.flatMap (·.secrets.toList) ++ (authInfo?.map (·.secrets.toList)).getD []).eraseDups,
-    envVars := (server?.map (·.envVars.toList)).getD [],
-    egress := (rawEgress.filter fun o => !o.isEmpty && isValidEgressOrigin o).eraseDups,
-    databases, auth? := authInfo?.map (·.spec), server? }
 
 end Qed.Deploy

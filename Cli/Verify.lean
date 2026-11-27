@@ -32,63 +32,37 @@ private def kwFlags : Std.HashMap String UInt32 :=
 private def builtinQedFStrLine : String :=
   "@[qedExpr_parser] def qedFStr        : Parser := leading_parser:maxPrec atomic (kw \"f\" >> checkNoWsBefore \"\") >> interpolatedStr (categoryParser `qedExpr 0)"
 
-private structure DelimBalance where
-  seen : Bool := false
-  cur : Int := 0
-  minD : Int := 0
+private structure DelimBalance where (seen : Bool := false) (cur minD : Int := 0)
 
 private def DelimBalance.step (b : DelimBalance) (openCh closeCh : Char) (s : String) : DelimBalance :=
   s.foldl (init := b) fun acc ch =>
     if ch == openCh then { acc with seen := true, cur := acc.cur + 1 }
-    else if ch == closeCh then let c := acc.cur - 1; { seen := true, cur := c, minD := min acc.minD c }
-    else acc
+    else if ch == closeCh then let c := acc.cur - 1; { seen := true, cur := c, minD := min acc.minD c } else acc
 
-@[inline] private def DelimBalance.isUnbalanced (b : DelimBalance) (hasChoice : Bool) : Bool :=
-  b.cur != 0 || b.minD < 0 || (b.seen && hasChoice)
+@[inline] private def DelimBalance.isUnbalanced (b : DelimBalance) (hasChoice : Bool) : Bool := b.cur != 0 || b.minD < 0 || (b.seen && hasChoice)
 
 private structure SyntaxScanInfo where
-  headerTokens : Array String := #[]
-  allLexerStrings : Array String := #[]
-  interpCount : Nat := 0
-  qedFStrInterpMatches : Nat := 0
-  hasAtInterpMacro : Bool := false
-  hasSyntaxGen : Bool := false
-  hasUnbalancedBrace : Bool := false
-  hasUnbalancedDelim : Bool := false
+  (headerTokens allLexerStrings : Array String := #[]) (interpCount qedFStrInterpMatches : Nat := 0)
+  (hasAtInterpMacro hasSyntaxGen hasUnbalancedBrace hasUnbalancedDelim : Bool := false)
 deriving Inhabited
 
 private structure CustomTokenMap where
-  byPair : Std.HashMap (Char × Char) (Array (Array Char × Bool)) := {}
-  pairMask : Array UInt64 := #[]
-  hasNonAscii : Bool := false
-  hasSingleCloseGuillemet : Bool := false
-  hasExactDocOpener : Bool := false
-  hasCloseBraceToken : Bool := false
+  (byPair : Std.HashMap (Char × Char) (Array (Array Char × Bool)) := {}) (pairMask : Array UInt64 := #[])
+  (hasNonAscii hasSingleCloseGuillemet hasExactDocOpener hasCloseBraceToken : Bool := false)
 
 /-! ### Shared Lean 4 Lexical Primitives -/
 
 private def sliceStr (cs : Array Char) (s e : Nat) : String := Id.run do
   let mut out := ""; for k in [s:e] do out := out.push cs[k]!
   return out
-
 @[inline] private def at2 (cs : Array Char) (n i : Nat) (a b : Char) : Bool := i + 1 < n && cs[i]! == a && cs[i + 1]! == b
-
-private partial def skipLine (cs : Array Char) (n i : Nat) : Nat :=
-  if i < n && cs[i]! != '\n' then skipLine cs n (i + 1) else i
-
-private partial def scanIdentEnd (cs : Array Char) (n i : Nat) : Nat :=
-  if i < n && Lean.isIdRest cs[i]! then scanIdentEnd cs n (i + 1) else i
-
+private partial def skipLine (cs : Array Char) (n i : Nat) : Nat := if i < n && cs[i]! != '\n' then skipLine cs n (i + 1) else i
+private partial def scanIdentEnd (cs : Array Char) (n i : Nat) : Nat := if i < n && Lean.isIdRest cs[i]! then scanIdentEnd cs n (i + 1) else i
 private partial def skipDigits (cs : Array Char) (n i : Nat) (alnum : Bool) : Nat :=
   if i < n && (if alnum then cs[i]!.isAlphanum || cs[i]! == '_' else cs[i]!.isDigit) then skipDigits cs n (i + 1) alnum else i
-
-private partial def countHashes (cs : Array Char) (n pos k : Nat) : Nat :=
-  if pos + k < n && cs[pos + k]! == '#' then countHashes cs n pos (k + 1) else k
-
+private partial def countHashes (cs : Array Char) (n pos k : Nat) : Nat := if pos + k < n && cs[pos + k]! == '#' then countHashes cs n pos (k + 1) else k
 private def rawStrHashesAt (cs : Array Char) (n pos : Nat) : Option Nat :=
-  if pos >= n || cs[pos]! != 'r' then none
-  else let k := countHashes cs n (pos + 1) 0; if pos + 1 + k < n && cs[pos + 1 + k]! == '"' then some k else none
-
+  if pos >= n || cs[pos]! != 'r' then none else let k := countHashes cs n (pos + 1) 0; if pos + 1 + k < n && cs[pos + 1 + k]! == '"' then some k else none
 @[inline] private def isRawStrStart (cs : Array Char) (n i : Nat) (prevIdent : Bool) : Bool :=
   cs[i]! == 'r' && !prevIdent && (i == 0 || (cs[i - 1]! != '.' && cs[i - 1]! != '`')) && (rawStrHashesAt cs n i).isSome
 
@@ -98,18 +72,14 @@ private partial def skipBlockComment (cs : Array Char) (n j ln ls depth : Nat) :
   else if at2 cs n j '/' '-' then skipBlockComment cs n (j + 2) ln ls (depth + 1)
   else if at2 cs n j '-' '/' then skipBlockComment cs n (j + 2) ln ls (depth - 1)
   else skipBlockComment cs n (j + 1) ln ls depth
-
 @[inline] private def enterBlockComment (cs : Array Char) (n i ln ls : Nat) : Nat × Nat × Nat :=
-  if i + 2 < n then
-    if cs[i + 2]! == '\n' then skipBlockComment cs n (i + 3) (ln + 1) (i + 3) 1 else skipBlockComment cs n (i + 3) ln ls 1
-  else (n, ln, ls)
+  if i + 2 < n then if cs[i + 2]! == '\n' then skipBlockComment cs n (i + 3) (ln + 1) (i + 3) 1 else skipBlockComment cs n (i + 3) ln ls 1 else (n, ln, ls)
 
 private partial def scanRawStrLoop (cs : Array Char) (n k bs j ln ls : Nat) : Nat × Nat × Nat × Nat × Nat :=
   if j >= n then (j, bs, n, ln, ls)
   else if cs[j]! == '\n' then scanRawStrLoop cs n k bs (j + 1) (ln + 1) (j + 1)
   else if cs[j]! == '"' && j + k < n && countHashes cs n (j + 1) 0 >= k then (j + 1 + k, bs, j, ln, ls)
   else scanRawStrLoop cs n k bs (j + 1) ln ls
-
 @[inline] private def scanRawStr (cs : Array Char) (n i ln ls : Nat) : Nat × Nat × Nat × Nat × Nat :=
   let k := (rawStrHashesAt cs n i).getD 0; scanRawStrLoop cs n k (i + 2 + k) (i + 2 + k) ln ls
 
@@ -117,38 +87,25 @@ private def scanCharLit (cs : Array Char) (n i : Nat) : Nat := Id.run do
   let mut j := i + 1
   if j < n && cs[j]! == '\\' then
     j := j + 2
-    while j < n && j < i + 10 && cs[j]! != '\n' do
-      if cs[j]! == '\'' then return j + 1
-      j := j + 1
+    while j < n && j < i + 10 && cs[j]! != '\n' do if cs[j]! == '\'' then return j + 1 else j := j + 1
   else if j + 1 < n && cs[j]! != '\n' && cs[j]! != '\'' && cs[j + 1]! == '\'' then return j + 2
   return i + 1
-
 private partial def scanGuillemetLoop (cs : Array Char) (n j ln ls : Nat) : Nat × Nat × Nat × Nat :=
   if j >= n || cs[j]! == '»' then (j, if j < n then j + 1 else j, ln, ls)
-  else if cs[j]! == '\n' then scanGuillemetLoop cs n (j + 1) (ln + 1) (j + 1)
-  else scanGuillemetLoop cs n (j + 1) ln ls
+  else if cs[j]! == '\n' then scanGuillemetLoop cs n (j + 1) (ln + 1) (j + 1) else scanGuillemetLoop cs n (j + 1) ln ls
 
 private def matchWord (cs : Array Char) (s e : Nat) (w : String) : Bool :=
   e - s == w.length && Id.run do
     let mut k := s
-    for c in w.toList do
-      if cs[k]! != c then return false
-      k := k + 1
+    for c in w.toList do if cs[k]! != c then return false else k := k + 1
     return true
-
-private def forbiddenAt? (cs : Array Char) (s e : Nat) : Option String :=
-  match e - s, cs[s]! with
-  | 5,  's' => if cs[s+1]! == 'o' && cs[s+2]! == 'r' && cs[s+3]! == 'r' && cs[s+4]! == 'y' then some "sorry" else none
-  | 5,  'a' => if cs[s+1]! == 'd' && cs[s+2]! == 'm' && cs[s+3]! == 'i' && cs[s+4]! == 't' then some "admit" else none
-  | 7,  's' => if cs[s+1]! == 'o' && cs[s+2]! == 'r' && cs[s+3]! == 'r' && cs[s+4]! == 'y' && cs[s+5]! == 'A' && cs[s+6]! == 'x' then some "sorryAx" else none
-  | 13, 'n' => if matchWord cs s e "native_decide" then some "native_decide" else none
-  | _,  _   => none
-
-private def hasForbiddenSubstr (s : String) : Bool :=
-  s.contains "sorry" || s.contains "admit" || s.contains "native_decide" || s.contains "#guard"
-
-private partial def skipSpaces (cs : Array Char) (stop i : Nat) : Nat :=
-  if i < stop && (cs[i]! == ' ' || cs[i]! == '\t') then skipSpaces cs stop (i + 1) else i
+private def forbiddenAt? (cs : Array Char) (s e : Nat) : Option String := match e - s, cs[s]! with
+  | 5, 's' => if cs[s+1]! == 'o' && cs[s+2]! == 'r' && cs[s+3]! == 'r' && cs[s+4]! == 'y' then some "sorry" else none
+  | 5, 'a' => if cs[s+1]! == 'd' && cs[s+2]! == 'm' && cs[s+3]! == 'i' && cs[s+4]! == 't' then some "admit" else none
+  | 7, 's' => if cs[s+1]! == 'o' && cs[s+2]! == 'r' && cs[s+3]! == 'r' && cs[s+4]! == 'y' && cs[s+5]! == 'A' && cs[s+6]! == 'x' then some "sorryAx" else none
+  | 13, 'n' => if matchWord cs s e "native_decide" then some "native_decide" else none | _, _ => none
+private def hasForbiddenSubstr (s : String) : Bool := s.contains "sorry" || s.contains "admit" || s.contains "native_decide" || s.contains "#guard"
+private partial def skipSpaces (cs : Array Char) (stop i : Nat) : Nat := if i < stop && (cs[i]! == ' ' || cs[i]! == '\t') then skipSpaces cs stop (i + 1) else i
 
 private partial def decodeLeanStrLoop (cs : Array Char) (stop : Nat) (stopAtQuote : Bool) (i ls : Nat) (out : String) : String × Nat × Nat :=
   if i >= stop then (out, i, ls)
@@ -251,22 +208,24 @@ private def countNewlines (cs : Array Char) (i len ls : Nat) (asLineStart : Bool
   for k in [0:len] do if cs[i + k]! == '\n' then cur := if asLineStart then i + k + 1 else cur + 1
   return cur
 
+private inductive LexSkip where
+  | newline (ni : Nat) | trivia (ni nln nls : Nat) | rawStr (ni bs be nln nls : Nat) | custom (cLen : Nat) | other
+
+@[inline] private def stepLexSkip (cs : Array Char) (n i ln ls : Nat) (toks : CustomTokenMap) (prevId prevEnd treatDoc blockCb : Bool) : LexSkip :=
+  match cs[i]! with
+  | '\n' => .newline (i + 1) | ' ' | '\t' | '\r' => .trivia (i + 1) ln ls
+  | c =>
+    if c.isWhitespace then .trivia (i + 1) ln ls
+    else if at2 cs n i '-' '-' then .trivia (skipLine cs n (i + 2)) ln ls
+    else if at2 cs n i '/' '-' && !isDocCommentOverridden cs n i toks prevId prevEnd treatDoc then let (ni, nl, nls) := enterBlockComment cs n i ln ls; .trivia ni nl nls
+    else if isRawStrStart cs n i prevId then let (ni, bs, be, nl, nls) := scanRawStr cs n i ln ls; .rawStr ni bs be nl nls
+    else if let some cLen := matchCustomTokenAt cs n toks i prevId prevEnd blockCb then .custom cLen else .other
+
 /-! ### Pass A: Tail-Recursive Register-Pure Syntax & Custom Token Extractor -/
 
-private structure ExtractCtx where
-  cs : Array Char
-  n : Nat
-  known : CustomTokenMap
-  ignoreDelim : Bool
-
+private structure ExtractCtx where (cs : Array Char) (n : Nat) (known : CustomTokenMap) (ignoreDelim : Bool)
 private structure ExtractAcc where
-  headerTokens : Array String := #[]
-  headerSet : Std.HashSet String := {}
-  allLexerStrings : Array String := #[]
-  allLexerSet : Std.HashSet String := {}
-  hdrB : DelimBalance := {}
-  hdrK : DelimBalance := {}
-  hdrP : DelimBalance := {}
+  (headerTokens allLexerStrings : Array String := #[]) (headerSet allLexerSet : Std.HashSet String := {}) (hdrB hdrK hdrP : DelimBalance := {})
 
 private def pushDedup (raw : String) (acc : Array String) (seen : Std.HashSet String) : Array String × Std.HashSet String :=
   let t := raw.cliTrim; if !seen.contains t && isLexerCustomToken t then (acc.push t, seen.insert t) else (acc, seen)
@@ -313,23 +272,17 @@ private partial def extractLoop (ctx : ExtractCtx) (i ls ic qm attrD delimD quot
       hasUnbalancedDelim := (fl &&& 4096) != 0 }
   else
     let c := cs[i]!; let prevId := (fl &&& 1) != 0; let prevEnd := (fl &&& 2) != 0; let fl0 := fl &&& ~~~3
-    match c with
-    | '\n' => extractLoop ctx (i + 1) (i + 1) ic qm attrD delimD quoteD (fl0 ||| 24) qp acc
-    | ' ' | '\t' | '\r' => extractLoop ctx (i + 1) ls ic qm attrD delimD quoteD fl0 qp acc
-    | '"' =>
-      let (s, ni, nls) := decodeLeanStrLoop cs n true (i + 1) ls ""; let (fl', acc') := recordStr (fl0 &&& ~~~24) acc s
+    match stepLexSkip cs n i 0 ls ctx.known prevId prevEnd false false with
+    | .newline ni => extractLoop ctx ni ni ic qm attrD delimD quoteD (fl0 ||| 24) qp acc
+    | .trivia ni _ nls => extractLoop ctx ni nls ic qm attrD delimD quoteD fl0 qp acc
+    | .rawStr ni bs be _ nls =>
+      let (fl', acc') := recordStr (fl0 &&& ~~~24) acc (sliceStr cs bs be)
       extractLoop ctx ni nls ic qm attrD delimD quoteD fl' qp acc'
-    | _ =>
-      if c.isWhitespace then extractLoop ctx (i + 1) ls ic qm attrD delimD quoteD fl0 qp acc
-      else if at2 cs n i '-' '-' then extractLoop ctx (skipLine cs n (i + 2)) ls ic qm attrD delimD quoteD fl0 qp acc
-      else if at2 cs n i '/' '-' && !isDocCommentOverridden cs n i ctx.known prevId prevEnd false then
-        let (ni, _, nls) := enterBlockComment cs n i 0 ls; extractLoop ctx ni nls ic qm attrD delimD quoteD fl0 qp acc
-      else if isRawStrStart cs n i prevId then
-        let (ni, bs, be, _, nls) := scanRawStr cs n i 0 ls; let (fl', acc') := recordStr (fl0 &&& ~~~24) acc (sliceStr cs bs be)
+    | .custom cLen => extractLoop ctx (i + cLen) (countNewlines cs i cLen ls true) ic qm attrD delimD quoteD (fl0 &&& ~~~24) qp acc
+    | .other => match c with
+      | '"' =>
+        let (s, ni, nls) := decodeLeanStrLoop cs n true (i + 1) ls ""; let (fl', acc') := recordStr (fl0 &&& ~~~24) acc s
         extractLoop ctx ni nls ic qm attrD delimD quoteD fl' qp acc'
-      else if let some cLen := matchCustomTokenAt cs n ctx.known i prevId prevEnd then
-        extractLoop ctx (i + cLen) (countNewlines cs i cLen ls true) ic qm attrD delimD quoteD (fl0 &&& ~~~24) qp acc
-      else match c with
       | '=' =>
         let fl1 := fl0 &&& ~~~24
         if i + 1 < n && cs[i + 1]! == '>' then
@@ -396,14 +349,7 @@ private partial def extractLoop (ctx : ExtractCtx) (i ls ic qm attrD delimD quot
 /-! ### Pass B: Tail-Recursive Register-Pure Forbidden Token Scanner -/
 
 private structure ScanCtx where
-  cs : Array Char
-  n : Nat
-  incInterp : Bool
-  toks : CustomTokenMap
-  allInterp : Bool
-  treatDoc : Bool
-  braceMode : Nat
-  allowCb : Bool
+  (cs : Array Char) (n : Nat) (incInterp : Bool) (toks : CustomTokenMap) (allInterp treatDoc : Bool) (braceMode : Nat) (allowCb : Bool)
 
 -- `ic : UInt32`: bit 0=prevInterp, bit 1=afterTrace, bit 2=inAtRefTail, bit 3=inAtField, bits 4..31=pendingAtArgs
 @[inline] private def mkIc (p : UInt32 := 0) (prev after tail field : Bool := false) : UInt32 :=
@@ -442,19 +388,12 @@ private partial def scanForbiddenLoop (ctx : ScanCtx) (i line : Nat) (sfl ic : U
     scanForbiddenLoop ctx ni nl 0 0 gs (if enterB then ib.push (0, gs.size) else ib) hits
   else
     let c := cs[i]!; let prevId := (sfl &&& 1) != 0; let prevEnd := (sfl &&& 2) != 0
-    match c with
-    | '\n' => scanForbiddenLoop ctx (i + 1) (line + 1) 0 (ic &&& ~~~4) gs ib hits
-    | ' ' | '\t' | '\r' => scanForbiddenLoop ctx (i + 1) line 0 (ic &&& ~~~4) gs ib hits
-    | _ =>
-      if c.isWhitespace then scanForbiddenLoop ctx (i + 1) line 0 (ic &&& ~~~4) gs ib hits
-      else if at2 cs n i '-' '-' then scanForbiddenLoop ctx (skipLine cs n (i + 2)) line 0 (ic &&& ~~~4) gs ib hits
-      else if at2 cs n i '/' '-' && !isDocCommentOverridden cs n i ctx.toks prevId prevEnd ctx.treatDoc then
-        let (ni, nl, _) := enterBlockComment cs n i line 0; scanForbiddenLoop ctx ni nl 0 (ic &&& ~~~4) gs ib hits
-      else if isRawStrStart cs n i prevId then
-        let (ni, _, _, nl, _) := scanRawStr cs n i line 0; scanForbiddenLoop ctx ni nl 0 0 gs ib hits
-      else if let some cLen := matchCustomTokenAt cs n ctx.toks i prevId prevEnd (!ctx.allowCb && !ib.isEmpty && ib.back!.1 == 0) then
-        scanForbiddenLoop ctx (i + cLen) (countNewlines cs i cLen line false) 0 (if inc then consumeAtArg ic else 0) gs ib hits
-      else match c with
+    match stepLexSkip cs n i line 0 ctx.toks prevId prevEnd ctx.treatDoc (!ctx.allowCb && !ib.isEmpty && ib.back!.1 == 0) with
+    | .newline ni => scanForbiddenLoop ctx ni (line + 1) 0 (ic &&& ~~~4) gs ib hits
+    | .trivia ni nl _ => scanForbiddenLoop ctx ni nl 0 (ic &&& ~~~4) gs ib hits
+    | .rawStr ni _ _ nl _ => scanForbiddenLoop ctx ni nl 0 0 gs ib hits
+    | .custom cLen => scanForbiddenLoop ctx (i + cLen) (countNewlines cs i cLen line false) 0 (if inc then consumeAtArg ic else 0) gs ib hits
+    | .other => match c with
       | '«' =>
         let ic' := if !inc then 0 else if (ic &&& 8) != 0 then finishAtField ic else consumeAtArg ic
         let (ge, ni, nl, _) := scanGuillemetLoop cs n (i + 1) line 0
@@ -720,30 +659,30 @@ def verify (checkExterns : Bool := true) (extraLakeTargets : Array String := #[]
   let hasExamples ← isInRepo
   let tGrep ← IO.asTask grepForbidden; let tEff ← spawnIf hasExamples effectsCovered
   let tGraph ← spawnIf hasExamples buildGraphClean; let tLp ← IO.asTask lakeEnvLeanPath
+  if !(← waitAllOk [tGrep]) then
+    discard <| waitAllOk [tEff, tGraph]; discard <| IO.wait tLp; return false
   let base ← if hasExamples then pure #["Qed", "Qed.Driver", "QedServer", "QedProofs", "JsProofs", "qedjs", "Examples", "QedTests"]
     else do let (root, jsMod) := (← webRoot, ← jsRoot); pure (if checkExterns && jsMod != root then #[root, jsMod] else #[root])
   let extra := targetMod?.elim extraLakeTargets (addUniq extraLakeTargets ·)
   if (← shLakeBuild (#["build"] ++ base ++ extra.filter (!base.contains ·))) != 0 then
-    discard <| waitAllOk [tGrep, tEff, tGraph]; discard <| IO.wait tLp; return false
+    discard <| waitAllOk [tEff, tGraph]; discard <| IO.wait tLp; return false
   let lp? := (← IO.wait tLp).toOption.join
   let q? ← match ← resolveQedjsBin (needBuild := false), lp? with
     | some bin, some leanPath => pure (some { bin, leanPath : QedjsEnv }) | _, _ => resolveQedjsEnv (needBuild := false)
   let tAxiom ← IO.asTask (axiomClean (q?.map (·.leanPath)))
   let tExt ← spawnIf checkExterns (externsCovered q? (alreadyBuilt := true))
   let okKernel ← kernelEnvClean q? (alreadyBuilt := true) (targetMod? := targetMod?)
-  return (← waitAllOk [tGrep, tEff, tGraph, tAxiom, tExt]) && okKernel
+  return (← waitAllOk [tEff, tGraph, tAxiom, tExt]) && okKernel
 
 def cmdCheck : IO UInt32 := do
   if ← verify (checkExterns := true) then IO.println (green "✓ verified"); return 0
   else IO.eprintln (red "✗ verification failed"); return 1
 
 def cmdTest : IO UInt32 := do
-  if !(← verify) then IO.eprintln (red "✗ verification failed"); return 1
-  step "building native test runner"
   let targets := #["qedtest", "qed/QedServer:static", "qed/Qed:static", "qed/libqed_server"] ++
     (if ← isInRepo then #["+QedTests.CheckHelper:c.o", "+QedTests.AuthChecks:c.o",
       "+QedTests.DbChecks:c.o", "+QedTests.WebEssentialsFixture:c.o", "+Examples.CloudBooks:c.o", "+Examples.LiveRoom:c.o"] else #[])
-  if (← shLakeBuild (#["build"] ++ targets)) != 0 then IO.eprintln (red "✗ failed to build native test runner"); return 1
+  if !(← verify (extraLakeTargets := targets)) then IO.eprintln (red "✗ verification failed"); return 1
   step "running tests"
   let some lp ← lakeEnvLeanPath | return 1
   sh (FilePath.mk ".lake" / "build" / "bin" / "qedtest").toString #[] #[("QED_SKIP_VERIFY", some "1"), ("QED_PREBUILT", some "1"), ("LEAN_PATH", some lp)]

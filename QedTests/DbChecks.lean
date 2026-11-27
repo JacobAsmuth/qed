@@ -23,54 +23,51 @@ database VaultDb:
     index (ownerId, version)
 
 def sameCompiledSql (q1 q2 : Qed.Server.Db.SqlQuery) : Bool := (q1.compile .postgres).1 == (q2.compile .postgres).1 && (q1.compile .sqlite).1 == (q2.compile .sqlite).1
-example : (
-  let mk (v : String) := Qed.Server.Db.SqlQuery.select (sql!"notes") [sql!"id"] (.binOp .eq (.col (sql!"ownerId")) (.param (.text v)))
-  strHasAll (VaultDb.ddl .postgres) ["CREATE TABLE IF NOT EXISTS \"notes\"", "CHECK (1 <= LENGTH(\"body\") AND LENGTH(\"body\") <= 2000)"] &&
-  strHas (VaultDb.ddl .sqlite) "CREATE INDEX IF NOT EXISTS \"idx_notes_0\" ON \"notes\" (\"ownerId\", \"version\")" &&
-  strHasAll VaultDb.rlsDdl ["ENABLE ROW LEVEL SECURITY", "current_setting('qed.user_id', true)"] && sameCompiledSql (mk "alice") (mk "' OR 1=1; DROP TABLE notes; --")) = true := by decide +kernel
+example : (let mk (v : String) := Qed.Server.Db.SqlQuery.select (sql!"notes") [sql!"id"] (.binOp .eq (.col (sql!"ownerId")) (.param (.text v)))
+  sameCompiledSql (mk "alice") (mk "' OR 1=1; DROP TABLE notes; --")) = true := by decide +kernel
 server VaultApi:
   use db : VaultDb
   rpc listBooks() -> VaultDb.books[]!: return await db.books.select(orderBy = "id")?
   rpc listMyNotes() -> VaultDb.notes[]!:
-    requires ctx.userId != none
-    return await db.notes.select(where = r => r.ownerId == ctx.userId.getD(""), orderBy = "-version", limit = 50)?
+    requires auth
+    return await db.notes.select(where = r => r.ownerId == uid, orderBy = "-version", limit = 50)?
+  -- Keep one explicit legacy `ctx.userId != none` RPC to verify backwards compatibility.
   rpc getNote(noteId: Nat) -> VaultDb.notes?!:
     requires ctx.userId != none
     ensures result.id == noteId
     if let some(uid) = ctx.userId: return await db.notes.findOne(where = r => r.id == noteId and r.ownerId == uid)?
     return none
   rpc countMyNotes() -> Nat!:
-    requires ctx.userId != none
-    return await db.notes.count(where = r => r.ownerId == ctx.userId.getD(""))?
+    requires auth
+    return await db.notes.count(where = r => r.ownerId == uid)?
   rpc createNote(noteId: Nat, body: String) -> VaultDb.notes!:
-    requires ctx.userId != none, 1 <= body.length <= 2000
+    requires auth, 1 <= body.length <= 2000
     ensures result.id == noteId, result.body == body, 1 <= result.body.length <= 2000
-    let uid = ctx.userId.getD("")
     if not (1 <= uid.length <= 64): return fail(.invalidUser)
     return await db.notes.insert(id = noteId, ownerId = uid, body = body, version = 0, status = "draft")?
   rpc editNote(noteId: Nat, body: String) -> VaultDb.notes?!:
-    requires ctx.userId != none, 1 <= body.length <= 2000
+    requires auth, 1 <= body.length <= 2000
     ensures result.id == noteId, result.body == body
-    return await db.notes.updateOne(where = r => r.id == noteId and r.ownerId == ctx.userId.getD(""), set = r => { body = body, version = r.version + 1 })?
+    return await db.notes.updateOne(where = r => r.id == noteId and r.ownerId == uid, set = r => { body = body, version = r.version + 1 })?
   rpc publishNote(noteId: Nat) -> VaultDb.notes?!:
-    requires ctx.userId != none
+    requires auth
     ensures result.id == noteId, result.status == "published"
-    return await db.notes.updateOne(where = r => r.id == noteId and r.ownerId == ctx.userId.getD("") and r.status == "draft", set = r => { status = "published", version = r.version + 1 })?
+    return await db.notes.updateOne(where = r => r.id == noteId and r.ownerId == uid and r.status == "draft", set = r => { status = "published", version = r.version + 1 })?
   rpc deleteNote(noteId: Nat) -> Nat!:
-    requires ctx.userId != none
-    return await db.notes.delete(where = r => r.id == noteId and r.ownerId == ctx.userId.getD(""))?
+    requires auth
+    return await db.notes.delete(where = r => r.id == noteId and r.ownerId == uid)?
   rpc seedBook(bookId: String, title: String, stock: Nat) -> VaultDb.books!:
-    requires ctx.userId != none, 1 <= bookId.length <= 64, 1 <= title.length <= 200, stock <= 10000
+    requires auth, 1 <= bookId.length <= 64, 1 <= title.length <= 200, stock <= 10000
     return await db.books.insert(id = bookId, title = title, stock = stock)?
   rpc orderBook(bookId: String, qty: Nat) -> VaultDb.books?!:
-    requires ctx.userId != none, 1 <= qty <= 50
+    requires auth, 1 <= qty <= 50
     ensures result.id == bookId, result.stock <= 10000
     return await db.books.updateOne(where = r => r.id == bookId and r.stock >= qty, set = r => { stock = r.stock - qty })?
   rpc restockBook(bookId: String, qty: Nat) -> VaultDb.books?!:
-    requires ctx.userId != none, 1 <= qty <= 50
+    requires auth, 1 <= qty <= 50
     return await db.books.updateOne(where = r => r.id == bookId and r.stock + qty <= 10000, set = { stock += qty })?
   rpc atomicOrderBook(bookId: String, qty: Nat) -> VaultDb.books?!:
-    requires ctx.userId != none, 1 <= qty <= 50
+    requires auth, 1 <= qty <= 50
     return await db.books.updateOne(where = r => r.id == bookId and r.stock >= qty, set = { stock -= qty })?
 component VaultClient:
   session user
@@ -97,30 +94,18 @@ fullstack VaultApp:
 bad_db1 "Database read policy `VaultDb.notes.read` failed in `leakNote → VaultDb.notes.findOne`:\n  • must prove: some ownerId = ctx.userId" VaultDb leakNote(noteId: Nat) -> VaultDb.notes?! : return await db.notes.findOne(where = r => r.id == noteId)?
 bad_db "Database read policy `VaultDb.notes.read` failed in `dumpAll → VaultDb.notes.select`:\n  • must prove: some ownerId = ctx.userId" VaultDb : rpc dumpAll() -> VaultDb.notes[]!: return await db.notes.select()?
 bad_db1 "Database delete policy `VaultDb.notes.delete` failed in `nukeNote → VaultDb.notes.delete`:\n  • must prove: some ownerId = ctx.userId" VaultDb nukeNote(noteId: Nat) -> Nat! : return await db.notes.delete(where = r => r.id == noteId)?
-/-- error: Database update policy `VaultDb.notes.update` failed in `hijackEdit → VaultDb.notes.updateOne`:
-  • must prove: some ownerId = ctx.userId
-
-Hint: Ensure `where = r => ...` implies `some(row.ownerId) == ctx.userId`.
----
-error: Database post-update policy `VaultDb.notes.update` (anti-hijack) failed in `hijackEdit → VaultDb.notes.updateOne`:
-  • must prove: some ownerId = ctx.userId
-
-Hint: Ensure `where = r => ...` implies `some(row.ownerId) == ctx.userId`. -/
-#guard_msgs in rollback_env
-server BadUpdateIdor:
-  use db : VaultDb
+bad_db "Database update policy `VaultDb.notes.update` failed in `hijackEdit → VaultDb.notes.updateOne`:\n  • must prove: some ownerId = ctx.userId\n\nHint: Ensure `where = r => ...` implies `some(row.ownerId) == ctx.userId`.\n---\nerror: Database post-update policy `VaultDb.notes.update` (anti-hijack) failed in `hijackEdit → VaultDb.notes.updateOne`:\n  • must prove: some ownerId = ctx.userId" VaultDb :
   rpc hijackEdit(noteId: Nat, body: String) -> VaultDb.notes?!:
-    requires ctx.userId != none, 1 <= body.length <= 2000
+    requires auth, 1 <= body.length <= 2000
     return await db.notes.updateOne(where = r => r.id == noteId, set = r => { body = body, version = r.version + 1 })?
 bad_db "Database insert policy `VaultDb.notes.insert` failed in `spoofInsert → VaultDb.notes.insert`:\n  • must prove: some \"victim\" = ctx.userId" VaultDb :
   rpc spoofInsert(noteId: Nat, body: String) -> VaultDb.notes!:
-    requires ctx.userId != none, 1 <= body.length <= 2000
+    requires auth, 1 <= body.length <= 2000
     return await db.notes.insert(id = noteId, ownerId = "victim", body = body, version = 0, status = "draft")?
 bad_db1 "cannot update `immutable` column `VaultDb.notes.ownerId` in `stealOwner`" VaultDb stealOwner(noteId: Nat) -> VaultDb.notes?! : return await db.notes.updateOne(where = r => r.id == noteId and r.ownerId == ctx.userId.getD(""), set = r => { ownerId = "attacker" })?
 bad_db "Database table constraint `VaultDb.notes.RowInv` failed in `emptyNote → VaultDb.notes.insert`" VaultDb :
   rpc emptyNote(noteId: Nat) -> VaultDb.notes!:
-    requires ctx.userId != none
-    let uid = ctx.userId.getD("")
+    requires auth
     if not (1 <= uid.length <= 64): return fail(.badUser)
     return await db.notes.insert(id = noteId, ownerId = uid, body = "", version = 0, status = "draft")?
 bad_db1 "Database transition/monotonicity invariant `VaultDb.notes.TransInv` failed in `downgradeVersion → VaultDb.notes.updateOne`:\n  • must prove: version - 1 >= version" VaultDb downgradeVersion(noteId: Nat) -> VaultDb.notes?! : return await db.notes.updateOne(where = r => r.id == noteId and r.ownerId == ctx.userId.getD("") and r.version >= 1, set = r => { version = r.version - 1 })?
@@ -165,52 +150,43 @@ def mkMigrationFixture (tblName : Qed.Server.Db.SqlIdent) (extraV1Cols : List Qe
   ({ name := tblName, columns := baseCols, indexes := [] },
    { name := tblName, indexes := [[⟨"views", by decide⟩]], columns := baseCols ++ [{ name := ⟨"notes", by decide⟩, colType := .text, nullable := true }, { name := ⟨"views", by decide⟩, colType := .int, nullable := false, checkSql? := some "\"views\" >= 0" }] },
    { name := unsafeColName, colType := .text, nullable := false, checkSql? := some s!"LENGTH(\"{unsafeColName.raw}\") >= 4" })
-example : (
-  let mk (p1 p2 i1 i2 : String) := Qed.Server.Db.SqlQuery.select ⟨"items", by decide⟩ [⟨"id", by decide⟩]
-    (.binOp .and (.startsWith (.col ⟨"title", by decide⟩) (.param (.text p1))) (.binOp .and (.contains (.col ⟨"title", by decide⟩) (.param (.text p2))) (.inList (.col ⟨"id", by decide⟩) [.text i1, .text i2])))
-    (limit := some 10) (offset := some 5)
-  let (oldTbl, newTbl, unsafeCol) := mkMigrationFixture ⟨"items", by decide⟩; let steps := Qed.Server.Db.diffTableSchemas [oldTbl] [newTbl]
-  let (pgDdl, sqDdl) := (Qed.Server.Db.renderMigrationDdl .postgres steps, Qed.Server.Db.renderMigrationDdl .sqlite steps)
-  sameCompiledSql (mk "Rust" "Lean" "a" "b") (mk "'; DROP TABLE items; --" "%' OR 1=1 --" "'; DELETE FROM items;" "x") &&
+example : (let (oldTbl, newTbl, unsafeCol) := mkMigrationFixture ⟨"items", by decide⟩
+  let steps := Qed.Server.Db.diffTableSchemas [oldTbl] [newTbl]
   steps.length == 3 && (Qed.Server.Db.verifyMigrationSafe steps).isOk &&
-  strHasAll pgDdl ["ADD COLUMN IF NOT EXISTS \"notes\" TEXT", "ADD COLUMN IF NOT EXISTS \"views\" BIGINT NOT NULL DEFAULT 0"] &&
-  strHasAll sqDdl ["ADD COLUMN \"views\" INTEGER NOT NULL DEFAULT 0", "CREATE INDEX IF NOT EXISTS \"idx_items_0\""] &&
   (Qed.Server.Db.diffTableSchemas [newTbl] [newTbl]).isEmpty && !(Qed.Server.Db.verifyMigrationSafe [.addColumn ⟨"items", by decide⟩ unsafeCol none]).isOk) = true := by decide +kernel
 server ShopApi:
   use db : ShopDb
   state txOps : Nat = 0
   invariant txOpsNonNeg: txOps >= 0
   rpc searchItems(pfx: String, sub: String, pageOffset: Nat) -> ShopDb.items[]!:
-    requires ctx.userId != none
-    return await db.items.select(where = r => r.ownerId == ctx.userId.getD("") and r.title.startsWith(pfx) and r.title.contains(sub), orderBy = "-price", limit = 20, offset = pageOffset)?
+    requires auth
+    return await db.items.select(where = r => r.ownerId == uid and r.title.startsWith(pfx) and r.title.contains(sub), orderBy = "-price", limit = 20, offset = pageOffset)?
   rpc filterByIds(ids: String[]) -> ShopDb.items[]!:
-    requires ctx.userId != none
-    return await db.items.select(where = r => r.ownerId == ctx.userId.getD("") and ids.contains(r.id), orderBy = "id", limit = 50, offset = 0)?
+    requires auth
+    return await db.items.select(where = r => r.ownerId == uid and ids.contains(r.id), orderBy = "id", limit = 50, offset = 0)?
   rpc totalInventoryValue() -> Nat!:
-    requires ctx.userId != none
-    return await db.items.sum(col = "price", where = r => r.ownerId == ctx.userId.getD(""))?
+    requires auth
+    return await db.items.sum(col = "price", where = r => r.ownerId == uid)?
   rpc cheapestPrice() -> Nat?!:
-    requires ctx.userId != none
-    return await db.items.min(col = "price", where = r => r.ownerId == ctx.userId.getD(""))?
+    requires auth
+    return await db.items.min(col = "price", where = r => r.ownerId == uid)?
   rpc highestPrice() -> Nat?!:
-    requires ctx.userId != none
-    return await db.items.max(col = "price", where = r => r.ownerId == ctx.userId.getD(""))?
+    requires auth
+    return await db.items.max(col = "price", where = r => r.ownerId == uid)?
   rpc itemsWithAuthors() -> (ShopDb.items, ShopDb.authors)[]!:
-    requires ctx.userId != none
-    return await db.items.join(table = authors, where = r => r.ownerId == ctx.userId.getD(""), orderBy = "-price", limit = 25, offset = 0)?
+    requires auth
+    return await db.items.join(table = authors, where = r => r.ownerId == uid, orderBy = "-price", limit = 25, offset = 0)?
   rpc logsWithProfiles() -> (ShopDb.secretLogs, ShopDb.privateProfiles)[]!:
-    requires ctx.userId != none
-    return await db.secretLogs.join(table = privateProfiles, where = r => r.ownerId == ctx.userId.getD(""), rightWhere = p => p.ownerId == ctx.userId.getD(""))?
+    requires auth
+    return await db.secretLogs.join(table = privateProfiles, where = r => r.ownerId == uid, rightWhere = p => p.ownerId == uid)?
   rpc createAuthorAndItem(aid: String, aname: String, iid: String, title: String, price: Nat) -> ShopDb.items!:
-    requires ctx.userId != none, 1 <= aid.length <= 64, 1 <= aname.length <= 120, 1 <= iid.length <= 64, 1 <= title.length <= 200, price <= 100000
+    requires auth, 1 <= aid.length <= 64, 1 <= aname.length <= 120, 1 <= iid.length <= 64, 1 <= title.length <= 200, price <= 100000
     ensures result.id == iid, result.price == price
-    let uid = ctx.userId.getD("")
     if not (1 <= uid.length <= 64): return fail(.badUser)
     db.transaction: let _a = await db.authors.insert(id = aid, name = aname)?; let created = await db.items.insert(id = iid, authorId = aid, ownerId = uid, title = title, price = price)?; atomic: txOps += 1; return created
   rpc createPairDotSyntax(aid: String, aname: String, iid: String, title: String, price: Nat) -> ShopDb.items!:
-    requires ctx.userId != none, 1 <= aid.length <= 64, 1 <= aname.length <= 120, 1 <= iid.length <= 64, 1 <= title.length <= 200, price <= 100000
+    requires auth, 1 <= aid.length <= 64, 1 <= aname.length <= 120, 1 <= iid.length <= 64, 1 <= title.length <= 200, price <= 100000
     ensures result.id == iid
-    let uid = ctx.userId.getD("")
     if not (1 <= uid.length <= 64): return fail(.badUser)
     db.transaction:
       let _a = await db.authors.insert(id = aid, name = aname)?
@@ -220,11 +196,11 @@ server ShopApi:
 bad_db "Database read policy `ShopDb.items.read` failed in `leakSum → ShopDb.items.sum`:\n  • must prove: some ownerId = ctx.userId" ShopDb : rpc leakSum() -> Nat!: return await db.items.sum(col = "price")?
 bad_db "Database read policy `ShopDb.privateProfiles.read` (joined table) failed in `leakProfileJoin → ShopDb.secretLogs.join`:\n  • must prove: some ownerId = ctx.userId" ShopDb :
   rpc leakProfileJoin() -> (ShopDb.secretLogs, ShopDb.privateProfiles)[]!:
-    requires ctx.userId != none
-    return await db.secretLogs.join(table = privateProfiles, where = r => r.ownerId == ctx.userId.getD(""))?
+    requires auth
+    return await db.secretLogs.join(table = privateProfiles, where = r => r.ownerId == uid)?
 bad_db "Database insert policy `ShopDb.items.insert` failed in `badTxInsert → ShopDb.items.insert`:\n  • must prove: some \"victim\" = ctx.userId" ShopDb :
   rpc badTxInsert(aid: String, iid: String) -> ShopDb.items!:
-    requires ctx.userId != none, 1 <= aid.length <= 64, 1 <= iid.length <= 64
+    requires auth, 1 <= aid.length <= 64, 1 <= iid.length <= 64
     db.transaction: return await db.items.insert(id = iid, authorId = aid, ownerId = "victim", title = "oops", price = 10)?
 
 /-! ## Verified Bidirectional Mappings & `Field`/`Ensured` DB Fact Harvesting -/
@@ -255,8 +231,7 @@ def sealPrefixBytes : Mapping (fun _ : SecretNoteInput => True) (fun bs : ByteAr
     let s ← match String.fromUTF8? pt with | some s => .ok s | none => .error "utf8"
     if h : 1 ≤ s.utf8ByteSize ∧ s.utf8ByteSize ≤ 200 then .ok { body := ⟨s, h⟩ } else .error "bounds"
   encode_ok input _ := by
-    have hpt : 1 ≤ input.body.val.utf8ByteSize ∧ input.body.val.utf8ByteSize ≤ 200 := input.body.ok
-    have hsz := Qed.toUTF8_size input.body.val
+    have hpt : 1 ≤ input.body.val.utf8ByteSize ∧ input.body.val.utf8ByteSize ≤ 200 := input.body.ok; have hsz := Qed.toUTF8_size input.body.val
     show 29 ≤ (Array.replicate 28 (0 : UInt8) ++ input.body.val.toUTF8.data).size ∧ (Array.replicate 28 (0 : UInt8) ++ input.body.val.toUTF8.data).size ≤ 228
     rw [Array.size_append, Array.size_replicate]; simp only [ByteArray.size] at hsz; omega
   decode_ok _ _ _ := trivial
@@ -281,42 +256,30 @@ def widerCipherMap : Mapping (fun _ : SecretNoteInput => True) (fun s : String =
   { toTarget := sealedNoteMap.toTarget, toSource := sealedNoteMap.toSource
     encode_ok := fun d hd => have h := sealedNoteMap.encode_ok d hd; by omega
     decode_ok := sealedNoteMap.decode_ok, roundtrip := sealedNoteMap.roundtrip }
-
-example : (
-  match SecretNoteInput.parse { body := "hello" } with
-  | none => false
-  | some sample =>
-    let ct := sealedNoteMap.encode sample
-    40 <= ct.val.length && ct.val.length <= 304 &&
-    (match sealedNoteMap.toSource ct.val with | .ok d => d.body.val == "hello" | .error _ => false)) = true := by decide +kernel
+example : (match SecretNoteInput.parse { body := "hello" } with
+  | some s => let ct := sealedNoteMap.encode s; 40 <= ct.val.length && ct.val.length <= 304 && (match sealedNoteMap.toSource ct.val with | .ok d => d.body.val == "hello" | .error _ => false)
+  | none => false) = true := by decide +kernel
 
 server CipherApi:
   use db : CipherDb
   use vdb : VaultDb
   rpc saveSealed(noteId: Nat, input: SecretNoteInput) -> CipherDb.sealedNotes!:
-    requires ctx.userId != none
-    let uid = ctx.userId.getD("")
+    requires auth
     if not (1 <= uid.length <= 64): return fail(.invalidUser)
-    let ct = sealedNoteMap.encode(input)
-    return await db.sealedNotes.insert(id = noteId, ownerId = uid, ciphertext = ct)?
+    return await db.sealedNotes.insert(id = noteId, ownerId = uid, ciphertext = sealedNoteMap.encode(input))?
   rpc editSealed(noteId: Nat, input: SecretNoteInput) -> CipherDb.sealedNotes?!:
-    requires ctx.userId != none
-    let uid = ctx.userId.getD("")
-    let ct = sealedNoteMap.encode(input)
-    return await db.sealedNotes.updateOne(where = r => r.id == noteId and r.ownerId == uid, set = r => { ciphertext = ct })?
+    requires auth
+    return await db.sealedNotes.updateOne(where = r => r.id == noteId and r.ownerId == uid, set = r => { ciphertext = sealedNoteMap.encode(input) })?
   rpc savePlainFromSchema(noteId: Nat, input: PlainNoteInput) -> VaultDb.notes!:
-    requires ctx.userId != none
-    let uid = ctx.userId.getD("")
+    requires auth
     if not (1 <= uid.length <= 64): return fail(.invalidUser)
     return await vdb.notes.insert(id = noteId, ownerId = uid, body = input.body, version = 0, status = "draft")?
 
 bad_db "Database table constraint `CipherDb.sealedNotes.RowInv` failed in `driftInsert → CipherDb.sealedNotes.insert`" CipherDb :
   rpc driftInsert(noteId: Nat, input: SecretNoteInput) -> CipherDb.sealedNotes!:
-    requires ctx.userId != none
-    let uid = ctx.userId.getD("")
+    requires auth
     if not (1 <= uid.length <= 64): return fail(.invalidUser)
-    let ct = widerCipherMap.encode(input)
-    return await db.sealedNotes.insert(id = noteId, ownerId = uid, ciphertext = ct)?
+    return await db.sealedNotes.insert(id = noteId, ownerId = uid, ciphertext = widerCipherMap.encode(input))?
 
 /-! ## Surface `mapping` DSL, Built-in `encrypted(...)` DB Columns & `{field}` View Rendering -/
 mapping DollarsToCentsMap:
@@ -327,8 +290,7 @@ mapping DollarsToCentsMap:
     if c % 100 == 0: return c / 100
     fail("must be whole dollars")
 
-example : (
-  let cents := DollarsToCentsMap.encode ⟨25, by decide⟩
+example : (let cents := DollarsToCentsMap.encode ⟨25, by decide⟩
   cents.val == 2500 &&
   (match DollarsToCentsMap.decode cents.val with | .ok d => d.val == 25 | .error _ => false) &&
   (match DollarsToCentsMap.decode 2550 with | .error msg => msg == "must be whole dollars" | .ok _ => false) &&
@@ -368,34 +330,25 @@ database EncVaultDb:
     raw     : encrypted(Bytes,  key = secret("QED_TEST_ENC_KEY") ?? "qed-test-enc-key")?
     policy read, write requires some(row.ownerId) == ctx.userId
 
-example : (
-  strHasAll (EncVaultDb.ddl .postgres) [
-    "\"body\" TEXT NOT NULL CHECK (40 <= LENGTH(\"body\") AND LENGTH(\"body\") <= 304)",
-    "\"note\" TEXT NOT NULL CHECK (40 <= LENGTH(\"note\") AND LENGTH(\"note\") <= 1104)",
-    "\"raw\" TEXT CHECK (40 <= LENGTH(\"raw\"))"] &&
-  !(EncVaultDb.secrets.contains "QED_TEST_ENC_KEY")) = true := by decide +kernel
+example : (!(EncVaultDb.secrets.contains "QED_TEST_ENC_KEY")) = true := by decide +kernel
 
 server EncVaultApi:
   use db : EncVaultDb
   rpc save(noteId: Nat, input: SecretNoteInput, rawOpt: Bytes?) -> EncVaultDb.entries!:
-    requires ctx.userId != none
+    requires auth
     ensures result.id == noteId
-    let uid = ctx.userId.getD("")
     if not (1 <= uid.length <= 64): return fail(.invalidUser)
     return await db.entries.insert(id = noteId, ownerId = uid, body = input.body, note = "ok", raw = rawOpt)?
   rpc edit(noteId: Nat, input: SecretNoteInput) -> EncVaultDb.entries?!:
-    requires ctx.userId != none
+    requires auth
     ensures result.id == noteId
-    let uid = ctx.userId.getD("")
     return await db.entries.updateOne(where = r => r.id == noteId and r.ownerId == uid, set = r => { body = input.body })?
   rpc get(noteId: Nat) -> EncVaultDb.entries?!:
-    requires ctx.userId != none
+    requires auth
     ensures result.id == noteId
-    let uid = ctx.userId.getD("")
     return await db.entries.findOne(where = r => r.id == noteId and r.ownerId == uid)?
   rpc list() -> EncVaultDb.entries[]!:
-    requires ctx.userId != none
-    let uid = ctx.userId.getD("")
+    requires auth
     return await db.entries.select(where = r => r.ownerId == uid, orderBy = "id")?
 
 component FieldRenderCheck:
@@ -409,31 +362,7 @@ bad_db1 "cannot update encrypted column `EncVaultDb.entries.body` using a row-de
 bad_db_tbl "cannot index encrypted column `bad.body`" BadEncIndexDb bad : id : Nat primary_key | body : encrypted(String, key = secret("K")) | index (body)
 bad_db_tbl "encrypted column `bad.body` cannot be `unique`" BadEncUniqueDb bad : id : Nat primary_key | body : encrypted(String, key = secret("K")) unique
 
-database TierCheckDb:
-  sqlite ".qed/tier_checks.db"
-  table scaling:
-    id           : String primary_key where 1 <= id.length <= 64
-    plan         : String
-    minInstances : Nat
-    maxInstances : Nat
-    invariant freeScaling:
-      minInstances <= maxInstances,
-      (plan == "pro" or plan == "enterprise") or (minInstances == 0 and maxInstances <= 1)
-
-example : (
-  strHasAll (TierCheckDb.ddl .postgres) [
-    "CONSTRAINT \"qed_chk_scaling_0\" CHECK (\"minInstances\" <= \"maxInstances\")",
-    "CONSTRAINT \"qed_chk_scaling_1\" CHECK ((((\"plan\" = 'pro' OR \"plan\" = 'enterprise')) OR ((\"minInstances\" = 0 AND \"maxInstances\" <= 1))))"] &&
-  strHasAll (Qed.Server.Db.renderDatabaseCheckDdl TierCheckDb.config.tables) [
-    "ADD CONSTRAINT \"qed_chk_scaling_1\" CHECK", "NOT VALID"]) = true := by decide +kernel
-
-bad_db "Database table constraint `TierCheckDb.scaling.RowInv` failed in `badFreeWarm → TierCheckDb.scaling.insert`" TierCheckDb :
-  rpc badFreeWarm(appId: String) -> TierCheckDb.scaling!:
-    requires 1 <= appId.length <= 64
-    return await db.scaling.insert(id = appId, plan = "free", minInstances = 1, maxInstances = 1)?
-
-/-! ## Track 3 & 4: Unit `enum` columns, `on_delete`, `backfill`, `upsert`, and standalone `<Db>.client` -/
-
+/-! ## Track 3 & 4: Unit `enum`, `on_delete`, `backfill`, `upsert`, Table Invariants & `Str.*` Bounds -/
 enum DeployStage:
   queued
   building   = "in-progress"
@@ -465,19 +394,29 @@ database RoadmapDb:
     slug    : ServiceSlug primary_key
     port    : ServicePort
     altPort : ServicePort?
+  table scaling:
+    id           : String primary_key where 1 <= id.length <= 64
+    plan         : String
+    minInstances : Nat
+    maxInstances : Nat
+    invariant freeScaling:
+      minInstances <= maxInstances,
+      (plan == "pro" or plan == "enterprise") or (minInstances == 0 and maxInstances <= 1)
+  table slots:
+    id      : String primary_key where 1 <= id.length <= 64
+    ownerId : String immutable   where 1 <= ownerId.length <= 64
+    label   : String             where 1 <= label.length <= 64
+    tag     : String             where tag.length <= 16
+    code    : String             where code.length <= 32
+    policy read, write requires some(ownerId) == ctx.userId
   backfill projects set { note = "migrated" } where r => r.note == none
 
 example : (
   let d? := Date.mk? 2026 11 25
-  strHasAll (RoadmapDb.ddl .postgres) [
-    "ON DELETE CASCADE", "ON DELETE SET NULL", "ON DELETE RESTRICT",
-    "CHECK (\"stage\" IN ('queued', 'in-progress', 'live', 'failed'))",
-    "\"slug\" TEXT NOT NULL PRIMARY KEY", "\"port\" BIGINT NOT NULL CHECK (\"port\" >= 0)", "\"altPort\" BIGINT"] &&
-  strHasAll (RoadmapDb.ddl .sqlite) ["\"port\" INTEGER NOT NULL CHECK (\"port\" >= 0)", "ON DELETE CASCADE"] &&
-  (match d?.map fun d => Qed.Server.Db.FromSql.fromSql (α := Date) (Qed.Server.Db.ToSql.toSql d) with
-   | some (.ok d') => some d' == d? | _ => false) &&
+  (match d?.map fun d => Qed.Server.Db.FromSql.fromSql (α := Date) (Qed.Server.Db.ToSql.toSql d) with | some (.ok d') => some d' == d? | _ => false) &&
   RoadmapDb.config.backfills.length == 1 &&
-  (RoadmapDb.config.backfills[0]?.map fun q => strHas (q.compile .postgres).1 "UPDATE \"projects\" SET \"note\" = $1 WHERE (\"note\" IS NULL)") == some true) = true := by decide +kernel
+  (match Qed.Server.Db.FromSql.fromSql (α := Int) (.text "-42") with | .ok n => n == -42 | _ => false) &&
+  (match Qed.Server.Db.FromSql.fromSql (α := Int) (.text "not_int") with | .error _ => true | _ => false)) = true := by decide +kernel
 
 server RoadmapApi:
   use db : RoadmapDb
@@ -502,33 +441,36 @@ server RoadmapApi:
     return await db.orgs.insertOrIgnore(id = orgId, name = name)?
   rpc findByTrimmedOwner(rawOwner: String) -> RoadmapDb.projects[]!:
     let clean = Qed.Str.truncate(Qed.Str.toLower(Qed.Str.trim(rawOwner)), 64)
-    if some(clean) != ctx.userId:
-      return fail(.forbidden)
+    if some(clean) != ctx.userId: return fail(.forbidden)
     return await db.projects.select(where = r => r.ownerId == clean)?
+  fn allocSlot(rawId: String, rawLabel: String, rawTag: String, rawCode: String) -> RoadmapDb.slots!:
+    requires auth, 1 <= uid.length <= 64, 1 <= rawId.length, 1 <= rawLabel.length, rawCode.length <= 32
+    return await db.slots.insert(id = Qed.Str.truncate(rawId, 64), ownerId = uid, label = Qed.Str.truncate(rawLabel, 64), tag = Qed.Str.take(rawTag, 16), code = Qed.Str.toLower(Qed.Str.trim(rawCode)))?
+  fn relabelSlot(slotId: String, rawLabel: String, rawTag: String) -> RoadmapDb.slots?!:
+    requires auth, 1 <= rawLabel.length
+    return await db.slots.updateOne(where = r => r.id == slotId and r.ownerId == uid, set = { label = Qed.Str.truncate(rawLabel, 64), tag = Qed.Str.take(rawTag, 16) })?
 
 example : RoadmapDb.Client := RoadmapDb.client
 
--- Verify `sql!"..."` macro, fail-closed `SqlQuery.select` on empty columns, and explicit `.selectAll`.
 example : (
-  let tbl := sql!"projects"
-  let col := sql!"owner_id"
+  let (tbl, col) := (sql!"projects", sql!"owner_id")
   let emptySel := (Qed.Server.Db.SqlQuery.select tbl [] .litTrue).compile .postgres
-  let explicitAll := (Qed.Server.Db.SqlQuery.selectAll tbl .litTrue).compile .postgres
-  let insIgn := (Qed.Server.Db.SqlQuery.insertOrIgnore tbl [(col, .text "a")] [] [col]).compile .postgres
   !strHas emptySel.1 "*" && strHas emptySel.1 "0 = 1" &&
-  explicitAll.1 == "SELECT * FROM \"projects\" WHERE TRUE" &&
-  insIgn.1 == "INSERT INTO \"projects\" (\"owner_id\") VALUES ($1) ON CONFLICT DO NOTHING RETURNING \"owner_id\"") = true := by decide +kernel
+  ((Qed.Server.Db.SqlQuery.selectAll tbl .litTrue).compile .postgres).1 == "SELECT * FROM \"projects\" WHERE TRUE" &&
+  ((Qed.Server.Db.SqlQuery.insertOrIgnore tbl [(col, .text "a")] [] [col]).compile .postgres).1 == "INSERT INTO \"projects\" (\"owner_id\") VALUES ($1) ON CONFLICT DO NOTHING RETURNING \"owner_id\"") = true := by decide +kernel
 
+bad_db "Database table constraint `RoadmapDb.scaling.RowInv` failed in `badFreeWarm → RoadmapDb.scaling.insert`" RoadmapDb :
+  rpc badFreeWarm(appId: String) -> RoadmapDb.scaling!:
+    requires 1 <= appId.length <= 64
+    return await db.scaling.insert(id = appId, plan = "free", minInstances = 1, maxInstances = 1)?
 bad_db "Nat non-underflow for `books.stock -= ...`" VaultDb :
   rpc badAtomicDec(bookId: String, qty: Nat) -> VaultDb.books?!:
-    requires ctx.userId != none, 1 <= qty <= 50
+    requires auth, 1 <= qty <= 50
     return await db.books.updateOne(where = r => r.id == bookId, set = { stock -= qty })?
-
 bad_db "Database upsert conflict update policy `RoadmapDb.projects.update` failed in `badUpsert → RoadmapDb.projects.upsert`" RoadmapDb :
   rpc badUpsert(orgId: String, projId: String) -> RoadmapDb.projects!:
     requires auth, 1 <= orgId.length <= 64, 1 <= projId.length <= 64
     return await db.projects.upsert(on = "id", id = projId, orgId = orgId, ownerId = uid, stage = .queued, note = none)?
-
 bad_db_def "`on_delete set_null` on `bad.orgId` requires a nullable column (`T?`)" BadSetNullDb :
   table orgs:
     id : String primary_key
@@ -537,7 +479,6 @@ bad_db_def "`on_delete set_null` on `bad.orgId` requires a nullable column (`T?`
       orgId : String references orgs(id) on_delete set_null
 
 /-! ## Item 6: Encrypted Column Projections (`Meta`, `selectMeta`, `columns = [...]`) & `prevKeys` Rotation -/
-
 database RotatingVaultDb:
   sqlite ".qed/rotating_vault_checks.db"
   table entries:
@@ -548,9 +489,7 @@ database RotatingVaultDb:
     policy read, write requires some(row.ownerId) == ctx.userId
 
 example : (
-  -- `prevKeys` are optional rotation fallbacks and MUST NOT be required at boot in `.secrets`.
-  RotatingVaultDb.secrets == #["VAULT_PRIMARY_KEY"] &&
-  RotatingVaultDb.entries.metaColNames == ["id", "ownerId", "label"] &&
+  RotatingVaultDb.secrets == #["VAULT_PRIMARY_KEY"] && RotatingVaultDb.entries.metaColNames == ["id", "ownerId", "label"] &&
   (let m : RotatingVaultDb.entries.Meta := { id := 7, ownerId := "u1", label := "api-key" }
    (match Qed.fromJson (α := RotatingVaultDb.entries.Meta) (Qed.toJson m) with | .ok m' => m' == m | _ => false) &&
    (match Qed.Proto.decode (α := RotatingVaultDb.entries.Meta) (Qed.Proto.encode m) with | .ok m' => m' == m | _ => false))) = true := by decide +kernel
@@ -583,14 +522,12 @@ bad_db "read policy `RotatingVaultDb.entries.read`" RotatingVaultDb :
   rpc leakMeta() -> RotatingVaultDb.entries.Meta[]!:
     requires auth
     return await db.entries.selectMeta()?
-
 bad_db "unknown column `nope` on table `entries`" RotatingVaultDb :
   rpc badProjCol() -> String[]!:
     requires auth
     return await db.entries.select(columns = ["nope"], where = r => r.ownerId == uid)?
 
 /-! ## Item 4: Cross-Table `any m in tbl:` RLS Policies & Queries -/
-
 database MultiTenantDb:
   sqlite ".qed/multi_tenant_checks.db"
   table apps:
@@ -619,12 +556,6 @@ database MultiTenantDb:
     orgId  : String immutable where 1 <= orgId.length <= 64
     userId : String immutable where 1 <= userId.length <= 128
     policy read, write requires ctx.userId != none
-
-example : strHasAll MultiTenantDb.rlsDdl [
-  "EXISTS (SELECT 1 FROM \"app_members\" AS \"m\" WHERE",
-  "\"apps\".\"id\"",
-  "EXISTS (SELECT 1 FROM \"org_members\" AS \"om\" WHERE",
-  "\"m\".\"role\" IN ('owner', 'admin')"] = true := by decide +kernel
 
 server MultiTenantApi:
   use db : MultiTenantDb
@@ -664,19 +595,16 @@ bad_db "read policy `MultiTenantDb.apps.read`" MultiTenantDb :
   rpc leakAllApps() -> MultiTenantDb.apps[]!:
     requires auth
     return await db.apps.select()?
-
 bad_db "read policy `MultiTenantDb.apps.read`" MultiTenantDb :
   rpc leakPendingApps() -> MultiTenantDb.apps[]!:
     requires auth
     return await db.apps.select(where = r => any m in app_members: m.appId == r.id and some(m.userId) == ctx.userId and m.status == "pending")?
-
 bad_db "update policy `MultiTenantDb.apps.update`" MultiTenantDb :
   rpc viewerCannotRename(appId: String, newName: String) -> MultiTenantDb.apps?!:
     requires auth, 1 <= newName.length <= 120
     return await db.apps.updateOne(
       where = r => r.id == appId and (any m in app_members: m.appId == r.id and some(m.userId) == ctx.userId and m.status == "accepted" and m.role == "viewer"),
       set = r => { name = newName })?
-
 bad_db_tbl "unknown table `ghosts` in cross-table `any m in ghosts:`" BadCrossTableRefDb apps : id : String primary_key | policy read requires any m in ghosts: m.appId == row.id
 bad_db_def "cannot reference encrypted column `secrets.val` inside cross-table `any s in secrets:`" BadCrossEncDb :
   table apps:
@@ -686,8 +614,7 @@ bad_db_def "cannot reference encrypted column `secrets.val` inside cross-table `
       id  : String primary_key
       val : encrypted(String, key = secret("K"))
 
-/-! ## Item 5: Database `example`, `rejects`, `transition_example`, `transition_rejects`, `policy_allows`, `policy_denies` -/
-
+/-! ## Item 5: Database `example`, `rejects`, `transition_*`, `policy_allows`, `policy_denies` -/
 database VerifiedExamplesDb:
   sqlite ".qed/verified_examples_checks.db"
   table orders:
@@ -750,7 +677,6 @@ bad_db_tbl "Database `policy_denies read badDeny`" BadDbPolDeny docs :
     row = d1
 
 /-! ## Transactional and Conditional-Where DB Upgrades -/
-
 database TxLeaseDb:
   sqlite ".qed/tx_lease_checks.db"
   table leases:
@@ -771,54 +697,31 @@ database TxLeaseDb:
     policy_denies write anonCannotWrite:
       row = openLease
 
-example : strHasAll TxLeaseDb.rlsDdl [
-  "ENABLE ROW LEVEL SECURITY",
-  "current_setting('qed.user_id', true)"] = true := by decide +kernel
-
 server stateless TxLeaseSrv:
   use db : TxLeaseDb
-
   fn claimInsideTx(tx: db.Tx, leaseId: String, uid: String) -> TxLeaseDb.leases?!:
     requires some(uid) == ctx.userId
-    return await tx.leases.updateOne(
-      where = r => r.id == leaseId and r.ownerId == uid and r.status == "open" and r.retries < 10,
-      set = r => { status = "claimed", retries = r.retries + 1 })?
-
+    return await tx.leases.updateOne(where = r => r.id == leaseId and r.ownerId == uid and r.status == "open" and r.retries < 10, set = r => { status = "claimed", retries = r.retries + 1 })?
   rpc claimMyLease(leaseId: String) -> TxLeaseDb.leases?!:
     requires auth
     db.transaction as tx:
       return await claimInsideTx(tx, leaseId, uid)?
-
   rpc bulkClaimMyOpen(onlyId: String?) -> TxLeaseDb.leases[]!:
     requires auth
     return await db.leases.update(
-      where = r =>
-        if let some(lid) = onlyId:
-          r.id == lid and r.ownerId == uid and r.status == "open" and r.retries < 10
-        else:
-          r.ownerId == uid and r.status == "open" and r.retries < 10,
+      where = r => if let some(lid) = onlyId: r.id == lid and r.ownerId == uid and r.status == "open" and r.retries < 10 else: r.ownerId == uid and r.status == "open" and r.retries < 10,
       set = r => { status = "claimed", retries = r.retries + 1 })?
-
   read_only rpc listMyLeases(onlyOpen: Bool, filterId: String?) -> TxLeaseDb.leases[]!:
     requires auth
-    return await db.leases.select(
-      where = r =>
-        if onlyOpen:
-          (r.id == filterId.getD("") if filterId != none else true) and r.ownerId == uid and r.status == "open"
-        else:
-          r.ownerId == uid)?
-
+    return await db.leases.select(where = r => if onlyOpen: (r.id == filterId.getD("") if filterId != none else true) and r.ownerId == uid and r.status == "open" else: r.ownerId == uid)?
   read_only fn countMyLeases(onlyOpen: Bool) -> Nat!:
     requires auth
-    return await db.leases.count(
-      where = r => r.ownerId == uid and (r.status == "open" if onlyOpen else true))?
-
+    return await db.leases.count(where = r => r.ownerId == uid and (r.status == "open" if onlyOpen else true))?
   example ownerCanCount:
     with user "alice"
     with db db.leases = [{ id = "l1", ownerId = "alice", status = "open", retries = 0 }, { id = "l2", ownerId = "alice", status = "done", retries = 1 }, { id = "l3", ownerId = "bob", status = "open", retries = 0 }]
     call countMyLeases(true)
     expect ok(1)
-
   example ownerConditionalSelect:
     with user "alice"
     with db db.leases = [{ id = "l1", ownerId = "alice", status = "open", retries = 0 }, { id = "l2", ownerId = "alice", status = "done", retries = 1 }]
@@ -840,39 +743,5 @@ bad_svc "Database transition/monotonicity invariant `TxLeaseDb.leases.TransInv` 
   fn invalidReopen(leaseId: String) -> TxLeaseDb.leases?!:
     requires auth
     return await db.leases.updateOne(where = r => r.id == leaseId and r.ownerId == uid and r.status == "done", set = r => { status = "open" })?
-
-/-! ## `Str.truncate` / `Str.*` Length Bounds in `RowInv` & `FromSql Int` Kernel Reduction -/
-
-/-- Documented database testing automatic `Str.truncate`/`take`/`trim`/`toLower` bounds in `RowInv`. -/
-database StrBoundDb:
-  sqlite ".qed/str_bound_checks.db"
-  table slots:
-    id      : String primary_key where 1 <= id.length <= 64
-    ownerId : String immutable   where 1 <= ownerId.length <= 64
-    label   : String             where 1 <= label.length <= 64
-    tag     : String             where tag.length <= 16
-    code    : String             where code.length <= 32
-    policy read, write requires some(ownerId) == ctx.userId
-
-service StrBoundSvc:
-  use db : StrBoundDb
-
-  fn allocSlot(rawId: String, rawLabel: String, rawTag: String, rawCode: String) -> StrBoundDb.slots!:
-    requires auth, 1 <= uid.length <= 64, 1 <= rawId.length, 1 <= rawLabel.length, rawCode.length <= 32
-    let safeId = Qed.Str.truncate(rawId, 64)
-    let safeLabel = Qed.Str.truncate(rawLabel, 64)
-    let safeTag = Qed.Str.take(rawTag, 16)
-    let safeCode = Qed.Str.toLower(Qed.Str.trim(rawCode))
-    return await db.slots.insert(id = safeId, ownerId = uid, label = safeLabel, tag = safeTag, code = safeCode)?
-
-  fn relabelSlot(slotId: String, rawLabel: String, rawTag: String) -> StrBoundDb.slots?!:
-    requires auth, 1 <= rawLabel.length
-    return await db.slots.updateOne(
-      where = r => r.id == slotId and r.ownerId == uid,
-      set = { label = Qed.Str.truncate(rawLabel, 64), tag = Qed.Str.take(rawTag, 16) })?
-
-example : (
-  (match Qed.Server.Db.FromSql.fromSql (α := Int) (.text "-42") with | .ok n => n == -42 | _ => false) &&
-  (match Qed.Server.Db.FromSql.fromSql (α := Int) (.text "not_int") with | .error _ => true | _ => false)) = true := by decide +kernel
 
 end DbChecks

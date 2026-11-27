@@ -5,10 +5,7 @@ open Qed.Server Qed.Server.Db
 
 namespace QedTests.Native.Database
 
-structure HttpSqlMock where
-  url        : String
-  seenSqlRef : IO.Ref (Array (String × Nat))
-  stop       : IO Unit
+structure HttpSqlMock where (url : String) (seenSqlRef : IO.Ref (Array (String × Nat))) (stop : IO Unit)
 
 private def startHttpSqlMock (sqliteFile : String) : IO (Except String HttpSqlMock) := do
   let seenSqlRef ← IO.mkRef (#[] : Array (String × Nat))
@@ -57,12 +54,7 @@ private def findZeroByte (ba : ByteArray) (start : Nat) : Nat := Id.run do
   return ba.size
 private def xorBytes (a b : ByteArray) : ByteArray := ByteArray.mk <| Array.ofFn (n := min a.size b.size) fun i => a[i.val]! ^^^ b[i.val]!
 
-structure PgWireMock where
-  url           : String
-  parsedSqlRef  : IO.Ref (Array String)
-  scramCountRef : IO.Ref Nat
-  startupOkRef  : IO.Ref Bool
-  stop          : IO Unit
+structure PgWireMock where (url : String) (parsedSqlRef : IO.Ref (Array String)) (scramCountRef : IO.Ref Nat) (startupOkRef : IO.Ref Bool) (stop : IO Unit)
 
 private partial def handlePgConn (conn : UInt64) (sqliteFile expectedUser expectedPass expectedDb : String)
     (parsedSqlRef : IO.Ref (Array String)) (scramCountRef : IO.Ref Nat) (startupOkRef : IO.Ref Bool) : IO Unit := do
@@ -103,10 +95,8 @@ private partial def handlePgConn (conn : UInt64) (sqliteFile expectedUser expect
   let serverSig ← Prim.hmacSha256 serverKey authMsg.toUTF8
   scramCountRef.modify (· + 1); send (pgAuthMsg 12 (s!"v={Net.base64Encode serverSig}").toUTF8 ++ pgAuthMsg 0 ++ pgReady)
   let mut preparedSql := ""; let mut boundParams : Array SqlVal := #[]; let mut activeTxId? : Option UInt64 := none; let mut txAborted := false
-  let readyFrame (tid? : Option UInt64) (aborted : Bool) : ByteArray :=
-    pgFrame 'Z' (ByteArray.mk #[if tid?.isNone then 0x49 else if aborted then 0x45 else 0x54])
-  let pgErrCode (sqlstate msg : String) : ByteArray :=
-    pgFrame 'E' (PgWire.pushCString (ByteArray.empty.push 0x53) "ERROR" ++ PgWire.pushCString (ByteArray.empty.push 0x43) sqlstate ++ PgWire.pushCString (ByteArray.empty.push 0x4D) msg |>.push 0)
+  let readyFrame (tid? : Option UInt64) (aborted : Bool) : ByteArray := pgFrame 'Z' (ByteArray.mk #[if tid?.isNone then 0x49 else if aborted then 0x45 else 0x54])
+  let pgErrCode (sqlstate msg : String) : ByteArray := pgFrame 'E' (PgWire.pushCString (ByteArray.empty.push 0x53) "ERROR" ++ PgWire.pushCString (ByteArray.empty.push 0x43) sqlstate ++ PgWire.pushCString (ByteArray.empty.push 0x4D) msg |>.push 0)
   while true do
     let some (tag, payload, rest) ← nextTagged buf | break
     buf := rest
@@ -121,14 +111,15 @@ private partial def handlePgConn (conn : UInt64) (sqliteFile expectedUser expect
           let mut resp := pgCmdDone (if upper == "COMMIT" && wasAborted then "ROLLBACK" else upper)
           if let some tid := activeTxId? then
             activeTxId? := none
-            if upper == "COMMIT" && !wasAborted then
-              if let .error e ← Prim.sqliteTxCommit tid then resp := pgErr e
+            if upper == "COMMIT" && !wasAborted then if let .error e ← Prim.sqliteTxCommit tid then resp := pgErr e
             else Prim.sqliteTxRollback tid
           send (resp ++ readyFrame none false)
-        else if txAborted then
-          send (pgErrCode "25P02" "current transaction is aborted, commands ignored until end of transaction block" ++ readyFrame activeTxId? true)
-        else
-          match ← Prim.sqliteDdl sqliteFile sql with | .ok () => send (pgCmdDone "CREATE TABLE" ++ readyFrame activeTxId? false) | .error e => if activeTxId?.isSome then txAborted := true; send (pgErr e ++ readyFrame activeTxId? txAborted)
+        else if txAborted then send (pgErrCode "25P02" "current transaction is aborted, commands ignored until end of transaction block" ++ readyFrame activeTxId? true)
+        else match ← Prim.sqliteDdl sqliteFile sql with
+          | .ok () => send (pgCmdDone "CREATE TABLE" ++ readyFrame activeTxId? false)
+          | .error e =>
+              if activeTxId?.isSome then txAborted := true
+              send (pgErr e ++ readyFrame activeTxId? txAborted)
     | 'P' => let n1 := findZeroByte payload 0; preparedSql := utf8Str (payload.extract (n1 + 1) (findZeroByte payload (n1 + 1))); send (pgFrame '1' ByteArray.empty)
     | 'B' =>
         let o2 := findZeroByte payload (findZeroByte payload 0 + 1) + 1
@@ -138,8 +129,7 @@ private partial def handlePgConn (conn : UInt64) (sqliteFile expectedUser expect
           if pLen < 0 then ps := ps.push .null else ps := ps.push (.text (utf8Str (payload.extract off (off + pLen.toNat)))); off := off + pLen.toNat
         boundParams := ps; parsedSqlRef.modify (·.push preparedSql); send (pgFrame '2' ByteArray.empty)
     | 'E' =>
-        if txAborted then
-          send (pgErrCode "25P02" "current transaction is aborted, commands ignored until end of transaction block")
+        if txAborted then send (pgErrCode "25P02" "current transaction is aborted, commands ignored until end of transaction block")
         else
           let (sqliteSql, sqliteParams) := translatePgSql preparedSql boundParams
           let execRes ← match activeTxId? with | some tid => Prim.sqliteTxExec tid sqliteSql sqliteParams | none => Prim.sqliteExec sqliteFile sqliteSql sqliteParams
@@ -161,6 +151,32 @@ private def startPgWireMock (sqliteFile user pass dbName : String) : IO (Except 
   let res ← startMockTcpServer (concurrent := true) fun conn => handlePgConn conn sqliteFile user pass dbName parsedSqlRef scramCountRef startupOkRef
   return res.map fun (port, stop) => { url := s!"postgres://{user}:{pass}@127.0.0.1:{port}/{dbName}?sslmode=disable", parsedSqlRef, scramCountRef, startupOkRef, stop }
 
+private def runMovedDbChecks (c : TestChecker) : IO Unit := do
+  let hasAll (s : String) (xs : List String) := xs.all (s.contains ·)
+  let mk (p1 p2 i1 i2 : String) := SqlQuery.select (sql!"items") [sql!"id"]
+    (.binOp .and (.startsWith (.col (sql!"title")) (.param (.text p1))) (.binOp .and (.contains (.col (sql!"title")) (.param (.text p2))) (.inList (.col (sql!"id")) [.text i1, .text i2])))
+    (limit := some 10) (offset := some 5)
+  let (oldTbl, newTbl, _) := DbChecks.mkMigrationFixture (sql!"items")
+  let steps := diffTableSchemas [oldTbl] [newTbl]; let (pgDdl, sqDdl) := (renderMigrationDdl .postgres steps, renderMigrationDdl .sqlite steps)
+  c.checkAll [
+    ("[ddl] VaultDb postgres/sqlite/rls DDL",
+      hasAll (DbChecks.VaultDb.ddl .postgres) ["CREATE TABLE IF NOT EXISTS \"notes\"", "CHECK (1 <= LENGTH(\"body\") AND LENGTH(\"body\") <= 2000)"] &&
+      (DbChecks.VaultDb.ddl .sqlite).contains "CREATE INDEX IF NOT EXISTS \"idx_notes_0\" ON \"notes\" (\"ownerId\", \"version\")" && hasAll DbChecks.VaultDb.rlsDdl ["ENABLE ROW LEVEL SECURITY", "current_setting('qed.user_id', true)"]),
+    ("[ddl] ShopDb migration DDL & SQLi parameterization",
+      DbChecks.sameCompiledSql (mk "Rust" "Lean" "a" "b") (mk "'; DROP TABLE items; --" "%' OR 1=1 --" "'; DELETE FROM items;" "x") &&
+      hasAll pgDdl ["ADD COLUMN IF NOT EXISTS \"notes\" TEXT", "ADD COLUMN IF NOT EXISTS \"views\" BIGINT NOT NULL DEFAULT 0"] && hasAll sqDdl ["ADD COLUMN \"views\" INTEGER NOT NULL DEFAULT 0", "CREATE INDEX IF NOT EXISTS \"idx_items_0\""]),
+    ("[ddl] EncVaultDb derived ciphertext CHECK bounds",
+      hasAll (DbChecks.EncVaultDb.ddl .postgres) ["\"body\" TEXT NOT NULL CHECK (40 <= LENGTH(\"body\") AND LENGTH(\"body\") <= 304)", "\"note\" TEXT NOT NULL CHECK (40 <= LENGTH(\"note\") AND LENGTH(\"note\") <= 1104)", "\"raw\" TEXT CHECK (40 <= LENGTH(\"raw\"))"]),
+    ("[ddl] RoadmapDb FK/enum/field/scaling CHECK & NOT VALID DDL + backfill",
+      hasAll (DbChecks.RoadmapDb.ddl .postgres) ["ON DELETE CASCADE", "ON DELETE SET NULL", "ON DELETE RESTRICT", "CHECK (\"stage\" IN ('queued', 'in-progress', 'live', 'failed'))",
+        "\"slug\" TEXT NOT NULL PRIMARY KEY", "\"port\" BIGINT NOT NULL CHECK (\"port\" >= 0)", "\"altPort\" BIGINT", "CONSTRAINT \"qed_chk_scaling_0\" CHECK (\"minInstances\" <= \"maxInstances\")",
+        "CONSTRAINT \"qed_chk_scaling_1\" CHECK ((((\"plan\" = 'pro' OR \"plan\" = 'enterprise')) OR ((\"minInstances\" = 0 AND \"maxInstances\" <= 1))))"] &&
+      hasAll (DbChecks.RoadmapDb.ddl .sqlite) ["\"port\" INTEGER NOT NULL CHECK (\"port\" >= 0)", "ON DELETE CASCADE"] && hasAll (renderDatabaseCheckDdl DbChecks.RoadmapDb.config.tables) ["ADD CONSTRAINT \"qed_chk_scaling_1\" CHECK", "NOT VALID"] &&
+      (DbChecks.RoadmapDb.config.backfills[0]?.map fun q => (q.compile .postgres).1.contains "UPDATE \"projects\" SET \"note\" = $1 WHERE (\"note\" IS NULL)") == some true),
+    ("[ddl] MultiTenantDb cross-table EXISTS RLS DDL",
+      hasAll DbChecks.MultiTenantDb.rlsDdl ["EXISTS (SELECT 1 FROM \"app_members\" AS \"m\" WHERE", "\"apps\".\"id\"", "EXISTS (SELECT 1 FROM \"org_members\" AS \"om\" WHERE", "\"m\".\"role\" IN ('owner', 'admin')"]),
+    ("[ddl] TxLeaseDb RLS DDL", hasAll DbChecks.TxLeaseDb.rlsDdl ["ENABLE ROW LEVEL SECURITY", "current_setting('qed.user_id', true)"])]
+
 private def runVaultSuite (c : TestChecker) (label : String) (srv : NativeServerProc) (aliceTok bobTok : String) (testRestart : Bool := false) : IO Unit := do
   let (sqli, lbl) := ("' OR 1=1; DROP TABLE notes; --", fun s => s!"[{label}] {s}")
   let call (fn : String) (req := ByteArray.empty) (tok? : Option String := none) := httpRpc srv.port "VaultApi" fn req tok?
@@ -169,7 +185,7 @@ private def runVaultSuite (c : TestChecker) (label : String) (srv : NativeServer
   let encNote (id : Nat) (body : String) := Qed.Proto.encode (id, body)
   let (id1, id2) := (Qed.Proto.encode (1 : Nat), Qed.Proto.encode (2 : Nat))
   let publishedNote1 : DbChecks.VaultDb.notes := { id := 1, ownerId := "alice", body := "updated text", version := 2, status := "published" }
-  for (tag, act, want) in [("unauthenticated createNote rejected (401)", call "createNote" (encNote 1 "hi"), 401), ("empty body rejected by requires (400)", alice "createNote" (encNote 1 ""), 400)] do c.checkStatus (lbl tag) (← act) want
+  c.checkStatusAll [(lbl "unauthenticated createNote rejected (401)", call "createNote" (encNote 1 "hi"), 401), (lbl "empty body rejected by requires (400)", alice "createNote" (encNote 1 ""), 400)]
   let checkCreate (tag : String) (id : Nat) (body : String) (k : DbChecks.VaultDb.notes → IO Unit) : IO Unit := do
     c.checkHttp (lbl tag) (← alice "createNote" (encNote id body)) (extra := fun r =>
       c.checkRpcDomainOk (E := DbChecks.VaultApi.createNote.Error) (α := DbChecks.VaultDb.notes) (lbl s!"{tag} payload") (.ok (ε := String) r.body) k)
@@ -197,28 +213,6 @@ private def withRedirectedDb (ep : DbEndpoint) : MonadServer IO :=
   { exec := fun
       | .dbExec c q => base.exec (.dbExec (r c) q) | .dbExecDdl c => base.exec (.dbExecDdl (r c)) | .dbTxBegin c => base.exec (.dbTxBegin (r c))
       | .dbTxExec c t q => base.exec (.dbTxExec (r c) t q) | .dbTxCommit c t => base.exec (.dbTxCommit (r c) t) | .dbTxRollback c t => base.exec (.dbTxRollback (r c) t) | eff => base.exec eff }
-
-@[implicit_reducible]
-private def withRedirectedDbAndEnv (ep : DbEndpoint) (envRef : IO.Ref (List (String × String))) (decCountRef : IO.Ref Nat) : MonadServer IO :=
-  let base := withRedirectedDb ep
-  let lookupKey (kEnv : String) (fb : Option String) : IO (Except ApiError String) := do
-    match (← envRef.get).lookup kEnv with
-    | some v => if v.isEmpty then return .error (ApiError.internal s!"empty key {kEnv}") else return .ok v
-    | none => match fb with
-      | some d => if d.isEmpty then return .error (ApiError.internal s!"empty key {kEnv}") else return .ok d
-      | none => return .error (ApiError.internal s!"missing required encryption key env var `{kEnv}`")
-  { exec := fun
-      | .readEnv v => return (← envRef.get).lookup v
-      | .aeadEncrypt kEnv fb aad pt => do
-          match ← lookupKey kEnv fb with
-          | .error e => return .error e
-          | .ok k => return (← Prim.aeadEncrypt k.toUTF8 aad pt).mapError ApiError.internal
-      | .aeadDecrypt kEnv fb aad ct => do
-          decCountRef.modify (· + 1)
-          match ← lookupKey kEnv fb with
-          | .error e => return .error e
-          | .ok k => return (← Prim.aeadDecrypt k.toUTF8 aad ct).mapError ApiError.internal
-      | eff => base.exec eff }
 
 private def runShopDirectSuite (c : TestChecker) (label : String) (srvInst : MonadServer IO) (testConcurrentReaders : Bool := false) : IO Unit := do
   let lbl (s : String) := s!"[{label}] {s}"; let stBox ← Prim.mkStateBox DbChecks.ShopApi.initState; let atomicInst : MonadAtomic DbChecks.ShopApi.State IO := Native.withStateBox stBox
@@ -280,16 +274,13 @@ private def runEncryptedColumnSuite (c : TestChecker) (srvInst : MonadServer IO)
       c.check "[enc-db] 2 raw rows stored" (res.rows.size == 2)
       match res.rows[0]?.bind (·[1]?), res.rows[1]?.bind (·[1]?) with
       | some (SqlVal.text ct1), some (SqlVal.text ct2) =>
-          c.check "[enc-db] ciphertext hides plaintext" (!ct1.contains "top-secret" && !ct2.contains "top-secret")
-          c.check "[enc-db] ciphertext satisfies derived CHECK bounds" (40 <= ct1.length && ct1.length <= 304 && 40 <= ct2.length && ct2.length <= 304)
-          c.check "[enc-db] randomized AES-GCM nonces differ" (ct1 != ct2)
+          c.checkAll [("[enc-db] ciphertext hides plaintext", !ct1.contains "top-secret" && !ct2.contains "top-secret"),
+            ("[enc-db] ciphertext satisfies derived CHECK bounds", 40 <= ct1.length && ct1.length <= 304 && 40 <= ct2.length && ct2.length <= 304),
+            ("[enc-db] randomized AES-GCM nonces differ", ct1 != ct2)]
       | _, _ => c.check "[enc-db] raw body cells are TEXT" false
-    c.checkProtoBy (α := Option DbChecks.EncVaultDb.entries) "[enc-db] findOne decrypts row 1"
-      (← alice "get" (Qed.Proto.encode (1 : Nat))) (fun opt => opt.map fun r => (r.body, r.raw)) (some ("top-secret payload 🔐", some blob))
-    c.checkProtoBy (α := Array DbChecks.EncVaultDb.entries) "[enc-db] select decrypts all rows"
-      (← alice "list") (fun rs => rs.map fun r => (r.id, r.body, r.raw)) #[(1, "top-secret payload 🔐", some blob), (2, "top-secret payload 🔐", none)]
-    c.checkProtoBy (α := Option DbChecks.EncVaultDb.entries) "[enc-db] updateOne re-encrypts"
-      (← alice "edit" (Qed.Proto.encode ((1 : Nat), inp2))) (fun opt => opt.map (·.body)) (some "updated secret 🔑")
+    c.checkProtoBy (α := Option DbChecks.EncVaultDb.entries) "[enc-db] findOne decrypts row 1" (← alice "get" (Qed.Proto.encode (1 : Nat))) (fun opt => opt.map fun r => (r.body, r.raw)) (some ("top-secret payload 🔐", some blob))
+    c.checkProtoBy (α := Array DbChecks.EncVaultDb.entries) "[enc-db] select decrypts all rows" (← alice "list") (fun rs => rs.map fun r => (r.id, r.body, r.raw)) #[(1, "top-secret payload 🔐", some blob), (2, "top-secret payload 🔐", none)]
+    c.checkProtoBy (α := Option DbChecks.EncVaultDb.entries) "[enc-db] updateOne re-encrypts" (← alice "edit" (Qed.Proto.encode ((1 : Nat), inp2))) (fun opt => opt.map (·.body)) (some "updated secret 🔑")
     let tamperQ := SqlQuery.update (sql!"entries") [(sql!"body", .param (.text (String.ofList (List.replicate 44 'A'))))] (.binOp .eq (.col (sql!"id")) (.param (.int 2))) []
     c.expectOk "[enc-db] raw tamper update" (← @MonadServer.dbExec IO srvInst cfg tamperQ) fun _ => do
       c.check "[enc-db] tampered ciphertext rejected on read" (!(← alice "get" (Qed.Proto.encode (2 : Nat))).isOk)
@@ -297,30 +288,22 @@ private def runEncryptedColumnSuite (c : TestChecker) (srvInst : MonadServer IO)
     c.check "[enc-db] SQLite CHECK rejects oversized ciphertext" (!(← @MonadServer.dbExec IO srvInst cfg badLenQ).isOk)
 
 private def runRoadmapSuite (c : TestChecker) (tmpDir : String) : IO Unit := do
-  let dbPath := s!"{tmpDir}/roadmap_worker.db"
-  let cfg := { DbChecks.RoadmapDb.config with endpoint := .sqlitePath dbPath, devFallback? := none, envEndpoints? := none }
+  let cfg := { DbChecks.RoadmapDb.config with endpoint := .sqlitePath s!"{tmpDir}/roadmap_worker.db", devFallback? := none, envEndpoints? := none }
   let db := DbChecks.RoadmapDb.clientWith cfg
   c.expectOk "[roadmap] migrateDatabase creates tables" (← Native.migrateDatabase cfg) fun _ => do
     c.checkOkBy "[roadmap] org inserted" (← db.orgs.insert { id := "org1", name := "Acme" }) (·.name) "Acme"
     c.checkOkBy "[roadmap] enum roundtrip (.queued)" (← db.projects.insert { id := "p1", orgId := "org1", ownerId := "alice", stage := .queued, note := none }) (·.stage) DbChecks.DeployStage.queued
-    -- Re-run migrateDatabase to verify declarative `backfill` populates NULL notes.
     c.expectOk "[roadmap] migrateDatabase runs backfill" (← Native.migrateDatabase cfg) fun _ => do
       c.checkOkBy "[roadmap] backfill updated null note to migrated" (← db.projects.findOne (.eq "id" "p1")) (·.bind (·.note)) (some "migrated")
-    -- Standalone client upsert (insert new + update existing + policy-guarded conflict)
     c.checkOkBy "[roadmap] upsert updated stage & note" (← db.projects.upsert { id := "p1", orgId := "org1", ownerId := "alice", stage := .building, note := some "v2" } ["id"] ["stage", "note"] (conflictWhere? := some (.eq "ownerId" "alice")))
       (·.map fun p => (p.stage, p.note)) (some (DbChecks.DeployStage.building, some "v2"))
     c.checkOkBy "[roadmap] conflict where filtered out update" (← db.projects.upsert { id := "p1", orgId := "org1", ownerId := "alice", stage := .live, note := some "hijack" } ["id"] ["stage", "note"] (conflictWhere? := some (.eq "ownerId" "bob"))) Option.isNone true
-    c.checkOkBy "[roadmap] updateReturning returned live row" (← db.projects.updateReturning [sqlSet "stage" DbChecks.DeployStage.live] (.eq "id" "p1"))
-      (fun rows => (rows.size, rows[0]?.map (·.stage))) (1, some DbChecks.DeployStage.live)
+    c.checkOkBy "[roadmap] updateReturning returned live row" (← db.projects.updateReturning [sqlSet "stage" DbChecks.DeployStage.live] (.eq "id" "p1")) (fun rows => (rows.size, rows[0]?.map (·.stage))) (1, some DbChecks.DeployStage.live)
     c.checkOkBy "[roadmap] live count == 1" (← db.projects.count (.eq "stage" DbChecks.DeployStage.live)) id 1
-    -- Transaction rollback leaves DB untouched
-    let txRes ← db.transaction fun tx => do
-      let _ ← db.orgs.insert { id := "org_rb", name := "Rolled Back" } (txId? := some tx)
-      return (.error (ApiError.badRequest "abort tx") : Except ApiError Unit)
+    let txRes ← db.transaction fun tx => do let _ ← db.orgs.insert { id := "org_rb", name := "Rolled Back" } (txId? := some tx); return (.error (ApiError.badRequest "abort tx") : Except ApiError Unit)
     c.check "[roadmap] transaction returned error" (!txRes.isOk)
     c.checkOkBy "[roadmap] rollback verified" (← db.orgs.findOne (.eq "id" "org_rb")) Option.isNone true
     c.check "[roadmap] unknown column rejected" (!(← db.projects.select (.eq "nonexistent_col" "x")).isOk)
-    -- `insertOrIgnore` + atomic `sqlAdd` / `sqlSub` + `updateOneReturning`
     for (lbl, name, want) in [("[roadmap] insertOrIgnore returned some", "First", some "First"), ("[roadmap] duplicate ignored", "Second", none)] do
       c.checkOkBy lbl (← db.orgs.insertOrIgnore { id := "org_ign", name }) (·.map (·.name)) want
     c.expectOk "[roadmap] insert service for atomic +=" (← db.services.insert { slug := DbChecks.ServiceSlug.make "web", port := DbChecks.ServicePort.make 8080, altPort := none }) fun _ => do
@@ -330,135 +313,101 @@ private def runRoadmapSuite (c : TestChecker) (tmpDir : String) : IO Unit := do
 
 private def runKeyRotationAndMetaSuite (c : TestChecker) (tmpDir : String) : IO Unit := do
   let dbPath := s!"{tmpDir}/rotating_vault.db"
-  let envRef ← IO.mkRef [("VAULT_PRIMARY_KEY", "key-v1-initial-material-32bytes!")]
-  let decCountRef ← IO.mkRef 0
-  let srvInst := withRedirectedDbAndEnv (.sqlitePath dbPath) envRef decCountRef
+  let (envRef, decCountRef) := (← IO.mkRef [("VAULT_PRIMARY_KEY", "key-v1-initial-material-32bytes!")], ← IO.mkRef 0)
+  let srvInst := withMockEnvInst (withRedirectedDb (.sqlitePath dbPath)) (fun v => return (← envRef.get).lookup v) (onDecrypt? := some (decCountRef.modify (· + 1)))
   let cfg := DbChecks.RotatingVaultDb.config
   c.expectOk "[enc-rot] schema init" (← @MonadServer.dbExecDdl IO srvInst cfg) fun () => do
     let alice (fn : String) (req := ByteArray.empty) := @DbChecks.RotatingVaultApi.dispatchM IO _ srvInst { userId := some "alice" } fn req
-    -- Write 2 rows encrypted with K1
     for (id, label, sec) in [((1 : Nat), "stripe-live", "sk_live_alpha"), (2, "github-pat", "ghp_beta")] do
       c.expectOk s!"[enc-rot] save row {id} under K1" (← alice "save" (Qed.Proto.encode (id, (label, sec)))) fun _ => pure ()
-    -- Unset ALL encryption keys: metadata projections MUST succeed with ZERO aeadDecrypt calls!
-    envRef.set []
-    decCountRef.set 0
-    c.checkProtoBy (α := Array DbChecks.RotatingVaultDb.entries.Meta) "[enc-meta] selectMeta succeeds without encryption key"
-      (← alice "listMeta") (·.map fun m => (m.id, m.label)) #[(1, "stripe-live"), (2, "github-pat")]
-    c.checkProtoBy (α := Option DbChecks.RotatingVaultDb.entries.Meta) "[enc-meta] findOneMeta succeeds without encryption key"
-      (← alice "getMeta" (Qed.Proto.encode (2 : Nat))) (·.map (·.label)) (some "github-pat")
-    c.checkProto (α := Array (Nat × String)) "[enc-meta] select(columns = [id, label]) succeeds without key"
-      (← alice "listLabels") #[(1, "stripe-live"), (2, "github-pat")]
-    c.checkProto (α := Option String) "[enc-meta] findOne(columns = [label]) succeeds without key"
-      (← alice "getLabel" (Qed.Proto.encode (1 : Nat))) (some "stripe-live")
-    let clientCfg := { cfg with endpoint := .sqlitePath dbPath, devFallback? := none, envEndpoints? := none }
-    let dbClient := DbChecks.RotatingVaultDb.clientWith clientCfg
-    let projRes ← (letI : MonadServer IO := srvInst
-      dbClient.entries.selectProjected DbChecks.RotatingVaultDb.entries.metaColNames DbChecks.RotatingVaultDb.entries.decodeMetaRow (.eq "ownerId" "alice") (orderBy? := some ("id", true)))
+    envRef.set []; decCountRef.set 0
+    c.checkProtoBy (α := Array DbChecks.RotatingVaultDb.entries.Meta) "[enc-meta] selectMeta succeeds without encryption key" (← alice "listMeta") (·.map fun m => (m.id, m.label)) #[(1, "stripe-live"), (2, "github-pat")]
+    c.checkProtoBy (α := Option DbChecks.RotatingVaultDb.entries.Meta) "[enc-meta] findOneMeta succeeds without encryption key" (← alice "getMeta" (Qed.Proto.encode (2 : Nat))) (·.map (·.label)) (some "github-pat")
+    c.checkProto (α := Array (Nat × String)) "[enc-meta] select(columns = [id, label]) succeeds without key" (← alice "listLabels") #[(1, "stripe-live"), (2, "github-pat")]
+    c.checkProto (α := Option String) "[enc-meta] findOne(columns = [label]) succeeds without key" (← alice "getLabel" (Qed.Proto.encode (1 : Nat))) (some "stripe-live")
+    let dbClient := DbChecks.RotatingVaultDb.clientWith { cfg with endpoint := .sqlitePath dbPath, devFallback? := none, envEndpoints? := none }
+    let projRes ← (letI : MonadServer IO := srvInst; dbClient.entries.selectProjected DbChecks.RotatingVaultDb.entries.metaColNames DbChecks.RotatingVaultDb.entries.decodeMetaRow (.eq "ownerId" "alice") (orderBy? := some ("id", true)))
     c.checkOkBy "[enc-meta] TableHandle.selectProjected rows match" projRes (·.map (·.label)) #["stripe-live", "github-pat"]
     c.checkEq "[enc-meta] ZERO aeadDecrypt calls across all metadata projections" (← decCountRef.get) 0
-    -- Primary key missing while prevKey IS set MUST STILL FAIL CLOSED!
     envRef.set [("VAULT_PREV_KEY", "key-v1-initial-material-32bytes!")]
     c.check "[enc-rot] missing primary key fails closed even when prevKey is set" (!(← alice "get" (Qed.Proto.encode (1 : Nat))).isOk)
-    -- Rotate: primary = K2, prevKey = K1 -> K1 rows decrypt cleanly!
     envRef.set [("VAULT_PRIMARY_KEY", "key-v2-rotated-material-32bytes!"), ("VAULT_PREV_KEY", "key-v1-initial-material-32bytes!")]
-    c.checkProtoBy (α := Option DbChecks.RotatingVaultDb.entries) "[enc-rot] K1 row 1 decrypts via prevKeys fallback"
-      (← alice "get" (Qed.Proto.encode (1 : Nat))) (·.map (·.secret)) (some "sk_live_alpha")
-    -- Re-encrypt row 1 under primary K2
-    c.checkProtoBy (α := Option DbChecks.RotatingVaultDb.entries) "[enc-rot] updateOne re-encrypts row 1 under K2"
-      (← alice "rotateValue" (Qed.Proto.encode ((1 : Nat), "sk_live_alpha_v2"))) (·.map (·.secret)) (some "sk_live_alpha_v2")
-    -- Drop K1 from prevKeys: row 1 (now K2) STILL reads, row 2 (still K1) fails cleanly
+    c.checkProtoBy (α := Option DbChecks.RotatingVaultDb.entries) "[enc-rot] K1 row 1 decrypts via prevKeys fallback" (← alice "get" (Qed.Proto.encode (1 : Nat))) (·.map (·.secret)) (some "sk_live_alpha")
+    c.checkProtoBy (α := Option DbChecks.RotatingVaultDb.entries) "[enc-rot] updateOne re-encrypts row 1 under K2" (← alice "rotateValue" (Qed.Proto.encode ((1 : Nat), "sk_live_alpha_v2"))) (·.map (·.secret)) (some "sk_live_alpha_v2")
     envRef.set [("VAULT_PRIMARY_KEY", "key-v2-rotated-material-32bytes!")]
-    c.checkProtoBy (α := Option DbChecks.RotatingVaultDb.entries) "[enc-rot] rotated row 1 reads with K2 alone"
-      (← alice "get" (Qed.Proto.encode (1 : Nat))) (·.map (·.secret)) (some "sk_live_alpha_v2")
+    c.checkProtoBy (α := Option DbChecks.RotatingVaultDb.entries) "[enc-rot] rotated row 1 reads with K2 alone" (← alice "get" (Qed.Proto.encode (1 : Nat))) (·.map (·.secret)) (some "sk_live_alpha_v2")
     c.check "[enc-rot] unrotated K1 row 2 fails once K1 removed" (!(← alice "get" (Qed.Proto.encode (2 : Nat))).isOk)
 
 private def runMultiTenantCrossTableSuite (c : TestChecker) (tmpDir : String) : IO Unit := do
   let srvInst := withRedirectedDb (.sqlitePath s!"{tmpDir}/multi_tenant.db")
   c.expectOk "[cross-rls] schema init" (← @MonadServer.dbExecDdl IO srvInst DbChecks.MultiTenantDb.config) fun () => do
-    let asUser (u : String) (fn : String) (req := ByteArray.empty) :=
-      @DbChecks.MultiTenantApi.dispatchM IO _ srvInst { userId := some u } fn req
+    let asUser (u : String) (fn : String) (req := ByteArray.empty) := @DbChecks.MultiTenantApi.dispatchM IO _ srvInst { userId := some u } fn req
     for (u, id, name, orgId) in [("alice", "app1", "Alpha", none), ("alice", "app2", "Beta Org", some "org1"), ("bob", "app3", "Bob Private", none)] do
       c.expectOk s!"[cross-rls] {u} creates {id}" (← asUser u "createApp" (Qed.Proto.encode (id, (name, orgId)))) fun _ => pure ()
     for (id, appId, u, role, status) in [("m1", "app1", "charlie", "admin", "accepted"), ("m2", "app1", "dave", "viewer", "accepted"), ("m3", "app1", "eve", "admin", "pending")] do
       c.expectOk s!"[cross-rls] add {u} ({status} {role}) on {appId}" (← asUser "alice" "addMember" (Qed.Proto.encode (id, (appId, (u, (role, status)))))) fun _ => pure ()
     c.expectOk "[cross-rls] add frank in org1" (← asUser "alice" "addOrgMember" (Qed.Proto.encode ("om1", ("org1", "frank")))) fun _ => pure ()
-    for (tag, u, want) in [
-        ("alice sees own app1, app2", "alice", #["app1", "app2"]),
-        ("charlie sees shared app1", "charlie", #["app1"]),
-        ("dave sees shared app1", "dave", #["app1"]),
-        ("eve (pending) sees nothing", "eve", #[]),
-        ("frank (org1) sees org app2", "frank", #["app2"]),
-        ("bob sees only own app3", "bob", #["app3"]),
-        ("outsider sees nothing", "mallory", #[])] do
-      c.checkProtoBy (α := Array DbChecks.MultiTenantDb.apps) s!"[cross-rls] {tag}"
-        (← asUser u "listAccessibleApps") (·.map (·.id)) want
-    c.checkProtoBy (α := Array DbChecks.MultiTenantDb.apps) "[cross-rls] listSharedApps for charlie returns [app1]"
-      (← asUser "charlie" "listSharedApps") (·.map (·.id)) #["app1"]
-    for (tag, u, fn, newName, want) in [
-        ("dave (viewer) cannot rename app1", "dave", "renameAppAsAdmin", "Hacked", none),
+    for (tag, u, want) in [("alice sees own app1, app2", "alice", #["app1", "app2"]), ("charlie sees shared app1", "charlie", #["app1"]),
+        ("dave sees shared app1", "dave", #["app1"]), ("eve (pending) sees nothing", "eve", #[]),
+        ("frank (org1) sees org app2", "frank", #["app2"]), ("bob sees only own app3", "bob", #["app3"]), ("outsider sees nothing", "mallory", #[])] do
+      c.checkProtoBy (α := Array DbChecks.MultiTenantDb.apps) s!"[cross-rls] {tag}" (← asUser u "listAccessibleApps") (·.map (·.id)) want
+    c.checkProtoBy (α := Array DbChecks.MultiTenantDb.apps) "[cross-rls] listSharedApps for charlie returns [app1]" (← asUser "charlie" "listSharedApps") (·.map (·.id)) #["app1"]
+    for (tag, u, fn, newName, want) in [("dave (viewer) cannot rename app1", "dave", "renameAppAsAdmin", "Hacked", none),
         ("eve (pending admin) cannot rename app1", "eve", "renameAppAsAdmin", "PendingHack", none),
         ("charlie (accepted admin) renames app1 via role in [owner, admin]", "charlie", "renameAppAsAdmin", "Alpha v2", some "Alpha v2"),
         ("charlie renames app1 via role == admin", "charlie", "renameAppAsSpecificAdmin", "Alpha v3", some "Alpha v3")] do
-      c.checkProtoBy (α := Option DbChecks.MultiTenantDb.apps) s!"[cross-rls] {tag}"
-        (← asUser u fn (Qed.Proto.encode ("app1", newName))) (·.map (·.name)) want
+      c.checkProtoBy (α := Option DbChecks.MultiTenantDb.apps) s!"[cross-rls] {tag}" (← asUser u fn (Qed.Proto.encode ("app1", newName))) (·.map (·.name)) want
 
 def run : IO Bool := do
   let c ← mkChecker "database"
   withDevApp c "QedTests.DbChecks" fun dir => do
-    checkLeakGate c "QedTests.DbChecks" #["DbChecks.VaultDb.config", "DbChecks.VaultDb.secrets", "DbChecks.VaultDb.ensureSchema", "DbChecks.VaultDb.ddl", "DbChecks.VaultDb.rlsDdl", "DbChecks.VaultApi.dispatchM", "DbChecks.VaultApi.createNote_handler"]
     let authSecret := "db-test-hmac-secret-key"; let (aliceTok, bobTok) := (← signSessionToken authSecret "alice", ← signSessionToken authSecret "bob")
     let dbEnv (url : String) := #[("QED_WORKERS", some "2"), ("QED_AUTH_SECRET", some authSecret), ("QED_TEST_DB_URL", some url)]
-    withTempDir "qed-db-native" fun tmpDir => do
-      withNativeServer c "[sqlite] native server healthy" dir (dbEnv s!"sqlite://{tmpDir}/vault.db") (dev := true) fun srv => runVaultSuite c "sqlite" srv aliceTok bobTok (testRestart := true)
-      withMockServer c "[http-sql] start mock" (startHttpSqlMock s!"{tmpDir}/http_mock.db") (·.stop) fun httpMock =>
-        withNativeServer c "[http-sql] native server healthy" dir (dbEnv httpMock.url) (dev := true) fun srv => do
-          runVaultSuite c "http-sql" srv aliceTok bobTok; let seen ← httpMock.seenSqlRef.get
-          c.check "[http-sql] SQLi payload NEVER interpolated into SQL" (!(seen.any fun (s, _) => s.contains "DROP TABLE"))
-          c.check "[http-sql] parameterized SQL sent with bound params" (seen.any fun (s, n) => s.contains "?" && n > 0)
-      withMockServer c "[pg-wire] start mock" (startPgWireMock s!"{tmpDir}/pg_mock.db" "qeduser" "qedpass" "qeddb") (·.stop) fun pgMock =>
-        withNativeServer c "[pg-wire] native server healthy" dir (dbEnv pgMock.url) (dev := true) fun srv => do
-          runVaultSuite c "pg-wire" srv aliceTok bobTok
-          c.check "[pg-wire] StartupMessage sent expected user & db" (← pgMock.startupOkRef.get)
-          let (scramCnt, parsed) := (← pgMock.scramCountRef.get, ← pgMock.parsedSqlRef.get)
-          c.check "[pg-wire] SCRAM-SHA-256 proof verified" (scramCnt > 0)
-          c.check s!"[pg-wire] connection pool reused authenticated sockets (scram={scramCnt}, queries={parsed.size})" (scramCnt < parsed.size && scramCnt <= 6) s!"scram={scramCnt}, parsed={parsed.size}"
-          c.check "[pg-wire] SQLi payload NEVER interpolated into Parse SQL" (!(parsed.any (·.contains "DROP TABLE")))
-          c.check "[pg-wire] Parse used $1 placeholders with Bind params" (parsed.any (·.contains "$1"))
-      runShopDirectSuite c "sqlite-direct" (withRedirectedDb (.sqlitePath s!"{tmpDir}/shop_direct.db")) (testConcurrentReaders := true)
-      runEncryptedColumnSuite c (withRedirectedDb (.sqlitePath s!"{tmpDir}/enc_vault.db"))
-      runKeyRotationAndMetaSuite c tmpDir
-      runMultiTenantCrossTableSuite c tmpDir
-      runMigrationSuite c tmpDir
-      runRoadmapSuite c tmpDir
-      withMockServer c "[pg-shop] start mock" (startPgWireMock s!"{tmpDir}/shop_pg_mock.db" "shopuser" "shoppass" "shopdb") (fun m => do Db.PgWire.clearPool; m.stop) fun shopPgMock => do
-        let ssrfRes ← Db.PgWire.execParameterized shopPgMock.url "SELECT 1" #[] (ssrfGuard := true)
-        c.check "[pg-ssrf] dynamic postgresUrl SSRF guard rejects loopback 127.0.0.1" (match ssrfRes with | .error _ => true | .ok _ => false) "expected SSRF rejection"
-        runShopDirectSuite c "pg-direct" (withRedirectedDb (.postgresUrl shopPgMock.url (ssrfGuard := false)))
-        let (scramCnt, parsed) := (← shopPgMock.scramCountRef.get, ← shopPgMock.parsedSqlRef.get)
-        c.check s!"[pg-direct] connection pool reused sockets across tx & queries (scram={scramCnt}, queries={parsed.size})" (scramCnt > 0 && scramCnt <= 3 && parsed.size >= 10) s!"scram={scramCnt}, queries={parsed.size}"
-        -- Postgres 25P02 aborted transaction safety: if a query errors inside a tx and caller falls through to COMMIT,
-        -- finishPgTx MUST fail closed instead of returning .ok () on Postgres's ROLLBACK command tag.
-        let pgCfg : DbConfig := { DbChecks.ShopDb.config with endpoint := .postgresUrl shopPgMock.url (ssrfGuard := false), devFallback? := none, envEndpoints? := none }
-        let pgShop := DbChecks.ShopDb.clientWith pgCfg
-        let _ ← pgShop.authors.insertOrIgnore { id := "pg_25p02_a", name := "Author" }
-        let abortedTxRes ← pgShop.transaction fun tx => do
-          let _ ← pgShop.authors.insert { id := "pg_25p02_a", name := "dup-pk-error" } (txId? := some tx)
-          return (.ok () : Except ApiError Unit)
-        c.check "[pg-25p02] COMMIT on aborted Postgres tx returns error (never silent .ok)" (!abortedTxRes.isOk) "expected finishPgTx error on aborted tx"
-        let ignTxRes ← pgShop.transaction fun tx => pgShop.authors.insertOrIgnore { id := "pg_25p02_a", name := "dup-ignored" } (txId? := some tx)
-        c.expectOk "[pg-25p02] insertOrIgnore inside Postgres tx commits cleanly" ignTxRes fun opt =>
-          c.check "[pg-25p02] duplicate author ignored" opt.isNone
-        -- Item 10a: resolveDbConfigCore honors explicit primary env var when QED_DEPLOY_ENV=dev
-        let devFallbackCfg : DbConfig := {
-          name := "DevOverrideDb", endpoint := .urlEnv "QED_DEV_TEST_DB_URL",
-          devFallback? := some (.sqlitePath ".qed/fallback.db"),
-          envEndpoints? := some { prod := .urlEnv "QED_DEV_TEST_DB_URL", staging := .urlEnv "QED_DEV_TEST_DB_URL",
-                                  preview := .urlEnv "QED_DEV_TEST_DB_URL", dev := .sqlitePath ".qed/fallback.db" } }
-        let resFallback ← Native.resolveDbConfigCore (some "dev") false devFallbackCfg
-        c.check "[db-resolve] QED_DEPLOY_ENV=dev uses dev sqlite when primary env unset" (match resFallback with | .ok (.sqlite ".qed/fallback.db") => true | _ => false)
-        let explicitCfg : DbConfig := { devFallbackCfg with endpoint := .urlEnv "HOME" }
-        let resExplicit ← Native.resolveDbConfigCore (some "dev") false explicitCfg
-        c.check "[db-resolve] QED_DEPLOY_ENV=dev honors explicitly set primary env var over dev sqlite" (match resExplicit with | .error e => e.message.contains "unrecognized database URL scheme" | _ => false)
+    withTempDir "qed-db-native" fun tmpDir =>
+      runTasks [
+        checkLeakGate c "QedTests.DbChecks" #["DbChecks.VaultDb.config", "DbChecks.VaultDb.secrets", "DbChecks.VaultDb.ensureSchema", "DbChecks.VaultDb.ddl", "DbChecks.VaultDb.rlsDdl", "DbChecks.VaultApi.dispatchM", "DbChecks.VaultApi.createNote_handler"],
+        runMovedDbChecks c,
+        withNativeServer c "[sqlite] native server healthy" dir (dbEnv s!"sqlite://{tmpDir}/vault.db") (dev := true) fun srv => runVaultSuite c "sqlite" srv aliceTok bobTok (testRestart := true),
+        withMockServer c "[http-sql] start mock" (startHttpSqlMock s!"{tmpDir}/http_mock.db") (·.stop) fun httpMock =>
+          withNativeServer c "[http-sql] native server healthy" dir (dbEnv httpMock.url) (dev := true) fun srv => do
+            runVaultSuite c "http-sql" srv aliceTok bobTok; let seen ← httpMock.seenSqlRef.get
+            c.checkAll [("[http-sql] SQLi payload NEVER interpolated into SQL", !(seen.any fun (s, _) => s.contains "DROP TABLE")),
+              ("[http-sql] parameterized SQL sent with bound params", seen.any fun (s, n) => s.contains "?" && n > 0)],
+        withMockServer c "[pg-wire] start mock" (startPgWireMock s!"{tmpDir}/pg_mock.db" "qeduser" "qedpass" "qeddb") (·.stop) fun pgMock =>
+          withNativeServer c "[pg-wire] native server healthy" dir (dbEnv pgMock.url) (dev := true) fun srv => do
+            runVaultSuite c "pg-wire" srv aliceTok bobTok
+            let (scramCnt, parsed) := (← pgMock.scramCountRef.get, ← pgMock.parsedSqlRef.get)
+            c.checkAll [("[pg-wire] StartupMessage sent expected user & db", ← pgMock.startupOkRef.get),
+              ("[pg-wire] SCRAM-SHA-256 proof verified", scramCnt > 0),
+              (s!"[pg-wire] connection pool reused authenticated sockets (scram={scramCnt}, queries={parsed.size})", scramCnt < parsed.size && scramCnt <= 6),
+              ("[pg-wire] SQLi payload NEVER interpolated into Parse SQL", !(parsed.any (·.contains "DROP TABLE"))),
+              ("[pg-wire] Parse used $1 placeholders with Bind params", parsed.any (·.contains "$1"))],
+        runShopDirectSuite c "sqlite-direct" (withRedirectedDb (.sqlitePath s!"{tmpDir}/shop_direct.db")) (testConcurrentReaders := true),
+        runEncryptedColumnSuite c (withRedirectedDb (.sqlitePath s!"{tmpDir}/enc_vault.db")),
+        runKeyRotationAndMetaSuite c tmpDir,
+        runMultiTenantCrossTableSuite c tmpDir,
+        runMigrationSuite c tmpDir,
+        runRoadmapSuite c tmpDir,
+        withMockServer c "[pg-shop] start mock" (startPgWireMock s!"{tmpDir}/shop_pg_mock.db" "shopuser" "shoppass" "shopdb") (fun m => do Db.PgWire.clearPool; m.stop) fun shopPgMock => do
+          let ssrfRes ← Db.PgWire.execParameterized shopPgMock.url "SELECT 1" #[] (ssrfGuard := true)
+          c.check "[pg-ssrf] dynamic postgresUrl SSRF guard rejects loopback 127.0.0.1" (match ssrfRes with | .error _ => true | .ok _ => false) "expected SSRF rejection"
+          runShopDirectSuite c "pg-direct" (withRedirectedDb (.postgresUrl shopPgMock.url (ssrfGuard := false)))
+          let (scramCnt, parsed) := (← shopPgMock.scramCountRef.get, ← shopPgMock.parsedSqlRef.get)
+          c.check s!"[pg-direct] connection pool reused sockets across tx & queries (scram={scramCnt}, queries={parsed.size})" (scramCnt > 0 && scramCnt <= 3 && parsed.size >= 10) s!"scram={scramCnt}, queries={parsed.size}"
+          let pgShop := DbChecks.ShopDb.clientWith { DbChecks.ShopDb.config with endpoint := .postgresUrl shopPgMock.url (ssrfGuard := false), devFallback? := none, envEndpoints? := none }
+          let _ ← pgShop.authors.insertOrIgnore { id := "pg_25p02_a", name := "Author" }
+          let abortedTxRes ← pgShop.transaction fun tx => do let _ ← pgShop.authors.insert { id := "pg_25p02_a", name := "dup-pk-error" } (txId? := some tx); return (.ok () : Except ApiError Unit)
+          c.check "[pg-25p02] COMMIT on aborted Postgres tx returns error (never silent .ok)" (!abortedTxRes.isOk) "expected finishPgTx error on aborted tx"
+          c.expectOk "[pg-25p02] insertOrIgnore inside Postgres tx commits cleanly" (← pgShop.transaction fun tx => pgShop.authors.insertOrIgnore { id := "pg_25p02_a", name := "dup-ignored" } (txId? := some tx)) fun opt =>
+            c.check "[pg-25p02] duplicate author ignored" opt.isNone
+          let devFallbackCfg : DbConfig := {
+            name := "DevOverrideDb", endpoint := .urlEnv "QED_DEV_TEST_DB_URL", devFallback? := some (.sqlitePath ".qed/fallback.db"),
+            envEndpoints? := some { prod := .urlEnv "QED_DEV_TEST_DB_URL", staging := .urlEnv "QED_DEV_TEST_DB_URL", preview := .urlEnv "QED_DEV_TEST_DB_URL", dev := .sqlitePath ".qed/fallback.db" } }
+          let resFallback ← Native.resolveDbConfigCore (some "dev") false devFallbackCfg
+          let resExplicit ← Native.resolveDbConfigCore (some "dev") false { devFallbackCfg with endpoint := .urlEnv "HOME" }
+          c.checkAll [
+            ("[db-resolve] QED_DEPLOY_ENV=dev uses dev sqlite when primary env unset", match resFallback with | .ok (.sqlite ".qed/fallback.db") => true | _ => false),
+            ("[db-resolve] QED_DEPLOY_ENV=dev honors explicitly set primary env var over dev sqlite", match resExplicit with | .error e => e.message.contains "unrecognized database URL scheme" | _ => false)]]
   c.finish
 
 end QedTests.Native.Database

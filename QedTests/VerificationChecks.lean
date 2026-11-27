@@ -3,7 +3,6 @@ import QedTests.CheckHelper
 open Qed
 
 namespace VerificationChecks
-
 /-! ## 1A. Schema `example` & Vacuity Detection -/
 schema OrderWithExample:
   name        : String where 1 <= name.length, name.length <= 40
@@ -86,10 +85,8 @@ component PhotoGallery:
   view: <section>{for tile in tiles: <PhotoTile state={tile}/>}</section>
   invariant allImgsOk: PhotoTile.imgsOk for_each tiles
   invariant allBtnsOk: PhotoTile.btnsOk for_each tiles
-example : (∀ m, Qed.a11yValid (AccessibleCard.app.view m) = true) ∧
-    Qed.htmlHasLang (el "html" [attr "lang" "en"] [el "body" [] ["Hello"]] : Html Unit) = true ∧
-    Qed.a11yValid ((el "div" [] [el "img" [alt "Ok"] []] : Html Nat).map (· + 1)) = true :=
-  ⟨AccessibleCard.accessible_app, rfl, (Html.a11yValid_map _ _).trans rfl⟩
+example : (∀ m, Qed.a11yValid (AccessibleCard.app.view m) = true) ∧ Qed.htmlHasLang (el "html" [attr "lang" "en"] [el "body" [] ["Hello"]] : Html Unit) = true ∧
+    Qed.a11yValid ((el "div" [] [el "img" [alt "Ok"] []] : Html Nat).map (· + 1)) = true := ⟨AccessibleCard.accessible_app, rfl, (Html.a11yValid_map _ _).trans rfl⟩
 bad_a11y imgsHaveAlt       : <div><img src={url("/banner.png")}/></div>
 bad_a11y buttonsAccessible : <div><button></button></div>
 bad_a11y validAriaRoles    : <div ariaRole="definitely-not-a-role">Hi</div>
@@ -99,13 +96,10 @@ bad_a11y headingsOrdered   : <div><h1>Title</h1><h3>Skipped h2</h3></div>
 bad_a11y htmlHasLang       : <html><body>Hello</body></html>
 
 /-! ## 3. Binary File Uploads & Verified Base64 -/
-example (bs : ByteArray) : Qed.Base64.decode (Qed.Base64.encode bs) = .ok bs ∧
-    (Qed.Base64.encode bs).length = Qed.Base64.encodedLength bs.size ∧
-    (Qed.Base64.encodeUrl bs).length = Qed.Base64.encodedUrlLength bs.size :=
-  ⟨Qed.Base64.decode_encode bs, Qed.Base64.encode_length bs, Qed.Base64.encodeUrl_length bs⟩
+example (bs : ByteArray) : Qed.Base64.decode (Qed.Base64.encode bs) = .ok bs ∧ (Qed.Base64.encode bs).length = Qed.Base64.encodedLength bs.size ∧
+    (Qed.Base64.encodeUrl bs).length = Qed.Base64.encodedUrlLength bs.size := ⟨Qed.Base64.decode_encode bs, Qed.Base64.encode_length bs, Qed.Base64.encodeUrl_length bs⟩
 example : (Qed.Base64.encode (ByteArray.mk #[]) == "" && Qed.Base64.encode (ByteArray.mk #[0, 1, 2, 255]) == "AAEC/w==" &&
-  (match Qed.FileBytes.decode "{\"name\":\"pic.png\",\"mime\":\"image/png\",\"size\":4,\"base64\":\"AAEC/w==\"}" with
-   | .ok fb => (fb.name, fb.mime, fb.size, fb.bytes.data) == ("pic.png", "image/png", 4, #[0, 1, 2, 255]) | .error _ => false) &&
+  (match Qed.FileBytes.decode "{\"name\":\"pic.png\",\"mime\":\"image/png\",\"size\":4,\"base64\":\"AAEC/w==\"}" with | .ok fb => (fb.name, fb.mime, fb.size, fb.bytes.data) == ("pic.png", "image/png", 4, #[0, 1, 2, 255]) | .error _ => false) &&
   (match Qed.FileBytes.decode "{\"error\":\"file too large\"}" with | .error "file too large" => true | _ => false) &&
   (match Qed.Cmd.pickFileBytes (msg := Unit) "image/*" 4096 (fun _ => ()) with | .fxResult "file.pickBytes" "image/*" "4096" _ => true | _ => false)) = true := by decide +kernel
 
@@ -126,25 +120,22 @@ server ScheduledWorker:
 server StatelessCron:
   rpc ping() -> String: return "pong"
   every 10s heartbeat: let _ = await HealthPing.ping()?; return
-example : ScheduledWorker.jobs.size = 4 ∧ ScheduledWorker.verifiedJobs.size = 4 ∧
-    ScheduledWorker.jobNames = ["tick", "cleanup", "syncRemote", "hourlyNote"] ∧ StatelessCron.jobs.size = 1 := ⟨rfl, rfl, rfl, rfl⟩
+example : ScheduledWorker.jobs.size = 4 ∧ ScheduledWorker.verifiedJobs.size = 4 ∧ ScheduledWorker.jobNames = ["tick", "cleanup", "syncRemote", "hourlyNote"] ∧ StatelessCron.jobs.size = 1 := ⟨rfl, rfl, rfl, rfl⟩
 example (s : ScheduledWorker.State) : Qed.Server.MultiCoreStep ScheduledWorker.StateInv ⟨s, []⟩
     ⟨s, [(ScheduledWorker.verifiedJobs[0]'(by decide)).runM (m := Qed.Server.ThreadProg ScheduledWorker.State)]⟩ :=
   Qed.Server.verifiedJob_spawn_step (ScheduledWorker.verifiedJobs[0]'(by decide)) s []
-bad_srv_st "background job `badZero` interval must be positive (got `0s`)" BadZeroJob n : Nat = 0 | every 0s badZero: n += 1
-bad_srv_st "unknown duration unit `d` in `every 2d badUnit`" BadUnitJob n : Nat = 0 | every 2d badUnit: n += 1
-bad_srv_inv "Server invariant `bounded` failed in `overflow`:\n  • must satisfy:  count + 1 <= 10" BadInvJob count : Nat = 0 | bounded : count <= 10 | every 1s overflow: count += 1
-bad_srv_inv "Server invariant `mono` failed in `shrink`:\n  • must satisfy:  s.total - 1 >= s.total" BadMonoJob total : Nat = 5 | mono : total >= old(total) | every 10s shrink: atomic: total -= 1
-bad_srv_st "cannot access server state `count` outside an `atomic` block in `racySync`" BadRacyJob count : Nat = 0 | every 30s racySync: let _ = await HealthPing.ping()?; count += 1
-bad_srv_st "cannot use `await` inside an `atomic` block" BadAwaitInAtomicJob count : Nat = 0 | every 30s badLock: atomic: let _ = await HealthPing.ping()?; count += 1
+bad_srv "background job `badZero` interval must be positive (got `0s`)" BadZeroJob : state n : Nat = 0 | every 0s badZero: n += 1
+bad_srv "unknown duration unit `d` in `every 2d badUnit`" BadUnitJob : state n : Nat = 0 | every 2d badUnit: n += 1
+bad_srv "Server invariant `bounded` failed in `overflow`:\n  • must satisfy:  count + 1 <= 10" BadInvJob : state count : Nat = 0 | invariant bounded: count <= 10 | every 1s overflow: count += 1
+bad_srv "Server invariant `mono` failed in `shrink`:\n  • must satisfy:  s.total - 1 >= s.total" BadMonoJob : state total : Nat = 5 | invariant mono: total >= old(total) | every 10s shrink: atomic: total -= 1
+bad_srv "cannot access server state `count` outside an `atomic` block in `racySync`" BadRacyJob : state count : Nat = 0 | every 30s racySync: let _ = await HealthPing.ping()?; count += 1
+bad_srv "cannot use `await` inside an `atomic` block" BadAwaitInAtomicJob : state count : Nat = 0 | every 30s badLock: atomic: let _ = await HealthPing.ping()?; count += 1
 
 /-! ## 5. Verified Typed Dictionaries (`{K: V}`) -/
-example : Qed.LawfulJson (Qed.Dict String Nat) × Qed.LawfulJson (Qed.Dict Nat String) ×
-    Qed.LawfulProto (Qed.Dict String Nat) × Qed.LawfulProto (Qed.Dict Nat (Array String)) :=
+example : Qed.LawfulJson (Qed.Dict String Nat) × Qed.LawfulJson (Qed.Dict Nat String) × Qed.LawfulProto (Qed.Dict String Nat) × Qed.LawfulProto (Qed.Dict Nat (Array String)) :=
   (inferInstance, inferInstance, inferInstance, inferInstance)
 example : (let d : Qed.Dict String Nat := Qed.Dict.ofList [("alice", 10), ("bob", 20)]
-  Qed.Json.render (Qed.toJson d) == "{\"alice\":10,\"bob\":20}" &&
-  (match Qed.Proto.decode (α := Qed.Dict String Nat) (Qed.Proto.encode d) with | .ok d' => d' == d | .error _ => false)) = true := by decide +kernel
+  Qed.Json.render (Qed.toJson d) == "{\"alice\":10,\"bob\":20}" && (match Qed.Proto.decode (α := Qed.Dict String Nat) (Qed.Proto.encode d) with | .ok d' => d' == d | .error _ => false)) = true := by decide +kernel
 component Scoreboard:
   state scores : {String: Nat}
   state preset = {"alice": 10, "bob": 20}
@@ -166,14 +157,8 @@ server ScoreboardApi:
   rpc lookup(name: String) -> Nat?: return scores[name]
   rpc clear(name: String) -> Unit: scores.remove(name)
   get "/scores": return json(scores)
-  get "/by-id":
-    let byId : {Nat: String} = {1: "one", 2: "two"}
-    return json(byId)
-expect_err "Server invariant `capped` failed in `recordUnsafe`:\n  • must satisfy:  (if scores.contains name = true then scores.size else scores.size + 1) <= 100" in
-server BadDictCap:
-  state scores : {String: Nat}
-  invariant capped: scores.size <= 100
-  rpc recordUnsafe(name: String, pts: Nat) -> Unit: scores[name] = pts
+  get "/by-id": let byId : {Nat: String} = {1: "one", 2: "two"}; return json(byId)
+bad_srv "Server invariant `capped` failed in `recordUnsafe`:\n  • must satisfy:  (if scores.contains name = true then scores.size else scores.size + 1) <= 100" BadDictCap : state scores : {String: Nat} | invariant capped: scores.size <= 100 | rpc recordUnsafe(name: String, pts: Nat) -> Unit: scores[name] = pts
 
 /-! ## 6. Multi-Child Hoisted Component Verification & Flat Reconcile -/
 component HoistedPane:
@@ -186,9 +171,7 @@ component HoistedPane:
   action tick: ticks += 1
   action pick: onPicked.emit(title)
   view: <div><span>{title}</span><button onClick={.tick}>{ticks}</button><button onClick={.pick}>Pick</button></div>
-
 inductive DashTab where | t0 | t1 | t2 | t3 | t4 | t5 | t6 | t7 | t8 | t9 deriving BEq, DecidableEq
-
 component HoistedDashboard:
   port audit : String
   session user
@@ -208,8 +191,7 @@ component HoistedDashboard:
   action onPick(v : String): lastPick = v; audit.send(v)
   action bump: if count < 10: count += 1
   action sortBy(col : String):
-    if sortCol == col:
-      sortAsc = not sortAsc
+    if sortCol == col: sortAsc = not sortAsc
     else:
       sortCol = col
       sortAsc = true
@@ -234,59 +216,42 @@ component HoistedDashboard:
         case .t8: <HoistedPane key={sortCol} title={sortCol} onPicked={.onPick}/>
         case .t9: <HoistedPane key={lastPick} title={lastPick} onPicked={.onPick}/>}
     </div>
-
 component HoistedEmitter:
   state showPane : Bool = true
   event done(ok : Bool)
   action finish: done.emit(true)
   action hide: showPane = false
   view: <div>{<HoistedPane key="p" title="P"/> if showPane else <span/>}</div>
-
 example : (
   let (s0, _) := HoistedDashboard.update HoistedDashboard.init (._onSession (some "alice"))
   let (s1, c1) := HoistedDashboard.update s0 (._sub_0 .tick)
   let (s2, c2) := HoistedDashboard.update s1 (.setTab .t1)
   let (s3, _) := HoistedDashboard.update s2 (._sub_1 .pick)
-  let hasStart (c : Cmd HoistedDashboard.Msg) : Bool := match c with | .batch [.none, .port "ping" "\"boot\""] => true | _ => false
   let (e1, eo1, _) := HoistedEmitter.update HoistedEmitter.init .finish
   let (e2, eo2, _) := HoistedEmitter.update e1 .hide
-  s1._sub_0.ticks == 1 && (match c1 with | .none => true | _ => false) &&
-  s2._sub_0.ticks == 0 && s2._sub_1.user == some "alice" && hasStart c2 &&
-  s3.lastPick == "b" &&
-  (match eo1 with | some (.done true) => true | _ => false) &&
-  eo2.isNone && e2.showPane == false) = true := by decide +kernel
+  s1._sub_0.ticks == 1 && (match c1 with | .none => true | _ => false) && s2._sub_0.ticks == 0 && s2._sub_1.user == some "alice" &&
+  (match c2 with | .batch [.none, .port "ping" "\"boot\""] => true | _ => false) && s3.lastPick == "b" &&
+  (match eo1 with | some (.done true) => true | _ => false) && eo2.isNone && e2.showPane == false) = true := by decide +kernel
 
 /-! ## 7. Upgraded Component `example` Blocks (`with props`, `from`, `emits`, Async `on Server.rpc => ...`) -/
-
 component PropsAndEmitsCard:
   prop step : Nat = 1
   prop maxVal : Nat = 10
   event changed(next: Nat)
   state count : Nat = 0
   invariant bounded: count <= maxVal
-  action inc:
-    if count + step <= maxVal:
-      count += step
-      changed.emit(count)
-  action reset:
-    count = 0
-    changed.emit(0)
+  action inc: if count + step <= maxVal: count += step; changed.emit(count)
+  action reset: count = 0; changed.emit(0)
   example defaultProps: .inc, .inc -> count == 2
-  example customPropsAndEmits with props { step = 3, maxVal = 10 } from { count = 1 }:
-    .inc, .inc -> count == 7 emits .changed(7)
-  example parametricProp(s: Nat, m: Nat) with props { step = s, maxVal = m }:
-    .reset -> count == 0 emits .changed(0)
+  example customPropsAndEmits with props { step = 3, maxVal = 10 } from { count = 1 }: .inc, .inc -> count == 7 emits .changed(7)
+  example parametricProp(s: Nat, m: Nat) with props { step = s, maxVal = m }: .reset -> count == 0 emits .changed(0)
   view: <button onClick={.inc}>{count}</button>
-
 server stateless LaunchRpcSrv:
   rpc trigger(appId: String) -> String!:
     requires auth
-    if appId == "full":
-      return fail(.quota, "limit reached")
-    if appId == "deny":
-      return fail(.forbidden)
+    if appId == "full": return fail(.quota, "limit reached")
+    if appId == "deny": return fail(.forbidden)
     return f"rel-{appId}"
-
 component AsyncLaunchPanel:
   prop appId : String
   session user
@@ -299,54 +264,33 @@ component AsyncLaunchPanel:
       busy = true
       errMsg = ""
       let rel = await LaunchRpcSrv.trigger(appId) catch:
-        case .quota(msg):
-          busy = false
-          errMsg = f"quota:{msg}"
-        case .forbidden:
-          busy = false
-          errMsg = "forbidden"
-        case .failed(msg):
-          busy = false
-          errMsg = msg
+        case .quota(msg): busy = false; errMsg = f"quota:{msg}"
+        case .forbidden: busy = false; errMsg = "forbidden"
+        case .failed(msg): busy = false; errMsg = msg
       busy = false
       lastRel = rel
       launched.emit(rel)
-  example happyPath with props { appId = "web" } from { user = some("alice") }:
-    .start, on LaunchRpcSrv.trigger => ok("rel-web")
-    -> not busy and lastRel == "rel-web" and errMsg == ""
-    emits .launched("rel-web")
-  example quotaDomainError with props { appId = "full" } from { user = some("alice") }:
-    .start, on LaunchRpcSrv.trigger => err(.quota, "limit reached")
-    -> not busy and errMsg == "quota:limit reached"
-  example networkError with props { appId = "web" } from { user = some("alice") }:
-    .start, on LaunchRpcSrv.trigger => error("timeout")
-    -> not busy and errMsg == "timeout"
-  example unauthNoOp with props { appId = "web" }:
-    .start -> not busy and lastRel == ""
+  example happyPath with props { appId = "web" } from { user = some("alice") }: .start, on LaunchRpcSrv.trigger => ok("rel-web") -> not busy and lastRel == "rel-web" and errMsg == "" emits .launched("rel-web")
+  example quotaDomainError with props { appId = "full" } from { user = some("alice") }: .start, on LaunchRpcSrv.trigger => err(.quota, "limit reached") -> not busy and errMsg == "quota:limit reached"
+  example networkError with props { appId = "web" } from { user = some("alice") }: .start, on LaunchRpcSrv.trigger => error("timeout") -> not busy and errMsg == "timeout"
+  example unauthNoOp with props { appId = "web" }: .start -> not busy and lastRel == ""
   view: <section><button onClick={.start}>Launch</button><span>{lastRel}</span><span>{errMsg}</span></section>
-
 expect_err "Example `BadCompExEmits.badEmits` failed" in
 component BadCompExEmits:
   prop step : Nat = 1
   event changed(next: Nat)
   state count : Nat = 0
-  action inc:
-    count += step
-    changed.emit(count)
-  example badEmits with props { step = 2 }:
-    .inc -> count == 2 emits .changed(99)
+  action inc: count += step; changed.emit(count)
+  example badEmits with props { step = 2 }: .inc -> count == 2 emits .changed(99)
   view: <span>{count}</span>
-
 expect_err "`on ... => ...` in `example danglingReply` requires component `BadCompExNoAsync` to have `await` / async effects" in
 component BadCompExNoAsync:
   prop appId : String
   session user
   state busy : Bool = false
   action noop: pass
-  example danglingReply with props { appId = "web" }:
-    .noop, on LaunchRpcSrv.trigger => ok("rel-web") -> not busy
+  example danglingReply with props { appId = "web" }: .noop, on LaunchRpcSrv.trigger => ok("rel-web") -> not busy
   view: <span>{appId}</span>
-
 expect_err "Example `BadCompExUnmatchedRpc.danglingReply` failed" in
 component BadCompExUnmatchedRpc:
   prop appId : String
@@ -358,8 +302,6 @@ component BadCompExUnmatchedRpc:
       let _ = await LaunchRpcSrv.trigger(appId) catch:
         case _: pass
       busy = false
-  example danglingReply with props { appId = "web" }:
-    .noop, on LaunchRpcSrv.trigger => ok("rel-web") -> not busy
+  example danglingReply with props { appId = "web" }: .noop, on LaunchRpcSrv.trigger => ok("rel-web") -> not busy
   view: <span>{appId}</span>
-
 end VerificationChecks

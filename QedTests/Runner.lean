@@ -6,12 +6,13 @@ import QedTests.Native.VerificationAndJobs
 import QedTests.Native.AuthAndDeploy
 import QedTests.Native.CloudDeploy
 
-def main : IO UInt32 := do
-  let suites : Array (String × IO Bool) := #[
+def main (args : List String) : IO UInt32 := do
+  let allSuites : Array (String × IO Bool) := #[
     ("cli-scaffold", QedTests.Native.CliScaffold.run), ("fullstack-rpc", QedTests.Native.FullstackRpc.run),
     ("database", QedTests.Native.Database.run), ("websockets", QedTests.Native.WebSocket.run),
     ("verification-and-jobs", QedTests.Native.VerificationAndJobs.run),
     ("auth-and-deploy", QedTests.Native.AuthAndDeploy.run), ("cloud-deploy", QedTests.Native.CloudDeploy.run)]
+  let suites := if args.isEmpty then allSuites else allSuites.filter fun (nm, _) => args.contains nm
   let tasks ← suites.mapM fun (name, fn) => return (name, ← IO.asTask (prio := .dedicated) fn)
   let mut failed := 0
   for (name, t) in tasks do

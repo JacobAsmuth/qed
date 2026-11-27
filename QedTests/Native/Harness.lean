@@ -2,7 +2,7 @@ import Qed.Server.Prim
 import Qed.Server.Http
 import Qed.Server.Net
 import Qed.Proto
-import Qed.Json
+import Qed.Json.Lawful
 open System (FilePath)
 open Qed.Server Qed.Server.Http
 
@@ -11,9 +11,7 @@ instance {ε α : Type} [BEq ε] [BEq α] : BEq (Except ε α) where beq | .ok a
 instance : BEq ByteArray where beq a b := a.data == b.data
 instance : Repr ByteArray where reprPrec b _ := s!"ByteArray({b.size} bytes)"
 
-structure TestChecker where
-  name  : String
-  state : IO.Ref (Nat × Nat)
+structure TestChecker where (name : String) (state : IO.Ref (Nat × Nat))
 class ErrMsg (ε : Type) where errMsg : ε → String
 instance : ErrMsg String where errMsg := id
 instance : ErrMsg ApiError where errMsg := ApiError.message
@@ -22,14 +20,12 @@ def mkChecker (name : String) : IO TestChecker := return { name, state := ← IO
 def TestChecker.check (c : TestChecker) (label : String) (ok : Bool) (detail : String := "") : IO Unit := do
   c.state.modify fun (p, f) => if ok then (p + 1, f) else (p, f + 1)
   if !ok then IO.eprintln s!"  FAIL  {label}{if detail.isEmpty then "" else s!": {detail}"}"
+def TestChecker.checkAll (c : TestChecker) (cases : List (String × Bool)) : IO Unit := for (lbl, ok) in cases do c.check lbl ok
 def TestChecker.checkEq {α : Type} [BEq α] [Repr α] (c : TestChecker) (label : String) (got want : α) : IO Unit := c.check label (got == want) s!"got {reprStr got}, want {reprStr want}"
 def TestChecker.expectOk {ε α : Type} [ErrMsg ε] (c : TestChecker) (label : String) (res : Except ε α) (k : α → IO Unit) : IO Unit := match res with | .ok v => k v | .error e => c.check label false (ErrMsg.errMsg e)
-def TestChecker.checkOkBy {ε α β : Type} [ErrMsg ε] [BEq β] [Repr β] (c : TestChecker) (label : String) (res : Except ε α) (f : α → β) (want : β) : IO Unit :=
-  c.expectOk label res fun v => c.checkEq label (f v) want
+def TestChecker.checkOkBy {ε α β : Type} [ErrMsg ε] [BEq β] [Repr β] (c : TestChecker) (label : String) (res : Except ε α) (f : α → β) (want : β) : IO Unit := c.expectOk label res fun v => c.checkEq label (f v) want
 def TestChecker.checkErrCode {α : Type} (c : TestChecker) (label : String) (res : Except ApiError α) (wantCode : Nat) (wantMsg? : Option String := none) : IO Unit :=
-  match res with
-  | .error e => if let some m := wantMsg? then c.checkEq label (e.code, e.message) (wantCode, m) else c.checkEq label e.code wantCode
-  | .ok _ => c.check label false s!"expected ApiError {wantCode}, got ok"
+  match res with | .error e => if let some m := wantMsg? then c.checkEq label (e.code, e.message) (wantCode, m) else c.checkEq label e.code wantCode | .ok _ => c.check label false s!"expected ApiError {wantCode}, got ok"
 def TestChecker.checkErrContains {ε α : Type} [ErrMsg ε] (c : TestChecker) (label : String) (res : Except ε α) (sub : String) : IO Unit :=
   match res with | .error e => let m := ErrMsg.errMsg e; c.check label (m.contains sub) m | .ok _ => c.check label false s!"expected error containing `{sub}`, got ok"
 def TestChecker.finish (c : TestChecker) : IO Bool := do
@@ -57,10 +53,13 @@ private def buildDevApp (webRoot : String) : IO (Option String) := do
 def withDevApp (c : TestChecker) (webRoot : String) (k : String → IO Unit) : IO Unit := do
   match ← buildDevApp webRoot with | some dir => k dir | none => c.check s!"buildDevApp {webRoot}" false
 def checkLeakGate (c : TestChecker) (modName : String) (decls : Array String) : IO Unit := do
-  let cwd ← IO.currentDir; let (qedjs, rtPath, lp) := (← qedjsBinPath, (cwd / "runtime" / "qed_rt.mjs").toString, ← getLeanPath)
+  let (cwd, qedjs, lp) := (← IO.currentDir, ← qedjsBinPath, ← getLeanPath)
+  let (code, out, err) ← runCmd qedjs (#["--check-leak-each", modName, "--"] ++ decls) (cwd := some cwd) (env := #[("LEAN_PATH", some lp)])
+  let rows := (out.splitOn "\n").filterMap fun l => match l.splitOn "\t" with | st :: d :: rest => some (d, st, "\t".intercalate rest) | _ => none
   for decl in decls do
-    let (code, out, err) ← runCmd qedjs #["--check-externs", rtPath, modName, "--", decl] (cwd := some cwd) (env := #[("LEAN_PATH", some lp)])
-    let comb := out ++ err; c.check s!"leak gate blocks {decl}" (code != 0 && comb.contains "client bundle leak gate") s!"exit={code}, out={comb.take 160}"
+    match rows.find? (·.1 == decl) with
+    | some (_, st, msg) => c.check s!"leak gate blocks {decl}" (code == 0 && st == "PASS" && msg.contains "client bundle leak gate") s!"exit={code}, status={st}, out={msg.take 160}"
+    | none => c.check s!"leak gate blocks {decl}" false s!"exit={code}, missing result line: {(out ++ err).take 160}"
 
 private def signHmac (secret payload : String) : IO String := return s!"{payload}.{Qed.Proto.encodeHex (← Prim.hmacSha256 secret.toUTF8 payload.toUTF8)}"
 def signSessionToken (secret userId : String) : IO String := signHmac secret userId
@@ -85,8 +84,7 @@ def readHeadUntilCrlfCrlf (handle : UInt64) (maxReads : Nat := 64) : IO (Option 
 def readExact (handle : UInt64) (buf : ByteArray) (n : Nat) : IO (Option ByteArray) := readSocketUntil handle buf (·.size >= n)
 private def readAllSocket (handle : UInt64) : IO ByteArray := do
   let mut acc := ByteArray.empty
-  for _ in [0 : 100000] do
-    match ← Prim.outboundReadSome handle 65536 with | .ok c => if c.size == 0 then break else acc := acc ++ c | .error _ => break
+  for _ in [0 : 100000] do match ← Prim.outboundReadSome handle 65536 with | .ok c => if c.size == 0 then break else acc := acc ++ c | .error _ => break
   return acc
 def rawTcpReq (port : UInt16) (rawReq : ByteArray) : IO (Except String ByteArray) := do
   match ← Prim.outboundAcquire 0 "127.0.0.1" port 0 (fun _ => false) with
@@ -96,11 +94,7 @@ def rawTcpReq (port : UInt16) (rawReq : ByteArray) : IO (Except String ByteArray
       let res ← match ← Prim.outboundWriteAll h rawReq with | .error e => pure (.error e) | .ok () => pure (.ok (← readAllSocket h))
       Prim.outboundRelease h 0; return res
 
-structure HttpResp where
-  status  : Nat
-  headers : Array (String × String)
-  body    : ByteArray
-
+structure HttpResp where (status : Nat) (headers : Array (String × String)) (body : ByteArray)
 def HttpResp.header? (r : HttpResp) (name : String) : Option String := getHeader? r.headers name
 def HttpResp.bodyStr (r : HttpResp) : String := utf8Str r.body
 def HttpResp.cookies (r : HttpResp) : List String := r.headers.foldl (init := []) fun acc (k, v) => if k.toLower == "set-cookie" then acc ++ [v] else acc
@@ -127,6 +121,7 @@ def httpRpc (port : UInt16) (srv fn : String) (body : ByteArray := ByteArray.emp
   httpReq port "POST" s!"/_qed/rpc/{srv}/{fn}" (#[("Content-Type", "application/x-protobuf")] ++ (tok?.map (fun t => #[("Authorization", s!"Bearer {t}")]) |>.getD #[]) ++ extraHdrs) body
 
 def TestChecker.checkStatus (c : TestChecker) (label : String) (res : Except String HttpResp) (want : Nat) : IO Unit := c.expectOk label res fun r => c.checkEq label r.status want
+def TestChecker.checkStatusAll (c : TestChecker) (cases : List (String × IO (Except String HttpResp) × Nat)) : IO Unit := for (lbl, act, want) in cases do c.checkStatus lbl (← act) want
 def TestChecker.checkHttp (c : TestChecker) (label : String) (res : Except String HttpResp) (status? : Option Nat := some 200) (headers : List (String × Option String) := [])
     (bodyEq? : Option String := none) (contains : List String := []) (notContains : List String := []) (extra : HttpResp → IO Unit := fun _ => pure ()) : IO Unit :=
   c.expectOk label res fun r => do r.check c label status? headers bodyEq? contains notContains; extra r
@@ -134,6 +129,12 @@ def TestChecker.checkRaw400 (c : TestChecker) (port : UInt16) (label raw : Strin
   c.expectOk label (← rawTcpReq port raw.toUTF8) fun resp => c.check label ((utf8Str resp).startsWith "HTTP/1.1 400 ")
 def TestChecker.checkRawNoLeak (c : TestChecker) (port : UInt16) (label reqPath forbidden : String) : IO Unit := do
   c.expectOk label (← rawTcpReq port s!"GET {reqPath} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n".toUTF8) fun resp => let s := utf8Str resp; c.check label (!s.contains forbidden) s
+def TestChecker.checkCliCases (c : TestChecker) (run : Array String → IO (UInt32 × String)) (cases : List (String × Array String × Bool × List String × List String)) (parallel : Bool := false) : IO Unit := do
+  let verify (lbl : String) (rc : UInt32) (out : String) (wantOk : Bool) (has omits : List String) := c.check lbl ((rc == 0) == wantOk && has.all (out.contains ·) && omits.all (!out.contains ·)) out
+  if parallel then
+    let ts ← cases.mapM fun (lbl, args, wantOk, has, omits) => return (lbl, wantOk, has, omits, ← IO.asTask (prio := .dedicated) (run args))
+    for (lbl, wantOk, has, omits, t) in ts do match ← IO.wait t with | .ok (rc, out) => verify lbl rc out wantOk has omits | .error e => c.check lbl false (toString e)
+  else for (lbl, args, wantOk, has, omits) in cases do let (rc, out) ← run args; verify lbl rc out wantOk has omits
 
 private def TestChecker.checkRpcDomain {ε E α : Type} [ErrMsg ε] [Qed.FromProto E] [Qed.FromProto α] (c : TestChecker) (label : String) (res : Except ε ByteArray) (k : Except (Qed.RpcDomainError E) α → IO Unit) : IO Unit :=
   c.expectOk label res fun bs => c.expectOk label (Qed.Proto.decode (α := Except (Qed.RpcDomainError E) α) bs) k
@@ -147,7 +148,6 @@ def TestChecker.checkJsonPath (c : TestChecker) (label : String) (j : Qed.Json) 
 def TestChecker.checkJsonArr (c : TestChecker) (label : String) (j : Qed.Json) (path : String) (pred : List Qed.Json → Bool) (detail : String := "") : IO Unit := c.checkJsonPath label j path (fun | .arr xs => pred xs | _ => false) detail
 def TestChecker.checkJsonStr (c : TestChecker) (label : String) (j : Qed.Json) (path want : String) : IO Unit := c.checkEq label (j.pathStr? path) (some want)
 def TestChecker.checkJsonInt (c : TestChecker) (label : String) (j : Qed.Json) (path : String) (want : Int) : IO Unit := c.checkEq label (((j.atPath path).bind (·.num?)).bind (·.toInt?)) (some want)
-
 def TestChecker.checkProtoBy {ε α β : Type} [ErrMsg ε] [Qed.FromProto α] [BEq β] [Repr β] (c : TestChecker) (label : String) (res : Except ε ByteArray) (f : α → β) (want : β) : IO Unit :=
   c.expectOk label res fun bs => c.expectOk label (Qed.Proto.decode (α := α) bs) fun v => c.checkEq label (f v) want
 def TestChecker.checkProto {ε α : Type} [ErrMsg ε] [Qed.FromProto α] [BEq α] [Repr α] (c : TestChecker) (label : String) (res : Except ε ByteArray) (want : α) : IO Unit := c.checkProtoBy label res id want
@@ -163,14 +163,9 @@ private def waitHealth (port : UInt16) (timeoutMs : Nat := 5000) : IO Bool := do
 private def spawnNullProc (cmd : String) (args : Array String) (env : Array (String × Option String)) : IO (IO.Process.Child ⟨.null, .null, .null⟩) :=
   IO.Process.spawn { cmd, args, env, stdin := .null, stdout := .null, stderr := .null }
 
-structure NativeServerProc where
-  port     : UInt16
-  cmd      : String
-  args     : Array String
-  env      : Array (String × Option String)
-  childRef : IO.Ref (IO.Process.Child ⟨.null, .null, .null⟩)
-
-def NativeServerProc.stop (s : NativeServerProc) : IO Unit := do let ch ← s.childRef.get; try ch.kill catch _ => pure (); try discard <| ch.wait catch _ => pure ()
+structure NativeServerProc where (port : UInt16) (cmd : String) (args : Array String) (env : Array (String × Option String)) (childRef : IO.Ref (IO.Process.Child ⟨.null, .null, .null⟩))
+def NativeServerProc.stop (s : NativeServerProc) : IO Unit := do
+  let ch ← s.childRef.get; (try ch.kill catch _ => pure ()); try discard <| ch.wait catch _ => pure ()
 def NativeServerProc.restart (s : NativeServerProc) : IO Bool := do s.stop; IO.sleep 50; s.childRef.set (← spawnNullProc s.cmd s.args s.env); waitHealth s.port
 def withNativeBin (c : TestChecker) (label bin : String) (args : Array String) (port : UInt16) (extraEnv : Array (String × Option String) := #[]) (k : NativeServerProc → IO Unit) : IO Unit := do
   let srv : NativeServerProc := { port, cmd := bin, args, env := extraEnv, childRef := ← IO.mkRef (← spawnNullProc bin args extraEnv) }
@@ -182,10 +177,9 @@ def startMockTcpServer (onConn : UInt64 → IO Unit) (concurrent : Bool := false
   match ← Prim.tcpListen 0 with
   | .error e => return .error e
   | .ok (lid, port) =>
-      let runningRef ← IO.mkRef true; let handle (conn : UInt64) : IO Unit := do try onConn conn catch _ => pure (); Prim.outboundRelease conn 0
+      let runningRef ← IO.mkRef true; let handle (conn : UInt64) : IO Unit := do (try onConn conn catch _ => pure ()); Prim.outboundRelease conn 0
       discard <| IO.asTask (prio := .dedicated) do
-        while ← runningRef.get do
-          match ← Prim.tcpAccept lid 100 with | .error "timeout" => pure () | .error _ => break | .ok conn => if concurrent then discard <| IO.asTask (prio := .dedicated) (handle conn) else handle conn
+        while ← runningRef.get do match ← Prim.tcpAccept lid 100 with | .error "timeout" => pure () | .error _ => break | .ok conn => if concurrent then discard <| IO.asTask (prio := .dedicated) (handle conn) else handle conn
       return .ok (port, do runningRef.set false; Prim.tcpCloseListener lid)
 def startMockHttpServer (onReq : String → String → Array (String × String) → ByteArray → IO (Nat × String × ByteArray)) : IO (Except String (UInt16 × IO Unit)) :=
   startMockTcpServer fun conn => do
@@ -196,11 +190,29 @@ def startMockHttpServer (onReq : String → String → Array (String × String) 
     let (status, ctype, respBytes) ← onReq h.method h.target h.headers body
     discard <| Prim.outboundWriteAll conn (formatHttpResponse status ctype respBytes false false true)
 
+@[implicit_reducible]
+def withMockEnvInst (base : MonadServer IO) (getEnv : String → IO (Option String))
+    (onHttp? : Option (OutboundReq → IO (Except ApiError OutboundResp)) := none) (onDecrypt? : Option (IO Unit) := none) : MonadServer IO :=
+  let withKey (kEnv : String) (fb : Option String) (f : ByteArray → IO (Except String ByteArray)) : IO (Except ApiError ByteArray) := do
+    match (← getEnv kEnv).orElse (fun _ => fb) with
+    | some v => if v.isEmpty then return .error (ApiError.internal s!"empty key {kEnv}") else return (← f v.toUTF8).mapError ApiError.internal
+    | none => return .error (ApiError.internal s!"missing required encryption key env var `{kEnv}`")
+  { exec := fun
+      | .readEnv v => getEnv v | .httpCall req => onHttp?.elim (base.exec (.httpCall req)) (· req)
+      | .aeadEncrypt kEnv fb aad pt => withKey kEnv fb (Prim.aeadEncrypt · aad pt)
+      | .aeadDecrypt kEnv fb aad ct => do
+          if let some hook := onDecrypt? then hook
+          withKey kEnv fb (Prim.aeadDecrypt · aad ct)
+      | eff => base.exec eff }
+
 def rmRf (path : String) : IO Unit := discard <| runCmd "rm" #["-rf", path]
 def withTempDir {α : Type} (prefixStr : String) (k : String → IO α) : IO α := do let dir := s!"/tmp/{prefixStr}-{← Prim.randomHex 8}"; IO.FS.createDirAll dir; try k dir finally rmRf dir
 def withSymlink (target link : String) (k : IO Unit) : IO Unit := do rmRf link; discard <| runCmd "ln" #["-sf", target, link]; try k finally rmRf link
 def runParallelAll (n : Nat) (f : IO Bool) : IO Bool := do
   let tasks ← (Array.range n).mapM fun _ => IO.asTask (prio := .dedicated) f
   tasks.allM fun t => return (← IO.wait t).toOption == some true
+def runTasks (acts : List (IO Unit)) : IO Unit := do
+  let ts ← acts.mapM fun a => (IO.asTask (prio := .dedicated) a : IO (Task (Except IO.Error Unit)))
+  for t in ts do if let .error e ← IO.wait t then throw e
 
 end QedTests.Native

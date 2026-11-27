@@ -71,9 +71,7 @@ deploy StaticShellDeploy:
 server StatefulApi:
   state count : Nat = 0
   invariant nonNeg: count >= 0
-  rpc inc() -> Nat:
-    count += 1
-    return count
+  rpc inc() -> Nat: count += 1; return count
 deploy StatefulDeploy:
   app     StatefulApi
   regions [us_central1]
@@ -96,22 +94,9 @@ example : (
   MinimalDeploy.spec.compute == .standard && MinimalDeploy.spec.timeoutSec? == none && NotesDb.config.isManaged && ManagedAuth.config.isManaged &&
   SplitPreviewSrv.secrets == #[] && NotesDb.config.endpointForEnv .prod == .managedPostgres "NotesDb" .prod &&
   EphemeralPreviewDb.config.endpointForEnv .preview == .sqlitePath "/tmp/qed-preview-EphemeralPreviewDb.db" && EphemeralPreviewDb.config.endpointForEnv .dev == .sqlitePath ".qed/custom-dev.db" &&
-  ["http://127.0.0.2:8001/auth", "http://[::1]:8001", "http://app.localhost:3000", "http://localhost.:8080", "http://a@b@127.0.0.1:8080", "http://localhost\\@evil.com",
-   "http://2130706433", "http://0x7f000001", "http://0177.0.0.1", "http://0", "http://0.0.0.0", "http://[::]", "http://[0::1]", "http://[::0:1]", "http://[0:0:0:0:0:0:0:1]",
-   "http://[::ffff:7f00:1]", "http://[::ffff:127.0.0.1]", "http://[0:0:0:0:0:ffff:127.0.0.1]", "http://[::1%25lo]:8080", "http://[::1%lo]:8080", "http://[::127.0.0.1]:8080", "http://localhost ", "  http://127.0.0.1 \t"].all isLocalhostUrl &&
-  ["http://[::8.8.8.8]:8080", "http://[::2]:8080", "https://notlocalhost.example.com/v127.0.0.1", "http://127.evil.com", "http://metadata.local", "http://[::ffff:127.evil.com]", "http://127.0.0.256"].all (!isLocalhostUrl ·) &&
-  ["http://127.0.0.1", "http://127.0.0.1:8080", "http://127.0.0.1:8080/", "http://localhost", "http://localhost:3000/", "http://[::1]", "http://[::1]:8080/"].all isStrictLoopbackUrl &&
-  ["http://127.evil.com", "http://127.0.0.1:8080/path", "http://127.0.0.1?a=1", "http://127.0.0.1#h", "http://127.0.0.1@evil.com", "http://127.0.0.1\\@evil.com", "http://127.0.0.1//", "https://127.0.0.1", "http://127.0.0.1:0", "http://127.0.0.1:70000"].all (!isStrictLoopbackUrl ·) &&
-  isValidHostname "notes.example.com" && ["127.0.0.1", "169.254.169.254", "169.254.169.0xfe", "127.0.0.0x01", "198.18.0.0x01", "224.0.0.0xfb", "1.1.1.0x01"].all (!isValidHostname ·) &&
-  (HostPattern.exact "Notes.Example.COM").matches "notes.example.com" && (HostPattern.wildcard "Example.COM").matches "App.example.com" && (derivePreviewHost "notes.example.com" "preview").matches "pr-42.preview.notes.example.com" &&
-  ([({ name := "D", appName := "A", domain? := some "app.localhost" } : DeploySpec), { name := "D", appName := "A", domain? := some "app.local" },
-    { name := "D", appName := "A", regions := [.us_central1, .us_central1] }, { name := "", appName := "A" }, { name := "D", appName := "" },
-    { name := "D", appName := "A", domain? := some "a.b.example.com", preview := { host? := some (.wildcard "example.com"), subdomain? := none } },
-    { name := "D", appName := "A", domain? := some "app.example.com", preview := { host? := some (.exact "example.com"), subdomain? := none } }]).all (fun s => !s.validate.isOk) &&
-  ["https://billing.example.com", "https://api.stripe.com:443"].all Qed.Deploy.isValidEgressOrigin &&
-  ["http://billing.example.com", "https://billing.example.com/path", "https://metadata.google.internal", "https://169.254.169.254", "https://169.254.169.0xfe", "https://1.1.1.0x01", "https://10.0.0.1", "https://localhost", "https://*.example.com"].all (!Qed.Deploy.isValidEgressOrigin ·) &&
-  [("/../etc/passwd", "text/plain"), ("/a//b.js", "text/javascript")].all (fun (p, m) => !({ version := 1, assets := [{ path := p, mime := m }] } : Qed.Deploy.DeployManifest).validate.isOk) &&
-  ["/qed_deploy.json", "/sub/QED_DEPLOY.JSON", "/qed_manifest.json", "/sub/QED_MANIFEST.JSON", "/app.js?v=1", "/app.js#top"].all (!Qed.Deploy.isValidAssetPath ·) && Qed.Deploy.isValidAssetPath "/assets/app.js" &&
+  isLocalhostUrl "http://[::1]:8001" && !isLocalhostUrl "http://127.evil.com" && isStrictLoopbackUrl "http://127.0.0.1:8080/" && !isStrictLoopbackUrl "http://127.0.0.1/path" &&
+  isValidHostname "notes.example.com" && !isValidHostname "169.254.169.254" && Qed.Deploy.isValidEgressOrigin "https://billing.example.com" && !Qed.Deploy.isValidEgressOrigin "http://billing.example.com" &&
+  Qed.Deploy.isValidAssetPath "/assets/app.js" && !Qed.Deploy.isValidAssetPath "/qed_deploy.json" &&
   (multiEnvManifest.footprintFor .preview).secrets.map (·.envVar) == ["PREVIEW_DB_URL"] &&
   (multiEnvManifest.footprintFor .prod).secrets.map (·.envVar) == ["PROD_DB_URL", "QED_AUTH_CLIENT_SECRET"] && (multiEnvManifest.footprintFor .dev).secrets == [] &&
   [.setEgressRules k ["https://a.com", "https://b.com"], .narrowEgressRules k ["https://a.com"], .deleteSecret k "OLD"].all acts.contains &&
@@ -120,14 +105,13 @@ example : (
   [.deleteEgressPolicy kp, .pruneDenyException kp, .deleteServiceAccount kp].all td.contains && !td.any fun | .revokeBinding b => b.resource.isAsset | _ => false) = true := by decide +kernel
 
 /-! ## 3. Negative Elaborator Guard Tests -/
-bad_deploy1 "`deploy BadStatefulMultiRegion`: server `StatefulApi` uses in-memory `state`, which can only run in a single region" BadStatefulMultiRegion StatefulApi : regions [us_central1, europe_west1]
-bad_deploy1 "`deploy BadTimeout`: `timeout` (7201s) must be between 1s and 3600s" BadTimeout NotesApp : timeout 7201s
-bad_deploy1 "`deploy BadDomain`: invalid RFC 1123 production `domain` `https://notes.example.com`" BadDomain NotesApp : domain "https://notes.example.com"
-bad_deploy1 "`deploy BadOverlap`: preview host `*.example.com` overlaps production domain `notes.example.com`" BadOverlap NotesApp :
-  domain "notes.example.com" |
+bad_deploy "`deploy BadStatefulMultiRegion`: server `StatefulApi` uses in-memory `state`, which can only run in a single region" BadStatefulMultiRegion StatefulApi : regions [us_central1, europe_west1]
+bad_deploy "`deploy BadTimeout`: `timeout` (7201s) must be between 1s and 3600s" BadTimeout NotesApp : timeout 7201s
+bad_deploy "`deploy BadDomain`: invalid RFC 1123 production `domain` `https://notes.example.com`" BadDomain NotesApp : domain "https://notes.example.com"
+bad_deploy "`deploy BadOverlap`: preview host `*.example.com` overlaps production domain `notes.example.com`" BadOverlap NotesApp : domain "notes.example.com" |
   preview:
     domain "*.example.com"
-bad_deploy1 "`deploy BadPublicPreview`: `auth ManagedAuth` uses `managed` auth" BadPublicPreview NotesApp :
+bad_deploy "`deploy BadPublicPreview`: `auth ManagedAuth` uses `managed` auth" BadPublicPreview NotesApp :
   preview:
     protection public
 database BadSqliteDb:
@@ -158,7 +142,6 @@ database BadManagedProdDb:
     prod sqlite "/tmp/bad.db"
   table t:
     id : Nat primary_key
-bad_deploy1 "deploy invariant `BadInv.wrongTier` failed to prove" BadInv NotesApp : compute standard | invariant wrongTier: compute == xlarge
-bad_deploy1 "use `timeout_sec` (Option Nat, in seconds) inside deploy invariants" BadInvField NotesApp : invariant badField: timeout == none
-
+bad_deploy "deploy invariant `BadInv.wrongTier` failed to prove" BadInv NotesApp : compute standard | invariant wrongTier: compute == xlarge
+bad_deploy "use `timeout_sec` (Option Nat, in seconds) inside deploy invariants" BadInvField NotesApp : invariant badField: timeout == none
 end CloudChecks

@@ -8,18 +8,10 @@ namespace Qed.Cloud
 def clusterForEnv : EnvInstance → DbCluster | .prod => .prodCluster | _ => .nonProdCluster
 
 structure GcpPlan where
-  key              : DeployKey
-  buildHash        : String
-  regions          : List GcpRegion
-  scale            : ScaleSpec
-  serviceAccountId : String
-  cloudRunName     : String
-  secretNames      : List String
-  managedDbs       : List (String × DbCluster)
-  assetPaths       : List String
-  egressAllow      : List String
-  bindings         : List GcpIamBinding
-  denies           : List GcpDenyRule
+  (key : DeployKey) (buildHash : String) (regions : List GcpRegion) (scale : ScaleSpec)
+  (serviceAccountId cloudRunName : String) (secretNames : List String)
+  (managedDbs : List (String × DbCluster)) (assetPaths egressAllow : List String)
+  (bindings : List GcpIamBinding) (denies : List GcpDenyRule)
 deriving Inhabited, DecidableEq, Repr
 
 def compileInfra (key : DeployKey) (buildHash : String) (spec : DeploySpec) (m : Qed.Deploy.DeployManifest) : GcpPlan :=
@@ -58,11 +50,7 @@ def realizeOrgPolicy (plans : List GcpPlan) : GcpPolicyState :=
   let st := compileOrgPolicy plans; { st with bindings := st.bindings.map realizeGcpBinding }
 
 structure GcpObservedState where
-  key         : DeployKey
-  secretNames : List String := []
-  managedDbs  : List String := []
-  egressAllow : List String := []
-  bindings    : List GcpIamBinding := []
+  (key : DeployKey) (secretNames managedDbs egressAllow : List String := []) (bindings : List GcpIamBinding := [])
 deriving Inhabited, DecidableEq, Repr
 
 def planRollout (live : GcpObservedState) (desired : GcpPlan) : List GcpAction :=

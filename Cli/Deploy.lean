@@ -1,78 +1,56 @@
 import Cli.Build
 import Cli.Cloud
 import Qed.Cloud.Executor
-
 open System (FilePath)
 open Qed.Cloud Qed.Server.Net
 
 namespace Qed.Cli
 
 private structure DeployCliOpts where
-  dryRun          : Bool := false
-  checkDrift      : Bool := false
-  teardown        : Bool := false
-  skipBuild       : Bool := false
-  envStr          : String := "prod"
-  prStr           : String := "0"
-  project?        : Option String := none
-  prodProject?    : Option String := none
-  nonProdProject? : Option String := none
-  tenantStr?      : Option String := none
-  appIdStr?       : Option String := none
-  mod?            : Option String := none
-  deployName?     : Option String := none
-  image?          : Option String := none
-  apiBase?        : Option String := none
-  distDir?        : Option String := none
+  (dryRun checkDrift teardown skipBuild : Bool := false)
+  envStr : String := "prod"
+  prStr  : String := "0"
+  (project? prodProject? nonProdProject? tenantStr? appIdStr? mod? deployName? image? apiBase? distDir? : Option String := none)
 
 private def parseDeployOpts (args : List String) : Except String DeployCliOpts :=
   let bad (flag : String) := s!"unknown or incomplete `qed deploy` flag: `{flag}`"
   Prod.fst <$> parseCliFlags {
-    flags := [
-      .bool ["--dry-run"] ({ · with dryRun := true }), .bool ["--check-drift"] ({ · with checkDrift := true }),
+    flags := [.bool ["--dry-run"] ({ · with dryRun := true }), .bool ["--check-drift"] ({ · with checkDrift := true }),
       .bool ["--teardown"] ({ · with teardown := true }), .bool ["--skip-build"] ({ · with skipBuild := true }),
       .valOk ["--env"] (fun o v => { o with envStr := v }), .valOk ["--pr"] (fun o v => { o with prStr := v }),
       .valOk ["--project"] (fun o v => { o with project? := some v }), .valOk ["--prod-project"] (fun o v => { o with prodProject? := some v }),
       .valOk ["--nonprod-project"] (fun o v => { o with nonProdProject? := some v }), .valOk ["--tenant"] (fun o v => { o with tenantStr? := some v }),
       .valOk ["--app-id"] (fun o v => { o with appIdStr? := some v }), .valOk ["--mod"] (fun o v => { o with mod? := some v }),
       .valOk ["--deploy"] (fun o v => { o with deployName? := some v }), .valOk ["--image"] (fun o v => { o with image? := some v }),
-      .valOk ["--api-base"] (fun o v => { o with apiBase? := some v }), .valOk ["--dist"] (fun o v => { o with distDir? := some v }) ],
-    allowEq := false, allowPos := false, unknownErr := bad, missingErr := bad
-  } {} args
+      .valOk ["--api-base"] (fun o v => { o with apiBase? := some v }), .valOk ["--dist"] (fun o v => { o with distDir? := some v })],
+    allowEq := false, allowPos := false, unknownErr := bad, missingErr := bad } {} args
 
 private def isAllowedRemoteApiBase (u : String) : Bool :=
-  u.startsWith "https://" && !u.toList.any (fun c => c.isWhitespace || c.toNat < 0x20 || c.toNat == 0x7F || "@\\?#".contains c) &&
-  let after := (u.drop 8).toString
-  let auth := if after.endsWith "/" then (after.dropEnd 1).toString else after
-  !auth.contains "/" && match auth.splitOn ":" with
-    | [h] | [h, "443"] =>
-        let host := h.toLower
-        isValidHostname host && (["private.googleapis.com", "restricted.googleapis.com", "run.googleapis.com", "iam.googleapis.com",
-          "secretmanager.googleapis.com", "sqladmin.googleapis.com", "cloudresourcemanager.googleapis.com", "networksecurity.googleapis.com"].contains host ||
-          (host.endsWith "-run.googleapis.com" && host.length > 19 && (GcpRegion.parse? (host.dropEnd 19).toString).isSome))
-    | _ => false
+  match parseHttpsHostPort? u (allowTrailingSlash := true) with
+  | some (host, none) | some (host, some 443) =>
+      ["private.googleapis.com", "restricted.googleapis.com", "run.googleapis.com", "iam.googleapis.com",
+       "secretmanager.googleapis.com", "sqladmin.googleapis.com", "cloudresourcemanager.googleapis.com", "networksecurity.googleapis.com"].contains host ||
+      (host.endsWith "-run.googleapis.com" && host.length > 19 && (GcpRegion.parse? (host.dropEnd 19).toString).isSome)
+  | _ => false
 
 private def validateContainerImageUri (uri targetProjectId : String) : Except String String := do
   let bad (msg : String) : Except String String := .error s!"invalid container image URI `{uri}`: {msg}"
   if uri.isEmpty || uri != uri.cliTrim then return ← bad "must not be empty or have leading/trailing whitespace"
-  if uri.toList.any (fun c => c.isWhitespace || c.toNat < 0x20 || c.toNat == 0x7F || "\\?#".contains c) then return ← bad "contains forbidden whitespace or control characters"
+  if Env.hasCtrlOrWs uri "\\?#" then return ← bad "contains forbidden whitespace or control characters"
   if uri.contains ".." then return ← bad "contains `..`"
-  match uri.splitOn "/" with
-  | host :: proj :: rest =>
-      if rest.isEmpty || rest.any (·.isEmpty) then return ← bad "missing repository/image path"
-      let validHost := host == "gcr.io" || [".gcr.io", "-docker.pkg.dev"].any fun suf => host.endsWith suf && host.length > suf.length && isValidDnsLabel (host.dropEnd suf.length).toString
-      if !validHost then return ← bad s!"host `{host}` must be `*-docker.pkg.dev` or `gcr.io`"
-      if proj != targetProjectId then return ← bad s!"project `{proj}` does not match target GCP project `{targetProjectId}`"
-      for seg in rest do if !seg.toList.all (fun c => c.isAlphanum || "._-:@".contains c) then return ← bad s!"invalid character in path segment `{seg}`"
-      return uri
-  | _ => bad "expected `<region>-docker.pkg.dev/<project>/<repo>/<image>:<tag>` or `gcr.io/<project>/<image>:<tag>`"
+  let host :: proj :: rest := uri.splitOn "/" | return ← bad "expected `<region>-docker.pkg.dev/<project>/<repo>/<image>:<tag>` or `gcr.io/<project>/<image>:<tag>`"
+  if rest.isEmpty || rest.any (·.isEmpty) then return ← bad "missing repository/image path"
+  let validHost := host == "gcr.io" || [".gcr.io", "-docker.pkg.dev"].any fun suf => host.endsWith suf && host.length > suf.length && isValidDnsLabel (host.dropEnd suf.length).toString
+  if !validHost then return ← bad s!"host `{host}` must be `*-docker.pkg.dev` or `gcr.io`"
+  if proj != targetProjectId then return ← bad s!"project `{proj}` does not match target GCP project `{targetProjectId}`"
+  for seg in rest do if !seg.toList.all (fun c => c.isAlphanum || "._-:@".contains c) then return ← bad s!"invalid character in path segment `{seg}`"
+  return uri
 
 private def canonicalizeBuildDir (outDir : FilePath) : ExceptT String IO FilePath := do
   let raw := outDir.toString
   if raw.isEmpty || raw.startsWith "-" then throw s!"invalid build output directory `{raw}`"
   if !(← outDir.pathExists) then throw s!"build output directory does not exist: `{raw}`"
-  let realDir ← realPathExcept outDir "failed to canonicalize build output directory"
-  let rs := realDir.toString
+  let realDir ← realPathExcept outDir "failed to canonicalize build output directory"; let rs := realDir.toString
   if ← orB (rs.isEmpty || rs.startsWith "-") ((!·) <$> realDir.isDir) then throw s!"invalid canonical build output directory `{rs}`"
   return realDir
 
@@ -124,10 +102,9 @@ private def buildAndPushContainer (plan : GcpPlan) (region : GcpRegion) (outDir 
     "FROM debian:bookworm-slim\nRUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/* && useradd --system --uid 65532 --no-create-home --shell /usr/sbin/nologin qed\n" ++
     "WORKDIR /app\nCOPY . /app/dist\nRUN rm -f /app/dist/Dockerfile /app/dist/.dockerignore /app/dist/qed_deploy.json /app/dist/.env /app/dist/.env.* && chmod +x /app/dist/server && chown -R 65532:65532 /app\n" ++
     "USER 65532:65532\nEXPOSE 8080\nENV PORT=8080\nENTRYPOINT [\"/app/dist/server\", \"/app/dist\", \"8080\"]\n"))
-  liftIO (step s!"building container image {imageUri}")
-  if (← sh "docker" #["build", "--platform", "linux/amd64", "-t", imageUri, "-f", dfPath.toString, realOutDir.toString]) != 0 then throw s!"docker build failed for {imageUri}"
-  liftIO (step s!"pushing container image {imageUri}")
-  if (← sh "docker" #["push", imageUri]) != 0 then throw s!"docker push failed for {imageUri}"
+  for (lbl, dArgs, errLbl) in [(s!"building container image {imageUri}", #["build", "--platform", "linux/amd64", "-t", imageUri, "-f", dfPath.toString, realOutDir.toString], "build"),
+      (s!"pushing container image {imageUri}", #["push", imageUri], "push")] do
+    liftIO (step lbl); if (← sh "docker" dArgs) != 0 then throw s!"docker {errLbl} failed for {imageUri}"
   return imageUri
 
 private def runDeploy (args : List String) : ExceptT String IO UInt32 := do
@@ -139,7 +116,7 @@ private def runDeploy (args : List String) : ExceptT String IO UInt32 := do
   let isLocalApi := opts.apiBase?.any isStrictLoopbackUrl
   if let some apiUrl := opts.apiBase? then if !isLocalApi && !isAllowedRemoteApiBase apiUrl then
     throw s!"`--api-base` must be either a strict local loopback URL (`http://127.0.0.1[:port]`) or an `https://*.googleapis.com` endpoint (got `{apiUrl}`)"
-  let mod ← liftIO (opts.mod?.elim jsRoot pure); let outDir : FilePath := (opts.distDir?.map FilePath.mk).getD distDir
+  let (mod, outDir) := (← liftIO (opts.mod?.elim jsRoot pure), (opts.distDir?.map FilePath.mk).getD distDir)
   let baseProj ← optOrEnv opts.project? "QED_GCP_PROJECT"
   let prodProject := ((← optOrEnv opts.prodProject? "QED_GCP_PROD_PROJECT").orElse fun _ => baseProj).getD (if opts.dryRun || isLocalApi then "qed-local" else "")
   if prodProject.isEmpty then throw "missing GCP project: pass `--project <gcp-project>` (or `--prod-project` / `--nonprod-project`) or set `QED_GCP_PROJECT`"
@@ -157,11 +134,10 @@ private def runDeploy (args : List String) : ExceptT String IO UInt32 := do
     endpoints := (opts.apiBase?.map GcpEndpoints.allLocal).getD {}, auth, region,
     edgeSaEmail := (← nonEmptyEnv "QED_EDGE_SA_EMAIL").getD "qed-edge@qed-cloud.iam.gserviceaccount.com",
     builderSaEmail := (← nonEmptyEnv "QED_BUILDER_SA_EMAIL").getD "qed-builder@qed-cloud.iam.gserviceaccount.com",
-    deployerSaEmail? := ← nonEmptyEnv "QED_DEPLOYER_SA_EMAIL", healthIdToken?, ssrfGuard := !isLocalApi,
-    healthBaseUrl? := if isLocalApi then opts.apiBase? else none }
+    deployerSaEmail? := ← nonEmptyEnv "QED_DEPLOYER_SA_EMAIL", healthIdToken?,
+    ssrfGuard := !isLocalApi, healthBaseUrl? := if isLocalApi then opts.apiBase? else none }
   let observe : ExceptT String IO GcpLiveSnapshot :=
-    if opts.apiBase?.isSome || (match auth with | .none => false | _ => true) then
-      liftE (observeGcpState cfg plan.key plan.managedDbs plan.regions plan.assetsArePublic)
+    if opts.apiBase?.isSome || (match auth with | .none => false | _ => true) then liftE (observeGcpState cfg plan.key plan.managedDbs plan.regions plan.assetsArePublic)
     else pure { observed := { key := plan.key } }
   if opts.checkDrift then
     liftIO (step s!"checking live GCP drift for {plan.cloudRunName}"); let findings := checkDriftLive (← observe) plan
@@ -184,21 +160,13 @@ private def runDeploy (args : List String) : ExceptT String IO UInt32 := do
   liftIO (IO.println (green s!"✓ deploy complete: {plan.cloudRunName} ({n} action(s) across 4 phases)")); return 0
 
 private def isLocalGcpDeployInvocation (args : List String) : IO Bool := do
-  let localFlags := ["--local-gcp", "--dry-run", "--check-drift", "--teardown", "--skip-build",
-    "--project", "--prod-project", "--nonprod-project", "--tenant", "--app-id",
-    "--image", "--api-base", "--dist"]
+  let localFlags := ["--local-gcp", "--dry-run", "--check-drift", "--teardown", "--skip-build", "--project", "--prod-project", "--nonprod-project", "--tenant", "--app-id", "--image", "--api-base", "--dist"]
   if args.any (localFlags.contains ·) then return true
-  if args.any (fun a => a == "--api" || a.startsWith "--api=" || a == "--app" || a.startsWith "--app=" ||
-      a == "--no-wait" || a == "--token" || a.startsWith "--token=") then return false
-  let hasGcpEnv ← orB (← (·.isSome) <$> nonEmptyEnv "QED_GCP_PROJECT") ((·.isSome) <$> nonEmptyEnv "QED_GCP_PROD_PROJECT")
-  let hasCloudEnv ← orB (← (·.isSome) <$> nonEmptyEnv "QED_CLOUD_API") do
-    orB (← (·.isSome) <$> nonEmptyEnv "QED_CREDENTIALS_FILE") ((·.isSome) <$> nonEmptyEnv "QED_CLOUD_TOKEN")
-  return hasGcpEnv && !hasCloudEnv
+  if args.any fun a => ["--api", "--app", "--token"].any (fun f => a == f || a.startsWith (f ++ "=")) || a == "--no-wait" then return false
+  let hasAny (ks : List String) : IO Bool := ks.anyM fun k => (·.isSome) <$> nonEmptyEnv k
+  andB (← hasAny ["QED_GCP_PROJECT", "QED_GCP_PROD_PROJECT"]) ((!·) <$> hasAny ["QED_CLOUD_API", "QED_CREDENTIALS_FILE", "QED_CLOUD_TOKEN"])
 
 def cmdDeploy (args : List String) : IO UInt32 := do
-  if ← isLocalGcpDeployInvocation args then
-    runExceptCmd (runDeploy (args.filter (· != "--local-gcp")))
-  else
-    cmdHostedDeploy args
+  if ← isLocalGcpDeployInvocation args then runExceptCmd (runDeploy (args.filter (· != "--local-gcp"))) else cmdHostedDeploy args
 
 end Qed.Cli

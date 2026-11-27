@@ -82,10 +82,7 @@ bad_spec_act "`predict:` computes a predicted server response and cannot mutate 
       catch:
         case _: pass
     remaining = rem
-bad_srv1 "`predict`, `on_confirm`, and `rollback` are only supported on client `component` `await` calls, not in `server` functions" BadServerPredict :
-  rpc f() -> Nat:
-    let x = 1 predict 1
-    return x
+bad_srv "`predict`, `on_confirm`, and `rollback` are only supported on client `component` `await` calls, not in `server` functions" BadServerPredict : rpc f() -> Nat: let x = 1 predict 1; return x
 bad_spec_act "`await StoreSrv.placeOrder(...)` has unhandled domain error(s): .outOfStock" BadPredictUnhandledDomainErr :
   if user.isSome and 1 <= remaining: let rem = await StoreSrv.placeOrder(1) predict remaining - 1; remaining = rem
 bad_comp_inv "Invariant `BadRollbackInv.bounded` failed in `BadRollbackInv.update`:\n  • `rollback` branch must satisfy:  20000 <= 10000" BadRollbackInv val : Nat = 0 | bounded : val <= 10000 | go :
@@ -111,7 +108,7 @@ component CheckoutSpec:
     let rem = await StoreSrv.placeOrder(qty) predict remaining - qty
       on_confirm: confirmedCount += 1; status = f"Confirmed: {rem}"
       catch:
-        case .outOfStock:  status = "Out of stock"
+        case .outOfStock: status = "Out of stock"
         case .failed(err): status = err
     remaining = rem
     status = f"Pending: {rem}"
@@ -129,7 +126,7 @@ component ClaimSpec:
       on_confirm: confirmed += 1
       rollback(actual): status = f"Mismatch:{actual}"
       catch:
-        case .locked:      status = "Locked"
+        case .locked: status = "Locked"
         case .failed(err): status = err
     owned.push(id)
     status = "Claimed"
@@ -149,8 +146,8 @@ component CatalogSpec:
           if let .ok(arr) = books:
             if idx < arr.size and arr[idx].slot == idx and arr[idx].stock >= 1: let b = arr[idx]; return SpecBook(slot=b.slot, title=b.title, stock=b.stock - 1)
         catch:
-          case .outOfStock:  statusMsg = "Out of stock"
-          case .notFound:    statusMsg = "Not found"
+          case .outOfStock: statusMsg = "Out of stock"
+          case .notFound: statusMsg = "Not found"
           case .failed(err): statusMsg = err
       books = books.map(arr => arr.set(idx, updated) if idx < arr.size else arr)
       lastSlot = some(idx)
@@ -208,5 +205,4 @@ fullstack SpecMain:
   server StoreSrv
   client CheckoutSpec
   title "Speculative Check"
-
 end SpeculativeChecks

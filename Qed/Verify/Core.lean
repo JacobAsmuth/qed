@@ -607,13 +607,17 @@ structure CloseFallbackConfig where
   return false
 
 private def boundaryLemmaGroups : Array (Name × Array Name) := #[
-  (``Array.size, #[``Array.size_push, ``Array.size_modify, ``Array.size_set, ``Array.size_pop, ``Array.size_map, ``Array.size_append, ``Array.size_eraseIdx, ``Array.size_reverse, ``Array.size_extract, ``Array.size_swap, ``Array.size_mergeSort]),
-  (``Array.sumBy, #[``Array.sumBy_empty, ``Array.sumBy_push, ``Array.sumBy_append, ``Array.sumBy_map, ``Array.sumBy_reverse, ``Array.sumBy_mergeSort]),
-  (``Array.sumByInt, #[``Array.sumByInt_empty, ``Array.sumByInt_push, ``Array.sumByInt_append, ``Array.sumByInt_map, ``Array.sumByInt_reverse, ``Array.sumByInt_mergeSort]),
-  (``Array.countWhere, #[``Array.countWhere_empty, ``Array.countWhere_push, ``Array.countWhere_append, ``Array.countWhere_reverse, ``Array.countWhere_mergeSort]),
+  (``Array.size, #[``Array.size_push, ``Array.size_modify, ``Array.size_set, ``Array.size_pop, ``Array.size_map, ``Array.size_append, ``Array.size_eraseIdx, ``Array.size_reverse, ``Array.size_extract, ``Array.size_swap, ``Array.size_mergeSort,
+    ``Qed.qedSortKey_array_size, ``Qed.qedSortDescKey_array_size, ``Qed.qedSortCmp_array_size, ``Qed.qedSortDescCmp_array_size]),
+  (``Array.sumBy, #[``Array.sumBy_empty, ``Array.sumBy_push, ``Array.sumBy_append, ``Array.sumBy_map, ``Array.sumBy_reverse, ``Array.sumBy_mergeSort, ``Qed.sumBy_qedSortKey]),
+  (``Array.sumByInt, #[``Array.sumByInt_empty, ``Array.sumByInt_push, ``Array.sumByInt_append, ``Array.sumByInt_map, ``Array.sumByInt_reverse, ``Array.sumByInt_mergeSort, ``Qed.sumByInt_qedSortKey]),
+  (``Array.countWhere, #[``Array.countWhere_empty, ``Array.countWhere_push, ``Array.countWhere_append, ``Array.countWhere_reverse, ``Array.countWhere_mergeSort, ``Qed.countWhere_qedSortKey]),
   (``Array.uniqueBy, #[``Array.uniqueBy_empty, ``Array.uniqueBy_push_iff]),
   (``Array.isSortedBy, #[``Array.isSortedBy_empty, ``Array.isSortedBy_singleton, ``Array.isSortedBy_push_iff]),
-  (``List.length, #[``List.length_cons, ``List.length_append, ``List.length_map]),
+  (``Qed.qedIsSortedKey, #[``Qed.qedIsSortedKey_sortKey, ``Qed.qedIsSortedKey_array_empty, ``Qed.qedIsSortedKey_array_singleton, ``Qed.qedIsSortedKey_array_push_iff, ``Qed.qedIsSortedKey_list_nil, ``Qed.qedIsSortedKey_list_singleton]),
+  (``Qed.qedIsSortedDescKey, #[``Qed.qedIsSortedDescKey_sortDescKey]),
+  (``List.length, #[``List.length_cons, ``List.length_append, ``List.length_map,
+    ``Qed.qedSortKey_list_length, ``Qed.qedSortDescKey_list_length, ``Qed.qedSortCmp_list_length, ``Qed.qedSortDescCmp_list_length]),
   (``Qed.Lang.QedSeqLit.ofList, #[``Qed.Lang.QedSeqLit.ofList_array, ``Qed.Lang.QedSeqLit.ofList_list]),
   (``Qed.Lang.QedMem.mem, #[``Qed.Lang.QedMem.mem_array, ``Qed.Lang.QedMem.mem_list, ``Qed.Lang.QedMem.mem_string, ``Array.contains_iff_mem, ``List.contains_iff_mem]),
   (``Qed.Lang.QedMemProp.memProp, #[``Qed.Lang.QedMemProp.memProp_array, ``Qed.Lang.QedMemProp.memProp_list, ``Qed.Lang.QedMemProp.memProp_string]),

@@ -19,11 +19,26 @@ instance {P : Prop} {Q : ¬ P → Prop} [Decidable P] [∀ h, Decidable (Q h)] :
 
 syntax (name := qedEqPropStx) "qedEqProp(" term ", " term ")" : term
 syntax (name := qedAsPropStx) "qedAsProp(" term ")" : term
+syntax (name := qedSeqLitStx) "qedSeqLit%[" term,* "]" : term
 
 open Lean Meta Elab Term in
 @[term_elab qedAsPropStx] def elabQedAsProp : TermElab := fun stx _ => do
   let e ← instantiateMVars (← elabTerm (stx.getArg 1) none); let ty ← whnf (← inferType e)
   if ty.isProp then return e else if ty.isConstOf ``Bool then mkEq e (mkConst ``Bool.true) else ensureHasType (mkSort Level.zero) e
+
+open Lean Meta Elab Term in
+@[noinline, term_elab qedSeqLitStx] def elabQedSeqLit : TermElab := fun stx expectedType? => do
+  let elems : Array Term := (stx.getArg 1).getSepArgs.map (⟨·⟩)
+  if let some expTy := expectedType? then
+    tryPostponeIfMVar expTy
+    let expTy ← instantiateMVars expTy
+    if !expTy.getAppFn.isMVar then
+      let expWhnf ← if expTy.isAppOfArity ``List 1 || expTy.isAppOfArity ``Array 1 then pure expTy else withTransparency .reducible (whnf expTy)
+      if expWhnf.isAppOfArity ``List 1 then
+        return ← elabTerm (← `([$[$elems:term],*])) (some expTy)
+      if expWhnf.isAppOfArity ``Array 1 then
+        return ← elabTerm (← `(#[$[$elems:term],*])) (some expTy)
+  elabTerm (← `($(mkCIdent `Qed.Lang.QedSeqLit.ofList) [$[$elems:term],*])) expectedType?
 
 open Lean Meta Elab Term in
 @[term_elab qedEqPropStx] def elabQedEqProp : TermElab := fun stx _ => do
@@ -146,6 +161,7 @@ def qedIdent       : Parser := leadP `Qed.Lang.qedIdent       (notReservedExprKw
 @[qedExpr_parser 65] def qedAdd      : TrailingParser := opaqueP (binOpP `Qed.Lang.qedAdd 65 66 "+")
 @[qedExpr_parser 65] def qedSub      : TrailingParser := opaqueP (binOpP `Qed.Lang.qedSub 65 66 "-")
 @[qedExpr_parser 65] def qedCat      : TrailingParser := opaqueP (binOpP `Qed.Lang.qedCat 65 66 "++")
+@[qedExpr_parser 63] def qedCons     : TrailingParser := opaqueP (binOpP `Qed.Lang.qedCons 63 63 "::")
 @[qedExpr_parser 60] def qedCoalesce : TrailingParser := opaqueP (binOpP `Qed.Lang.qedCoalesce 60 60 "??")
 
 @[qedExpr_parser 50] def qedCmp : TrailingParser := opaqueP (trailP `Qed.Lang.qedCmp 50 (many1 (node `Qed.Lang.cmpLink (
@@ -174,11 +190,26 @@ def qedExprFor   : Parser := leadP `Qed.Lang.qedExprFor   (withPosition (atomic 
 def qedExprMatch : Parser := leadP `Qed.Lang.qedExprMatch (withPosition (symbol "match" >> sepBy1 pExpr "," >> ":" >> many1 (checkColGt >> node `Qed.Lang.qedExprCase (withPosition (atomic (kw "case") >> qedCasePats >> ":" >> pExpr))))) 10
 @[qedExpr_parser 10] def qedExprCtrlP : Parser := opaqueP (qedExprLet <|> qedExprIfLet <|> qedExprIf <|> qedExprFor <|> qedExprMatch)
 
+def qedOptProof : Parser := optional (
+  node `Qed.fnProofBy (":=" >> kw "by" >> Parser.Tactic.tacticSeq) <|>
+  node `Qed.fnProofProve (atomic (checkColGt "expected indented `prove:` block" >> identEq `prove >> ":") >> checkColGt "expected indented proof tactics" >> Parser.Tactic.tacticSeq))
+@[combinator_parenthesizer qedOptProof] def qedOptProof.parenthesizer : Parenthesizer := pure ()
+@[combinator_formatter qedOptProof] def qedOptProof.formatter : Formatter := pure ()
+
 def qedSuite : Parser := node `Qed.Lang.suite (
   (checkLineEq >> sepBy1 (categoryParser `qedStmt 0) ";") <|>
   (checkColGt "expected indented block" >> withPosition (many1 (checkColEq "expected aligned statement" >> categoryParser `qedStmt 0))))
 @[combinator_parenthesizer qedSuite] def qedSuite.parenthesizer : Parenthesizer := pure ()
 @[combinator_formatter qedSuite] def qedSuite.formatter : Formatter := pure ()
+private def qedForInvStart : Parser := kw "invariant" >> notFollowedBy (symbol "=" <|> symbol "+=" <|> symbol "-=" <|> symbol "(" <|> symbol ".") "invariant"
+def qedForInv : Parser := node `Qed.Lang.qedForInv (withPosition (qedForInvStart >> sepBy1 pExpr "," >> qedOptProof))
+def qedForSuite : Parser := node `Qed.Lang.forSuite (
+  (checkLineEq >> sepBy1 (categoryParser `qedStmt 0) ";") <|>
+  (checkColGt "expected indented block" >> withPosition (
+    many (atomic (checkColEq "invariant" >> lookahead qedForInvStart) >> qedForInv) >>
+    many1 (checkColEq "expected aligned statement" >> categoryParser `qedStmt 0))))
+@[combinator_parenthesizer qedForSuite] def qedForSuite.parenthesizer : Parenthesizer := pure ()
+@[combinator_formatter qedForSuite] def qedForSuite.formatter : Formatter := pure ()
 def qedStmtCase : Parser := node `Qed.Lang.qedStmtCase (withPosition (atomic (kw "case") >> qedCasePats >> ":" >> qedSuite))
 @[combinator_parenthesizer qedStmtCase] def qedStmtCase.parenthesizer : Parenthesizer := pure ()
 @[combinator_formatter qedStmtCase] def qedStmtCase.formatter : Formatter := pure ()
@@ -202,7 +233,7 @@ def qedStmtLet      : Parser := stmtP `Qed.Lang.qedStmtLet      (symbol "let" >>
 def qedStmtIfLet    : Parser := stmtP `Qed.Lang.qedStmtIfLet    (atomic (symbol "if" >> symbol "let") >> pPat >> "=" >> pExpr >> ":" >> qedSuite >> optional (atomic (checkColEq >> symbol "else" >> ":") >> qedSuite))
 def qedStmtIf       : Parser := stmtP `Qed.Lang.qedStmtIf       (symbol "if" >> notFollowedBy (symbol "let") "let" >> pExpr >> ":" >> qedSuite >> many (node `Qed.Lang.elifClause (atomic (checkColEq >> kw "elif") >> pExpr >> ":" >> qedSuite)) >> optional (atomic (checkColEq >> symbol "else" >> ":") >> qedSuite))
 def qedStmtMatch    : Parser := stmtP `Qed.Lang.qedStmtMatch    (symbol "match" >> sepBy1 pExpr "," >> ":" >> many1 (checkColGt >> qedStmtCase))
-def qedStmtFor      : Parser := stmtP `Qed.Lang.qedStmtFor      (atomic (symbol "for" >> qedBinder >> symbol "in") >> pExpr >> ":" >> qedSuite)
+def qedStmtFor      : Parser := stmtP `Qed.Lang.qedStmtFor      (atomic (symbol "for" >> qedBinder >> symbol "in") >> pExpr >> ":" >> qedForSuite)
 def qedStmtAssign   : Parser := stmtP `Qed.Lang.qedStmtAssign   (atomic (pExpr 90 >> ((symbol "=" >> notFollowedBy (symbol "=") "=") <|> symbol "+=" <|> symbol "-=")) >> pExpr >> optional qedLetPredict)
 def qedStmtExpr     : Parser := stmtP `Qed.Lang.qedStmtExpr     (notFollowedBy (symbol "if" <|> symbol "match" <|> symbol "for" <|> symbol "return" <|> symbol "let" <|> kw "atomic" <|> kw "pass" <|> kw "break" <|> kw "continue") "statement" >> pExpr)
 @[qedStmt_parser] def qedStmtP : Parser := opaqueP (
@@ -286,7 +317,6 @@ instance : MonadQuotation PureQuotM where
   match k (← getPureQuotCtxMacro) with | .ok v => pure v | .error (ref, msg) => Macro.throwErrorAt ref msg
 
 private def qValId     : Ident := mkCIdent `Qed.Lang.QedVal.val
-private def qSeqId     : Ident := mkCIdent `Qed.Lang.QedSeqLit.ofList
 private def qMemId     : Ident := mkCIdent `Qed.Lang.QedMem.mem
 private def qMemPropId : Ident := mkCIdent `Qed.Lang.QedMemProp.memProp
 private def qRange1Id  : Ident := mkCIdent `Qed.QedRange.mk1
@@ -325,7 +355,15 @@ structure ParsedEnvRef where mk :: (isSecret : Bool) (envKey : String) (default?
   return .mk ((stx.getArg 0).getId.eraseMacroScopes == `secret) envKey (if defOpt.getNumArgs == 2 then some (⟨defOpt.getArg 1⟩ : TSyntax `str).getString else none)
 
 partial def suiteStmts (stx : Syntax) : Array Syntax :=
-  let body := if stx.getKind == `Qed.Lang.suite then stx.getArg 0 else stx; if body.getKind == nullKind then body.getArgs.filter (!·.isAtom) else #[body]
+  if stx.getKind == `Qed.Lang.forSuite then
+    if stx.getNumArgs == 2 then (stx.getArg 1).getArgs else (stx.getArg 0).getSepArgs
+  else let body := if stx.getKind == `Qed.Lang.suite then stx.getArg 0 else stx; if body.getKind == nullKind then body.getArgs.filter (!·.isAtom) else #[body]
+def forSuiteInvs (stx : Syntax) : Array Syntax :=
+  if stx.getKind == `Qed.Lang.forSuite && stx.getNumArgs == 2 then (stx.getArg 0).getArgs else #[]
+def parseOptTacSeq (optNode : Syntax) : Option (TSyntax ``Lean.Parser.Tactic.tacticSeq) :=
+  if optNode.getNumArgs == 1 then
+    let i := optNode.getArg 0; if i.getKind == `Qed.fnProofBy || i.getKind == `Qed.fnProofProve then some ⟨i.getArg 2⟩ else none
+  else none
 partial def unwrapParens1 (stx : Syntax) : Syntax :=
   if stx.getKind == ``qedParen && (stx.getArg 1).getSepArgs.size == 1 then unwrapParens1 (stx.getArg 1).getSepArgs[0]! else stx
 partial def extractDottedChain? (stx : Syntax) : Option (List String) :=
@@ -575,7 +613,7 @@ private def exprHasIndex (stx : Syntax) : Bool := stxAny (fun s => s.getKind == 
 
 private def isPlainLiteralOrCtor (stx : Syntax) : Bool :=
   let u := unwrapParens1 stx; let k := u.getKind; let plainFields := ["size", "length", "isSome", "isNone", "isEmpty", "val"]
-  if [``qedLitNum, `Qed.Lang.qedLitSci, ``qedLitStr, `Qed.Lang.qedLitChar, ``qedFStr, ``qedArrLit, `Qed.Lang.qedDictLit, ``qedRecLit, ``qedDotIdent, ``qedNeg, ``qedMul, ``qedDiv, ``qedMod, ``qedAdd, ``qedSub, ``qedCat].contains k then true
+  if [``qedLitNum, `Qed.Lang.qedLitSci, ``qedLitStr, `Qed.Lang.qedLitChar, ``qedFStr, ``qedArrLit, `Qed.Lang.qedDictLit, ``qedRecLit, ``qedDotIdent, ``qedNeg, ``qedMul, ``qedDiv, ``qedMod, ``qedAdd, ``qedSub, ``qedCat, ``qedCons].contains k then true
   else if k == ``qedIdent then
     let nm := (u.getArg 0).getId; let s := nm.toString
     ["true", "false", "none"].contains s || (nm.isStr && nm.getPrefix != .anonymous && plainFields.contains (match nm with | .str _ f => f | _ => s))
@@ -671,7 +709,7 @@ def LocalMutAction.rhsSyntax : LocalMutAction → Syntax | .assign _ _ s | .push
       mkBinNode kind tok a b (paren := false)
 
 @[noinline] private def mkArrLitPure (direct : Bool) (elems : Array Term) : PureQuotM Term :=
-  if direct then `(#[$[$elems],*]) else `($qSeqId [$[$elems],*])
+  if direct then `(#[$[$elems],*]) else `(qedSeqLit%[$[$elems],*])
 @[noinline] private def mkDictLitPure (stx : Syntax) (pairs : Array Term) : PureQuotM Term :=
   `($(mkIdentFrom stx `Qed.Dict.ofList) [$[$pairs],*])
 @[noinline] private def mkCoalescePure (a b : Term) : PureQuotM Term :=
@@ -706,6 +744,109 @@ def LocalMutAction.rhsSyntax : LocalMutAction → Syntax | .assign _ _ s | .push
   match argTs with
   | #[s] => some <$> `($qRange1Id $s) | #[a, b] => some <$> `($qRange2Id $a $b) | #[a, b, c] => some <$> `($qRange3Id $a $b $c) | _ => pure none
 
+private inductive CollArgKind where | lam1 | lam2 | other deriving BEq
+
+private def classifyCollArgStx (argStx : Syntax) : CollArgKind :=
+  let u := unwrapParens1 (argStx.getArg 0)
+  if u.getKind == ``qedLam1 then .lam1
+  else if u.getKind == ``qedLamN then
+    if (u.getArg 1).getSepArgs.size == 2 then .lam2 else .lam1
+  else .other
+
+private def nameRootStartsLower : Name → Bool
+  | .str .anonymous s => match s.toList.head? with | some c => c.isLower || c == '_' | none => false
+  | .str p _ => nameRootStartsLower p
+  | _ => false
+
+private structure CollOrdSpec where
+  takesRes : Bool
+  keyFn    : Name
+  cmpFn    : Name
+  argFn    : Name
+
+private def collOrdSpec? (nm : Name) (isProp : Bool) : Option CollOrdSpec :=
+  match nm with
+  | `min          => some ⟨false, `Qed.qedMinKey, `Qed.qedMinCmp, `Qed.QedOrdArg.minFn⟩
+  | `max          => some ⟨false, `Qed.qedMaxKey, `Qed.qedMaxCmp, `Qed.QedOrdArg.maxFn⟩
+  | `sort         => some ⟨false, `Qed.qedSortKey, `Qed.qedSortCmp, `Qed.QedOrdArg.sortFn⟩
+  | `sortDesc     => some ⟨false, `Qed.qedSortDescKey, `Qed.qedSortDescCmp, `Qed.QedOrdArg.sortDescFn⟩
+  | `isSorted     => some ⟨false,
+      if isProp then `Qed.qedIsSortedKey else `Qed.qedIsSortedKeyB,
+      if isProp then `Qed.qedIsSortedCmp else `Qed.qedIsSortedCmpB,
+      if isProp then `Qed.QedOrdArg.isSortedFn else `Qed.QedOrdArg.isSortedBFn⟩
+  | `isSortedDesc => some ⟨false,
+      if isProp then `Qed.qedIsSortedDescKey else `Qed.qedIsSortedDescKeyB,
+      if isProp then `Qed.qedIsSortedDescCmp else `Qed.qedIsSortedDescCmpB,
+      if isProp then `Qed.QedOrdArg.isSortedDescFn else `Qed.QedOrdArg.isSortedDescBFn⟩
+  | `isMinOf      => some ⟨true, `Qed.qedIsMinOfKey, `Qed.qedIsMinOfCmp, `Qed.QedOrdArg.isMinOfFn⟩
+  | `isMaxOf      => some ⟨true, `Qed.qedIsMaxOfKey, `Qed.qedIsMaxOfCmp, `Qed.QedOrdArg.isMaxOfFn⟩
+  | _             => none
+
+@[noinline] private def mkCollOrdAppPure (spec : CollOrdSpec) (recv : Term) (extraPrefix? : Option Term)
+    (optArg? : Option (Term × CollArgKind)) : PureQuotM Term := do
+  let (fnId, keyT) := match optArg? with
+    | none              => (mkCIdent spec.keyFn, mkCIdent `id)
+    | some (t, .lam1)   => (mkCIdent spec.keyFn, t)
+    | some (t, .lam2)   => (mkCIdent spec.cmpFn, t)
+    | some (t, .other)  => (mkCIdent spec.argFn, t)
+  match extraPrefix? with
+  | some pfx => `($fnId $pfx $recv $keyT)
+  | none     => `($fnId $recv $keyT)
+
+@[noinline, nospecialize] private def tryLowerCollectionCall {m : Type → Type} [Monad m]
+    (qctx : PureQuotCtx) (go : ExprMode → Syntax → m Term) (finish : Term → Term) (mode : ExprMode)
+    (calleeStx : Syntax) (rawArgs : Array Syntax) : m (Option Term) := do
+  if !rawArgs.all (·.getKind == ``qedCallArgPos) then return none
+  let lowerOptKey (a? : Option Syntax) : m (Option (Term × CollArgKind)) := match a? with
+    | none => pure none
+    | some a => return some (← go .val (a.getArg 0), classifyCollArgStx a)
+  let methodRecv? : Option (Syntax × Name) :=
+    if calleeStx.getKind == ``qedProj then
+      some (calleeStx.getArg 0, (calleeStx.getArg 2).getId.eraseMacroScopes)
+    else if calleeStx.getKind == ``qedIdent then
+      match (calleeStx.getArg 0).getId.eraseMacroScopes with
+      | .str pfx s =>
+          if pfx != .anonymous && nameRootStartsLower pfx then
+            some (calleeStx.setArg 0 (mkIdentFrom (calleeStx.getArg 0) pfx), Name.mkSimple s)
+          else none
+      | _ => none
+    else none
+  if let some (recvStx, nm) := methodRecv? then
+    let some spec := collOrdSpec? nm mode.isProp | return none
+    if !spec.takesRes && (rawArgs.size == 0 || rawArgs.size == 1) then
+      let recvT ← go .val recvStx
+      let optK ← lowerOptKey rawArgs[0]?
+      return some (finish (qctx.runPure (mkCollOrdAppPure spec recvT none optK)))
+    if spec.takesRes && (rawArgs.size == 1 || rawArgs.size == 2) then
+      let resT ← go .val recvStx
+      let xsT ← go .val (rawArgs[0]!.getArg 0)
+      let optK ← lowerOptKey rawArgs[1]?
+      return some (finish (qctx.runPure (mkCollOrdAppPure spec xsT (some resT) optK)))
+    return none
+  if calleeStx.getKind == ``qedIdent then
+    let nm := (calleeStx.getArg 0).getId.eraseMacroScopes
+    if (nm == `filter || nm == `map) && rawArgs.size == 2 then
+      let xsT ← go .val (rawArgs[0]!.getArg 0)
+      let fnT ← go .val (rawArgs[1]!.getArg 0)
+      let mId := mkIdent nm
+      return some (finish (qctx.runPure `(($xsT).$mId:ident $fnT)))
+    if (nm == `min || nm == `max) && rawArgs.size == 2 && classifyCollArgStx rawArgs[1]! == .other then
+      let aT ← go .val (rawArgs[0]!.getArg 0)
+      let bT ← go .val (rawArgs[1]!.getArg 0)
+      let runId := mkCIdent (if nm == `min then `Qed.QedMin2.run else `Qed.QedMax2.run)
+      return some (finish (qctx.runPure `($runId $aT $bT)))
+    let some spec := collOrdSpec? nm mode.isProp | return none
+    if !spec.takesRes && (rawArgs.size == 1 || rawArgs.size == 2) then
+      let xsT ← go .val (rawArgs[0]!.getArg 0)
+      let optK ← lowerOptKey rawArgs[1]?
+      return some (finish (qctx.runPure (mkCollOrdAppPure spec xsT none optK)))
+    if spec.takesRes && (rawArgs.size == 2 || rawArgs.size == 3) then
+      let resT ← go .val (rawArgs[0]!.getArg 0)
+      let xsT ← go .val (rawArgs[1]!.getArg 0)
+      let optK ← lowerOptKey rawArgs[2]?
+      return some (finish (qctx.runPure (mkCollOrdAppPure spec xsT (some resT) optK)))
+  return none
+
 @[noinline] private def mkRecLitPure (base? : Option Term) (fIds : Array Ident) (fVals : Array Term) : PureQuotM Term :=
   match base? with | some b => `({ $b with $[$fIds:ident := $fVals:term],* }) | none => if fIds.isEmpty then `({}) else `({ $[$fIds:ident := $fVals:term],* })
 
@@ -713,6 +854,7 @@ def LocalMutAction.rhsSyntax : LocalMutAction → Syntax | .assign _ _ s | .push
     (qctx : PureQuotCtx) (hooks : LowerHooks m) (go : ExprMode → Syntax → m Term) (finish : Term → Term) (mode : ExprMode) (stx : Syntax) : m Term := do
   let (calleeStx, rawArgs) := (stx.getArg 0, (stx.getArg 2).getSepArgs)
   if let some custom ← hooks.lowerCall stx calleeStx rawArgs mode go then return custom
+  if let some collT ← tryLowerCollectionCall qctx go finish mode calleeStx rawArgs then return collT
   if calleeStx.getKind == ``qedIdent && (calleeStx.getArg 0).getId.eraseMacroScopes == `url &&
       rawArgs.size == 1 && rawArgs[0]!.getKind == ``qedCallArgPos && (rawArgs[0]!.getArg 0).getKind == ``qedLitStr then
     let info := SourceInfo.fromRef stx
@@ -820,6 +962,9 @@ def LocalMutAction.rhsSyntax : LocalMutAction → Syntax | .assign _ _ s | .push
     | "qedNeg"    => let a ← lowerValOp (stx.getArg 1); return qctx.runPure (mkUnNode `«term-_» "-" a)
     | "qedMul" | "qedDiv" | "qedMod" | "qedAdd" | "qedSub" | "qedCat" =>
       return qctx.runPure (mkBinOpPure k (← lowerValOp (stx.getArg 0)) (← lowerValOp (stx.getArg 2)))
+    | "qedCons" =>
+      let (hd, tl) := (← go .val (stx.getArg 0), ← go .val (stx.getArg 2))
+      return qctx.runPure `(List.cons $hd $tl)
     | "qedCoalesce" =>
       let (a, b) := (← go .val (stx.getArg 0), ← go .val (stx.getArg 2))
       return finish (qctx.runPure (mkCoalescePure a b))
@@ -977,13 +1122,16 @@ where
 def collectMutatedIds (stmts : Array Syntax) : Std.HashSet Name := collectMutatedInNode.collectMutatedInStmts {} stmts 0 {}
 @[noinline] def mkMutPack (ids : List Ident) : PureQuotM Term := buildTupleValPure (ids.toArray.map (⟨·.raw⟩))
 @[noinline] def wrapMutUnpack (stId : Ident) (ids : List Ident) (body : Term) : PureQuotM Term :=
-  match ids with | [] => pure body | [x] => `(let $x:ident := $stId:ident; $body) | _ => do let pat ← mkMutPack ids; `(let $pat:term := $stId:ident; $body)
+  match ids with
+  | [] => pure body
+  | [x] => if x.getId.eraseMacroScopes == stId.getId.eraseMacroScopes then pure body else `(let $x:ident := $stId:ident; $body)
+  | _ => do let pat ← mkMutPack ids; `(let $pat:term := $stId:ident; $body)
 
 end Qed.Lang
 
 namespace Qed
 
-export Qed.Lang (PureQuotCtx PureQuotM runPureQuot)
+export Qed.Lang (PureQuotCtx PureQuotM runPureQuot parseOptTacSeq)
 
 open Lean Meta Elab Tactic Command Term PrettyPrinter
 
@@ -1070,9 +1218,7 @@ private abbrev fContract : Parser := categoryParser `qedFnContract 0
 def fnBlindTarget : Parser := node `Qed.fnBlindTarget (ident >> optional (checkNoWsBefore "" >> ".{" >> sepBy1 ident "," >> "}"))
 @[combinator_parenthesizer fnBlindTarget] def fnBlindTarget.parenthesizer : Parenthesizer := pure ()
 @[combinator_formatter fnBlindTarget] def fnBlindTarget.formatter : Formatter := pure ()
-def fnOptProof : Parser := optional (
-  node `Qed.fnProofBy (":=" >> kw "by" >> Parser.Tactic.tacticSeq) <|>
-  node `Qed.fnProofProve (atomic (checkColGt "expected indented `prove:` block" >> identEq `prove >> ":") >> checkColGt "expected indented proof tactics" >> Parser.Tactic.tacticSeq))
+def fnOptProof : Parser := qedOptProof
 @[combinator_parenthesizer fnOptProof] def fnOptProof.parenthesizer : Parenthesizer := pure ()
 @[combinator_formatter fnOptProof] def fnOptProof.formatter : Formatter := pure ()
 
@@ -1174,14 +1320,23 @@ private structure PureFnEnv where
   depth     : Nat := 0
 
 @[noinline] private def mkPureForTerm (depth : Nat) (bStx iterStx : Syntax) (usedMuts : Array Ident)
-    (outerMuts? : Option (Array Ident)) (iterTerm bodyInner restTerm : Term) : PureQuotM Term := do
+    (outerMuts? : Option (Array Ident)) (iterTerm bodyInner restTerm : Term) (invBody? : Option Term := none) : PureQuotM Term := do
   let initSt ← mkMutPack usedMuts.toList
-  let (stParam, resSt, resRet, retValId) := (mkIdent (Name.mkSimple s!"_qedSt{depth}"), mkIdent (Name.mkSimple s!"_qedLoopSt{depth}"),
+  let stParam := if usedMuts.size == 1 then usedMuts[0]! else mkIdent (Name.mkSimple s!"_qedSt{depth}")
+  let (resSt, resRet, retValId) := (mkIdent (Name.mkSimple s!"_qedLoopSt{depth}"),
     mkIdent (Name.mkSimple s!"_qedLoopRet{depth}"), mkIdent (Name.mkSimple s!"_qedRet{depth}"))
   let bodyWithUnpack ← wrapMutUnpack stParam usedMuts.toList bodyInner
   let lam ← if bStx.isIdent then `(fun $stParam:ident $(⟨bStx⟩):ident => $bodyWithUnpack) else `(fun $stParam:ident _ => $bodyWithUnpack)
-  let loopFn := if isRangeCallExpr iterStx then mkCIdent `Qed.qedForRange else mkCIdent `Qed.qedForFold
-  let loopCall ← `($loopFn $iterTerm $initSt $lam)
+  let isRange := isRangeCallExpr iterStx
+  let loopCall ← match invBody? with
+    | none =>
+        let loopFn := if isRange then mkCIdent `Qed.qedForRange else mkCIdent `Qed.qedForFold
+        `($loopFn $iterTerm $initSt $lam)
+    | some invBody =>
+        let invWithUnpack ← wrapMutUnpack stParam usedMuts.toList invBody
+        let invLam ← `(fun $(mkIdent `seen):ident $stParam:ident => $invWithUnpack)
+        if isRange then `($(mkCIdent `Qed.qedForRangeAnn) $iterTerm $initSt $lam $invLam)
+        else `($(mkCIdent `Qed.qedForFoldAnn) ($(mkCIdent `Qed.QedIterable.toList) $iterTerm) $initSt $lam $invLam)
   let someArm ← match outerMuts? with | none => pure (⟨retValId.raw⟩ : Term) | some om => `($(mkCIdent `Qed.QedLoopStep.ret) $(← mkMutPack om.toList) $retValId)
   let afterLoop ← wrapMutUnpack resSt usedMuts.toList (← `(match $resRet:ident with | Option.some $retValId:ident => $someArm | Option.none => $restTerm))
   `(let ($resSt:ident, $resRet:ident) := $loopCall; $afterLoop)
@@ -1190,8 +1345,12 @@ private structure PureFnEnv where
   let st ← mkMutPack lm.toList; match retVal? with | some v => `($(mkCIdent ctor) $st $v) | none => `($(mkCIdent ctor) $st)
 
 @[noinline] private def lowerPureFnForStmt (qctx : PureQuotCtx) (e : PureFnEnv) (s : Syntax) (rest : List Syntax)
-    (lowerVal : Array String → Syntax → CommandElabM Term) (go : PureFnEnv → List Syntax → CommandElabM Term) : CommandElabM Term := do
-  let bStx := s.getArg 1; let iterStx := s.getArg 3; let bodyStmts := suiteStmts (s.getArg 5)
+    (lowerVal : Array String → Syntax → CommandElabM Term)
+    (lowerInv : Array String → Syntax → CommandElabM Term)
+    (onLoopInv? : Option (Option (TSyntax ``Lean.Parser.Tactic.tacticSeq) → CommandElabM Unit))
+    (go : PureFnEnv → List Syntax → CommandElabM Term) : CommandElabM Term := do
+  let bStx := s.getArg 1; let iterStx := s.getArg 3
+  let invStxs := forSuiteInvs (s.getArg 5); let bodyStmts := suiteStmts (s.getArg 5)
   if bStx.isIdent then
     let bNm := bStx.getId.eraseMacroScopes
     if e.muts.any (·.getId.eraseMacroScopes == bNm) then
@@ -1199,16 +1358,25 @@ private structure PureFnEnv where
   let iterTerm ← lowerVal e.locals iterStx
   let mutated := collectMutatedIds bodyStmts
   let usedMuts := e.muts.filter fun m => mutated.contains m.getId.eraseMacroScopes
+  let invBody? ← if invStxs.isEmpty then pure none else do
+    let invLocs := e.locals.push "seen"
+    let preds ← Lang.foldlCmd invStxs (#[] : Array Term) fun acc iv => do
+      if let some cb := onLoopInv? then cb (parseOptTacSeq (iv.getArg 2))
+      let ps ← Lang.mapCmd (iv.getArg 1).getSepArgs (lowerInv invLocs)
+      return acc ++ ps
+    some <$> mkConjBody preds
   let bodyLocs := if bStx.isIdent then e.locals.push bStx.getId.eraseMacroScopes.toString else e.locals
   let bodyInner ← go { e with locals := bodyLocs, loopMuts? := some usedMuts, depth := e.depth + 1 } bodyStmts.toList
   let restTerm ← go { e with depth := e.depth + 1 } rest
-  return qctx.runPure (mkPureForTerm e.depth bStx iterStx usedMuts e.loopMuts? iterTerm bodyInner restTerm)
+  return qctx.runPure (mkPureForTerm e.depth bStx iterStx usedMuts e.loopMuts? iterTerm bodyInner restTerm invBody?)
 
 private def extendPureFnEnv (e : PureFnEnv) (names : Array Name) : PureFnEnv :=
   { e with locals := e.locals ++ names.map (·.toString), muts := e.muts.filter fun m => !names.contains m.getId.eraseMacroScopes }
 
 @[noinline] private def lowerPureFnCustomStmt (fnDesc : String) (qctx : PureQuotCtx)
     (lowerVal : Array String → Syntax → CommandElabM Term)
+    (lowerInv : Array String → Syntax → CommandElabM Term)
+    (onLoopInv? : Option (Option (TSyntax ``Lean.Parser.Tactic.tacticSeq) → CommandElabM Unit))
     (e : PureFnEnv) (s : Syntax) (rest : List Syntax) (go : PureFnEnv → List Syntax → CommandElabM Term) : CommandElabM (Option Term) := do
   let lowerMutAct (act : LocalMutAction) : CommandElabM (Option Term) := do
     let newVal ← liftPureErr (applyLocalMutRhsPure qctx act (← lowerVal e.locals act.rhsSyntax))
@@ -1227,7 +1395,7 @@ private def extendPureFnEnv (e : PureFnEnv) (names : Array Name) : PureFnEnv :=
     let cont ← go { e with locals := e.locals.push nm.toString, muts := e.muts.push lId } rest
     let ty? ← if (s.getArg 3).getNumArgs == 2 then some <$> (return (← liftPureErr (lowerQedTypePure qctx ((s.getArg 3).getArg 1) false)).1) else pure none
     return some (qctx.runPure (mkLetBindTerm lId.raw ty? rhsT cont))
-  | ``qedStmtFor => some <$> lowerPureFnForStmt qctx e s rest lowerVal go
+  | ``qedStmtFor => some <$> lowerPureFnForStmt qctx e s rest lowerVal lowerInv onLoopInv? go
   | ``qedStmtLetElse =>
     let pat ← liftPureErr (lowerQedPatPure qctx (s.getArg 1)); let scrut ← lowerVal e.locals (s.getArg 3)
     let elseT ← go e (extractLetElseStmts s).toList; let thenT ← go (extendPureFnEnv e (collectQedPatIds (s.getArg 1))) rest
@@ -1242,6 +1410,8 @@ private def extendPureFnEnv (e : PureFnEnv) (names : Array Name) : PureFnEnv :=
 
 @[noinline] private def lowerPureFnStmtsAux (fnDesc : String)
     (lowerVal : Array String → Syntax → CommandElabM Term) (lowerGuard : Array String → Syntax → CommandElabM Term)
+    (lowerInv : Array String → Syntax → CommandElabM Term)
+    (onLoopInv? : Option (Option (TSyntax ``Lean.Parser.Tactic.tacticSeq) → CommandElabM Unit))
     (stmts : List Syntax) : CommandElabM Term := do
   let qctx ← getPureQuotCtxCmd
   let hooks : PureStmtHooks CommandElabM PureFnEnv := {
@@ -1259,17 +1429,20 @@ private def extendPureFnEnv (e : PureFnEnv) (names : Array Name) : PureFnEnv :=
     onMissingElse := fun _ _ => throwError s!"missing `return` on fallthrough path of `{fnDesc}`"
     onUnsupported := fun s => let sn := stxSnippet s; throwErrorAt s s!"unsupported statement{if sn.isEmpty then "" else s!" `{sn}`"} in pure `{fnDesc}`"
     letClauseErr := s!"`predict`/`catch` clauses are not supported in pure `{fnDesc}`"
-    onCustom? := some (lowerPureFnCustomStmt fnDesc qctx lowerVal)
+    onCustom? := some (lowerPureFnCustomStmt fnDesc qctx lowerVal lowerInv onLoopInv?)
   }
   lowerPureStmtsGo qctx hooks {} stmts
 
 @[noinline] def lowerPureFnStmts (fnDesc : String) (stmts : List Syntax)
     (lowerVal : Syntax → CommandElabM Term := fun s => liftMacroM (lowerSimpleQedExpr .val s))
     (lowerGuard : Syntax → CommandElabM Term := fun s => liftMacroM (lowerSimpleQedExpr .propGuard s))
-    (lowerWithLocals? : Option (Array String → ExprMode → Syntax → CommandElabM Term) := none) : CommandElabM Term :=
+    (lowerWithLocals? : Option (Array String → ExprMode → Syntax → CommandElabM Term) := none)
+    (onLoopInv? : Option (Option (TSyntax ``Lean.Parser.Tactic.tacticSeq) → CommandElabM Unit) := none) : CommandElabM Term :=
+  let defaultInv (_ : Array String) (s : Syntax) : CommandElabM Term :=
+    liftMacroM (lowerSimpleQedExpr .propInv s (allowOptElse := true) (optElseFallback := `(True)))
   match lowerWithLocals? with
-  | some f => lowerPureFnStmtsAux fnDesc (fun ls s => f ls .val s) (fun ls s => f ls .propGuard s) stmts
-  | none   => lowerPureFnStmtsAux fnDesc (fun _ s => lowerVal s) (fun _ s => lowerGuard s) stmts
+  | some f => lowerPureFnStmtsAux fnDesc (fun ls s => f ls .val s) (fun ls s => f ls .propGuard s) (fun ls s => f ls .propInv s) onLoopInv? stmts
+  | none   => lowerPureFnStmtsAux fnDesc (fun _ s => lowerVal s) (fun _ s => lowerGuard s) defaultInv onLoopInv? stmts
 
 end PureStmtLower
 

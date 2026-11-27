@@ -27,6 +27,8 @@ def extractViewInvPred (childStyled : Ident) : Term.TermElabM Term := do
 private inductive FeOp where | exactH | direct (lem : Name) | elem (lem : Name) | map | mod | updateKeyed
 private def feOpTable : List (Name × FeOp) := [
   (``Array.filter, .direct ``Qed.ForEach.forall_filter), (``Array.sortBy, .direct ``Qed.ForEach.forall_sortBy),
+  (``Qed.qedSortKey, .direct ``Qed.ForEach.forall_qedSortKey), (``Qed.qedSortDescKey, .direct ``Qed.ForEach.forall_qedSortDescKey),
+  (``Qed.qedSortCmp, .direct ``Qed.ForEach.forall_qedSortCmp), (``Qed.qedSortDescCmp, .direct ``Qed.ForEach.forall_qedSortDescCmp),
   (``Array.pop, .direct ``Qed.ForEach.forall_pop), (``Array.reverse, .direct ``Qed.ForEach.forall_reverse),
   (``Array.extract, .direct ``Qed.ForEach.forall_extract), (``Array.eraseIdx, .direct ``Qed.ForEach.forall_eraseIdx),
   (``Array.eraseIdxIfInBounds, .direct ``Qed.ForEach.forall_eraseIdxIfInBounds), (``Array.swap, .direct ``Qed.ForEach.forall_swap),

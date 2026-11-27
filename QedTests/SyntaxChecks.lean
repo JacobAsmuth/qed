@@ -770,7 +770,7 @@ fn multilineAndErgo(
     multilineAndErgo([10, 20], (3, "ok"), ["first"]) == .ok(Json.object([("sum", Qed.toJson(33)), ("first", .str("first")), ("items", Json.array([.str("ok")]))]))
   let (n, label) = pair
   let mut items : List Json = []
-  items = List.cons(.str(label), items)
+  items = .str(label) :: items
   let mut total = n
   match xs:
     case []: total += 0
@@ -852,4 +852,508 @@ bad_fn "`ensures` contract failed for `mkBadSecretId?`:\n  • action `right` mu
   if env not in ["dev", "dev-eu", "prod"]: return none | if name.length == 0: return none | return some(f"qed-t{tenantId}-{env}-{name}")
 bad_fn "`ensures` contract failed for `mkBadConcat`:\n  • action `left` must satisfy:  a = a2\n  • action `right` must satisfy:  b = b2" mkBadConcat(a: Nat, b: Nat) -> String | ensures all a2: Nat, b2: Nat: result == mkBadConcat(a2, b2) -> a == a2 and b == b2 : return f"k-{a}{b}"
 bad_fn "`ensures` contract failed for `mkBadValidity?`" mkBadValidity?(tenantId: Nat, name: String) -> String? | ensures if let some(id) = result: isValidGcpSecretId(id) : if name.length == 0: return none | return some(f"k-{tenantId}-{name}")
+
+/-! ## Issue #22 Section 2: Ground `String.all`, Helper `Char -> Bool`, `List.mem_cons`, `::`, `qedSeqLit%`, `Repr Json` -/
+fn isGcpSecretCharHelper(c: Char) -> Bool:
+  if c == '-' or c == '_': return true
+  return c.isLower or c.isUpper or c.isDigit
+fn isValidGcpSecretIdHelper(s: String) -> Bool:
+  example ok: isValidGcpSecretIdHelper("qed-t1-a2-prod-api_key") == true
+  example bad: isValidGcpSecretIdHelper("bad/key") == false
+  return s.length > 0 and s.length <= 255 and s.all(isGcpSecretCharHelper)
+fn mkSecretWithHelper?(tenantId: Nat, name: String) -> String?:
+  ensures if let some(id) = result: isValidGcpSecretIdHelper(id) and id.toList.all(isGcpSecretCharHelper)
+  if name.length == 0 or name.length > 64: return none
+  if not name.all(c => c.isLower or c.isDigit or c == '_'): return none
+  if toString(tenantId).length > 20: return none
+  return some(f"t-{tenantId}-{name}")
+record Sec2AlertEv:
+  kind: String
+  msg: String
+record Sec2Snap:
+  requests: Nat
+  errors: Nat
+  latencyMs: Nat
+fn evaluateSec2Alerts(snap: Sec2Snap) -> Sec2AlertEv[]:
+  ensures snap.requests == 0 -> (all ev in result: ev.kind != "high_error_rate")
+  if snap.requests > 0 and snap.errors * 100 >= snap.requests * 5:
+    return [{ kind = "high_error_rate", msg = f"errors={snap.errors}" }]
+  if snap.latencyMs > 1000:
+    return [{ kind = "high_latency", msg = f"latency={snap.latencyMs}ms" }]
+  return []
+fn evaluateSec2AlertsMut(snap: Sec2Snap) -> Sec2AlertEv[]:
+  ensures snap.requests == 0 -> (all ev in result: ev.kind != "high_error_rate")
+  let mut out : Sec2AlertEv[] = []
+  if snap.requests > 0 and snap.errors * 100 >= snap.requests * 5:
+    out.push({ kind = "high_error_rate", msg = f"errors={snap.errors}" })
+  if snap.latencyMs > 1000:
+    out.push({ kind = "high_latency", msg = f"latency={snap.latencyMs}ms" })
+  if snap.latencyMs > 5000:
+    out.push({ kind = "critical_latency", msg = f"crit={snap.latencyMs}ms" })
+  return out
+fn consAndJsonExample(n: Nat, xs: List Nat) -> List Nat:
+  example consOk: consAndJsonExample(2, [10]) == 3 :: 4 :: [10]
+  example jsonPolOk:
+    let pol = Json.object([("k", .str("v")), ("bindings", Json.array([Json.object([("role", .str("r")), ("members", Json.array([.str("m")]))])]))]);
+    pol.strAtD("k") == "v"
+  return n + 1 :: n + 2 :: xs
+record JsonPayloadRec:
+  label: String
+  body: Json
+example : Repr JsonPayloadRec := inferInstance
+check_decls [isValidGcpSecretIdHelper_example_ok, isValidGcpSecretIdHelper_example_bad, mkSecretWithHelper?_ensures,
+  evaluateSec2Alerts_ensures, evaluateSec2AlertsMut_ensures, consAndJsonExample_example_consOk, consAndJsonExample_example_jsonPolOk]
+bad_fn "`example` failed for `badGroundStrAll`" badGroundStrAll(s: String) -> Bool | example wrong: badGroundStrAll("abc") == false : return s.all(c => c >= 'a' and c <= 'z')
+bad_fn "`example` failed for `badGroundBigBase64`" badGroundBigBase64(s: String) -> String |
+  example wrong: badGroundBigBase64("abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz") == "wrong" :
+  return Qed.Base64.encode(s.toUTF8)
+
+/-! ## Issue #22 Section 1.3: Pure `fn` `for`-Loop Invariants (Phase A + Phase B + Diagnostics) -/
+record LoopShard:
+  id     : String
+  active : Bool
+  used   : Nat
+  cap    : Nat
+fn selectAvailableShard(shards: LoopShard[]) -> LoopShard?:
+  ensures if let some(b) = result: b in shards
+  ensures if let some(b) = result: b.active and b.used < b.cap
+  ensures if let some(b) = result: all s in shards: (s.active and s.used < s.cap) -> b.used <= s.used
+  ensures (any s in shards: s.active and s.used < s.cap) -> result.isSome
+  let mut best : LoopShard? = none
+  for shard in shards:
+    if shard.active and shard.used < shard.cap:
+      match best:
+        case none: best = some(shard)
+        case some(cur):
+          if shard.used < cur.used: best = some(shard)
+  return best
+fn findActiveShard(shards: LoopShard[]) -> LoopShard?:
+  ensures if let some(b) = result: b in shards and b.active
+  ensures (any s in shards: s.active) -> result.isSome
+  for shard in shards:
+    if shard.active: return some(shard)
+  return none
+fn filterActiveShards(shards: LoopShard[]) -> LoopShard[]:
+  ensures all e in result: e in shards and e.active
+  ensures result.size <= shards.size
+  let mut out : LoopShard[] = []
+  for shard in shards:
+    if shard.active: out.push(shard)
+  return out
+fn sumPositiveLoop(xs: Nat[]) -> Nat:
+  ensures result >= xs.size
+  let mut acc : Nat = 0
+  for x in xs:
+    acc = acc + x + 1
+  return acc
+fn countToLoop(n: Nat) -> Nat:
+  ensures result == n
+  let mut acc : Nat = 0
+  for _i in range(n):
+    acc = acc + 1
+  return acc
+fn guardedLoopSum(xs: Nat[]) -> Nat:
+  ensures result >= xs.size
+  if xs.size == 0: return 0
+  let mut acc : Nat = 0
+  for x in xs:
+    acc = acc + x + 1
+  return acc
+fn findFirstGtLoop(xs: Nat[], threshold: Nat) -> Nat?:
+  ensures if let some(v) = result: v in xs and v > threshold
+  let mut found : Nat? = none
+  for x in xs:
+    if x <= threshold: continue
+    found = some(x)
+    break
+  return found
+record LoopCand:
+  id       : String
+  active   : Bool
+  weight   : Nat
+  priority : Nat
+fn loopCandScore(x: LoopCand) -> Nat:
+  return x.weight * 2 + x.priority
+fn pickBestCand(items: LoopCand[]) -> LoopCand?:
+  ensures if let some(b) = result: b in items and b.active
+  ensures if let some(b) = result: all x in items: x.active -> loopCandScore(b) >= loopCandScore(x)
+  ensures (any x in items: x.active) -> result.isSome
+  let mut best : LoopCand? = none
+  let mut bestScore : Nat = 0
+  for item in items:
+    invariant if let some(b) = best: bestScore == loopCandScore(b)
+    if item.active:
+      let sc = loopCandScore(item)
+      if best.isNone or sc > bestScore:
+        best = some(item)
+        bestScore = sc
+  return best
+fn pickBestActiveCand(items: LoopCand[]) -> LoopCand?:
+  ensures if let some(b) = result: b in items and b.active
+  ensures if let some(b) = result: all x in items: x.active -> b.weight <= x.weight
+  let mut active : LoopCand[] = []
+  for item in items:
+    invariant all a in active: a in items and a.active
+    invariant all x in seen: x.active -> x in active
+    if item.active: active.push(item)
+  let mut best : LoopCand? = none
+  for item in active:
+    match best:
+      case none: best = some(item)
+      case some(cur):
+        if item.weight < cur.weight: best = some(item)
+  return best
+fn triangularLoop(n: Nat) -> Nat:
+  ensures 2 * result == n * (n + 1)
+  let mut acc : Nat = 0
+  for i in range(n):
+    invariant 2 * acc == seen.length * (seen.length + 1) prove:
+      subst ‹i = seen.length›
+      have h : (seen.length + 1) * (seen.length + 1 + 1) = seen.length * (seen.length + 1) + 2 * (seen.length + 1) := by
+        simp [Nat.mul_add, Nat.add_mul]; omega
+      omega
+    acc = acc + (i + 1)
+  return acc
+fn standaloneLoopInv(xs: Nat[]) -> Nat:
+  let mut total : Nat = 0
+  for x in xs:
+    invariant total >= seen.length
+    total = total + x + 1
+  return total
+fn multiClauseLoopInv(xs: Nat[]) -> Nat:
+  ensures result >= xs.size
+  let mut a : Nat = 0
+  let mut b : Nat = 0
+  for x in xs:
+    invariant a >= seen.length, b >= a
+    a = a + 1
+    b = b + x + 1
+  return b
+fn nestedLoopSum(grid: Nat[][]) -> Nat:
+  ensures result >= grid.size
+  let mut total : Nat = 0
+  for row in grid:
+    invariant total >= seen.length
+    let mut rowSum : Nat = 1
+    for cell in row:
+      invariant rowSum >= 1
+      rowSum = rowSum + cell
+    total = total + rowSum
+  return total
+fn sumWithInvGround(xs: Nat[]) -> Nat:
+  example groundOk: sumWithInvGround([1, 2, 3]) == 9
+  ensures result >= xs.size
+  let mut acc : Nat = 0
+  for x in xs:
+    invariant acc >= seen.length
+    acc = acc + x + 1
+  return acc
+check_decls [selectAvailableShard_ensures_1, selectAvailableShard_ensures_2, selectAvailableShard_ensures_3, selectAvailableShard_ensures_4,
+  findActiveShard_ensures_1, findActiveShard_ensures_2, filterActiveShards_ensures_1, filterActiveShards_ensures_2,
+  sumPositiveLoop_ensures, countToLoop_ensures, guardedLoopSum_ensures, findFirstGtLoop_ensures,
+  pickBestCand_ensures_1, pickBestCand_ensures_2, pickBestCand_ensures_3,
+  pickBestActiveCand_ensures_1, pickBestActiveCand_ensures_2,
+  triangularLoop_ensures, standaloneLoopInv_loop_invariants, multiClauseLoopInv_ensures, nestedLoopSum_ensures,
+  sumWithInvGround_ensures, sumWithInvGround_example_groundOk]
+expect_err "loop invariant failed before the first iteration (`seen = []`):\n      must satisfy:  0 >= 1" in
+  fn badLoopInit(xs: Nat[]) -> Nat:
+    let mut acc : Nat = 0
+    for x in xs:
+      invariant acc >= 1
+      acc = acc + x + 1
+    return acc
+expect_err "quantifies over the full collection without referencing `seen`" in
+  fn badLoopFullColl(shards: LoopShard[]) -> LoopShard?:
+    ensures if let some(b) = result: all s in shards: s.active -> b.used <= s.used
+    let mut best : LoopShard? = none
+    for shard in shards:
+      invariant if let some(b) = best: all s in shards: s.active -> b.used <= s.used
+      if shard.active:
+        match best:
+          case none: best = some(shard)
+          case some(cur):
+            if shard.used < cur.used: best = some(shard)
+    return best
+expect_err "updates multiple `let mut` variables; add an `invariant <expr>` inside the `for` loop" in
+  fn badLoopMultiMut(items: LoopCand[]) -> LoopCand?:
+    ensures if let some(b) = result: all x in items: x.active -> loopCandScore(b) >= loopCandScore(x)
+    let mut best : LoopCand? = none
+    let mut bestScore : Nat = 0
+    for item in items:
+      if item.active:
+        let sc = loopCandScore(item)
+        if best.isNone or sc > bestScore:
+          best = some(item)
+          bestScore = sc
+    return best
+expect_err "inner `for` loop; add an `invariant <expr>` inside the inner `for` loop too" in
+  fn badLoopNested(grid: Nat[][]) -> Nat:
+    ensures result >= grid.size
+    let mut total : Nat = 0
+    for row in grid:
+      invariant total >= seen.length
+      let mut a : Nat = 1
+      let mut b : Nat = 0
+      for cell in row:
+        b = a
+        a = a + cell
+      total = total + b
+    return total
+expect_err "this function has multiple `for` loops; add an `invariant <expr>` inside the first `for` loop" in
+  fn badLoopSeq(shards: LoopShard[]) -> LoopShard?:
+    ensures if let some(b) = result: b in shards and b.active
+    let mut active : LoopShard[] = []
+    for shard in shards:
+      if shard.active: active.push(shard)
+    let mut best : LoopShard? = none
+    for shard in active:
+      best = some(shard)
+    return best
+expect_err "loop invariant held, but was not strong enough to prove `ensures` after the loop:\n      must satisfy:  acc >= xs.size + 10" in
+  fn badLoopWeakInv(xs: Nat[]) -> Nat:
+    ensures result >= xs.size + 10
+    let mut acc : Nat = 0
+    for x in xs:
+      invariant acc >= seen.length
+      acc = acc + x + 1
+    return acc
+expect_err "loop invariant was not preserved on an iteration step (`seen` -> `seen ++ [_x]`):\n      must satisfy:  acc + 1 >= (seen.length + 1) * 2" in
+  fn badLoopStandaloneStep(xs: Nat[]) -> Nat:
+    let mut acc : Nat = 0
+    for _x in xs:
+      invariant acc >= seen.length * 2
+      acc = acc + 1
+    return acc
+expect_err "loop `invariant` clauses are only supported in pure `fn` functions" in
+  server BadSrvLoopInv:
+    state n : Nat = 0
+    rpc ping(xs: Nat[]) -> Nat:
+      for x in xs:
+        invariant n >= 0
+        n += x
+      return n
+
+/-! ## Verified Collection `min`, `max`, `sort`, `sortDesc`, `isSorted`, `isMinOf`, `isMaxOf`, `filter`, `map` -/
+fn selectShardOneLiner(shards: LoopShard[]) -> LoopShard?:
+  ensures if let some(b) = result: b in shards and b.active and b.used < b.cap
+  ensures if let some(b) = result: all s in shards: (s.active and s.used < s.cap) -> b.used <= s.used
+  ensures (any s in shards: s.active and s.used < s.cap) -> result.isSome
+  ensures result.isMinOf(shards.filter(s => s.active and s.used < s.cap), s => s.used)
+  example picksLeast:
+    selectShardOneLiner([
+      { id = "a", active = false, used = 0, cap = 10 },
+      { id = "b", active = true, used = 5, cap = 10 },
+      { id = "c", active = true, used = 2, cap = 10 }
+    ]) == some({ id = "c", active = true, used = 2, cap = 10 })
+  example noneFull:
+    selectShardOneLiner([{ id = "a", active = true, used = 10, cap = 10 }]) == none
+  return shards.filter(s => s.active and s.used < s.cap).min(s => s.used)
+
+fn pickBestCandOneLiner(items: LoopCand[]) -> LoopCand?:
+  ensures if let some(b) = result: b in items and b.active
+  ensures if let some(b) = result: all x in items: x.active -> loopCandScore(x) <= loopCandScore(b)
+  ensures (any x in items: x.active) -> result.isSome
+  ensures result.isMaxOf(filter(items, x => x.active), loopCandScore)
+  example bestScore:
+    pickBestCandOneLiner([
+      { id = "a", active = true, weight = 3, priority = 1 },
+      { id = "b", active = true, weight = 2, priority = 10 },
+      { id = "c", active = false, weight = 99, priority = 99 }
+    ]) == some({ id = "b", active = true, weight = 2, priority = 10 })
+  return max(filter(items, x => x.active), loopCandScore)
+
+fn rankShardsLex(shards: LoopShard[]) -> LoopShard[]:
+  ensures result.size == shards.size
+  ensures all s in result: s in shards
+  ensures all s in shards: s in result
+  ensures result.isSorted(s => (Desc(s.active), s.used, Desc(s.cap), s.id))
+  example orderCheck:
+    rankShardsLex([
+      { id = "d", active = false, used = 0, cap = 10 },
+      { id = "b", active = true, used = 5, cap = 10 },
+      { id = "a", active = true, used = 5, cap = 20 },
+      { id = "c", active = true, used = 1, cap = 5 }
+    ]) == [
+      { id = "c", active = true, used = 1, cap = 5 },
+      { id = "a", active = true, used = 5, cap = 20 },
+      { id = "b", active = true, used = 5, cap = 10 },
+      { id = "d", active = false, used = 0, cap = 10 }
+    ]
+  return shards.sort(s => (Desc(s.active), s.used, Desc(s.cap), s.id))
+
+fn pickShardTieBreak(shards: LoopShard[]) -> LoopShard?:
+  ensures if let some(b) = result: b in shards
+  ensures if let some(b) = result: all s in shards: b.used <= s.used and (b.used == s.used -> b.id <= s.id)
+  return shards.min(s => (s.used, s.id))
+
+fn firstSortedShard(shards: LoopShard[]) -> LoopShard?:
+  ensures result.isMinOf(shards, s => s.used)
+  return shards.sort(s => s.used)[0]?
+
+fn sortedActiveShards(shards: LoopShard[]) -> LoopShard[]:
+  ensures result.isSorted(s => s.used)
+  ensures all s in result: s in shards and s.active
+  ensures result.size <= shards.size
+  return shards.sort(s => s.used).filter(s => s.active)
+
+fn filterKeepsSorted(shards: LoopShard[]) -> LoopShard[]:
+  requires shards.isSorted(s => s.used)
+  ensures result.isSorted(s => s.used)
+  return shards.filter(s => s.active)
+
+fn freeFnCollPipeline(xs: Nat[]) -> Nat[]:
+  ensures result.size <= xs.size
+  ensures all y in result: y >= 1
+  ensures isSorted(result)
+  example pipelineOk: freeFnCollPipeline([3, 0, 2, 1]) == [2, 3, 4]
+  return sort(map(filter(xs, x => x > 0), x => x + 1))
+
+fn sortDescNats(xs: Nat[]) -> Nat[]:
+  ensures result.size == xs.size
+  ensures result.isSortedDesc()
+  example descOk: sortDescNats([1, 4, 2, 3]) == [4, 3, 2, 1]
+  return sortDesc(xs)
+
+fn clampScalarMinMax(x: Nat, lo: Nat, hi: Nat) -> Nat:
+  requires lo <= hi
+  ensures result >= lo and result <= hi
+  ensures result == min(max(x, lo), hi)
+  if x < lo: return lo
+  if x > hi: return hi
+  return x
+
+fn minListNats(xs: List Nat) -> Nat?:
+  ensures result.isMinOf(xs)
+  ensures if let some(m) = result: m in xs and (all x in xs: m <= x)
+  return min(xs)
+
+fn sortListCands(items: List LoopCand) -> List LoopCand:
+  ensures result.length == items.length
+  ensures isSorted(result, loopCandScore)
+  return sort(items, loopCandScore)
+
+fn checkSortedBool(xs: Nat[]) -> Bool:
+  example yes: checkSortedBool([1, 2, 2, 5]) == true
+  example no: checkSortedBool([1, 3, 2]) == false
+  return xs.isSorted()
+
+fn ensureSortedFlow(xs: Nat[]) -> Nat[]:
+  ensures result.isSorted()
+  ensures result.size == xs.size
+  if xs.isSorted(): return xs
+  return xs.sort()
+
+fn shardCustomCmp(a: LoopShard, b: LoopShard) -> Bool:
+  return a.used < b.used or (a.used == b.used and a.cap >= b.cap)
+
+fn sortCustomLam(shards: LoopShard[]) -> LoopShard[]:
+  ensures result.size == shards.size
+  ensures result.isSorted((a, b) => a.used < b.used or (a.used == b.used and a.cap >= b.cap))
+  return shards.sort((a, b) => a.used < b.used or (a.used == b.used and a.cap >= b.cap))
+
+fn minCustomLam(shards: LoopShard[]) -> LoopShard?:
+  ensures result.isMinOf(shards, (a, b) => a.used < b.used or (a.used == b.used and a.cap >= b.cap))
+  return shards.min((a, b) => a.used < b.used or (a.used == b.used and a.cap >= b.cap))
+
+fn sortCustomNamed(shards: LoopShard[]) -> LoopShard[]:
+  ensures result.size == shards.size
+  ensures result.isSorted(shardCustomCmp)
+  return shards.sort(shardCustomCmp)
+
+fn maxCustomNamed(shards: LoopShard[]) -> LoopShard?:
+  ensures result.isMaxOf(shards, shardCustomCmp)
+  return max(shards, shardCustomCmp)
+
+fn manualLoopIsMinOf(shards: LoopShard[]) -> LoopShard?:
+  ensures result.isMinOf(shards.filter(s => s.active and s.used < s.cap), s => s.used)
+  let mut best : LoopShard? = none
+  for s in shards:
+    if s.active and s.used < s.cap:
+      match best:
+        case none: best = some(s)
+        case some(cur):
+          if s.used < cur.used: best = some(s)
+  return best
+
+fn manualLoopEqMin(shards: LoopShard[]) -> LoopShard?:
+  ensures result == shards.min(s => s.used)
+  let mut best : LoopShard? = none
+  for s in shards:
+    match best:
+      case none: best = some(s)
+      case some(cur):
+        if s.used < cur.used: best = some(s)
+  return best
+
+fn manualLoopTieBreakStr(shards: LoopShard[]) -> LoopShard?:
+  ensures if let some(b) = result: if let some(m) = shards.min(s => s.id): b.id == m.id
+  let mut best : LoopShard? = none
+  for s in shards:
+    invariant if let some(b) = best: b in seen and (all x in seen: b.id <= x.id)
+    invariant best.isNone -> seen.isEmpty
+    match best:
+      case none: best = some(s)
+      case some(cur):
+        if s.id <= cur.id: best = some(s)
+  return best
+
+fn sortStringsAndInts(xs: String[]) -> String[]:
+  ensures result.isSorted()
+  ensures result.size == xs.size
+  example alpha: sortStringsAndInts(["pear", "apple", "banana"]) == ["apple", "banana", "pear"]
+  example sortedProp: sortStringsAndInts(["c", "a", "b"]).isSorted()
+  return sort(xs)
+
+fn minIntVals(xs: Int[]) -> Int?:
+  ensures result.isMinOf(xs)
+  example negs: minIntVals([3, -5, 2, -1]) == some(-5)
+  example minProp: minIntVals([3, -5, 2]).isMinOf([3, -5, 2])
+  return min(xs)
+
+fn sortPreservesSum(shards: LoopShard[]) -> LoopShard[]:
+  ensures result.sumBy(s => s.used) == shards.sumBy(s => s.used)
+  ensures result.isSorted(s => s.used)
+  return shards.sort(s => s.used)
+
+component SortedCollectionComp:
+  state items : Nat[] = []
+  action addPos(x: Nat):
+    if x > 0:
+      items = items.push(x).sort()
+  action keepPos(xs: Nat[]):
+    items = sort(map(filter(xs, x => x > 0), x => x + 1))
+  invariant allPos: all x in items: x > 0
+  invariant alwaysSorted: items.isSorted()
+  view: <div>{items.size}</div>
+
+check_decls [selectShardOneLiner_ensures_1, selectShardOneLiner_ensures_2, selectShardOneLiner_ensures_3, selectShardOneLiner_ensures_4,
+  selectShardOneLiner_example_picksLeast, selectShardOneLiner_example_noneFull,
+  pickBestCandOneLiner_ensures_1, pickBestCandOneLiner_ensures_2, pickBestCandOneLiner_ensures_3, pickBestCandOneLiner_ensures_4,
+  rankShardsLex_ensures_1, rankShardsLex_ensures_2, rankShardsLex_ensures_3, rankShardsLex_ensures_4, rankShardsLex_example_orderCheck,
+  pickShardTieBreak_ensures_1, pickShardTieBreak_ensures_2, firstSortedShard_ensures,
+  sortedActiveShards_ensures_1, sortedActiveShards_ensures_2, sortedActiveShards_ensures_3, filterKeepsSorted_ensures,
+  freeFnCollPipeline_ensures_1, freeFnCollPipeline_ensures_2, freeFnCollPipeline_ensures_3, freeFnCollPipeline_example_pipelineOk,
+  sortDescNats_ensures_1, sortDescNats_ensures_2, sortDescNats_example_descOk,
+  clampScalarMinMax_ensures_1, clampScalarMinMax_ensures_2,
+  minListNats_ensures_1, minListNats_ensures_2, sortListCands_ensures_1, sortListCands_ensures_2,
+  checkSortedBool_example_yes, checkSortedBool_example_no, ensureSortedFlow_ensures_1, ensureSortedFlow_ensures_2,
+  sortCustomLam_ensures_1, sortCustomLam_ensures_2, minCustomLam_ensures,
+  sortCustomNamed_ensures_1, sortCustomNamed_ensures_2, maxCustomNamed_ensures,
+  manualLoopIsMinOf_ensures, manualLoopEqMin_ensures, manualLoopTieBreakStr_ensures,
+  sortStringsAndInts_ensures_1, sortStringsAndInts_ensures_2, sortStringsAndInts_example_alpha, sortStringsAndInts_example_sortedProp,
+  minIntVals_ensures, minIntVals_example_negs, minIntVals_example_minProp,
+  sortPreservesSum_ensures_1, sortPreservesSum_ensures_2]
+
+expect_err "custom comparator failed totality check" in
+  fn badStrictCmp(shards: LoopShard[]) -> LoopShard[]:
+    ensures result.isSorted((a, b) => a.used < b.used)
+    return shards.sort((a, b) => a.used < b.used)
+expect_err "custom comparator failed transitivity check" in
+  fn badNonTransCmp(xs: Nat[]) -> Nat[]:
+    ensures result.isSorted((a, b) => a <= b + 1)
+    return xs.sort((a, b) => a <= b + 1)
+expect_err "`ensures` contract failed for `badUnsortedFn`" in
+  fn badUnsortedFn(xs: Nat[]) -> Nat[]:
+    ensures result.isSorted()
+    return xs
 end SyntaxChecks

@@ -242,6 +242,8 @@ end
   funext j; symm; unfold render renderFast; rw [renderAcc_eq, String.empty_append]
 end Json
 
+instance : Repr Json where reprPrec j _ := Std.Format.text j.render
+
 def Json.bool? : Json → Option Bool                   | .bool b => some b | _ => none
 def Json.str?  : Json → Option String                 | .str s  => some s | _ => none
 def Json.num?  : Json → Option JsonNumber             | .num n  => some n | _ => none
@@ -330,9 +332,12 @@ macro_rules
       let fromBody ← match val? with
         | some vfn => `(fun j => do let r := $recExpr; let () ← ($vfn:term) r; return r)
         | none     => `(fun j => do return $recExpr)
-      let mkInst (cls body : Lean.TSyntax `term) := match p? with
-        | some _ => `(command| private instance : $cls := ⟨$body⟩)
-        | none   => `(command| instance : $cls := ⟨$body⟩)
-      return Lean.mkNullNode #[← mkInst (← `(Qed.ToJson $ty)) toBody, ← mkInst (← `(Qed.FromJson $ty)) fromBody]
+      let mkInst (cls body : Lean.TSyntax `term) (low : Bool := false) := match p?, low with
+        | some _, true  => `(command| private instance (priority := low) : $cls := ⟨$body⟩)
+        | some _, false => `(command| private instance : $cls := ⟨$body⟩)
+        | none,   true  => `(command| instance (priority := low) : $cls := ⟨$body⟩)
+        | none,   false => `(command| instance : $cls := ⟨$body⟩)
+      return Lean.mkNullNode #[← mkInst (← `(Qed.ToJson $ty)) toBody, ← mkInst (← `(Qed.FromJson $ty)) fromBody,
+        ← mkInst (← `(Repr $ty)) (← `(fun (v : $ty) _ => Std.Format.text (Qed.Json.render (Qed.toJson v)))) (low := true)]
 
 end Qed

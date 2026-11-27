@@ -898,6 +898,8 @@ private def rejectSrvAssignPredict (stmt : Syntax) : LowerM Unit := do
 @[noinline] private def lowerSrvForFoldCore (qctx : PureQuotCtx) (mode : BlockMode) (ctx : LowerCtx) (stmt : Syntax) (rest : Array Syntax)
     (recBlock : LowerCtx → Array Syntax → LowerM Term) : LowerM Term := do
   let binderStx := stmt.getArg 1; let iterStx := stmt.getArg 3; let bodyStmts := suiteStmts (stmt.getArg 5)
+  if let some badInv := (forSuiteInvs (stmt.getArg 5))[0]? then
+    lowerErr badInv "loop `invariant` clauses are only supported in pure `fn` functions"
   if binderStx.isIdent then
     let bNm := binderStx.getId.eraseMacroScopes
     if ctx.mutLocals.any (·.getId.eraseMacroScopes == bNm) then lowerErr binderStx s!"`for` loop variable `{bNm}` shadows mutable variable `{bNm}`; use a different loop variable name"

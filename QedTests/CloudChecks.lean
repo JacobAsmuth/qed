@@ -1,4 +1,5 @@
 import Qed
+import Qed.Cloud.Protocol
 import Qed.Cloud.Proofs
 import QedTests.CheckHelper
 open Qed Qed.Cloud
@@ -122,4 +123,10 @@ bad_db_raw "cannot override `prod` inside `managed postgres:` in `database BadMa
       id : Nat primary_key
 bad_deploy "deploy invariant `BadInv.wrongTier` failed to prove" BadInv NotesApp : compute standard | invariant wrongTier: compute == xlarge
 bad_deploy "use `timeout_sec` (Option Nat, in seconds) inside deploy invariants" BadInvField NotesApp : invariant badField: timeout == none
+record CloudLogBundle:
+  metaJson: Json
+  logs: Qed.Cloud.Protocol.RuntimeLogView[]
+example : Repr Qed.Cloud.Protocol.RuntimeLogView := inferInstance
+example : Repr (Array Qed.Cloud.Protocol.RuntimeLogView) := inferInstance
+example : Repr CloudLogBundle := inferInstance
 end CloudChecks

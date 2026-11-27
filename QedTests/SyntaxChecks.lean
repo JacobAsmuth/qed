@@ -161,33 +161,33 @@ example : Counter.update { step := 3 } { count := 4, saved := 0 } (.advance 2) =
     Counter.update { step := 3 } { count := 4, saved := 0 } (.advance 0) = ({ count := 4, saved := 0 }, none) ∧
     (Owned.update { caption := "Live" } { id := 4, count := 2 } .increment).count = 3 ∧
     ModernCounter.init.quantity = 1 ∧ ModernCounter.init.draft = "" := ⟨rfl, rfl, rfl, rfl, rfl⟩
-#guard
+example : (
   let ids := HelperApp.app.locals.map (·.id)
   let ssr := Html.renderWith Counter.regs (<div><style>{".a > .b { content: \"</style>\"; }"}</style><br/>{defaults}</div> : Html Unit)
   let draft : Ticket.Draft := { title := "Fix parser", priority := "2" }
   let jx := Html.render (jsxErgonomicsView #[1, 2] (some "ok") true)
   let jxElseT := Html.render (jsxElseBranchesView (some "hi") true [<span>ex</span>])
   let jxElseF := Html.render (jsxElseBranchesView none false [<span>ex</span>])
-  (Html.renderWith Counter.regs defaults).contains "8</button>" &&
+  strHas (Html.renderWith Counter.regs defaults) "8</button>" &&
   ids.length == 3 && ["SyntaxChecks.HelperApp", "SyntaxChecks.LocalNested.Widget", "SyntaxChecks.LocalNested.Tag"].all ids.contains &&
-  (Html.render (<Owned state={{ id = 4, count = 2 }} caption="Live" onMsg={Prod.mk}/> : Html (String × Owned.Msg))).contains "Live" &&
-  [".a > .b", "<\\/style>", "8</button>"].all (ssr.contains ·) && !ssr.contains "</br>" &&
+  strHas (Html.render (<Owned state={{ id = 4, count = 2 }} caption="Live" onMsg={Prod.mk}/> : Html (String × Owned.Msg))) "Live" &&
+  strHasAll ssr [".a > .b", "<\\/style>", "8</button>"] && !strHas ssr "</br>" &&
   Router.toURL (DocRoute.sec .architecture 2) == "/docs/arch/2" &&
   [("/docs/bench/5", some (DocRoute.sec .benchmarks 5)), ("/docs/unknown/5", none), ("/docs/arch/2?tab=api#top", some (DocRoute.sec .architecture 2)), ("/?utm=1#hero", some DocRoute.home)].all (fun (u, w) => Router.fromURL u == w) &&
   (RoutedDehydrated.app.rehydrate (RoutedDehydrated.app.dehydrate { r := .sec .benchmarks 3 })).map (·.r) == some (.sec .benchmarks 3) &&
-  (Html.render (TypedLink.view { target := .sec .architecture 2 } { cur := .home })).contains "href=\"/docs/arch/2\"" &&
-  AutoStyled.app.styles.length == 2 && (AutoStyled.app.ssrStep "T" "/qed.js" "/" "").contains navOn.raw &&
-  ResetTheme.style.raw.contains ":where(*, *::before) { margin: 0px; }" && typedBorderStyle.raw == "border: 1px solid var(--border-subtle); border-bottom: 2px dashed #333; border-top: none;" &&
-  (Html.render (ParentPage.view { route := .sec .architecture 3 })).contains "/docs/arch/1" &&
+  strHas (Html.render (TypedLink.view { target := .sec .architecture 2 } { cur := .home })) "href=\"/docs/arch/2\"" &&
+  AutoStyled.app.styles.length == 2 && strHas (AutoStyled.app.ssrStep "T" "/qed.js" "/" "") navOn.raw &&
+  strHas ResetTheme.style.raw ":where(*, *::before) { margin: 0px; }" && typedBorderStyle.raw == "border: 1px solid var(--border-subtle); border-bottom: 2px dashed #333; border-top: none;" &&
+  strHas (Html.render (ParentPage.view { route := .sec .architecture 3 })) "/docs/arch/1" &&
   Router.toURL (RepoRoute.edit "acme" "qed") == "/orgs/acme/repos/qed/edit" &&
   [("/orgs/acme/repos/qed/edit", some (RepoRoute.edit "acme" "qed")), ("/orgs/acme/repos/qed", some (RepoRoute.blob "acme" "qed")), ("/orgs/acme/issues/3", some (RepoRoute.issues "acme" 3))].all (fun (u, w) => Router.fromURL u == w) &&
   ((Json.parse (Json.render (toJson draft))).bind fromJson).toOption == some draft &&
-  ["<p>ok</p>", "<li>3</li><li>4</li>"].all (jx.contains ·) && !(Html.render (jsxErgonomicsView #[] none false)).contains "<em>" &&
-  ["<span>yes</span>", "<p>hi</p>", "<span>ex</span><span>ex</span>"].all (jxElseT.contains ·) &&
-  ["<span>no</span>", "<p>empty</p>", "<b>f1</b><b>f2</b>", "<i>m1</i><i>m2</i>"].all (jxElseF.contains ·) &&
+  strHasAll jx ["<p>ok</p>", "<li>3</li><li>4</li>"] && !strHas (Html.render (jsxErgonomicsView #[] none false)) "<em>" &&
+  strHasAll jxElseT ["<span>yes</span>", "<p>hi</p>", "<span>ex</span><span>ex</span>"] &&
+  strHasAll jxElseF ["<span>no</span>", "<p>empty</p>", "<b>f1</b><b>f2</b>", "<i>m1</i><i>m2</i>"] &&
   (RichAuto.app.rehydrate (RichAuto.app.dehydrate { tab := .tagged "lean", notes := #[{ id := 1, text := "hello" }], pick := some { id := 2, text := "pinned" }, cache := ({} : Cached String).put "k" (.ok "v") "k", child := { count := 42, saved := 0 } })).map
     (fun m => m.tab == .tagged "lean" && m.notes == #[{ id := 1, text := "hello" }] && m.pick == some { id := 2, text := "pinned" } && m.cache.lookup "k" == some "v" && m.child.count == 42) == some true &&
-  ((PartialFn.app.rehydrate (PartialFn.app.dehydrate { count := 8, fn := (· * 2) })).map fun m => (m.count, m.fn 5)) == some (8, 15)
+  ((PartialFn.app.rehydrate (PartialFn.app.dehydrate { count := 8, fn := (· * 2) })).map fun m => (m.count, m.fn 5)) == some (8, 15)) = true := by decide +kernel
 
 -- ── Compile-time rejection checks ──
 expect_err "URL attribute `href` cannot take raw string literal `\"/raw\"`" in def badRawHref : Html Unit := <a href="/raw">bad</a>
@@ -274,26 +274,26 @@ component FineGrainedCheck:
   state items : Nat[] = [1, 2]
   action bump: count += 1
   view: <div><span class="c">{count}</span>{<p>zero</p> if count == 0 else <p>nonzero</p>}{Qed.lazy(lazyBadge, count)}<ul>{for n in items: <li key={n}>{n}</li>}</ul></div>
-#guard
+example : (
   let gl := Html.render (GoodLazy.app.view { m := 7 })
   let cs := Html.render (<Card title="Docs" badge={<span class="badge">v2</span>}><p>First</p><ul><ListChip key="a" text="Alpha"/></ul></Card> : Html Unit)
   let s1 := CompositeDemo.update CompositeDemo.init (._sub_0 (._emit (.set_filter "lean4")))
   let s2 := CompositeDemo.update s1 (._sub_0 (._emit (.onPick "lean4")))
   let s3 := CompositeDemo.update s2 (._sub_1 .toggle)
-  gl.contains "href=\"/docs/guide\"" && gl.contains "<span>3</span>" &&
+  Qed.Str.contains gl "href=\"/docs/guide\"" && Qed.Str.contains gl "<span>3</span>" &&
   fracStyle.raw == "text-align: center; padding: 0.35rem 0 0.5rem; margin: 2rem auto; gap: 4px 8px; line-height: 1.5; font-weight: 600; opacity: 0.85; z-index: -1;" &&
   (match (Resource.ok (none : Option Nat)).someOr "missing" with | .failed "missing" => true | _ => false) &&
   (match (Resource.ok (some 42)).someOr "missing" with | .ok 42 => true | _ => false) &&
   (match (({} : Cached Nat).put "a" (.ok 1) "b").state with | .idle => true | _ => false) &&
   ((({} : Cached Nat).put "a" (.ok 1) "b").lookup "a" == some 1) && (match (({} : Cached Nat).put "a" (.ok 7) "a").state with | .ok 7 => true | _ => false) &&
-  cs.contains "<h3>Docs</h3><span class=\"badge\">v2</span>" && cs.contains "<li class=\"chip\">Alpha</li>" && !cs.contains "data-qed-local" &&
-  s1.query == "lean4" && s2.picked == "lean4" && !(Html.render (CompositeDemo.view CompositeDemo.init)).contains "class=\"panel\"" &&
-  (Html.render (CompositeDemo.view s3)).contains "class=\"panel\"" &&
+  Qed.Str.contains cs "<h3>Docs</h3><span class=\"badge\">v2</span>" && Qed.Str.contains cs "<li class=\"chip\">Alpha</li>" && !Qed.Str.contains cs "data-qed-local" &&
+  s1.query == "lean4" && s2.picked == "lean4" && !Qed.Str.contains (Html.render (CompositeDemo.view CompositeDemo.init)) "class=\"panel\"" &&
+  Qed.Str.contains (Html.render (CompositeDemo.view s3)) "class=\"panel\"" &&
   (CompositeDemo.app.rehydrate (CompositeDemo.app.dehydrate { s3 with clicks := 5, scratch := 0 })).map (fun s => (s.query, s.clicks, s.scratch)) == some ("lean4", 5, 99) &&
-  (Html.render (awaitSample .loading)).contains "<p>Wait</p>" && (Html.render (awaitSample (.failed "boom"))).contains "<p class=\"err\">boom</p>" &&
+  Qed.Str.contains (Html.render (awaitSample .loading)) "<p>Wait</p>" && Qed.Str.contains (Html.render (awaitSample (.failed "boom"))) "<p class=\"err\">boom</p>" &&
   (EarlyReturnCheck.update { x := 5 } (.step 0)).x == 5 && (EarlyReturnCheck.update { x := 5 } (.step 3)).x == 8 &&
   (EarlyReturnCheck.app.rehydrate (EarlyReturnCheck.app.dehydrate { x := 5 })).map (·.x) == some 5 && (EarlyReturnCheck.app.rehydrate (EarlyReturnCheck.app.dehydrate { x := -1 })).isNone &&
-  (match FineGrainedCheck.app.template with | .element "div" _ [.element "span" _ [.dyn _], .ifElse _ _ _, .memo _, .keyedList "ul" _ _ _ _ _ _ (some _)] => true | _ => false)
+  (match FineGrainedCheck.app.template with | .element "div" _ [.element "span" _ [.dyn _], .ifElse _ _ _, .memo _, .keyedList "ul" _ _ _ _ _ _ (some _)] => true | _ => false)) = true := by decide +kernel
 expect_err "Invariant `BadUnguardedDecrease.inRange` failed in `BadUnguardedDecrease.update`:\n  • action `decrease` must satisfy:  1 <= quantity - 1 and quantity - 1 <= 10" in
 component BadUnguardedDecrease:
   state quantity = 1
@@ -377,18 +377,18 @@ component PythonicShowcase:
     label = a ++ b
   invariant exprElseProp: (if score > 0: score else: 0) == score and (if let some(v) = pick: v else: 0) >= 0
   view: <div><span>{label}</span><span>{"has-lean" if "lean" in tags and pick is not none else "none"}</span></div>
-#guard
+example : (
   let vd : Ticket.Draft := { title := "Fix bug", priority := "3", kind := "bug" }
   let upd := PythonicShowcase.update PythonicShowcase.init
   SelfHostedFormKeep.init.picked.isNone && SelfHostedFormKeep.init._form_0 == Ticket.Draft.empty &&
-  (Html.render (SelfHostedFormKeep.view SelfHostedFormKeep.init)).contains "disabled" &&
-  !(Html.render (SelfHostedFormKeep.view { picked := none, _form_0 := vd })).contains "disabled" &&
+  strHas (Html.render (SelfHostedFormKeep.view SelfHostedFormKeep.init)) "disabled" &&
+  !strHas (Html.render (SelfHostedFormKeep.view { picked := none, _form_0 := vd })) "disabled" &&
   (match Ticket.parse vd with | some t => let sK := SelfHostedFormKeep.update { picked := none, _form_0 := vd } (.set_picked (some t)); let sR := SelfHostedFormReset.update { picked := none, _form_0 := vd } ._form_reset_0; sK.picked.map (·.title.val) == some t.title.val && sK._form_0 == vd && sR.picked.map (·.title.val) == some t.title.val && sR._form_0 == Ticket.Draft.empty | none => false) &&
   MultiParamAndAutoDefaults.init.xs == #[] && MultiParamAndAutoDefaults.init.x.isNone &&
   [(.classify 5, "low:5"), (.classify 25, "mid:25"), (.classify 80, "high:80"), (.addTag "qed", "tags:2"), (.usePick, "score=4"), (.describeTab (.tagged "ui"), "tag:ui"),
    (.exprBranches 3 (some 7), "pos:7"), (.exprBranches 0 none, "zero:none")].all (fun (m, want) => (upd m).label == want) &&
-  (upd (.addTag "lean")).tags.size == 1 && (Html.render (PythonicShowcase.view PythonicShowcase.init)).contains "has-lean" &&
-  Json.pathStr "{\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}" "choices.0.delta.content" == "hi" && Json.pathStr "{\"choices\":[]}" "choices.0.delta.content" == ""
+  (upd (.addTag "lean")).tags.size == 1 && strHas (Html.render (PythonicShowcase.view PythonicShowcase.init)) "has-lean" &&
+  Json.pathStr "{\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}" "choices.0.delta.content" == "hi" && Json.pathStr "{\"choices\":[]}" "choices.0.delta.content" == "") = true := by decide +kernel
 bad_srv1 "`if cond: ...` expression requires `else:` here" BadExprIfNoElse : rpc go() -> Nat: return if true: 1
 bad_srv1 "`if let pat = expr: ...` expression requires `else:` here" BadExprIfLetNoElse : rpc go(opt: Nat?) -> Nat: return if let some(v) = opt: v
 expect_err "invalid HTML5 nesting: <div> is not allowed inside <p>" in def badElseBranchNesting : Html Unit := <p>{if true: <span>ok</span> else: <div>bad</div>}</p>
@@ -512,7 +512,7 @@ mapping RoomFrameMap:
     let bytes = Proto.decodeHex(frame)?
     return Proto.decode(bytes)?
 
-#guard
+example : (
   let r := RoomSnapshotRec.sample
   let tick := TickEvent.tick 7 "go"
   (GamePhase.ofString (toString GamePhase.playing)).toOption == some .playing &&
@@ -526,7 +526,7 @@ mapping RoomFrameMap:
   (RoomSnapshotRec.decodeBytes (RoomSnapshotRec.encodeBytes r)).toOption == some r &&
   (OptSchema.decode (OptSchema.encode { title := "x", note := some "n", phase := some .playing })).toOption == some { title := "x", note := some "n", phase := some .playing } &&
   (OptSchema.decode (OptSchema.encode { title := "x", note := none, phase := none })).toOption == some { title := "x", note := none, phase := none } &&
-  (RoomFrameMap.decode (RoomFrameMap.encode r).val).toOption == some r
+  (RoomFrameMap.decode (RoomFrameMap.encode r).val).toOption == some r) = true := by decide +kernel
 
 expect_err "duplicate variant `a` in `enum DupEnum`" in
 enum DupEnum:
@@ -767,14 +767,14 @@ component PureForwardHost:
 
 example := @PureForwardHost.app_view_eq
 example : Type → Type := PureContentPage.Props
-#guard
+example : (
   let rendered := Html.render (PureForwardHost.view PureForwardHost.init)
   let (_, hs) := renderNode #[] (PureForwardHost.view PureForwardHost.init)
   let s1 := PureForwardHost.update PureForwardHost.init (hs[0]?.getD (.setLang ""))
   let s2 := PureForwardHost.update s1 (hs[1]?.getD (.setLang ""))
-  rendered.contains "class=\"lang-select\"" && rendered.contains "data-qed-local=\"SyntaxChecks.KeyedTagPicker@tp\"" &&
+  Qed.Str.contains rendered "class=\"lang-select\"" && Qed.Str.contains rendered "data-qed-local=\"SyntaxChecks.KeyedTagPicker@tp\"" &&
   PureForwardHost.app.locals.any (·.id == "SyntaxChecks.KeyedTagPicker") &&
-  s1.lang == "fr" && s2.lang == "en"
+  s1.lang == "fr" && s2.lang == "en") = true := by decide +kernel
 
 /-! ## Track 2, 4 & 5: Session propagation, query controls, async component `fn`, nested struct mutation, or-patterns, JSX `let`, CSS dup check, `Qed.Str`/`Qed.Time` -/
 
@@ -936,7 +936,7 @@ example := @ServicePort.satisfiable
 example := @SessionParentShell.app_view_eq
 example := @MultiStyleSpliceDemo.app_view_eq
 
-#guard
+example : (
   let s0 := SessionParentShell.init
   let (s1, _) := SessionParentShell.update s0 (._onSession (some "alice"))
   let (s2, _) := SessionParentShell.update s1 (._onRoute .account)
@@ -1007,7 +1007,7 @@ example := @MultiStyleSpliceDemo.app_view_eq
   (ServiceFieldForm.parse { slug := "api", port := "8080", tag := "v1" }).isSome &&
   (ServiceFieldForm.parse { slug := "", port := "8080", tag := "v1" }).isNone &&
   (ServiceFieldForm.parse { slug := "api", port := "70000", tag := "v1" }).isNone &&
-  (Html.render (ServiceFieldForm.formView { slug := "api", port := "8080", tag := "v1" } id (fun _ => ServiceFieldForm.Draft.empty))).contains "type=\"number\"" &&
+  strHas (Html.render (ServiceFieldForm.formView { slug := "api", port := "8080", tag := "v1" } id (fun _ => ServiceFieldForm.Draft.empty))) "type=\"number\"" &&
   (match Date.mk? 2026 11 25 with
    | some d => (PolishRoute.report d).toPath == "/reports/2026-11-25" && PolishRoute.fromPath "/reports/2026-11-25" == some (.report d)
    | none => false) &&
@@ -1016,10 +1016,10 @@ example := @MultiStyleSpliceDemo.app_view_eq
    | none => false) &&
   LawfulKey.toKey PolishTab.deployLogs == "deploy-logs" &&
   LawfulKey.toKey (ShortSlug.make "my-app") == "my-app" &&
-  (PolishEvent.encode (.deployStarted "r1")).contains "\"deploy-started\"" &&
+  strHas (PolishEvent.encode (.deployStarted "r1")) "\"deploy-started\"" &&
   (match PolishEvent.decode (PolishEvent.encode (.deployFailed "oom")) with | .ok (.deployFailed "oom") => true | _ => false) &&
-  rOff.contains spliceBaseBtn.className && !rOff.contains spliceActiveBtn.className &&
-  rOn.contains spliceBaseBtn.className && rOn.contains spliceActiveBtn.className &&
+  strHas rOff spliceBaseBtn.className && !strHas rOff spliceActiveBtn.className &&
+  strHas rOn spliceBaseBtn.className && strHas rOn spliceActiveBtn.className &&
   c0.getD 0 == 10 && c1.getD 0 == 15 && c2.getD 0 == 30 && !c3.isOk &&
   Qed.Str.trim "  hi\t\n " == "hi" &&
   Qed.Str.containsCI "Hello Qed" "qed" &&
@@ -1032,7 +1032,7 @@ example := @MultiStyleSpliceDemo.app_view_eq
   Qed.Time.formatDateUtc (11016 * 86400) == "2000-02-29" &&
   Qed.Time.formatUtc 1700000000 == "2023-11-14 22:13 UTC" &&
   Qed.Time.formatDuration 125 == "2m 5s" &&
-  Qed.Time.formatRelative 1000 700 == "5m ago"
+  Qed.Time.formatRelative 1000 700 == "5m ago") = true := by decide +kernel
 
 /-! ## Wide Schema Proof Synthesis (24 fields under default heartbeats) -/
 
@@ -1064,5 +1064,178 @@ schema Wide24Schema:
 
 example : Qed.LawfulJson Wide24Schema × Qed.LawfulProto Wide24Schema × Qed.LawfulJson Wide24Schema.Draft :=
   (inferInstance, inferInstance, inferInstance)
+
+/-! ## Grammar Upgrades (private/const, for/mut/range/break/continue, ??, enum examples) -/
+
+private record PrivateToken:
+  label : String where 1 <= label.length <= 16
+  score : Nat    where score <= 100
+  example okTok: label = "alpha", score = 42
+  rejects badTok: label = "", score = 5
+
+private enum PrivateStage:
+  queued
+  running = "in-progress"
+  done
+
+private enum PrivateMsg:
+  ping
+  note(text: String)
+
+const DEFAULT_STEP : Nat = 3
+private const SECRET_CAP = 100
+const ALLOWED_REGIONS : String[] = ["us", "eu"]
+
+enum OrderRole:
+  viewer
+  editor
+  admin
+
+fn OrderRole.rank(self: OrderRole) -> Nat:
+  match self:
+    case .viewer: return 0
+    case .editor: return 1
+    case .admin: return 2
+
+fn OrderRole.atLeast(self: OrderRole, other: OrderRole) -> Bool:
+  example refl(r: OrderRole): r.atLeast(r) == true
+  example trans(a: OrderRole, b: OrderRole, c: OrderRole) where a.atLeast(b) == true, b.atLeast(c) == true: a.atLeast(c) == true
+  example rankMonotone(r: OrderRole, bonus: Nat): r.rank() + bonus >= r.rank()
+  return self.rank() >= other.rank()
+
+private fn OrderRole.isPrivileged(self: OrderRole) -> Bool:
+  return self.atLeast(.editor)
+
+fn sumRange1(n: Nat) -> Nat:
+  let mut acc = 0
+  for i in range(n):
+    acc += i
+  return acc
+
+fn sumRange2(lo: Nat, hi: Nat) -> Nat:
+  let mut acc = 0
+  for i in range(lo, hi):
+    acc += i
+  return acc
+
+fn sumRange3(lo: Nat, hi: Nat, step: Nat) -> Nat:
+  let mut acc = 0
+  for i in range(lo, hi, step):
+    acc += i
+  return acc
+
+fn findFirstOver(xs: Nat[], limit: Nat) -> Nat?:
+  for x in xs:
+    if x <= limit: continue
+    if x > 100: break
+    return some(x)
+  return none
+
+fn collectEvens(n: Nat) -> Nat[]:
+  let mut out : Nat[] = []
+  for i in range(0, n, 2):
+    out.push(i)
+  return out
+
+fn nestedBreak(rows: Nat, cols: Nat) -> Nat:
+  let mut total = 0
+  for r in range(rows):
+    for c in range(cols):
+      if c == 2: break
+      total += r * 10 + c
+  return total
+
+fn mutArith(n: Nat) -> Nat:
+  let mut x = n
+  x -= 2
+  x = x + 1
+  return x
+
+fn coalesceOpt(a: Nat?, b: Nat?, fallback: Nat) -> Nat:
+  return a ?? b ?? fallback
+
+fn coalesceRes(r: Resource Nat, fallback: Nat) -> Nat:
+  return r ?? fallback
+
+fn coalesceCached(c: Cached Nat, fallback: Nat) -> Nat:
+  return c ?? fallback
+
+example : (
+  let tok := PrivateToken.okTok
+  let deduped := #[("a", 1), ("b", 2), ("a", 9), ("c", 3), ("b", 7)].dedupBy (·.1)
+  let jobj := Json.object #[("k", Json.str "v"), ("n", Json.num ⟨7, 0⟩)]
+  let cOk : Cached Nat := { state := .ok 8 }
+  let cLoad : Cached Nat := { state := .loading }
+  let cIdle : Cached Nat := { state := .idle }
+  tok.label.val == "alpha" && tok.score.val == 42 &&
+  LawfulKey.toKey PrivateStage.running == "in-progress" &&
+  (match PrivateMsg.note "ok" with | .note s => s == "ok" | .ping => false) &&
+  DEFAULT_STEP == 3 && SECRET_CAP == 100 && ALLOWED_REGIONS == #["us", "eu"] &&
+  OrderRole.admin.isPrivileged && !OrderRole.viewer.isPrivileged &&
+  sumRange1 5 == 10 &&
+  sumRange2 2 6 == 14 && sumRange2 5 2 == 0 &&
+  sumRange3 1 10 3 == 12 && sumRange3 0 10 0 == 0 &&
+  findFirstOver #[1, 5, 20, 40] 10 == some 20 &&
+  findFirstOver #[1, 150, 20] 10 == none &&
+  collectEvens 7 == #[0, 2, 4, 6] &&
+  nestedBreak 3 5 == 63 &&
+  mutArith 10 == 9 &&
+  coalesceOpt none (some 7) 99 == 7 &&
+  coalesceOpt (some 3) (some 7) 99 == 3 &&
+  coalesceOpt none none 99 == 99 &&
+  coalesceRes (.ok 12) 0 == 12 &&
+  coalesceRes .loading 55 == 55 &&
+  coalesceRes (.failed "boom") 55 == 55 &&
+  coalesceCached cOk 0 == 8 &&
+  coalesceCached cLoad 44 == 44 &&
+  coalesceCached cIdle 44 == 44 &&
+  cOk.get? == some 8 &&
+  cLoad.get? == none &&
+  cIdle.get? == none &&
+  deduped == #[("a", 1), ("b", 2), ("c", 3)] &&
+  Json.render jobj == "{\"k\":\"v\",\"n\":7}") = true := by decide +kernel
+
+expect_err "`break` can only be used inside a `for` loop" in
+fn badBreakOutsideFor(n: Nat) -> Nat:
+  break
+  return n
+
+expect_err "`continue` can only be used inside a `for` loop" in
+fn badContinueOutsideFor(n: Nat) -> Nat:
+  continue
+  return n
+
+expect_err "cannot assign to `x` in pure" in
+fn badAssignImmutable(n: Nat) -> Nat:
+  let x = n
+  x = 5
+  return x
+
+expect_err "mutable variable `acc` is already declared in this scope" in
+fn badDupLetMut(n: Nat) -> Nat:
+  let mut acc = 0
+  let mut acc = n
+  return acc
+
+expect_err "shadows mutable variable `acc`" in
+fn badForShadowMut(n: Nat) -> Nat:
+  let mut acc = 0
+  for acc in range(n):
+    acc += 1
+  return acc
+
+expect_err "`range(...)` expects 1, 2, or 3 arguments" in
+fn badRangeZero() -> Nat:
+  let mut s = 0
+  for i in range():
+    s += i
+  return s
+
+expect_err "`range(...)` expects 1, 2, or 3 arguments" in
+fn badRangeFour() -> Nat:
+  let mut s = 0
+  for i in range(0, 10, 2, 1):
+    s += i
+  return s
 
 end SyntaxChecks

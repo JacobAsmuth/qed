@@ -51,15 +51,6 @@ def truncate (s : String) (maxLen : Nat) (ellipsis : String := "...") : String :
   else if maxLen ≤ ellipsis.length then take s maxLen
   else take s (maxLen - ellipsis.length) ++ ellipsis
 
-private def splitCharAux (sep : Char) (cur : List Char) (acc : List String) : List Char → List String
-  | [] => (String.ofList cur.reverse :: acc).reverse
-  | c :: cs =>
-      if c == sep then splitCharAux sep [] (String.ofList cur.reverse :: acc) cs
-      else splitCharAux sep (c :: cur) acc cs
-
-def splitChar (s : String) (sep : Char) : List String :=
-  splitCharAux sep [] [] s.toList
-
 private def splitAux (sep : List Char) (sepLen : Nat) (cur : List Char) (acc : List String) : Nat → List Char → List String
   | 0, xs => (String.ofList (cur.reverse ++ xs) :: acc).reverse
   | _, [] => (String.ofList cur.reverse :: acc).reverse
@@ -75,21 +66,6 @@ def split (s sep : String) : List String :=
 
 def replace (s old new : String) : String :=
   if old.isEmpty then s else String.intercalate new (split s old)
-
-private def parseNatAux (acc : Nat) : List Char → Option Nat
-  | [] => some acc
-  | c :: cs =>
-      if '0' ≤ c && c ≤ '9' then parseNatAux (acc * 10 + (c.toNat - 48)) cs else none
-
-def parseNat? (s : String) : Option Nat :=
-  match s.toList with | [] => none | cs => parseNatAux 0 cs
-
-def parseInt? (s : String) : Option Int :=
-  match s.toList with
-  | [] => none
-  | '-' :: [] => none
-  | '-' :: cs => (parseNatAux 0 cs).map fun n => -(Int.ofNat n)
-  | cs => (parseNatAux 0 cs).map Int.ofNat
 
 private theorem dropWhileWs_length_le : ∀ cs : List Char, (dropWhileWs cs).length ≤ cs.length
   | [] => Nat.le_refl 0
@@ -132,8 +108,8 @@ theorem truncate_length_le (s : String) (maxLen : Nat) (ellipsis : String := "..
       rw [String.length_append]; omega
 
 -- Prevent `Meta.whnf`/`isDefEq` from unfolding string helper internals during DB `where` / invariant proofs
--- while keeping kernel `decide` and `#guard` working.
-attribute [irreducible] trimLeft trimRight trim toLower toUpper contains containsCI take drop truncate splitChar split replace
+-- while keeping kernel `decide +kernel` working.
+attribute [irreducible] trimLeft trimRight trim toLower toUpper contains containsCI take drop truncate split replace
 
 end Str
 
@@ -169,48 +145,15 @@ instance : ToString Date := ⟨Date.toString⟩
 def before (a b : Date) : Bool := a.year < b.year || (a.year == b.year && (a.month < b.month || (a.month == b.month && a.day < b.day)))
 
 section RoundTripProof
-private theorem digitChar_ok (d : Fin 10) :
-    ('0' ≤ Nat.digitChar d.val ∧ Nat.digitChar d.val ≤ '9') ∧ (Nat.digitChar d.val).toNat - 48 = d.val ∧ Nat.digitChar d.val ≠ '-' := by
-  revert d; decide
-
-private theorem toDigitsCore_ne_nil : ∀ fuel n ds, Nat.toDigitsCore 10 (fuel + 1) n ds ≠ []
-  | 0, n, ds => by rw [Nat.toDigitsCore]; by_cases hq : n / 10 = 0 <;> simp [hq, Nat.toDigitsCore]
-  | fuel + 1, n, ds => by
-      rw [Nat.toDigitsCore]; by_cases hq : n / 10 = 0
-      · simp [hq]
-      · simpa [hq] using toDigitsCore_ne_nil fuel (n / 10) ((n % 10).digitChar :: ds)
-
 private theorem toDigitsCore_noDash : ∀ fuel n ds, '-' ∉ ds → '-' ∉ Nat.toDigitsCore 10 fuel n ds
   | 0, _, ds, h => h
   | fuel + 1, n, ds, h => by
       rw [Nat.toDigitsCore]
-      have hd : Nat.digitChar (n % 10) ≠ '-' := (digitChar_ok ⟨n % 10, Nat.mod_lt _ (by omega)⟩).2.2
+      have hd : Nat.digitChar (n % 10) ≠ '-' := (Str.digitChar_ok ⟨n % 10, Nat.mod_lt _ (by omega)⟩).2.2
       have hcons : '-' ∉ Nat.digitChar (n % 10) :: ds := by simp [hd.symm, h]
       by_cases hq : n / 10 = 0
       · simpa [hq] using hcons
       · simpa [hq] using toDigitsCore_noDash fuel (n / 10) _ hcons
-
-private theorem parseNatAux_digit (acc d : Nat) (hd : d < 10) (ds : List Char) :
-    Str.parseNatAux acc (Nat.digitChar d :: ds) = Str.parseNatAux (acc * 10 + d) ds := by
-  have ⟨⟨h1, h2⟩, hval, _⟩ := digitChar_ok ⟨d, hd⟩
-  simp [Str.parseNatAux, h1, h2, hval]
-
-private theorem parseNatAux_toDigitsCore : ∀ fuel n ds, n ≤ fuel →
-    Str.parseNatAux 0 (Nat.toDigitsCore 10 (fuel + 1) n ds) = Str.parseNatAux n ds
-  | 0, n, ds, hn => by
-      have hn0 : n = 0 := by omega
-      subst hn0; simp [Nat.toDigitsCore, Str.parseNatAux]; rfl
-  | fuel + 1, n, ds, hn => by
-      rw [Nat.toDigitsCore]
-      by_cases hq : n / 10 = 0
-      · simp only [hq, ↓reduceIte]
-        have hlt : n < 10 := by omega
-        rw [parseNatAux_digit 0 (n % 10) (Nat.mod_lt _ (by omega)) ds]
-        simp [Nat.mod_eq_of_lt hlt]
-      · simp only [hq, ↓reduceIte]
-        have hsub : n / 10 ≤ fuel := by omega
-        rw [parseNatAux_toDigitsCore fuel (n / 10) _ hsub, parseNatAux_digit (n / 10) (n % 10) (Nat.mod_lt _ (by omega)) ds,
-            Nat.mul_comm (n / 10) 10, Nat.div_add_mod]
 
 private theorem parseNatAux_repZero : ∀ k xs, Str.parseNatAux 0 (List.replicate k '0' ++ xs) = Str.parseNatAux 0 xs
   | 0, _ => rfl
@@ -230,8 +173,8 @@ private theorem padNat_noDash (w n : Nat) : '-' ∉ (padNat w n).toList := by
 
 private theorem parseNat?_padNat (w n : Nat) : Str.parseNat? (padNat w n) = some n := by
   unfold padNat padZero Nat.repr Nat.toDigits
-  have hne := toDigitsCore_ne_nil n n []
-  have hcore := parseNatAux_toDigitsCore n n [] (Nat.le_refl n)
+  have hne := Str.toDigitsCore_ne_nil n n []
+  have hcore := Str.parseNatAux_toDigitsCore n n [] (Nat.le_refl n)
   split
   · unfold Str.parseNat?; rw [String.toList_append, String.toList_ofList, String.toList_ofList]
     cases hEq : List.replicate (w - (String.ofList (Nat.toDigitsCore 10 (n + 1) n [])).length) '0' ++ Nat.toDigitsCore 10 (n + 1) n [] with

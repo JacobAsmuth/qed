@@ -2,18 +2,17 @@ import Qed.Runtime.AppCore
 
 namespace Qed
 
-mutual
-  def renderWithLocals {m : Type} (locals : List LocalDef) : Nat → Html m → String
-    | 0, _ => "" | _ + 1, .text s => escapeHtml s
-    | fuel + 1, .element tag attrs children =>
-        match attrs.findSome? (fun | .localCell _ comp init p _ => some (comp, init, p) | _ => none) with
-        | some (comp, init?, p) =>
-            let childStr := match locals.find? (·.id == comp) with | some ldef => renderWithLocals locals fuel (ldef.viewForProps p (init?.getD ldef.init)) | none => ""
-            s!"<{tag}{(renderAttrs #[] (normalizeAttrs attrs)).1}>{childStr}</{tag}>"
-        | none => (renderElement (fun hs => (renderWithLocalsChildren locals fuel "" children, hs)) #[] tag attrs children).1
-  def renderWithLocalsChildren {m : Type} (locals : List LocalDef) (fuel : Nat) (acc : String) : List (Html m) → String
-    | [] => acc | c :: cs => renderWithLocalsChildren locals fuel (acc ++ renderWithLocals locals fuel c) cs
-end
+private def renderChildrenWith {m : Type} (renderOne : Html m → String) (acc : String) : List (Html m) → String
+  | [] => acc | c :: cs => renderChildrenWith renderOne (acc ++ renderOne c) cs
+
+def renderWithLocals {m : Type} (locals : List LocalDef) : Nat → Html m → String
+  | 0, _ => "" | _ + 1, .text s => escapeHtml s
+  | fuel + 1, .element tag attrs children =>
+      match attrs.findSome? (fun | .localCell _ comp init p _ => some (comp, init, p) | _ => none) with
+      | some (comp, init?, p) =>
+          let childStr := match locals.find? (·.id == comp) with | some ldef => renderWithLocals locals fuel (ldef.viewForProps p (init?.getD ldef.init)) | none => ""
+          s!"<{tag}{(renderAttrs #[] (normalizeAttrs attrs)).1}>{childStr}</{tag}>"
+      | none => (renderElement (fun hs => (renderChildrenWith (renderWithLocals locals fuel) "" children, hs)) #[] tag attrs children).1
 
 def Html.renderWith (locals : List LocalDef) (h : Html msg) (fuel : Nat := 64) : String := renderWithLocals locals fuel h
 def App.renderModel (app : App Model Msg) (m : Model) : String := if app.locals.isEmpty then Html.render (app.view m) else Html.renderWith app.locals (app.view m)
@@ -53,7 +52,7 @@ private def docScriptTag (script : String) : String := "<script type=\"module\" 
 
 def renderDocument (title : String) (appHtml : String) (script : String := "/qed.js")
     (state : String := "") (css : String := "") (stylesheets : List String := []) (headMeta : HeadMeta := {}) : String :=
-  let styleTag := if css.isEmpty || appHtml.contains css then "" else docStyleTag css
+  let styleTag := if css.isEmpty || Str.containsBytes appHtml css then "" else docStyleTag css
   docHeadPrefix (headMeta.title.getD title) (renderHeadMeta headMeta ++ renderStylesheetLinks stylesheets) ++
     styleTag ++ "</head>\n<body><div id=\"app\">" ++ appHtml ++ "</div>\n" ++
     (if state.isEmpty then "" else "<script id=\"qed-state\" type=\"application/json\">" ++ escapeRawText state ++ "</script>\n") ++ docScriptTag script
@@ -68,7 +67,8 @@ private structure SsrNeed where
 @[reducible] def ssrSlotBytes (slot : Bool × Bool × String) : Except String ByteArray :=
   if slot.1 then if slot.2.1 then Proto.decodeHex slot.2.2 else .ok slot.2.2.toUTF8 else .error slot.2.2
 
-private def ssrDrain (app : App Model Msg) (results : Array (Bool × Bool × String)) :
+private def ssrDrainWith (onHit : Model → List (Cmd Msg) → Nat → Model × Array SsrNeed)
+    (app : App Model Msg) (results : Array (Bool × Bool × String)) :
     Model → List (Cmd Msg) → Nat → Array SsrNeed → Model × Array SsrNeed
   | m, [], _, needs => (m, needs)
   | m, c :: rest, i, needs =>
@@ -76,15 +76,23 @@ private def ssrDrain (app : App Model Msg) (results : Array (Bool × Bool × Str
     | .request method url body onResult =>
         if h : needs.isEmpty ∧ i < results.size then
           let (m', c') := app.update m (onResult (ssrSlotText results[i]))
-          ssrDrain app results m' (rest ++ Cmd.flatten c') (i + 1) needs
-        else ssrDrain app results m rest i (needs.push ⟨method, url, body, false⟩)
+          onHit m' (rest ++ Cmd.flatten c') (i + 1)
+        else ssrDrainWith onHit app results m rest i (needs.push ⟨method, url, body, false⟩)
     | .requestBytes method url body onResult =>
         if h : needs.isEmpty ∧ i < results.size then
           let (m', c') := app.update m (onResult (ssrSlotBytes results[i]))
-          ssrDrain app results m' (rest ++ Cmd.flatten c') (i + 1) needs
-        else ssrDrain app results m rest i (needs.push ⟨method, url, Proto.encodeHex body, true⟩)
-    | _ => ssrDrain app results m rest i needs
-  termination_by _ q i _ => (results.size - i, q.length)
+          onHit m' (rest ++ Cmd.flatten c') (i + 1)
+        else ssrDrainWith onHit app results m rest i (needs.push ⟨method, url, Proto.encodeHex body, true⟩)
+    | _ => ssrDrainWith onHit app results m rest i needs
+
+private def ssrDrainFuel (app : App Model Msg) (results : Array (Bool × Bool × String)) :
+    Nat → Model → List (Cmd Msg) → Nat → Array SsrNeed → Model × Array SsrNeed
+  | 0, m, q, i, needs => ssrDrainWith (fun m' _ _ => (m', #[])) app results m q i needs
+  | rem + 1, m, q, i, needs => ssrDrainWith (fun m' q' i' => ssrDrainFuel app results rem m' q' i' #[]) app results m q i needs
+
+private def ssrDrain (app : App Model Msg) (results : Array (Bool × Bool × String))
+    (m : Model) (q : List (Cmd Msg)) (i : Nat) (needs : Array SsrNeed) : Model × Array SsrNeed :=
+  ssrDrainFuel app results (results.size - i) m q i needs
 
 private def ssrResults (resultsJson : String) : Array (Bool × Bool × String) :=
   match Json.parse resultsJson with
@@ -207,14 +215,20 @@ private theorem ssrDrain_eq_ssrDrainQueueM {Model Msg : Type} (app : App Model M
     (hmatch : SsrResultsMatch app results dispatchBytes dispatchText i m q fuel mFinal) :
     ssrDrain app results m q i #[] = (mFinal, #[]) ∧ ssrDrainQueueM (m := Id) app dispatchBytes dispatchText fuel m q = mFinal := by
   induction hmatch with
-  | nil fuel => cases fuel <;> simp [ssrDrain, ssrDrainQueueM, pure]
-  | reqHit hi _ _ _ _ _ _ _ _ hdisp _ ih | reqBytesHit hi _ _ _ _ _ _ _ _ hdisp _ ih =>
-      simp only [ssrDrain, Array.isEmpty_empty, hi, ssrDrainQueueM, hdisp, bind]; exact ih
-  | @skip _ c hnot _ _ _ _ _ ih =>
+  | nil fuel _ i => cases fuel <;> (unfold ssrDrain; cases results.size - i <;> simp [ssrDrainFuel, ssrDrainWith, ssrDrainQueueM, pure])
+  | @reqHit i hi _ _ _ _ _ _ _ _ hdisp _ ih | @reqBytesHit i hi _ _ _ _ _ _ _ _ hdisp _ ih =>
+      unfold ssrDrain
+      rw [show results.size - i = (results.size - (i + 1)) + 1 by omega]
+      simp only [ssrDrainFuel, ssrDrainWith, Array.isEmpty_empty, hi, and_self, ↓reduceDIte, ssrDrainQueueM, hdisp, bind]
+      exact ih
+  | @skip i c hnot _ _ _ _ _ ih =>
       cases c with
       | request m' u b cb => exact absurd rfl (hnot.1 m' u b cb)
       | requestBytes m' u b cb => exact absurd rfl (hnot.2 m' u b cb)
-      | _ => simpa only [ssrDrain, ssrDrainQueueM] using ih
+      | _ =>
+          unfold ssrDrain
+          cases hrem : results.size - i <;> simp only [ssrDrainFuel, ssrDrainWith, ssrDrainQueueM] <;>
+            simpa only [ssrDrain, hrem, ssrDrainFuel] using ih
 
 theorem App.ssrStep_equiv_ssrRenderNativeBytes {Model Msg : Type} (app : App Model Msg) (path title script resultsJson : String)
     (dispatchBytes : String → String → ByteArray → Except String ByteArray) (dispatchText : String → String → String → Except String String)

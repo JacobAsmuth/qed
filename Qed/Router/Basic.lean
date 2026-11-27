@@ -1,5 +1,3 @@
-import Std.Data.String.ToNat
-import Std.Data.String.ToInt
 import Qed.Html
 
 namespace Qed
@@ -10,8 +8,8 @@ class RouteParam (α : Type) where
   round_trip : ∀ a, fromSeg (toSeg a) = some a
 attribute [simp] RouteParam.round_trip
 instance : RouteParam String := ⟨id, some, fun _ => rfl⟩
-instance : RouteParam Nat    := ⟨Nat.repr, String.toNat?, Nat.toNat?_repr⟩
-instance : RouteParam Int    := ⟨Int.repr, String.toInt?, Int.toInt?_repr⟩
+instance : RouteParam Nat    := ⟨Nat.repr, Str.parseNat?, Str.parseNat?_repr⟩
+instance : RouteParam Int    := ⟨Int.repr, Str.parseInt?, Str.parseInt?_repr⟩
 @[simp] theorem RouteParam.toSeg_string (s : String) : RouteParam.toSeg s = s := rfl
 @[simp] theorem RouteParam.fromSeg_string (s : String) : (RouteParam.fromSeg s : Option String) = some s := rfl
 

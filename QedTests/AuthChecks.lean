@@ -80,7 +80,7 @@ example : Qed.Auth.parseJwtAlg "none" = none ∧ Qed.Auth.parseJwtAlg "HS256" = 
   ⟨Qed.Auth.parseJwtAlg_rejects_none, Qed.Auth.parseJwtAlg_rejects_hs256,
    Qed.Auth.isSafeReturnTo_rejects_protocol_relative, Qed.Auth.isSafeReturnTo_rejects_javascript,
    rfl, rfl, rfl⟩
-#guard Qed.Auth.isSafeReturnTo "/dashboard?tab=1" && (CloudAuth.logoutUrl "/bye").raw == "/_qed/auth/logout?returnTo=%2Fbye" &&
+example : (Qed.Auth.isSafeReturnTo "/dashboard?tab=1" && (CloudAuth.logoutUrl "/bye").raw == "/_qed/auth/logout?returnTo=%2Fbye" &&
   (CloudAuth.loginUrl AuthRoute.dashboard).raw == (CloudAuth.loginUrl "/dashboard").raw &&
   (CloudAuth.loginUrl (AuthRoute.project "demo")).raw == (CloudAuth.loginUrl "/projects/demo").raw &&
   (CloudAuth.logoutUrl AuthRoute.home).raw == (CloudAuth.logoutUrl "/").raw &&
@@ -98,7 +98,7 @@ example : Qed.Auth.parseJwtAlg "none" = none ∧ Qed.Auth.parseJwtAlg "HS256" = 
    | .error _ => false) &&
   (match Qed.Auth.parseJwtClaims (.obj [("iss", .str "https://idp.test"), ("sub", .str "u1"), ("aud", .str "app"), ("exp", Qed.toJson (9999999999 : Nat)), ("email_verified", .bool true)]) with
    | .ok jc => jc.emailVerified && jc.claim "email_verified" == some "true"
-   | .error _ => false)
+   | .error _ => false)) = true := by decide +kernel
 bad_srv1 "`onSignIn` in `server MissingAuthServer` requires `use auth : <Auth>`" MissingAuthServer : onSignIn(user): pass
 
 end AuthChecks

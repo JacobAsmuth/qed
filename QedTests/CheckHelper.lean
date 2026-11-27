@@ -1,5 +1,8 @@
 import Qed
 
+abbrev strHas := Qed.Str.containsBytes
+abbrev strHasAll := Qed.Str.containsAllBytes
+
 open Lean in
 elab "rollback_env " cmd:command : command => withoutModifyingEnv (Elab.Command.elabCommand cmd)
 

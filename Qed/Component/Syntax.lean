@@ -98,9 +98,28 @@ def compHeadCase   : Parser := node `Qed.compHeadCase (withPosition (atomic (kw 
 def compHeadItem   : Parser := compHeadCase <|> compHeadDirective
 def compHeadClause : Parser := leading_parser withPosition (atomic (identEq `head >> ":") >> checkColGt "expected indented `head` directives" >> many1Indent compHeadItem)
 
+def compExAssign : Parser := node `Qed.compExAssign (ident >> "=" >> pExpr)
+def compExRecord : Parser := node `Qed.compExRecord ("{" >> sepBy compExAssign "," >> "}")
+def compExWithProps : Parser := node `Qed.compExWithProps (
+  atomic (symbol "with" >> identEq `props) >> (compExRecord <|> ("=" >> pExpr)))
+def compExFrom : Parser := node `Qed.compExFrom (
+  atomic (symbol "from") >> (compExRecord <|> pExpr))
+def compExOnReply : Parser := node `Qed.compExOnReply (
+  atomic (identEq `on >> ident >> "=>") >>
+  (node `Qed.compExReplyOk (atomic (identEq `ok) >> checkNoWsBefore "" >> "(" >> pExpr >> ")") <|>
+   node `Qed.compExReplyErr (atomic (identEq `error) >> checkNoWsBefore "" >> "(" >> pExpr >> ")") <|>
+   node `Qed.compExReplyDomain (atomic (identEq `err) >> checkNoWsBefore "" >> "(" >> "." >> checkNoWsBefore "" >> ident >> optional ("," >> pExpr) >> ")")))
+def compExStep : Parser := compExOnReply <|> pExpr 55
+def compExEmits : Parser := node `Qed.compExEmits (atomic (identEq `emits) >> pExpr)
+
 def compExampleClause : Parser := leading_parser withPosition (
-  atomic (symbol "example" >> ident) >> optional (checkNoWsBefore "" >> "(" >> sepBy1 compParam "," >> ")") >>
-  optional (symbol "where" >> sepBy1 pExpr ",") >> ":" >> sepBy1 (pExpr 55) "," >> "->" >> pExpr >>
+  atomic (symbol "example" >> ident) >>
+  optional (checkNoWsBefore "" >> "(" >> sepBy1 compParam "," >> ")") >>
+  optional compExWithProps >>
+  optional compExFrom >>
+  optional (symbol "where" >> sepBy1 pExpr ",") >>
+  ":" >> sepBy1 compExStep "," >> "->" >> pExpr >>
+  optional compExEmits >>
   optional (":=" >> kw "by" >> Parser.Tactic.tacticSeq))
 
 def compInvAny : Parser := compForEachInvClause <|> compInvariantClause <|> compExampleClause

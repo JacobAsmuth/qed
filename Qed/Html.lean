@@ -809,4 +809,137 @@ local macro "html_abbrevs " nms:ident* : command => do
 
 html_abbrevs imgsHaveAlt buttonsAccessible validAriaRoles labelsAssociated noDuplicateIds headingsOrdered htmlHasLang a11yValid
 
+/-! ## Core JS-Safe & Kernel-Reducible String Primitives (`Qed.Str`) -/
+
+namespace Str
+
+def splitCharAux (sep : Char) (cur : List Char) (acc : List String) : List Char → List String
+  | [] => (String.ofList cur.reverse :: acc).reverse
+  | c :: cs =>
+      if c == sep then splitCharAux sep [] (String.ofList cur.reverse :: acc) cs
+      else splitCharAux sep (c :: cur) acc cs
+
+def splitChar (s : String) (sep : Char) : List String :=
+  splitCharAux sep [] [] s.toList
+
+def parseNatAux (acc : Nat) : List Char → Option Nat
+  | [] => some acc
+  | c :: cs =>
+      if '0' ≤ c && c ≤ '9' then parseNatAux (acc * 10 + (c.toNat - 48)) cs else none
+
+def parseNat? (s : String) : Option Nat :=
+  match s.toList with | [] => none | cs => parseNatAux 0 cs
+
+def parseInt? (s : String) : Option Int :=
+  match s.toList with
+  | [] => none
+  | '-' :: [] => none
+  | '-' :: cs => (parseNatAux 0 cs).map fun n => -(Int.ofNat n)
+  | cs => (parseNatAux 0 cs).map Int.ofNat
+
+theorem digitChar_ok (d : Fin 10) :
+    ('0' ≤ Nat.digitChar d.val ∧ Nat.digitChar d.val ≤ '9') ∧ (Nat.digitChar d.val).toNat - 48 = d.val ∧ Nat.digitChar d.val ≠ '-' := by
+  revert d; decide
+
+theorem toDigitsCore_ne_nil : ∀ fuel n ds, Nat.toDigitsCore 10 (fuel + 1) n ds ≠ []
+  | 0, n, ds => by rw [Nat.toDigitsCore]; by_cases hq : n / 10 = 0 <;> simp [hq, Nat.toDigitsCore]
+  | fuel + 1, n, ds => by
+      rw [Nat.toDigitsCore]; by_cases hq : n / 10 = 0
+      · simp [hq]
+      · simpa [hq] using toDigitsCore_ne_nil fuel (n / 10) ((n % 10).digitChar :: ds)
+
+private theorem parseNatAux_digit (acc d : Nat) (hd : d < 10) (ds : List Char) :
+    parseNatAux acc (Nat.digitChar d :: ds) = parseNatAux (acc * 10 + d) ds := by
+  have ⟨⟨h1, h2⟩, hval, _⟩ := digitChar_ok ⟨d, hd⟩
+  simp [parseNatAux, h1, h2, hval]
+
+theorem parseNatAux_toDigitsCore : ∀ fuel n ds, n ≤ fuel →
+    parseNatAux 0 (Nat.toDigitsCore 10 (fuel + 1) n ds) = parseNatAux n ds
+  | 0, n, ds, hn => by
+      have hn0 : n = 0 := by omega
+      subst hn0; simp [Nat.toDigitsCore, parseNatAux]; rfl
+  | fuel + 1, n, ds, hn => by
+      rw [Nat.toDigitsCore]
+      by_cases hq : n / 10 = 0
+      · simp only [hq, ↓reduceIte]
+        have hlt : n < 10 := by omega
+        rw [parseNatAux_digit 0 (n % 10) (Nat.mod_lt _ (by omega)) ds]
+        simp [Nat.mod_eq_of_lt hlt]
+      · simp only [hq, ↓reduceIte]
+        have hsub : n / 10 ≤ fuel := by omega
+        rw [parseNatAux_toDigitsCore fuel (n / 10) _ hsub, parseNatAux_digit (n / 10) (n % 10) (Nat.mod_lt _ (by omega)) ds,
+            Nat.mul_comm (n / 10) 10, Nat.div_add_mod]
+
+theorem parseNat?_repr (n : Nat) : parseNat? (Nat.repr n) = some n := by
+  unfold parseNat? Nat.repr Nat.toDigits
+  rw [String.toList_ofList]
+  have hne := toDigitsCore_ne_nil n n []
+  cases h : Nat.toDigitsCore 10 (n + 1) n [] with
+  | nil => exact absurd h hne
+  | cons c cs =>
+      have := parseNatAux_toDigitsCore n n [] (Nat.le_refl n)
+      rw [h] at this; exact this
+
+theorem parseInt?_repr (i : Int) : parseInt? (Int.repr i) = some i := by
+  cases i with
+  | ofNat n =>
+      simp only [Int.repr, parseInt?]
+      have hne := toDigitsCore_ne_nil n n []
+      have h1 := parseNatAux_toDigitsCore n n [] (Nat.le_refl n)
+      have hdigit : ∀ c cs, Nat.toDigitsCore 10 (n + 1) n [] = c :: cs → c ≠ '-' := by
+        intro c cs hcs
+        have hp : parseNatAux 0 (c :: cs) = some n := hcs ▸ h1
+        simp only [parseNatAux] at hp
+        split at hp
+        · intro heq; subst heq; contradiction
+        · contradiction
+      unfold Nat.repr Nat.toDigits at *
+      rw [String.toList_ofList]
+      cases h : Nat.toDigitsCore 10 (n + 1) n [] with
+      | nil => exact absurd h hne
+      | cons c cs =>
+          have hnc := hdigit c cs h
+          have hmatch : (match c :: cs with
+            | [] => none
+            | '-' :: [] => none
+            | '-' :: cs' => (parseNatAux 0 cs').map fun m => -(Int.ofNat m)
+            | cs' => (parseNatAux 0 cs').map Int.ofNat) = (parseNatAux 0 (c :: cs)).map Int.ofNat := by
+            split <;> simp_all
+          rw [hmatch, ← h, h1]; rfl
+  | negSucc n =>
+      simp only [Int.repr, parseInt?, String.toList_append, show "-".toList = ['-'] from rfl, List.cons_append, List.nil_append]
+      unfold Nat.repr Nat.toDigits
+      rw [String.toList_ofList]
+      have hne := toDigitsCore_ne_nil (n + 1) (n + 1) []
+      have h1 := parseNatAux_toDigitsCore (n + 1) (n + 1) [] (Nat.le_refl _)
+      cases h : Nat.toDigitsCore 10 (n + 2) (n + 1) [] with
+      | nil => exact absurd h hne
+      | cons c cs =>
+          have h2 : (parseNatAux 0 (c :: cs)).map (fun m => -(Int.ofNat m)) = some (Int.negSucc n) := by
+            rw [← h, h1]; rfl
+          exact h2
+
+attribute [irreducible] splitChar
+
+private def bytesStartsWith : List UInt8 → List UInt8 → Bool
+  | _, [] => true
+  | [], _ :: _ => false
+  | a :: as, b :: bs => a == b && bytesStartsWith as bs
+
+private def bytesContains (needle : List UInt8) : List UInt8 → Bool
+  | [] => needle.isEmpty
+  | xs@(_ :: tl) => bytesStartsWith xs needle || bytesContains needle tl
+
+/-- Kernel-fast byte-level UTF-8 substring check (UTF-8 is self-synchronizing). -/
+def containsBytes (haystack needle : String) : Bool :=
+  if needle.utf8ByteSize == 0 then true
+  else bytesContains needle.toByteArray.data.toList haystack.toByteArray.data.toList
+
+/-- Kernel-fast check that `haystack` contains every substring in `needles` (converts `haystack` once). -/
+def containsAllBytes (haystack : String) (needles : List String) : Bool :=
+  let hbs := haystack.toByteArray.data.toList
+  needles.all fun n => if n.utf8ByteSize == 0 then true else bytesContains n.toByteArray.data.toList hbs
+
+end Str
+
 end Qed

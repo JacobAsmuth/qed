@@ -12,6 +12,7 @@ declare_syntax_cat extWsSubClause
 declare_syntax_cat srvClause
 declare_syntax_cat srvChanSubClause
 declare_syntax_cat fullstackClause
+declare_syntax_cat srvExItem
 
 section SrvParsers
 open Lean Parser Qed.Lang
@@ -26,18 +27,39 @@ private def authP (kw : Name) (inner : Parser) : Parser := withPosition (atomic 
 private def callSig (p : Parser) : Parser := ident >> checkNoWsBefore "" >> "(" >> sepBy p "," >> ")" >> " -> " >> qType
 private def reconnectP : Parser := withPosition (atomic (kw "reconnect") >> qExpr)
 private def srvContractSuite (msg : String) (lineP : Parser) : Parser :=
-  checkColGt msg >> withPosition (many (atomic (checkColEq "contract" >> lineP)) >> many1 (checkColEq "statement" >> categoryParser `qedStmt 0))
+  (checkLineEq >> pushNone >> sepBy1 (categoryParser `qedStmt 0) ";") <|>
+  (checkColGt msg >> withPosition (many (atomic (checkColEq "contract" >> lineP)) >> many1 (checkColEq "statement" >> categoryParser `qedStmt 0)))
+
+declare_syntax_cat srvContractItem
 
 def srvParam : Parser := node `Qed.Server.srvParam (ident >> ":" >> qType >> optional ("=" >> qExpr))
 def srvRequiresLine : Parser := node `Qed.Server.srvRequiresLine (withPosition (atomic (identEq `requires) >> sepBy1 qExpr ","))
 def srvEnsuresLine : Parser := node `Qed.Server.srvEnsuresLine (withPosition (atomic (identEq `ensures) >> sepBy1 qExpr "," >> Qed.fnOptProof))
-def srvContractLine : Parser := srvRequiresLine <|> srvEnsuresLine
+def srvEnsuresErrLine : Parser := node `Qed.Server.srvEnsuresErrLine (withPosition (atomic (identEq `ensures_error) >> sepBy1 qExpr "," >> Qed.fnOptProof))
+def srvEnsuresFailsLine : Parser := node `Qed.Server.srvEnsuresFailsLine (withPosition (atomic (identEq `ensures_fails) >> optional (checkLineEq >> numLit) >> Qed.fnOptProof))
+def srvEffectTag : Parser := node `Qed.Server.srvEffectTag (identEq `no_http <|> identEq `no_decrypt <|> identEq `no_crypto <|> identEq `no_db_write)
+def srvEffectLine : Parser := node `Qed.Server.srvEffectLine (withPosition (atomic (sepBy1 srvEffectTag ",") >> Qed.fnOptProof))
+def srvBlindToLine : Parser := node `Qed.Server.srvBlindToLine (withPosition (atomic (identEq `blindTo) >> sepBy1 Qed.fnBlindTarget "," >> Qed.fnOptProof))
+@[srvContractItem_parser] def srvCIReq : Parser := leading_parser srvRequiresLine
+@[srvContractItem_parser] def srvCIEns : Parser := leading_parser srvEnsuresLine
+@[srvContractItem_parser] def srvCIEnsErr : Parser := leading_parser srvEnsuresErrLine
+@[srvContractItem_parser] def srvCIEnsFails : Parser := leading_parser srvEnsuresFailsLine
+@[srvContractItem_parser] def srvCIEff : Parser := leading_parser srvEffectLine
+@[srvContractItem_parser] def srvCIBlind : Parser := leading_parser srvBlindToLine
+@[srvContractItem_parser] def srvCIIf : Parser := leading_parser
+  withPosition (atomic (symbol "if" >> notFollowedBy (symbol "let") "let" >> sepBy1 qExpr "," >> ":" >>
+    checkColGt "expected indented contract clauses" >> many1Indent (categoryParser `srvContractItem 0)))
+def srvContractLine : Parser := categoryParser `srvContractItem 0
 def extHttpMethod : Parser := identEq `get <|> identEq `post <|> identEq `put <|> identEq `patch <|> identEq `delete
 
 @[extParam_parser] def extParamHeader : Parser := leading_parser atomic (identEq `header >> checkNoWsBefore "" >> "(") >> strLit >> ")" >> ident >> ":" >> qType
 @[extParam_parser] def extParamQuery  : Parser := leading_parser atomic (identEq `query >> optional (checkNoWsBefore "" >> "(" >> strLit >> ")") >> ident >> ":") >> qType
 @[extParam_parser] def extParamPlain  : Parser := leading_parser ident >> ":" >> qType
-@[extClause_parser] def extBaseClause : Parser := leading_parser withPosition (atomic (identEq `base) >> strLit)
+def extBaseWhereEnum : Parser := node `Qed.Server.extBaseWhereEnum (atomic (ident >> ":") >> ident)
+def extBaseWhereIn   : Parser := node `Qed.Server.extBaseWhereIn (atomic (ident >> symbol "in" >> "[") >> sepBy1 strLit "," >> "]")
+def extBaseWhereItem : Parser := extBaseWhereIn <|> extBaseWhereEnum
+@[extClause_parser] def extBaseClause : Parser := leading_parser
+  withPosition (atomic (identEq `base) >> strLit >> optional (checkLineEq >> symbol "where" >> sepBy1 extBaseWhereItem ","))
 @[extClause_parser] def extSsrfGuardClause : Parser := leading_parser withPosition (atomic (identEq `ssrf_guard) >> optional (checkLineEq >> (identEq `true <|> identEq `false)))
 @[extClause_parser] def extAuthBearer : Parser := leading_parser authP `bearer secretArg
 @[extClause_parser] def extAuthHeader : Parser := leading_parser authP `header (strLit >> ", " >> secretArg)
@@ -62,7 +84,16 @@ def extHttpMethod : Parser := identEq `get <|> identEq `post <|> identEq `put <|
 @[srvClause_parser] def srvSecretClause : Parser := leading_parser withPosition (atomic (identEq `secret) >> ident >> "=" >> strLit)
 @[srvClause_parser] def srvStateClause : Parser := leading_parser withPosition (atomic (identEq `state) >> ident >> ":" >> qType >> optional ("=" >> qExpr))
 @[srvClause_parser] def srvInvMutatingClause : Parser := leading_parser withPosition (atomic ("invariant " >> ident >> ":" >> identEq `mutating) >> ident >> kw "requires" >> qExpr)
-@[srvClause_parser] def srvInvClause : Parser := leading_parser withPosition ("invariant " >> ident >> ":" >> notFollowedBy (identEq `mutating) "mutating" >> sepBy1 qExpr ",")
+@[srvClause_parser] def srvInvRoutesAuthClause : Parser := leading_parser
+  withPosition (atomic ("invariant " >> ident >> ":" >> identEq `routes) >> strLit >>
+    optional (identEq `except >> "[" >> sepBy strLit "," >> "]") >> identEq `require >> identEq `auth)
+@[srvClause_parser] def srvInvRpcsAuthClause : Parser := leading_parser
+  withPosition (atomic ("invariant " >> ident >> ":" >> identEq `rpcs) >>
+    optional (identEq `except >> "[" >> sepBy strLit "," >> "]") >> identEq `require >> identEq `auth)
+@[srvClause_parser] def srvInvNoSecretsClause : Parser := leading_parser
+  withPosition (atomic ("invariant " >> ident >> ":" >> identEq `no_required_secrets))
+@[srvClause_parser] def srvInvClause : Parser := leading_parser
+  withPosition ("invariant " >> ident >> ":" >> notFollowedBy (identEq `mutating <|> identEq `routes <|> identEq `rpcs <|> identEq `no_required_secrets) "state invariant" >> sepBy1 qExpr ",")
 
 @[srvChanSubClause_parser] def srvChanReqClause : Parser := leading_parser srvRequiresLine
 @[srvChanSubClause_parser] def srvChanEnsClause : Parser := leading_parser srvEnsuresLine
@@ -87,16 +118,45 @@ private def identDotTransaction : Parser :=
       | .str (.str .anonymous _) "transaction" => s'
       | _ => s.mkError "expected `<db>.transaction`") Parser.ident
 
-@[qedStmt_parser] def qedStmtDbTransaction : Parser := leading_parser withPosition (atomic (identDotTransaction >> ":") >> qedSuite)
+@[qedStmt_parser] def qedStmtDbTransaction : Parser := leading_parser
+  withPosition (atomic (identDotTransaction >> optional (identEq `as >> ident) >> ":") >> qedSuite)
 @[srvClause_parser] def srvHttpRouteClause : Parser := leading_parser withPosition (atomic (extHttpMethod >> strLit >> ":") >> srvContractSuite "expected indented HTTP route body" srvContractLine)
 @[srvClause_parser] def srvStreamClause : Parser := leading_parser withPosition (atomic (identEq `stream) >> strLit >> ":" >> srvContractSuite "expected indented `stream` body" srvContractLine)
 @[srvClause_parser] def srvFnClause : Parser := leading_parser
   withPosition (optional (atomic (identEq `read_only)) >> atomic (identEq `rpc) >> callSig srvParam >> ":" >> srvContractSuite "expected indented RPC body" srvContractLine)
+def srvFnMod : Parser := node `Qed.Server.srvFnMod (atomic (identEq `read_only) <|> atomic (identEq `system))
 @[srvClause_parser] def srvHelperFnClause : Parser := leading_parser
-  withPosition (optional (atomic (identEq `read_only)) >> atomic (identEq `fn) >> ident >> checkNoWsBefore "" >> "(" >> sepBy srvParam "," >> ")" >> optional (" -> " >> qType) >> ":" >>
+  withPosition (atomic (many srvFnMod >> identEq `fn) >> ident >> checkNoWsBefore "" >> "(" >> sepBy srvParam "," >> ")" >> optional (" -> " >> qType) >> ":" >>
     srvContractSuite "expected indented helper function body" srvContractLine)
 @[srvClause_parser] def srvBeforeClause : Parser := leading_parser withPosition (atomic (identEq `before >> ":") >> qedSuite)
-@[srvClause_parser] def srvJobClause : Parser := leading_parser withPosition (atomic (identEq `every) >> numLit >> ident >> ident >> ":" >> qedSuite)
+@[srvClause_parser] def srvJobClause : Parser := leading_parser
+  withPosition (atomic (identEq `every) >> numLit >> ident >> ident >> optional (" -> " >> qType) >> ":" >>
+    srvContractSuite "expected indented `every` job body" srvContractLine)
+def srvExMethod : Parser := extHttpMethod <|> identEq `GET <|> identEq `POST <|> identEq `PUT <|> identEq `PATCH <|> identEq `DELETE
+@[srvExItem_parser] def srvExEnv : Parser := leading_parser withPosition (atomic (symbol "with" >> identEq `env) >> strLit >> "=" >> qExpr)
+@[srvExItem_parser] def srvExNow : Parser := leading_parser withPosition (atomic (symbol "with" >> identEq `now >> "=") >> qExpr)
+@[srvExItem_parser] def srvExUser : Parser := leading_parser withPosition (atomic (symbol "with" >> identEq `user) >> qExpr)
+@[srvExItem_parser] def srvExRole : Parser := leading_parser withPosition (atomic (symbol "with" >> identEq `role) >> qExpr)
+@[srvExItem_parser] def srvExSession : Parser := leading_parser withPosition (atomic (symbol "with" >> identEq `session >> "=") >> qExpr)
+@[srvExItem_parser] def srvExSystem : Parser := leading_parser withPosition (atomic (symbol "with" >> identEq `system) >> optional ("=" >> qExpr))
+@[srvExItem_parser] def srvExHeader : Parser := leading_parser withPosition (atomic (symbol "with" >> identEq `header) >> strLit >> "=" >> qExpr)
+@[srvExItem_parser] def srvExQuery : Parser := leading_parser withPosition (atomic (symbol "with" >> identEq `query >> "=") >> qExpr)
+@[srvExItem_parser] def srvExBody : Parser := leading_parser withPosition (atomic (symbol "with" >> identEq `body >> "=") >> qExpr)
+@[srvExItem_parser] def srvExCtx : Parser := leading_parser withPosition (atomic (symbol "with" >> identEq `ctx >> "=") >> qExpr)
+@[srvExItem_parser] def srvExState : Parser := leading_parser withPosition (atomic (symbol "with" >> identEq `state >> "=") >> qExpr)
+@[srvExItem_parser] def srvExHttp : Parser := leading_parser withPosition (atomic (symbol "with" >> identEq `http) >> srvExMethod >> strLit >> "=>" >> numLit >> optional (checkLineEq >> qExpr))
+@[srvExItem_parser] def srvExHttpErr : Parser := leading_parser withPosition (atomic (symbol "with" >> identEq `http_error) >> srvExMethod >> strLit >> "=>" >> numLit >> optional (checkLineEq >> qExpr))
+@[srvExItem_parser] def srvExDb : Parser := leading_parser withPosition (atomic (symbol "with" >> identEq `db) >> ident >> "=" >> qExpr)
+@[srvExItem_parser] def srvExCall : Parser := leading_parser withPosition (atomic (identEq `call) >> ident >> checkNoWsBefore "" >> "(" >> sepBy qExpr "," >> ")")
+@[srvExItem_parser] def srvExReq : Parser := leading_parser withPosition (atomic (extHttpMethod >> strLit))
+@[srvExItem_parser] def srvExExpectOk : Parser := leading_parser withPosition (atomic (identEq `expect >> identEq `ok) >> optional (checkNoWsBefore "" >> "(" >> qExpr >> ")"))
+@[srvExItem_parser] def srvExExpectErr : Parser := leading_parser withPosition (atomic (identEq `expect >> identEq `error) >> optional (checkNoWsBefore "" >> "(" >> numLit >> ")"))
+@[srvExItem_parser] def srvExExpectStatus : Parser := leading_parser withPosition (atomic (identEq `expect >> identEq `status >> "==") >> qExpr)
+@[srvExItem_parser] def srvExExpectExpr : Parser := leading_parser withPosition (atomic (identEq `expect >> notFollowedBy (identEq `ok <|> identEq `error <|> (identEq `status >> "==")) "expect expr") >> qExpr)
+
+@[srvClause_parser] def srvExampleClause : Parser := leading_parser
+  withPosition (atomic (symbol "example" >> ident >> ":") >>
+    checkColGt "expected indented `example` steps" >> many1Indent (categoryParser `srvExItem 0))
 @[srvClause_parser] def srvOnCreateAccountClause : Parser := leading_parser authHook `onCreateAccount
 @[srvClause_parser] def srvOnSignInClause : Parser := leading_parser authHook `onSignIn
 @[command_parser] def serverCmd : Parser := leading_parser
@@ -125,6 +185,8 @@ syntax "qedSrvPrepStep " "[" ident,* "]" : tactic
 syntax "qedSrvProveAsync " ident "[" ident,* "]" str str : tactic
 syntax "qedSrvProveAsyncEnsures " ident "[" ident,* "]" str str : tactic
 syntax "qedSrvPrepAsyncEnsures " ident "[" ident,* "]" : tactic
+syntax "qedSrvProveEffSpec " ident "[" ident,* "]" str str : tactic
+syntax "qedSrvPrepEffSpec " ident "[" ident,* "]" : tactic
 syntax "qedSrvProveSafeIO " ident : tactic
 syntax "qedProveRpcReq" : tactic
 

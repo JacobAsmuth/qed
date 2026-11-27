@@ -328,6 +328,10 @@ inductive SqlQuery where
   | delete (table : SqlIdent) (whereExpr : SqlExpr) (returning : List SqlIdent)
 deriving Inhabited, DecidableEq
 
+@[reducible] def SqlQuery.isWrite : SqlQuery → Bool
+  | .insert .. | .insertOrIgnore .. | .upsert .. | .update .. | .delete .. => true
+  | _ => false
+
 def SqlIdent.joinQuotedPrefixed (pfx : String) : List SqlIdent → String
   | [] => "" | [c] => pfx ++ c.quoteIdent | c :: cs => pfx ++ c.quoteIdent ++ ", " ++ joinQuotedPrefixed pfx cs
 abbrev SqlIdent.joinQuoted : List SqlIdent → String := SqlIdent.joinQuotedPrefixed ""
@@ -798,5 +802,10 @@ def decodeTaggedResultJson (raw : String) : Except String DbResult := do
   let j@(.obj _) ← Json.parse raw 128 | .error "expected JSON object from database result"
   let rows ← decodeJsonRows j "rows" (decodeJsonArrayRow SqlVal.fromTaggedJson "expected row array") "expected rows array"
   return { rows, affected := jsonNatAt j "affected" }
+
+/-- Branded transaction handle carrying a live transaction ID for a specific `database`. -/
+structure DbTx (dbTag : String) where
+  id : UInt64
+deriving Inhabited, DecidableEq, Repr
 
 end Qed.Server.Db

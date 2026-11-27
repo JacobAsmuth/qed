@@ -100,9 +100,9 @@ private def elabStateInlineInv (spec : ComponentSpec) (invId : Ident) (clauses :
     | none,    none     => `(by qedDischargePreserved [$[$usingL],*] $updT $invId ($pred))
   if spec.hasProps then
     if spec.mountable then
-      elabIsolatedTheorem (← `(theorem $(mkIdentFrom invId (invId.getId.appendAfter "_init")):ident : ($pred) $(spec.initId) := by qedDischargeInit [$[$usingL],*] $(spec.initId) $invId ($pred)))
+      elabIsolatedTheorem (← `(command| set_option linter.unusedVariables false in theorem $(mkIdentFrom invId (invId.getId.appendAfter "_init")):ident (p : $(spec.propsId)) : ($pred) $(spec.initId) := by qedDischargeInit [$[$usingL],*] $(spec.initId) $invId ($pred)))
     let rhs ← pf?.getDM (mkPresTac (← `(($(spec.updateId) p))))
-    elabIsolatedTheorem (← `(theorem $invId:ident (p : $(spec.propsId)) : ∀ m msg, ($pred) m → ($pred) (InvTarget.proj ($(spec.updateId) p m msg)) := $rhs))
+    elabIsolatedTheorem (← `(command| set_option linter.unusedVariables false in theorem $invId:ident (p : $(spec.propsId)) : ∀ m msg, ($pred) m → ($pred) (InvTarget.proj ($(spec.updateId) p m msg)) := $rhs))
   else
     let presProp ← `(∀ m msg, ($pred) m → ($pred) (InvTarget.proj ($(spec.updateId) m msg)))
     let (prop, rhs) ← if spec.mountable then
@@ -149,10 +149,41 @@ def elabInlineInvariantsPhase (spec : ComponentSpec) (wantView : Bool) : Command
         statePreds := statePreds.push (pred, if !spec.hasProps && spec.mountable then some invId else none)
   return statePreds
 
+private def parseCompExRecord (recStx : Syntax) (validFields : Array Name) (kindLabel : String) (compId : Name) :
+    CommandElabM (Array (Ident × Term)) := do
+  (recStx.getArg 1).getSepArgs.mapM fun item => do
+    let fid : Ident := ⟨item.getArg 0⟩; let fn := fid.getId.eraseMacroScopes
+    unless validFields.contains fn do
+      throwErrorAt fid s!"unknown {kindLabel} `{fn}` on component `{compId}` (valid: {String.intercalate ", " (validFields.toList.map toString)})"
+    return (mkIdentFrom fid fn, ← lowerCompExpr .val (item.getArg 2))
+
+private def extractRpcWireTys (mInfo : ServerMethodInfo) : CommandElabM (Option Term × Term) := do
+  liftTermElabM do
+    let some (.defnInfo dinfo) := (← getEnv).find? mInfo.outcomeConst
+      | throwError s!"internal: missing outcome declaration `{mInfo.outcomeConst}`"
+    Meta.lambdaTelescope dinfo.value fun _ body => do
+      let ty ← Meta.whnf body
+      let unwrapEns (e : Expr) : MetaM Expr := do
+        let e' ← Meta.whnf e
+        if e'.isAppOfArity ``Qed.Ensured 2 then return e'.appFn!.appArg!
+        if e'.isAppOfArity ``Option 1 then
+          let inner ← Meta.whnf e'.appArg!
+          if inner.isAppOfArity ``Qed.Ensured 2 then return ← Meta.mkAppM ``Option #[inner.appFn!.appArg!]
+        return e'
+      if ty.isAppOfArity ``Qed.RpcOutcome 2 then
+        let errT ← PrettyPrinter.delab ty.appFn!.appArg!
+        let payT ← PrettyPrinter.delab (← unwrapEns ty.appArg!)
+        return (some errT, payT)
+      else if ty.isAppOfArity ``Qed.RpcSimpleOutcome 1 then
+        let payT ← PrettyPrinter.delab (← unwrapEns ty.appArg!)
+        return (none, payT)
+      else
+        throwError s!"internal: unexpected RPC outcome type for `{mInfo.name}`"
+
+@[noinline]
 def elabCompReachableAndWitnesses (spec : ComponentSpec) : CommandElabM Unit := do
   for cl in spec.invariants do
     if cl.getKind == ``compExampleClause then
-      unless spec.mountable && !spec.hasProps do throwErrorAt cl "`example` inside a `component` requires a mountable component without `prop`s"
       let nameIdent : Ident := ⟨cl.getArg 1⟩; let thmId := mkIdentFrom nameIdent (spec.t.getId ++ nameIdent.getId.eraseMacroScopes)
       let parsedParams ← parseParamList (cl.getArg 2)
       let paramBinders : Array BinderStx ← parsedParams.mapM fun (pId, pTy) => do
@@ -160,18 +191,105 @@ def elabCompReachableAndWitnesses (spec : ComponentSpec) : CommandElabM Unit := 
         if spec.allNames.contains pName then throwErrorAt pId s!"`example` parameter `{pName}` shadows a field of `{spec.t.getId}`; rename the parameter"
         `(bracketedBinder| ($pId:ident : $pTy:term))
       let paramNames := parsedParams.map (·.1.getId.eraseMacroScopes)
-      let whereBinders ← if (cl.getArg 3).getNumArgs == 2 then
-          ((cl.getArg 3).getArg 1).getSepArgs.zipIdx.mapM fun (wStx, idx) => do
+      let optProps := cl.getArg 3
+      let propsTerm? : Option Term ←
+        if optProps.getNumArgs == 1 then
+          unless spec.hasProps do throwErrorAt optProps s!"`with props` cannot be used on component `{spec.t.getId}` which has no `prop` or `bind` fields"
+          let wp := optProps.getArg 0
+          if wp.getNumArgs == 3 && (wp.getArg 2).getKind == `Qed.compExRecord then
+            let pairs ← parseCompExRecord (wp.getArg 2) (spec.props.map (·.id.getId.eraseMacroScopes)) "prop" spec.t.getId
+            let (fIds, fVals) := (pairs.map (·.1), pairs.map (·.2))
+            some <$> `(({ $[$fIds:ident := $fVals:term],* } : $(spec.propsId)))
+          else
+            some <$> `(($(← lowerCompExpr .val (wp.getArg 3)) : $(spec.propsId)))
+        else if spec.hasProps then
+          let reqProps := spec.props.filter (·.def?.isNone)
+          if reqProps.isEmpty then some <$> `(({} : $(spec.propsId)))
+          else throwErrorAt cl s!"`example {nameIdent.getId}` on prop-bearing component `{spec.t.getId}` requires `with props \{ ... }` for required prop(s): {String.intercalate ", " (reqProps.toList.map (·.id.getId.toString))}"
+        else pure none
+      let optFrom := cl.getArg 4
+      let initTerm : Term ←
+        if optFrom.getNumArgs == 1 then
+          let fNode := (optFrom.getArg 0).getArg 1
+          if fNode.getKind == `Qed.compExRecord then
+            let pairs ← parseCompExRecord fNode (spec.states.map (·.id.getId.eraseMacroScopes)) "state field" spec.t.getId
+            let (fIds, fVals) := (pairs.map (·.1), pairs.map (·.2))
+            if spec.mountable then `(({ $(spec.initId) with $[$fIds:ident := $fVals:term],* } : $(spec.stateId)))
+            else `(({ $[$fIds:ident := $fVals:term],* } : $(spec.stateId)))
+          else `(($(← lowerCompExpr .val fNode) : $(spec.stateId)))
+        else
+          unless spec.mountable do throwErrorAt cl s!"`example {nameIdent.getId}` on non-mountable component `{spec.t.getId}` requires `from \{ ... }` to specify initial state"
+          pure spec.initId
+      let whereBinders ← if (cl.getArg 5).getNumArgs == 2 then
+          ((cl.getArg 5).getArg 1).getSepArgs.zipIdx.mapM fun (wStx, idx) => do
             `(bracketedBinder| ($(mkIdentFrom wStx (Name.mkSimple s!"_hWhere{idx}")):ident : $(← lowerCompExpr .propInv wStx):term))
         else pure #[]
-      let traceTerm ← `(([$(← (cl.getArg 5).getSepArgs.mapM (lowerCompExpr .val)):term,*] : List $(spec.msgId)))
-      let rawGoal := cl.getArg 7; let goalTerm ← lowerCompExpr .propInv rawGoal
-      let pred ← `(fun (s : $(spec.stateId)) => $(← bindMentionedFields spec (fun nm => !paramNames.contains nm && mentionsIdent goalTerm.raw nm) goalTerm))
+      let rawSteps := (cl.getArg 7).getSepArgs
+      let hasRpcReplies := rawSteps.any (·.getKind == `Qed.compExOnReply)
+      let rawGoal := cl.getArg 9; let goalTerm ← lowerCompExpr .propInv rawGoal
+      let predBody0 ← bindMentionedFields spec (fun nm => !paramNames.contains nm && mentionsIdent goalTerm.raw nm) goalTerm
+      let predBody ← match propsTerm? with | some pt => `(let p : $(spec.propsId) := $pt; $predBody0) | none => pure predBody0
+      let pred ← `(fun (s : $(spec.stateId)) => $predBody)
+      let optEmits := cl.getArg 10
+      let emitsTerm? : Option Term ← if optEmits.getNumArgs == 1 then do
+          unless spec.outTy?.isSome do throwErrorAt optEmits s!"`emits` requires component `{spec.t.getId}` to declare at least one `event` or `bind`"
+          let evRaw := (optEmits.getArg 0).getArg 1
+          let evVal ← lowerCompExpr .val evRaw
+          let evBound0 ← bindMentionedFields spec (fun nm => !paramNames.contains nm && !spec.fieldNames.contains nm && mentionsIdent evVal.raw nm) evVal
+          let mut evBound := evBound0
+          for bd in spec.binds.reverse do
+            let sn := bindSetName bd.id.getId
+            if mentionsIdent evBound.raw sn then
+              evBound ← `(let $(mkIdent sn):ident := $(spec.outCtor sn); $evBound)
+          let evFinal ← match propsTerm? with | some pt => `(let p : $(spec.propsId) := $pt; $evBound) | none => pure evBound
+          some <$> `(($evFinal : $(spec.id `Out)))
+        else pure none
+      let updTerm : Term ← match propsTerm? with | some pt => `(($(spec.updateId) $pt)) | none => pure spec.updateId
       let lbl := Syntax.mkStrLit (let s := stxSnippet rawGoal; if s.isEmpty then "target" else s)
       let allBinders := paramBinders ++ whereBinders
-      let pf ← if (cl.getArg 8).getNumArgs == 3 then let tacSeq : TSyntax `Lean.Parser.Tactic.tacticSeq := ⟨(cl.getArg 8).getArg 2⟩; `(by qedWithFreshHeartbeats $tacSeq)
-               else `(by qedDischargeReachable $(spec.updateId) $(spec.initId) $thmId $lbl)
-      elabIsolatedTheorem (← `(command| theorem $thmId:ident $[$allBinders:bracketedBinder]* : Qed.Reachable $(spec.updateId) $(spec.initId) ($pred) := Qed.reachable_of_trace $(spec.updateId) $(spec.initId) ($pred) $traceTerm $pf))
+      let pf ← if (cl.getArg 11).getNumArgs == 3 then let tacSeq : TSyntax `Lean.Parser.Tactic.tacticSeq := ⟨(cl.getArg 11).getArg 2⟩; `(by qedWithFreshHeartbeats $tacSeq)
+               else `(by qedDischargeReachable $updTerm $initTerm $thmId $lbl)
+      if hasRpcReplies then
+        unless spec.hasEffects do throwErrorAt cl s!"`on ... => ...` in `example {nameIdent.getId}` requires component `{spec.t.getId}` to have `await` / async effects"
+        let stepTerms ← rawSteps.mapM fun st => do
+          if st.getKind == `Qed.compExOnReply then
+            let rpcId : Ident := ⟨st.getArg 1⟩
+            let some (srvInfo, mInfo) := lookupServerMethod? (← getEnv) (← getCurrNamespace) (← getScope).openDecls rpcId.getId
+              | throwErrorAt rpcId s!"unknown server RPC `{rpcId.getId}` in `on {rpcId.getId} => ...`"
+            let urlLit := Syntax.mkStrLit s!"/_qed/rpc/{srvInfo.shortName}/{mInfo.name}"
+            let rNode := st.getArg 3; let rk := rNode.getKind
+            if rk == `Qed.compExReplyErr then
+              let msgT ← lowerCompExpr .val (rNode.getArg 2)
+              `(Qed.TraceStep.rpcReply $urlLit (Except.error $msgT))
+            else
+              let (errTy?, payTy) ← extractRpcWireTys mInfo
+              if rk == `Qed.compExReplyOk then
+                let valT ← lowerCompExpr .val (rNode.getArg 2)
+                match errTy? with
+                | none => `(Qed.TraceStep.rpcReply $urlLit (Except.ok (Qed.Proto.encode ($valT : $payTy))))
+                | some eTy => `(Qed.TraceStep.rpcReply $urlLit (Except.ok (Qed.Proto.encode (Except.ok ($valT : $payTy) : Except (Qed.RpcDomainError $eTy) $payTy))))
+              else
+                let some eTy := errTy?
+                  | throwErrorAt rNode s!"RPC `{rpcId.getId}` has no domain error tags; use `error(\"...\")` for transport errors"
+                let tagId : Ident := ⟨rNode.getArg 3⟩
+                let msgT ← if (rNode.getArg 4).getNumArgs == 2 then lowerCompExpr .val ((rNode.getArg 4).getArg 1) else `("")
+                let tagDot := Syntax.node (.fromRef tagId) ``Lean.Parser.Term.dotIdent #[Syntax.atom (.fromRef tagId) ".", tagId.raw]
+                `(Qed.TraceStep.rpcReply $urlLit (Except.ok (Qed.Proto.encode (Except.error ({ tag := $(⟨tagDot⟩), message := $msgT } : Qed.RpcDomainError $eTy) : Except (Qed.RpcDomainError $eTy) $payTy))))
+          else
+            `(Qed.TraceStep.msg ($(← lowerCompExpr .val st) : $(spec.msgId)))
+        let stepsTerm ← `(([$[$stepTerms:term],*] : List (Qed.TraceStep $(spec.msgId))))
+        match emitsTerm? with
+        | some evT =>
+            elabIsolatedTheorem (← `(command| set_option linter.unusedVariables false in theorem $thmId:ident $[$allBinders:bracketedBinder]* : Qed.optSat (Qed.runTraceAsyncEmits $updTerm $initTerm $stepsTerm) (fun _tr => ($pred) _tr.1 ∧ ($evT ∈ _tr.2)) := $pf))
+        | none =>
+            elabIsolatedTheorem (← `(command| set_option linter.unusedVariables false in theorem $thmId:ident $[$allBinders:bracketedBinder]* : Qed.optSat (Qed.runTraceAsync $updTerm $initTerm $stepsTerm) ($pred) := $pf))
+      else
+        let traceTerm ← `(([$(← rawSteps.mapM (lowerCompExpr .val)):term,*] : List $(spec.msgId)))
+        match emitsTerm? with
+        | some evT =>
+            elabIsolatedTheorem (← `(command| set_option linter.unusedVariables false in theorem $thmId:ident $[$allBinders:bracketedBinder]* : let _tr := Qed.runTraceEmits $updTerm $initTerm $traceTerm; ($pred) _tr.1 ∧ ($evT ∈ _tr.2) := $pf))
+        | none =>
+            elabIsolatedTheorem (← `(command| set_option linter.unusedVariables false in theorem $thmId:ident $[$allBinders:bracketedBinder]* : Qed.Reachable $updTerm $initTerm ($pred) := Qed.reachable_of_trace $updTerm $initTerm ($pred) $traceTerm $pf))
 
 end CompElab
 end Qed

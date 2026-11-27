@@ -130,4 +130,121 @@ macro "qedNonlinearClose" : tactic => `(tactic| first
   | (apply Int.mul_nonneg <;> omega) | (apply Int.mul_le_mul_of_nonneg_left <;> omega)
   | (apply Int.mul_le_mul_of_nonneg_right <;> omega) | (apply Int.mul_le_mul <;> omega))
 
+/-! ## Bounded `range(stop | start, stop | start, stop, step)`, Loop Folding, Coalescing & `dedupBy` -/
+
+/-- Zero-allocation bounded arithmetic progression `start, start + step, ... < stop`.
+    Always total: `step == 0` or `start >= stop` produces 0 iterations. -/
+structure QedRange where
+  start : Nat
+  stop  : Nat
+  step  : Nat := 1
+deriving Inhabited, DecidableEq, Repr
+
+namespace QedRange
+@[inline] def mk1 (stop : Nat) : QedRange := ⟨0, stop, 1⟩
+@[inline] def mk2 (start stop : Nat) : QedRange := ⟨start, stop, 1⟩
+@[inline] def mk3 (start stop step : Nat) : QedRange := ⟨start, stop, step⟩
+
+@[inline] def count (r : QedRange) : Nat :=
+  if r.step == 0 || r.stop ≤ r.start then 0
+  else (r.stop - r.start + r.step - 1) / r.step
+
+def toListAux (cur step : Nat) : Nat → List Nat
+  | 0 => []
+  | k + 1 => cur :: toListAux (cur + step) step k
+
+def toList (r : QedRange) : List Nat := toListAux r.start r.step r.count
+def toArray (r : QedRange) : Array Nat := r.toList.toArray
+def reverse (r : QedRange) : List Nat := r.toList.reverse
+
+theorem toListAux_bounds (cur step : Nat) (hstep : 0 < step) :
+    ∀ (k stop : Nat), (k > 0 → cur + (k - 1) * step < stop) →
+    ∀ i ∈ toListAux cur step k, cur ≤ i ∧ i < stop
+  | 0, _, _, _, hi => nomatch hi
+  | k + 1, stop, hlim, i, hi => by
+      simp only [toListAux, List.mem_cons] at hi
+      rcases hi with rfl | hmem
+      · have h0 := hlim (Nat.succ_pos k); exact ⟨Nat.le_refl _, by omega⟩
+      · have hrec := toListAux_bounds (cur + step) step hstep k stop (fun hk => by
+          have h0 := hlim (Nat.succ_pos k)
+          simp only [Nat.add_sub_cancel] at h0
+          have hStepEq : cur + step + (k - 1) * step = cur + k * step := by
+            cases k with | zero => omega | succ k' => simp [Nat.succ_mul]; omega
+          omega) i hmem
+        exact ⟨by omega, hrec.2⟩
+
+theorem mem_toList_bounds (r : QedRange) {i : Nat} (hi : i ∈ r.toList) :
+    r.start ≤ i ∧ i < r.stop := by
+  unfold toList count at hi
+  by_cases h0 : r.step == 0 || r.stop ≤ r.start
+  · simp [h0, toListAux] at hi
+  · simp only [h0, Bool.false_eq_true, ↓reduceIte] at hi
+    simp only [Bool.or_eq_true, beq_iff_eq, decide_eq_true_eq, not_or] at h0
+    have hstep : 0 < r.step := Nat.pos_of_ne_zero h0.1
+    refine toListAux_bounds r.start r.step hstep ((r.stop - r.start + r.step - 1) / r.step) r.stop ?_ i hi
+    intro hk
+    have hmul := Nat.div_mul_le_self (r.stop - r.start + r.step - 1) r.step
+    have hsub : ((r.stop - r.start + r.step - 1) / r.step - 1) * r.step + r.step =
+        ((r.stop - r.start + r.step - 1) / r.step) * r.step := by
+      cases hc : (r.stop - r.start + r.step - 1) / r.step with
+      | zero => omega
+      | succ k' => simp [Nat.succ_mul]
+    omega
+end QedRange
+
+/-- Total loop-control result for `for ... in ...:` with `let mut`, `continue`, `break`, and `return`. -/
+inductive QedLoopStep (σ ρ : Type) where
+  | next (st : σ)
+  | breakLoop (st : σ)
+  | ret (st : σ) (val : ρ)
+deriving Inhabited, DecidableEq, Repr
+
+/-- Unified iterable class for `for x in xs:` over `List`, `Array`, and `QedRange`. -/
+class QedIterable (C : Type) (α : outParam Type) where
+  toList : C → List α
+instance {α : Type} : QedIterable (List α) α := ⟨id⟩
+instance {α : Type} : QedIterable (Array α) α := ⟨Array.toList⟩
+instance : QedIterable QedRange Nat := ⟨QedRange.toList⟩
+
+@[simp] theorem qedIterable_toList_list  {α : Type} (xs : List α)  : QedIterable.toList xs = xs := rfl
+@[simp] theorem qedIterable_toList_array {α : Type} (xs : Array α) : QedIterable.toList xs = xs.toList := rfl
+@[simp] theorem qedIterable_toList_range (r : QedRange)            : QedIterable.toList r = r.toList := rfl
+
+/-- Closure-free pure fold for `for x in xs:` with mutable state `σ` and early `break`/`return`. -/
+def qedForFoldList {α σ ρ : Type} (xs : List α) (st : σ) (body : σ → α → QedLoopStep σ ρ) : σ × Option ρ :=
+  match xs with
+  | [] => (st, none)
+  | x :: rest =>
+      match body st x with
+      | .next st' => qedForFoldList rest st' body
+      | .breakLoop st' => (st', none)
+      | .ret st' v => (st', some v)
+
+/-- Zero-allocation pure range loop for `for i in range(...)`. -/
+def qedForRangeAux {σ ρ : Type} (cur step : Nat) : Nat → σ → (σ → Nat → QedLoopStep σ ρ) → σ × Option ρ
+  | 0, st, _ => (st, none)
+  | k + 1, st, body =>
+      match body st cur with
+      | .next st' => qedForRangeAux (cur + step) step k st' body
+      | .breakLoop st' => (st', none)
+      | .ret st' v => (st', some v)
+
+def qedForRange {σ ρ : Type} (r : QedRange) (st : σ) (body : σ → Nat → QedLoopStep σ ρ) : σ × Option ρ :=
+  qedForRangeAux r.start r.step r.count st body
+
+def qedForFold {C α σ ρ : Type} [QedIterable C α] (xs : C) (st : σ) (body : σ → α → QedLoopStep σ ρ) : σ × Option ρ :=
+  qedForFoldList (QedIterable.toList xs) st body
+
+/-- Typeclass for `a ?? b` coalescing (lazy lowering via `toOption`). -/
+class QedCoalesce (C : Type) (α : outParam Type) where
+  toOption : C → Option α
+instance {α : Type} : QedCoalesce (Option α) α := ⟨id⟩
+@[simp] theorem qedCoalesce_option {α : Type} (o : Option α) : QedCoalesce.toOption o = o := rfl
+
+/-- Deduplicates an array preserving first-seen order by key. -/
+def _root_.Array.dedupBy {α β : Type} [BEq β] (xs : Array α) (key : α → β) : Array α :=
+  xs.foldl (init := #[]) fun acc x =>
+    let kx := key x
+    if acc.any (fun y => key y == kx) then acc else acc.push x
+
 end Qed

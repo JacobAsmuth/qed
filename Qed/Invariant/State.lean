@@ -319,6 +319,7 @@ private abbrev fType : Parser := categoryParser `qedType 0
 private abbrev fContract : Parser := categoryParser `qedFnContract 0
 
 def fnParam : Parser := node `Qed.fnParam (ident >> ":" >> fType >> optional ("=" >> fExpr))
+def fnExParam : Parser := node `Qed.fnExParam (ident >> ":" >> fType)
 def fnBlindTarget : Parser := node `Qed.fnBlindTarget (ident >> optional (checkNoWsBefore "" >> ".{" >> sepBy1 ident "," >> "}"))
 def fnProofBy : Parser := node `Qed.fnProofBy (":=" >> kw "by" >> Parser.Tactic.tacticSeq)
 def fnProofProve : Parser := node `Qed.fnProofProve (atomic (checkColGt "expected indented `prove:` block" >> identEq `prove >> ":") >> checkColGt "expected indented proof tactics" >> Parser.Tactic.tacticSeq)
@@ -330,29 +331,35 @@ def fnOptProof : Parser := optional (fnProofBy <|> fnProofProve)
   withPosition (atomic (identEq `ensures) >> sepBy1 fExpr "," >> fnOptProof)
 @[qedFnContract_parser] def fnBlindToClause : Parser := leading_parser
   withPosition (atomic (identEq `blindTo) >> sepBy1 fnBlindTarget "," >> fnOptProof)
+@[qedFnContract_parser] def fnExampleClause : Parser := leading_parser
+  withPosition (atomic (symbol "example" >> ident) >>
+    optional (checkNoWsBefore "" >> "(" >> sepBy1 fnExParam "," >> ")") >>
+    optional (symbol "where" >> sepBy1 fExpr ",") >> ":" >> sepBy1 fExpr "," >> fnOptProof)
 @[qedFnContract_parser] def fnContractIf : Parser := leading_parser
   withPosition (atomic (symbol "if" >> notFollowedBy (symbol "let") "let" >> sepBy1 fExpr "," >> ":" >>
     checkColGt "expected indented contract clauses" >> many1Indent fContract))
 
 @[command_parser] def fnCmd : Parser := leading_parser
   optional Command.docComment >>
-  withPosition (atomic (identEq `fn >> ident >> "(") >> sepBy fnParam "," >> ")" >> " -> " >> fType >> ":" >>
+  withPosition (atomic (optional (symbol "private") >> identEq `fn >> ident >> "(") >> sepBy fnParam "," >> ")" >> " -> " >> fType >> ":" >>
     checkColGt "expected indented `fn` body" >>
     withPosition (many (atomic (checkColEq "contract" >> fContract)) >>
                   many1 (checkColEq "statement" >> categoryParser `qedStmt 0)))
 
 end FnParsers
 
-/-! ## Pure `fn` Contract Proof Tactics (`qedProveFnEnsures`, `qedProveBlindTo`) -/
+/-! ## Pure `fn` Contract Proof Tactics (`qedProveFnEnsures`, `qedProveBlindTo`, `qedProveFnExample`) -/
 
 private def fnContractSimpNames : Array Name :=
   impHypSimpNames ++ #[``Array.size_push, ``Array.size_set, ``Array.size_map, ``Array.size_append,
     ``Array.size_reverse, ``List.length_cons, ``List.length_append, ``List.length_map,
+    ``Qed.qedCoalesce_option, ``Qed.qedIterable_toList_list, ``Qed.qedIterable_toList_array, ``Qed.qedIterable_toList_range,
     ``true_and, ``and_true, ``false_or, ``or_false, ``true_or, ``or_true, ``id_eq, ``ne_eq]
 
 private def runProveFnGoal (fnId : Ident) (isBlind : Bool) : TacticM Unit := do
   if isBlind then evalTactic (← `(tactic| intros))
   else discard <| tryTac `(tactic| dsimp only)
+  discard <| tryTac `(tactic| unfold $fnId:ident)
   discard <| tryTac `(tactic| simp only [$fnId:ident])
   discard <| tryTac `(tactic| dsimp only at *)
   if (← getGoals).isEmpty then return
@@ -365,9 +372,49 @@ private def runProveFnGoal (fnId : Ident) (isBlind : Bool) : TacticM Unit := do
   if (← getGoals).isEmpty then return
   discard <| tryTac `(tactic| repeat' split)
   forEachGoal (closeSplitBranch #[] false (some simpL) 3)
+  if !(← getGoals).isEmpty then
+    forEachGoal fun _ => discard <| tryTac `(tactic| first | rfl | decide | decide +kernel | omega)
+
+private def finiteEnumCtorCount? (ty : Expr) : MetaM (Option Nat) := do
+  let ty ← Meta.whnf ty
+  let .const nm _ := ty | return none
+  let some (.inductInfo ind) := (← getEnv).find? nm | return none
+  if ind.numParams != 0 || ind.numIndices != 0 || ind.isRec then return none
+  for ctorNm in ind.ctors do
+    let some (.ctorInfo ci) := (← getEnv).find? ctorNm | return none
+    if ci.numFields != 0 then return none
+  return some ind.ctors.length
+
+private partial def splitFiniteEnumsAndProve (fnId : Ident) (budget : Nat) (g : MVarId) : TacticM Unit := do
+  setGoals [g]
+  if ← tryCloseContradiction g then setGoals []; return
+  if ← tryTac (requireClosed := true) `(tactic| first | rfl | decide | decide +kernel | omega) then return
+  let nextEnum? : Option (FVarId × Nat) ← g.withContext do
+    for d in (← getLCtx) do
+      if !d.isImplementationDetail && !d.isLet then
+        if let some k ← finiteEnumCtorCount? d.type then
+          if k > 0 && k ≤ budget then return some (d.fvarId, k)
+    return none
+  match nextEnum? with
+  | none =>
+      runProveFnGoal fnId false
+  | some (fv, k) =>
+      let subgoals ← g.cases fv
+      let nextBudget := budget / k
+      let mut rem : List MVarId := []
+      for sg in subgoals do
+        setGoals [sg.mvarId]
+        let pruned ← tryTac (requireClosed := true) `(tactic| (
+          try simp only [$fnId:ident] at *
+          first | contradiction | rfl | decide | decide +kernel))
+        unless pruned do
+          splitFiniteEnumsAndProve fnId nextBudget (← getMainGoal)
+          rem := rem ++ (← getGoals)
+      setGoals rem
 
 syntax "qedProveFnEnsures " ident ident : tactic
 syntax "qedProveBlindTo " ident ident str : tactic
+syntax "qedProveFnExample " ident ident : tactic
 
 elab_rules : tactic
   | `(tactic| qedProveFnEnsures $fnId $thmId) => do
@@ -380,32 +427,102 @@ elab_rules : tactic
       throwUnsolvedInvGoals thmId m!"`blindTo {desc.getString}` failed in `{fnId.getId}` (output may depend on blinded field/parameter):"
         m!"Hint: Redact every branch that reads {desc.getString} under this guard, strengthen the `if` condition, or supply a `:= by` proof."
 
+  | `(tactic| qedProveFnExample $fnId $thmId) => do
+      if ← tryTac (requireClosed := true) `(tactic| first | rfl | decide | decide +kernel) then return
+      let saved ← saveState
+      runProveFnGoal fnId false
+      if !(← getGoals).isEmpty then
+        restoreState saved
+        forEachGoal (splitFiniteEnumsAndProve fnId 256)
+      throwUnsolvedInvGoals thmId m!"`example` failed for `{fnId.getId}`:"
+        m!"Hint: Check the expected output in the `example`, fix `{fnId.getId}`, or supply a `prove:` / `:= by` proof."
+
 /-! ## Shared Pure Statement Lowering & `fn` Contract Elaboration -/
 
 section FnElab
 open Lean Elab Command Qed.Lang
 
 @[noinline]
-partial def lowerPureFnStmts (fnDesc : String) (stmts : List Syntax)
-    (lowerVal : Syntax → CommandElabM Term := fun s => liftMacroM (lowerSimpleQedExpr .val s))
-    (lowerGuard : Syntax → CommandElabM Term := fun s => liftMacroM (lowerSimpleQedExpr .propGuard s)) : CommandElabM Term := do
+private partial def lowerPureFnStmtsAux (fnDesc : String)
+    (lowerVal : Syntax → CommandElabM Term) (lowerGuard : Syntax → CommandElabM Term)
+    (muts : Array Ident) (loopMuts? : Option (Array Ident)) (depth : Nat) (stmts : List Syntax) : CommandElabM Term := do
+  let recSelf (m' : Array Ident := muts) (lm' : Option (Array Ident) := loopMuts?) (d' : Nat := depth) (ss : List Syntax) :=
+    lowerPureFnStmtsAux fnDesc lowerVal lowerGuard m' lm' d' ss
+  let dropShadowed (names : Array Name) (ms : Array Ident) : Array Ident :=
+    ms.filter fun m => !names.contains m.getId.eraseMacroScopes
   match stmts with
-  | [] => throwError s!"missing `return` on fallthrough path of `{fnDesc}`"
+  | [] =>
+      match loopMuts? with
+      | none => throwError s!"missing `return` on fallthrough path of `{fnDesc}`"
+      | some lm => let stPack ← liftMacroM (mkMutPack lm.toList); `(Qed.QedLoopStep.next $stPack)
   | s :: rest =>
       let sk := s.getKind
-      if sk == ``qedStmtPass then lowerPureFnStmts fnDesc rest lowerVal lowerGuard
+      if sk == ``qedStmtPass then recSelf (ss := rest)
+      else if sk == ``qedStmtBreak then
+        let some lm := loopMuts? | throwErrorAt s "`break` can only be used inside a `for` loop"
+        let stPack ← liftMacroM (mkMutPack lm.toList); `(Qed.QedLoopStep.breakLoop $stPack)
+      else if sk == ``qedStmtContinue then
+        let some lm := loopMuts? | throwErrorAt s "`continue` can only be used inside a `for` loop"
+        let stPack ← liftMacroM (mkMutPack lm.toList); `(Qed.QedLoopStep.next $stPack)
       else if sk == ``qedStmtReturn then
-        if (s.getArg 1).getNumArgs == 1 then lowerVal ((s.getArg 1).getArg 0)
-        else throwErrorAt s s!"`return` inside `{fnDesc}` must return a value"
+        unless (s.getArg 1).getNumArgs == 1 do throwErrorAt s s!"`return` inside `{fnDesc}` must return a value"
+        let v ← lowerVal ((s.getArg 1).getArg 0)
+        match loopMuts? with
+        | none => pure v
+        | some lm => let stPack ← liftMacroM (mkMutPack lm.toList); `(Qed.QedLoopStep.ret $stPack $v)
+      else if sk == ``qedStmtLetMut then
+        let lId : Ident := ⟨s.getArg 2⟩; let nm := lId.getId.eraseMacroScopes
+        if muts.any (·.getId.eraseMacroScopes == nm) then
+          throwErrorAt lId s!"mutable variable `{nm}` is already declared in this scope; update it with `{nm} = ...`"
+        let rhsT ← lowerVal (s.getArg 5)
+        let cont ← recSelf (m' := muts.push lId) (ss := rest)
+        if (s.getArg 3).getNumArgs == 2 then
+          let lTy ← liftMacroM (return (← lowerQedType ((s.getArg 3).getArg 1) false).1)
+          `(let $lId:ident : $lTy := $rhsT; $cont)
+        else `(let $lId:ident := $rhsT; $cont)
+      else if let some act := tryMatchLocalMut? muts s then
+        if sk == ``qedStmtAssign && s.getNumArgs > 3 && (s.getArg 3).getNumArgs > 0 then
+          throwErrorAt ((s.getArg 3).getArg 0) s!"`predict` is not supported in pure `{fnDesc}`"
+        let rhsT ← lowerVal act.rhsSyntax
+        let newVal ← liftMacroM (applyLocalMutRhs act rhsT)
+        let lId := act.targetIdent
+        let cont ← recSelf (ss := rest)
+        `(let $lId:ident := $newVal; $cont)
+      else if sk == ``qedStmtFor then
+        let bStx := s.getArg 1; let iterStx := s.getArg 3; let bodyStmts := suiteStmts (s.getArg 5)
+        if bStx.isIdent then
+          let bNm := bStx.getId.eraseMacroScopes
+          if muts.any (·.getId.eraseMacroScopes == bNm) then
+            throwErrorAt bStx s!"`for` loop variable `{bNm}` shadows mutable variable `{bNm}`; use a different loop variable name"
+        let iterTerm ← lowerVal iterStx
+        let mutated := collectMutatedIds bodyStmts
+        let usedMuts := muts.filter fun m => mutated.contains m.getId.eraseMacroScopes
+        let initSt ← liftMacroM (mkMutPack usedMuts.toList)
+        let stParam := mkIdent (Name.mkSimple s!"_qedSt{depth}")
+        let resSt := mkIdent (Name.mkSimple s!"_qedLoopSt{depth}")
+        let resRet := mkIdent (Name.mkSimple s!"_qedLoopRet{depth}")
+        let retValId := mkIdent (Name.mkSimple s!"_qedRet{depth}")
+        let bodyInner ← recSelf (lm' := some usedMuts) (d' := depth + 1) (ss := bodyStmts.toList)
+        let bodyWithUnpack ← liftMacroM (wrapMutUnpack stParam usedMuts.toList bodyInner)
+        let lam ← if bStx.isIdent then `(fun $stParam:ident $(⟨bStx⟩):ident => $bodyWithUnpack) else `(fun $stParam:ident _ => $bodyWithUnpack)
+        let loopCall ← if isRangeCallExpr iterStx then `(Qed.qedForRange $iterTerm $initSt $lam) else `(Qed.qedForFold $iterTerm $initSt $lam)
+        let restTerm ← recSelf (d' := depth + 1) (ss := rest)
+        let someArm ← match loopMuts? with
+          | none => pure (⟨retValId.raw⟩ : Term)
+          | some outerMuts => let outerPack ← liftMacroM (mkMutPack outerMuts.toList); `(Qed.QedLoopStep.ret $outerPack $retValId)
+        let afterLoop ← liftMacroM (wrapMutUnpack resSt usedMuts.toList (← `(match $resRet:ident with | Option.some $retValId:ident => $someArm | Option.none => $restTerm)))
+        `(let ($resSt:ident, $resRet:ident) := $loopCall; $afterLoop)
       else if sk == ``qedStmtExpr then
-        if rest.isEmpty then lowerVal (s.getArg 0)
+        if rest.isEmpty && loopMuts?.isNone then lowerVal (s.getArg 0)
         else throwErrorAt s s!"unexpected bare expression statement in pure `{fnDesc}`; bind it with `let _ = ...` or return it"
       else if sk == ``qedStmtLet then
         if (s.getArg 5).getNumArgs > 0 then throwErrorAt ((s.getArg 5).getArg 0) s!"`predict`/`catch` clauses are not supported in pure `{fnDesc}`"
         let rhsT ← lowerVal (s.getArg 4)
-        let cont ← lowerPureFnStmts fnDesc rest lowerVal lowerGuard
-        if (s.getArg 1).isIdent then
-          let lId : Ident := ⟨s.getArg 1⟩
+        let bStx := s.getArg 1
+        let muts' := if bStx.isIdent then dropShadowed #[bStx.getId.eraseMacroScopes] muts else muts
+        let cont ← recSelf (m' := muts') (ss := rest)
+        if bStx.isIdent then
+          let lId : Ident := ⟨bStx⟩
           if (s.getArg 2).getNumArgs == 2 then
             let lTy ← liftMacroM (return (← lowerQedType ((s.getArg 2).getArg 1) false).1)
             `(let $lId:ident : $lTy := $rhsT; $cont)
@@ -415,32 +532,42 @@ partial def lowerPureFnStmts (fnDesc : String) (stmts : List Syntax)
         let pat ← liftMacroM (lowerQedPat (s.getArg 1))
         let scrut ← lowerVal (s.getArg 3)
         let elseStmts := extractLetElseStmts s
-        let elseT ← lowerPureFnStmts fnDesc elseStmts.toList lowerVal lowerGuard
-        let thenT ← lowerPureFnStmts fnDesc rest lowerVal lowerGuard
+        let elseT ← recSelf (ss := elseStmts.toList)
+        let thenT ← recSelf (m' := dropShadowed (collectQedPatIds (s.getArg 1)) muts) (ss := rest)
         `(match $(mkIdent `_qedLetElse):ident : $scrut:term with | $pat:term => $thenT | _ => $elseT)
       else if sk == ``qedStmtIf then
         let cond ← lowerGuard (s.getArg 1)
-        let thenT ← lowerPureFnStmts fnDesc ((suiteStmts (s.getArg 3)).toList ++ rest) lowerVal lowerGuard
+        let thenT ← recSelf (ss := (suiteStmts (s.getArg 3)).toList ++ rest)
         let elseStmts := (desugarElifs (s.getArg 4).getArgs (s.getArg 5)).getD #[]
-        let elseT ← lowerPureFnStmts fnDesc (elseStmts.toList ++ rest) lowerVal lowerGuard
+        let elseT ← recSelf (ss := elseStmts.toList ++ rest)
         `(if $(mkIdent `_qedIf):ident : $cond then $thenT else $elseT)
       else if sk == ``qedStmtIfLet then
         let pat ← liftMacroM (lowerQedPat (s.getArg 2))
         let scrut ← lowerVal (s.getArg 4)
-        let thenT ← lowerPureFnStmts fnDesc ((suiteStmts (s.getArg 6)).toList ++ rest) lowerVal lowerGuard
+        let thenT ← recSelf (m' := dropShadowed (collectQedPatIds (s.getArg 2)) muts) (ss := (suiteStmts (s.getArg 6)).toList ++ rest)
         let elseStmts := (extractElseSuite (s.getArg 7)).getD #[]
-        let elseT ← lowerPureFnStmts fnDesc (elseStmts.toList ++ rest) lowerVal lowerGuard
+        let elseT ← recSelf (ss := elseStmts.toList ++ rest)
         `(match $(mkIdent `_qedIfLet):ident : $scrut:term with | $pat:term => $thenT | _ => $elseT)
       else if sk == ``qedStmtMatch then
         let scruts ← (s.getArg 1).getSepArgs.mapM lowerVal
         let alts ← (s.getArg 3).getArgs.mapM fun alt => do
           let altTerms ← liftMacroM (lowerCasePatAlts (alt.getArg 1))
-          let body ← lowerPureFnStmts fnDesc ((suiteStmts (alt.getArg 3)).toList ++ rest) lowerVal lowerGuard
+          let patIds := collectCasePatIds (extractCasePatAlts (alt.getArg 1))
+          let body ← recSelf (m' := dropShadowed patIds muts) (ss := (suiteStmts (alt.getArg 3)).toList ++ rest)
           mkMatchAltFromAlts altTerms body
         `(match $[$scruts:term],* with $[$alts:matchAlt]*)
+      else if sk == ``qedStmtAssign then
+        let lhsStr := stxSnippet (s.getArg 0)
+        throwErrorAt s s!"cannot assign to `{lhsStr}` in pure `{fnDesc}`; declare local variables with `let mut {lhsStr} = ...` to mutate them"
       else
         let sn := stxSnippet s
-        throwErrorAt s s!"unsupported statement{if sn.isEmpty then "" else s!" `{sn}`"} in pure `{fnDesc}` (pure functions cannot mutate state; use `let` or return a value)"
+        throwErrorAt s s!"unsupported statement{if sn.isEmpty then "" else s!" `{sn}`"} in pure `{fnDesc}`"
+
+@[noinline]
+def lowerPureFnStmts (fnDesc : String) (stmts : List Syntax)
+    (lowerVal : Syntax → CommandElabM Term := fun s => liftMacroM (lowerSimpleQedExpr .val s))
+    (lowerGuard : Syntax → CommandElabM Term := fun s => liftMacroM (lowerSimpleQedExpr .propGuard s)) : CommandElabM Term :=
+  lowerPureFnStmtsAux fnDesc lowerVal lowerGuard #[] none 0 stmts
 
 private structure ParsedBlindTarget where
   paramId : Ident
@@ -458,10 +585,19 @@ private structure ParsedFnBlindTo where
   targets : Array ParsedBlindTarget
   tac?    : Option (TSyntax ``Lean.Parser.Tactic.tacticSeq)
 
+private structure ParsedFnExample where
+  ref    : Syntax
+  name   : Ident
+  params : Array Syntax
+  wheres : Array Syntax
+  preds  : Array Syntax
+  tac?   : Option (TSyntax ``Lean.Parser.Tactic.tacticSeq)
+
 private structure ParsedFnContracts where
   requires : Array Syntax := #[]
   ensures  : Array ParsedFnEnsures := #[]
   blinds   : Array ParsedFnBlindTo := #[]
+  examples : Array ParsedFnExample := #[]
 
 def parseOptTacSeq (optNode : Syntax) : Option (TSyntax ``Lean.Parser.Tactic.tacticSeq) :=
   if optNode.getNumArgs == 1 then
@@ -493,6 +629,14 @@ private partial def collectFnContracts (guards : Array Syntax) (clauses : Array 
     else if k == ``fnBlindToClause then
       let tgts ← (cl.getArg 1).getSepArgs.mapM parseBlindTarget
       acc := { acc with blinds := acc.blinds.push { ref := cl, guards, targets := tgts, tac? := parseOptTacSeq (cl.getArg 2) } }
+    else if k == ``fnExampleClause then
+      unless guards.isEmpty do throwErrorAt cl "`example` must appear at the top level of `fn` (use `where` on `example` for preconditions)"
+      let exName : Ident := ⟨cl.getArg 1⟩
+      if acc.examples.any (·.name.getId.eraseMacroScopes == exName.getId.eraseMacroScopes) then
+        throwErrorAt exName s!"duplicate `example {exName.getId}` in `fn`"
+      let params := if (cl.getArg 2).getNumArgs == 3 then ((cl.getArg 2).getArg 1).getSepArgs else #[]
+      let wheres := if (cl.getArg 3).getNumArgs == 2 then ((cl.getArg 3).getArg 1).getSepArgs else #[]
+      acc := { acc with examples := acc.examples.push { ref := cl, name := exName, params, wheres, preds := (cl.getArg 5).getSepArgs, tac? := parseOptTacSeq (cl.getArg 6) } }
     else if k == ``fnContractIf then
       let conds := (cl.getArg 1).getSepArgs
       acc ← collectFnContracts (guards ++ conds) (cl.getArg 3).getArgs acc
@@ -506,10 +650,14 @@ private def fmtBlindTarget (t : ParsedBlindTarget) : String :=
 
 @[noinline]
 def elabPureFnContracts (thmBaseId fnConstId : Ident) (paramIds : Array Ident) (paramTys : Array Term) (retTy : Term)
-    (contracts : Array Syntax) (extraPreHyps : Array (Ident × Term) := #[]) : CommandElabM Unit := do
+    (contracts : Array Syntax) (extraPreHyps : Array (Ident × Term) := #[]) (isPrivate : Bool := false) : CommandElabM Unit := do
   if contracts.isEmpty then return
   let parsed ← collectFnContracts #[] contracts {}
   let lowerProp (s : Syntax) : CommandElabM Term := liftMacroM (lowerSimpleQedExpr .propInv s)
+  let elabThm (thmId : Ident) (binders : Array (TSyntax `Lean.Parser.Term.bracketedBinder)) (goal : Term) (proofTac : TSyntax ``Lean.Parser.Tactic.tacticSeq) : CommandElabM Unit := do
+    Qed.Lang.elabCmdWithVis isPrivate (← `(command|
+      set_option linter.unusedVariables false in
+      theorem $thmId $[$binders:bracketedBinder]* : $goal := by $proofTac))
   let reqProp? : Option Term ← if parsed.requires.isEmpty then pure none else some <$> mkConjBody (← parsed.requires.mapM lowerProp)
   let mkPreBinders (guards : Array Syntax) : CommandElabM (Array (TSyntax `Lean.Parser.Term.bracketedBinder)) := do
     let mut bs : Array (TSyntax `Lean.Parser.Term.bracketedBinder) := #[]
@@ -531,9 +679,7 @@ def elabPureFnContracts (thmBaseId fnConstId : Ident) (paramIds : Array Ident) (
     let proofTac : TSyntax ``Lean.Parser.Tactic.tacticSeq ← match ens.tac? with
       | some ts => pure ts
       | none    => `(Lean.Parser.Tactic.tacticSeq| qedProveFnEnsures $fnConstId $thmId)
-    elabCommand (← `(command|
-      set_option linter.unusedVariables false in
-      theorem $thmId $[$binders:bracketedBinder]* : let $resId:ident : $retTy := $rhsCall; $ensProp := by $proofTac))
+    elabThm thmId binders (← `(let $resId:ident : $retTy := $rhsCall; $ensProp)) proofTac
   for (bl, idx) in parsed.blinds.zipIdx do
     let thmName := if parsed.blinds.size == 1 then thmBaseId.getId.appendAfter "_blindTo" else thmBaseId.getId.appendAfter s!"_blindTo_{idx + 1}"
     let thmId := mkIdentFrom bl.ref thmName
@@ -578,14 +724,28 @@ def elabPureFnContracts (thmBaseId fnConstId : Ident) (paramIds : Array Ident) (
     let proofTac : TSyntax ``Lean.Parser.Tactic.tacticSeq ← match bl.tac? with
       | some ts => pure ts
       | none    => `(Lean.Parser.Tactic.tacticSeq| qedProveBlindTo $fnConstId $thmId $descLit)
-    elabCommand (← `(command|
-      set_option linter.unusedVariables false in
-      theorem $thmId $[$binders:bracketedBinder]* : $eqProp := by $proofTac))
+    elabThm thmId binders eqProp proofTac
+  for ex in parsed.examples do
+    let thmId := mkIdentFrom ex.name (thmBaseId.getId.appendAfter s!"_example_{ex.name.getId.eraseMacroScopes}")
+    let mut exBinders : Array (TSyntax `Lean.Parser.Term.bracketedBinder) := #[]
+    for ep in ex.params do
+      let pid : Ident := ⟨ep.getArg 0⟩
+      let pty ← liftMacroM (return (← lowerQedType (ep.getArg 2) false).1)
+      exBinders := exBinders.push (← `(bracketedBinder| ($pid:ident : $pty)))
+    for (w, i) in ex.wheres.zipIdx do
+      let wp ← lowerProp w
+      exBinders := exBinders.push (← `(bracketedBinder| ($(mkIdent (Name.mkSimple s!"_hExWhere_{i}")):ident : $wp)))
+    let exProp ← mkConjBody (← ex.preds.mapM lowerProp)
+    let proofTac : TSyntax ``Lean.Parser.Tactic.tacticSeq ← match ex.tac? with
+      | some ts => pure ts
+      | none    => `(Lean.Parser.Tactic.tacticSeq| qedProveFnExample $fnConstId $thmId)
+    elabThm thmId exBinders exProp proofTac
 
 @[noinline, command_elab fnCmd] def elabFnCmd : CommandElab := fun stx => do
   let doc? := if (stx.getArg 0).getNumArgs == 1 then some (⟨(stx.getArg 0).getArg 0⟩ : TSyntax ``Lean.Parser.Command.docComment) else none
-  let fnId : Ident := ⟨stx.getArg 2⟩
-  let rawParams := (stx.getArg 4).getSepArgs
+  let isPrivate := (stx.getArg 1).getNumArgs == 1
+  let fnId : Ident := ⟨stx.getArg 3⟩
+  let rawParams := (stx.getArg 5).getSepArgs
   let mut paramIds : Array Ident := #[]; let mut paramTys : Array Term := #[]
   let mut defBinders : Array (TSyntax `Lean.Parser.Term.bracketedBinder) := #[]; let mut seenDefault := false
   for rp in rawParams do
@@ -602,13 +762,13 @@ def elabPureFnContracts (thmBaseId fnConstId : Ident) (paramIds : Array Ident) (
       if seenDefault then throwErrorAt pid s!"non-default parameter `{pid.getId}` cannot follow a parameter with a default value in `fn {fnId.getId}`"
       defBinders := defBinders.push (← `(bracketedBinder| ($pid:ident : $pty)))
     paramIds := paramIds.push pid; paramTys := paramTys.push pty
-  let retTy ← liftMacroM (return (← lowerQedType (stx.getArg 7) false).1)
-  let contracts := (stx.getArg 9).getArgs
-  let bodyStmts := (stx.getArg 10).getArgs
+  let retTy ← liftMacroM (return (← lowerQedType (stx.getArg 8) false).1)
+  let contracts := (stx.getArg 10).getArgs
+  let bodyStmts := (stx.getArg 11).getArgs
   let bodyTerm ← lowerPureFnStmts s!"fn {fnId.getId}" bodyStmts.toList
-  elabCommand (← `(command|
+  Qed.Lang.elabCmdWithVis isPrivate (← `(command|
     $[$doc?:docComment]? def $fnId $[$defBinders:bracketedBinder]* : $retTy := $bodyTerm))
-  elabPureFnContracts fnId fnId paramIds paramTys retTy contracts
+  elabPureFnContracts fnId fnId paramIds paramTys retTy contracts #[] isPrivate
 
 end FnElab
 

@@ -1,3 +1,4 @@
+import Qed.Collection
 import Qed.Resource.Basic
 import Qed.Runtime.AppCore
 import Qed.Server.Ensured
@@ -15,6 +16,8 @@ def view (r : Resource α) (ready : α → Html msg) (loading : Html msg := .tex
   match r with | .idle => idle | .loading => loading | .ok a => ready a | .failed e => failed e
 def get? : Resource α → Option α | .ok a => some a | _ => none
 def getD (r : Resource α) (fallback : α) : α := (r.get?).getD fallback
+instance : QedCoalesce (Resource α) α := ⟨Resource.get?⟩
+@[simp] theorem qedCoalesce_resource (r : Resource α) : QedCoalesce.toOption r = r.get? := rfl
 def isOk : Resource α → Bool | .ok _ => true | _ => false
 def isLoading : Resource α → Bool | .loading => true | _ => false
 def map (f : α → β) : Resource α → Resource β
@@ -52,7 +55,10 @@ def putRev (c : Cached α) (issuedKey : String) (r : Resource α) (currentDataKe
 def activate (c : Cached α) (k : String) : Cached α := { c with state := (c.lookup k).elim .loading .ok }
 def map (f : α → β) (c : Cached α) : Cached β :=
   { state := c.state.map f, seen := c.seen.map fun (k, v) => (k, f v), rev := c.rev }
+def get? (c : Cached α) : Option α := c.state.get?
 def getD (c : Cached α) (fallback : α) : α := c.state.getD fallback
+instance : QedCoalesce (Cached α) α := ⟨Cached.get?⟩
+@[simp] theorem qedCoalesce_cached (c : Cached α) : QedCoalesce.toOption c = c.get? := rfl
 def isOk (c : Cached α) : Bool := c.state.isOk
 def isLoading (c : Cached α) : Bool := c.state.isLoading
 def updateCurrent (c : Cached α) (currentKey : String) (f : α → α) : Cached α :=

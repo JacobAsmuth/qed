@@ -126,8 +126,9 @@ private def extractDirectScopedCol? (scopes : Array (String × DbTableInfo × St
   | _ => none
 
 @[noinline, nospecialize]
-private partial def lowerRowSqlExpr (lowerVal : Syntax → M Term) (dbInfo : DatabaseInfo)
+private partial def lowerRowSqlExpr (lowerValWithLocals : Array String → Syntax → M Term) (dbInfo : DatabaseInfo)
     (scopes : Array (String × DbTableInfo × String)) (stx : Syntax) : M Term := do
+  let lowerVal := lowerValWithLocals #[]
   let u := unwrapParens1 stx; let k := u.getKind
   let mentionsScope (s : Syntax) : Bool :=
     scopes.any (fun (v, _, _) => stxMentionsVar v s) || stxAny (·.getKind == ``qedAnyIn) s
@@ -141,7 +142,7 @@ private partial def lowerRowSqlExpr (lowerVal : Syntax → M Term) (dbInfo : Dat
       throwErrorAt tgt "cross-table `any <alias> in <table>:` expects a sibling table name from the same `database`"
     let subTblName := (tgt.getArg 0).getId.eraseMacroScopes.toString
     let subTbl ← findDbTable tgt dbInfo subTblName
-    let bodySql ← lowerRowSqlExpr lowerVal dbInfo (scopes.push (aliasStr, subTbl, aliasStr)) (u.getArg 5)
+    let bodySql ← lowerRowSqlExpr lowerValWithLocals dbInfo (scopes.push (aliasStr, subTbl, aliasStr)) (u.getArg 5)
     return ← `(Qed.Server.Db.SqlExpr.existsSubquery $(← liftM (mkSqlIdentTerm tgt subTbl.tableName)) $(← liftM (mkSqlIdentTerm aliasId aliasStr)) $bodySql)
   if !mentionsScope u then
     if k == ``qedIdent then
@@ -168,7 +169,7 @@ private partial def lowerRowSqlExpr (lowerVal : Syntax → M Term) (dbInfo : Dat
           checkNotEnc stbl colInfo col
           return ← `(Qed.Server.Db.SqlExpr.strLen $(← mkColSql sqlQual col))
   | _ => pure ()
-  let sub := lowerRowSqlExpr lowerVal dbInfo scopes
+  let sub := lowerRowSqlExpr lowerValWithLocals dbInfo scopes
   let lowerTypedParam (stbl : DbTableInfo) (colName : String) (valStx : Syntax) : M Term := do
     if isBoolLitStx valStx then sub valStx
     else mkTypedSqlParamTerm (mkIdentFrom valStx stbl.rowTypeConst) (mkIdentFrom valStx (Name.mkSimple colName)) (← lowerVal valStx)
@@ -218,6 +219,32 @@ private partial def lowerRowSqlExpr (lowerVal : Syntax → M Term) (dbInfo : Dat
           `(Qed.Server.Db.SqlExpr.binOp $(mkIdent op) $(← lowerSide lhs rhs) $(← lowerSide rhs lhs))
       cs := cs.push c; lhs := rhs
     match cs.toList with | [] => `(Qed.Server.Db.SqlExpr.litTrue) | c :: rs => rs.foldlM (init := c) fun a x => `(Qed.Server.Db.SqlExpr.binOp .and $a $x)
+  else if k == ``qedExprIf || k == ``qedTernary then
+    let (cI, tI, eI) := if k == ``qedTernary then (2, 0, 3) else (1, 3, 4)
+    let eOpt := u.getArg eI
+    if eOpt.getNumArgs == 0 then
+      throwErrorAt u "conditional `if` inside SQL `where`/`set` clause requires an `else` branch"
+    let condStx := u.getArg cI; let thenStx := u.getArg tI; let elseStx := eOpt.getArg (eOpt.getNumArgs - 1)
+    if !mentionsScope condStx then
+      let cT ← lowerVal condStx; let tSql ← sub thenStx; let eSql ← sub elseStx
+      `(if ($cT : Bool) then $tSql else $eSql)
+    else
+      let cSql ← sub condStx; let tSql ← sub thenStx; let eSql ← sub elseStx
+      `(Qed.Server.Db.SqlExpr.binOp Qed.Server.Db.SqlBinOp.or
+          (Qed.Server.Db.SqlExpr.binOp Qed.Server.Db.SqlBinOp.and $cSql $tSql)
+          (Qed.Server.Db.SqlExpr.binOp Qed.Server.Db.SqlBinOp.and (Qed.Server.Db.SqlExpr.not $cSql) $eSql))
+  else if k == ``qedExprIfLet then
+    let scrutStx := u.getArg 4; let eOpt := u.getArg 7
+    if eOpt.getNumArgs == 0 then
+      throwErrorAt u "conditional `if let` inside SQL `where` clause requires an `else:` branch"
+    if mentionsScope scrutStx then
+      throwErrorAt scrutStx "`if let` scrutinee inside SQL `where` cannot depend on a row column; match an outer `Option` variable instead"
+    let patT ← liftM (m := CommandElabM) (liftMacroM (lowerQedPat (u.getArg 2)))
+    let scrutT ← lowerVal scrutStx
+    let patLocals := (collectQedPatIds (u.getArg 2)).map (·.toString)
+    let thenSql ← lowerRowSqlExpr (fun locs e => lowerValWithLocals (patLocals ++ locs) e) dbInfo scopes (u.getArg 6)
+    let elseSql ← sub (eOpt.getArg (eOpt.getNumArgs - 1))
+    `(match $scrutT:term with | $patT:term => $thenSql | _ => $elseSql)
   else if k == ``qedCall then
     if let some (recv, meth, args) := matchMethodCall? u then
       if args.size == 1 && args[0]!.getKind == ``qedCallArgPos then
@@ -233,31 +260,32 @@ private partial def lowerRowSqlExpr (lowerVal : Syntax → M Term) (dbInfo : Dat
     throwErrorAt u s!"unsupported call `{stxSnippet u}` in SQL `where`/`set` clause"
   else throwErrorAt u s!"unsupported expression `{stxSnippet u}` in SQL `where`/`set` clause (use row columns, comparisons, `and`/`or`/`not`, `any m in tbl:`, `in`, arithmetic, `.length`, `.startsWith`, `.contains`, `xs.contains(r.col)`, or bound variables)"
 
-private def parseWhereArg (lowerVal : Syntax → M Term) (lowerValWithLocals : Array String → Syntax → M Term)
+private def parseWhereArg (lowerValWithLocals : Array String → Syntax → M Term)
     (dbInfo : DatabaseInfo) (tbl : DbTableInfo) (rowTyId : Ident) (whereStx? : Option Syntax)
     (needCross : Bool := false) : M (Term × Term × Option (String × Syntax) × Bool) := do
-  let usesCross := whereStx?.any (stxAny (·.getKind == ``qedAnyIn))
-  let isCross := needCross || usesCross
-  if isCross then
-    let some snapConst := dbInfo.snapTypeConst?
-      | throwErrorAt (whereStx?.getD rowTyId.raw) s!"cross-table `any ... in ...` requires a multi-table `database` (`{dbInfo.shortName}` has no `Snap` type)"
-    let snapTyId := mkIdent snapConst; let snapId := mkIdent `_dbSnap
-    let some wRaw := whereStx?
-      | return (← `(fun (_ : $snapTyId) (_ : $rowTyId) => true), ← `(Qed.Server.Db.SqlExpr.litTrue), none, true)
-    let u := unwrapParens1 wRaw
-    if u.getKind != ``qedLam1 then throwErrorAt wRaw "database `where` clause must be a row lambda, e.g. `where = r => r.id == noteId and r.ownerId == uid`"
-    let b := u.getArg 0; let rId : Ident := if b.isIdent then ⟨b⟩ else mkIdent `_row
-    let rName := rId.getId.eraseMacroScopes.toString; let body := u.getArg 2
-    let rewritten := rewriteSnapTables snapId (dbInfo.tables.map (·.tableName)) body
-    let predT ← `(fun ($snapId:ident : $snapTyId) ($rId:ident : $rowTyId) => ($(← lowerValWithLocals #[rName, "_dbSnap"] rewritten) : Bool))
-    let sqlW ← lowerRowSqlExpr lowerVal dbInfo #[(rName, tbl, tbl.tableName)] body
-    return (predT, sqlW, some (rName, body), true)
-  let some wRaw := whereStx? | return (← `(fun (_ : $rowTyId) => true), ← `(Qed.Server.Db.SqlExpr.litTrue), none, false)
+  let isCross := needCross || whereStx?.any (stxAny (·.getKind == ``qedAnyIn))
+  let snapTyId? ← if isCross then
+      let some snapConst := dbInfo.snapTypeConst?
+        | throwErrorAt (whereStx?.getD rowTyId.raw) s!"cross-table `any ... in ...` requires a multi-table `database` (`{dbInfo.shortName}` has no `Snap` type)"
+      pure (some (mkIdent snapConst))
+    else pure none
+  let some wRaw := whereStx? | do
+    let triv ← match snapTyId? with
+      | some sTy => `(fun (_ : $sTy) (_ : $rowTyId) => true)
+      | none     => `(fun (_ : $rowTyId) => true)
+    return (triv, ← `(Qed.Server.Db.SqlExpr.litTrue), none, isCross)
   let u := unwrapParens1 wRaw
   if u.getKind != ``qedLam1 then throwErrorAt wRaw "database `where` clause must be a row lambda, e.g. `where = r => r.id == noteId and r.ownerId == uid`"
   let b := u.getArg 0; let rId : Ident := if b.isIdent then ⟨b⟩ else mkIdent `_row
   let rName := rId.getId.eraseMacroScopes.toString; let body := u.getArg 2
-  return (← `(fun ($rId:ident : $rowTyId) => ($(← lowerValWithLocals #[rName] body) : Bool)), ← lowerRowSqlExpr lowerVal dbInfo #[(rName, tbl, tbl.tableName)] body, some (rName, body), false)
+  let sqlW ← lowerRowSqlExpr lowerValWithLocals dbInfo #[(rName, tbl, tbl.tableName)] body
+  let predT ← match snapTyId? with
+    | some sTy =>
+        let snapId := mkIdent `_dbSnap
+        let rewritten := rewriteSnapTables snapId (dbInfo.tables.map (·.tableName)) body
+        `(fun ($snapId:ident : $sTy) ($rId:ident : $rowTyId) => ($(← lowerValWithLocals #[rName, "_dbSnap"] rewritten) : Bool))
+    | none => `(fun ($rId:ident : $rowTyId) => ($(← lowerValWithLocals #[rName] body) : Bool))
+  return (predT, sqlW, some (rName, body), isCross)
 
 private def parseQueryWindow (tbl : DbTableInfo) (lowerVal : Syntax → M Term) (findNamed : String → Option Syntax) : M (Term × Term × Term) := do
   let optNat (s? : Option Syntax) : M Term := match s? with | none => `(none) | some s => do `(some ($(← lowerVal s) : Nat))
@@ -297,7 +325,7 @@ def lowerDbCall (lowerVal : Syntax → M Term) (lowerValWithLocals : Array Strin
         `(($pf : ∀ (_dbSnap : $snapTyId) (_r : $rowTyId), $rowInvId _r → $predT _dbSnap _r = true → $polApp))
 
       if opName == "select" || opName == "findOne" || opName == "count" || opName == "selectMeta" || opName == "findOneMeta" then
-        let (predT, sqlW, _, isCross) ← parseWhereArg lowerVal lowerValWithLocals dbInfo tbl rowTyId whereArg? tbl.hasCrossReadPolicy
+        let (predT, sqlW, _, isCross) ← parseWhereArg lowerValWithLocals dbInfo tbl rowTyId whereArg? tbl.hasCrossReadPolicy
         let pf ← if isCross then mkCrossPolProof predT readPolId tbl.hasCrossReadPolicy readPolKind (mkReadPolHint tbl)
                  else mkDbProveTac #[rowInvId, readPolId] readPolKind opQual (mkReadPolHint tbl)
         if opName == "count" then
@@ -361,7 +389,7 @@ def lowerDbCall (lowerVal : Syntax → M Term) (lowerValWithLocals : Array Strin
           | throwErrorAt stx s!"`{dbInfo.shortName}.{tbl.tableName}.{opName}` requires a column selector (e.g. `\"{tbl.columns[0]?.map (·.name) |>.getD "col"}\"` or `col = \"...\"`)"
         let colInfo ← liftM (parseAggColArg tbl colStx)
         let aggWhere? := (findNamed "where").orElse fun _ => (findNamed "filter").orElse fun _ => if (findNamed "col").isSome then posArgs[0]? else posArgs[1]?
-        let (predT, sqlW, _, isCross) ← parseWhereArg lowerVal lowerValWithLocals dbInfo tbl rowTyId aggWhere? tbl.hasCrossReadPolicy
+        let (predT, sqlW, _, isCross) ← parseWhereArg lowerValWithLocals dbInfo tbl rowTyId aggWhere? tbl.hasCrossReadPolicy
         let pf ← if isCross then mkCrossPolProof predT readPolId tbl.hasCrossReadPolicy readPolKind (mkReadPolHint tbl)
                  else mkDbProveTac #[rowInvId, readPolId] readPolKind opQual (mkReadPolHint tbl)
         let aggOp := mkIdent <| match opName with | "sum" => `Qed.Server.Db.SqlAggOp.sum | "min" => `Qed.Server.Db.SqlAggOp.min | _ => `Qed.Server.Db.SqlAggOp.max
@@ -388,8 +416,8 @@ def lowerDbCall (lowerVal : Syntax → M Term) (lowerValWithLocals : Array Strin
             rightTbl.columns.findSome? fun c => c.refs?.bind fun (rt, rc) => if rt == tbl.tableName && onCol?.all (· == rc) then some (rc, c.name) else none
           | throwErrorAt stx s!"cannot `join` `{tbl.tableName}` with `{rightTbl.tableName}`: no `references` foreign key links these tables"
         let rRowTyId := mkIdentFrom stx rightTbl.rowTypeConst; let (rTblSqlId, rAllColsT) ← liftM (mkTblSqlParts stx rightTbl)
-        let (lPredT, lSqlW, _, _) ← parseWhereArg lowerVal lowerValWithLocals dbInfo tbl rowTyId (findNamed "where")
-        let (rPredT, rSqlW, _, _) ← parseWhereArg lowerVal lowerValWithLocals dbInfo rightTbl rRowTyId (findNamed "rightWhere")
+        let (lPredT, lSqlW, _, _) ← parseWhereArg lowerValWithLocals dbInfo tbl rowTyId (findNamed "where")
+        let (rPredT, rSqlW, _, _) ← parseWhereArg lowerValWithLocals dbInfo rightTbl rRowTyId (findNamed "rightWhere")
         let (ordT, limT, offT) ← parseQueryWindow tbl lowerVal findNamed
         let qT ← `(Qed.Server.Db.SqlQuery.joinSelect $tblSqlId $rTblSqlId $allColsT $rAllColsT $(← liftM (mkSqlIdentTerm stx lCol)) $(← liftM (mkSqlIdentTerm stx rCol)) $lSqlW $rSqlW $ordT $limT $offT)
         let lPf ← mkDbProveTac #[rowInvId, readPolId] readPolKind opQual (mkReadPolHint tbl)
@@ -403,7 +431,7 @@ def lowerDbCall (lowerVal : Syntax → M Term) (lowerValWithLocals : Array Strin
             $readPolId $(tid rightTbl `ReadPolicy) $ctxId $lPf $rPf $txOptT $joinEncReadT), false)
 
       else if opName == "delete" then
-        let (predT, sqlW, _, isCross) ← parseWhereArg lowerVal lowerValWithLocals dbInfo tbl rowTyId whereArg? tbl.hasCrossDeletePolicy
+        let (predT, sqlW, _, isCross) ← parseWhereArg lowerValWithLocals dbInfo tbl rowTyId whereArg? tbl.hasCrossDeletePolicy
         let delPolId := tid tbl `DeletePolicy
         let delKind := s!"delete policy `{dbInfo.shortName}.{tbl.tableName}.delete`"
         let delHint := mkPolHint tbl.deletePolicyLabel "Check the `where = r => ...` clause against the table's `policy delete` / `policy write`." "Ensure `where = r => ...` implies"
@@ -486,7 +514,7 @@ def lowerDbCall (lowerVal : Syntax → M Term) (lowerValWithLocals : Array Strin
           let conflictColTs ← conflictCols.mapM fun cc => liftM (mkSqlIdentTerm stx cc.name)
           let updCols := tbl.columns.filter fun c => !c.isPrimaryKey && !c.isImmutable && !conflictNames.contains c.name
           let updColTs ← updCols.mapM fun c => liftM (mkSqlIdentTerm stx c.name)
-          let (conflictPredT, conflictSqlW, _, _) ← parseWhereArg lowerVal lowerValWithLocals dbInfo tbl rowTyId conflictWhereStx?
+          let (conflictPredT, conflictSqlW, _, _) ← parseWhereArg lowerValWithLocals dbInfo tbl rowTyId conflictWhereStx?
           let conflictSqlOptT ← if conflictWhereStx?.isSome then `(some $conflictSqlW) else `(none)
           let (updPolId, transInvId) := (tid tbl `UpdatePolicy, tid tbl `TransInv)
           let updHint := mkPolHint tbl.updatePolicyLabel "Ensure `where = r => ...` satisfies the table's `policy update` / `policy write`." "Ensure `where = r => ...` implies"
@@ -500,7 +528,7 @@ def lowerDbCall (lowerVal : Syntax → M Term) (lowerValWithLocals : Array Strin
 
       else if opName == "update" || opName == "updateOne" then
         let some setRaw := findNamed "set" | throwErrorAt stx s!"`{dbInfo.shortName}.{tbl.tableName}.{opName}` requires `set = r => \{ col = expr, ... }`"
-        let (predT, sqlW, whereInfo?, isCross) ← parseWhereArg lowerVal lowerValWithLocals dbInfo tbl rowTyId whereArg? tbl.hasCrossUpdatePolicy
+        let (predT, sqlW, whereInfo?, isCross) ← parseWhereArg lowerValWithLocals dbInfo tbl rowTyId whereArg? tbl.hasCrossUpdatePolicy
         let uSet := unwrapParens1 setRaw
         let (setRowVar, recStx) : Ident × Syntax ←
           if uSet.getKind == ``qedLam1 then let b := uSet.getArg 0; pure (if b.isIdent then ⟨b⟩ else mkIdent `_row, unwrapParens1 (uSet.getArg 2))
@@ -527,7 +555,7 @@ def lowerDbCall (lowerVal : Syntax → M Term) (lowerValWithLocals : Array Strin
             let deltaT ← wrapField (← lowerValWithLocals #[setRowName] valStx)
             let deltaSqlT ← if !stxMentionsVar setRowName valStx && !isBoolLitStx valStx then
                 mkTypedSqlParamTerm rowTyId fId (← wrapField (← lowerVal valStx))
-              else lowerRowSqlExpr lowerVal dbInfo #[(setRowName, tbl, tbl.tableName)] valStx
+              else lowerRowSqlExpr lowerValWithLocals dbInfo #[(setRowName, tbl, tbl.tableName)] valStx
             leanFIds := leanFIds.push fId
             if setOp == "+=" then
               leanFVals := leanFVals.push (← `(($setRowVar.$fId + $deltaT)))
@@ -544,7 +572,7 @@ def lowerDbCall (lowerVal : Syntax → M Term) (lowerValWithLocals : Array Strin
             leanFIds := leanFIds.push fId; leanFVals := leanFVals.push (← wrapField (← lowerValWithLocals #[setRowName] valStx))
             let sqlValT ← if !stxMentionsVar setRowName valStx && !isBoolLitStx valStx then
                 mkTypedSqlParamTerm rowTyId fId (← wrapField (← lowerVal valStx))
-              else lowerRowSqlExpr lowerVal dbInfo #[(setRowName, tbl, tbl.tableName)] valStx
+              else lowerRowSqlExpr lowerValWithLocals dbInfo #[(setRowName, tbl, tbl.tableName)] valStx
             sqlSetPairs := sqlSetPairs.push (← `(($colSqlId, $sqlValT)))
             if !stxMentionsVar setRowName valStx && !isCross then postChecks := postChecks.push (← `(($postRowVar.$fId == $(← wrapField (← lowerVal valStx)))))
         if !isCross then

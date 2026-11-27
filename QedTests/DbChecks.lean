@@ -23,11 +23,11 @@ database VaultDb:
     index (ownerId, version)
 
 def sameCompiledSql (q1 q2 : Qed.Server.Db.SqlQuery) : Bool := (q1.compile .postgres).1 == (q2.compile .postgres).1 && (q1.compile .sqlite).1 == (q2.compile .sqlite).1
-#guard
+example : (
   let pg := VaultDb.ddl .postgres; let mk (v : String) := Qed.Server.Db.SqlQuery.select ⟨"notes", by decide⟩ [⟨"id", by decide⟩] (.binOp .eq (.col ⟨"ownerId", by decide⟩) (.param (.text v)))
-  ["CREATE TABLE IF NOT EXISTS \"notes\"", "CHECK (1 <= LENGTH(\"body\") AND LENGTH(\"body\") <= 2000)"].all (pg.contains ·) &&
-  (VaultDb.ddl .sqlite).contains "CREATE INDEX IF NOT EXISTS \"idx_notes_0\" ON \"notes\" (\"ownerId\", \"version\")" &&
-  ["ENABLE ROW LEVEL SECURITY", "current_setting('qed.user_id', true)"].all (VaultDb.rlsDdl.contains ·) && sameCompiledSql (mk "alice") (mk "' OR 1=1; DROP TABLE notes; --")
+  ["CREATE TABLE IF NOT EXISTS \"notes\"", "CHECK (1 <= LENGTH(\"body\") AND LENGTH(\"body\") <= 2000)"].all (Qed.Str.contains pg ·) &&
+  Qed.Str.contains (VaultDb.ddl .sqlite) "CREATE INDEX IF NOT EXISTS \"idx_notes_0\" ON \"notes\" (\"ownerId\", \"version\")" &&
+  ["ENABLE ROW LEVEL SECURITY", "current_setting('qed.user_id', true)"].all (Qed.Str.contains VaultDb.rlsDdl ·) && sameCompiledSql (mk "alice") (mk "' OR 1=1; DROP TABLE notes; --")) = true := by decide +kernel
 server VaultApi:
   use db : VaultDb
   rpc listBooks() -> VaultDb.books[]!: return await db.books.select(orderBy = "id")?
@@ -169,7 +169,7 @@ def mkMigrationFixture (tblName : Qed.Server.Db.SqlIdent) (extraV1Cols : List Qe
   ({ name := tblName, columns := baseCols, indexes := [] },
    { name := tblName, indexes := [[⟨"views", by decide⟩]], columns := baseCols ++ [{ name := ⟨"notes", by decide⟩, colType := .text, nullable := true }, { name := ⟨"views", by decide⟩, colType := .int, nullable := false, checkSql? := some "\"views\" >= 0" }] },
    { name := unsafeColName, colType := .text, nullable := false, checkSql? := some s!"LENGTH(\"{unsafeColName.raw}\") >= 4" })
-#guard
+example : (
   let mk (p1 p2 i1 i2 : String) := Qed.Server.Db.SqlQuery.select ⟨"items", by decide⟩ [⟨"id", by decide⟩]
     (.binOp .and (.startsWith (.col ⟨"title", by decide⟩) (.param (.text p1))) (.binOp .and (.contains (.col ⟨"title", by decide⟩) (.param (.text p2))) (.inList (.col ⟨"id", by decide⟩) [.text i1, .text i2])))
     (limit := some 10) (offset := some 5)
@@ -177,9 +177,9 @@ def mkMigrationFixture (tblName : Qed.Server.Db.SqlIdent) (extraV1Cols : List Qe
   let (pgDdl, sqDdl) := (Qed.Server.Db.renderMigrationDdl .postgres steps, Qed.Server.Db.renderMigrationDdl .sqlite steps)
   sameCompiledSql (mk "Rust" "Lean" "a" "b") (mk "'; DROP TABLE items; --" "%' OR 1=1 --" "'; DELETE FROM items;" "x") &&
   steps.length == 3 && (Qed.Server.Db.verifyMigrationSafe steps).isOk &&
-  ["ADD COLUMN IF NOT EXISTS \"notes\" TEXT", "ADD COLUMN IF NOT EXISTS \"views\" BIGINT NOT NULL DEFAULT 0"].all (pgDdl.contains ·) &&
-  ["ADD COLUMN \"views\" INTEGER NOT NULL DEFAULT 0", "CREATE INDEX IF NOT EXISTS \"idx_items_0\""].all (sqDdl.contains ·) &&
-  (Qed.Server.Db.diffTableSchemas [newTbl] [newTbl]).isEmpty && !(Qed.Server.Db.verifyMigrationSafe [.addColumn ⟨"items", by decide⟩ unsafeCol none]).isOk
+  ["ADD COLUMN IF NOT EXISTS \"notes\" TEXT", "ADD COLUMN IF NOT EXISTS \"views\" BIGINT NOT NULL DEFAULT 0"].all (Qed.Str.contains pgDdl ·) &&
+  ["ADD COLUMN \"views\" INTEGER NOT NULL DEFAULT 0", "CREATE INDEX IF NOT EXISTS \"idx_items_0\""].all (Qed.Str.contains sqDdl ·) &&
+  (Qed.Server.Db.diffTableSchemas [newTbl] [newTbl]).isEmpty && !(Qed.Server.Db.verifyMigrationSafe [.addColumn ⟨"items", by decide⟩ unsafeCol none]).isOk) = true := by decide +kernel
 server ShopApi:
   use db : ShopDb
   state txOps : Nat = 0
@@ -286,13 +286,13 @@ def widerCipherMap : Mapping (fun _ : SecretNoteInput => True) (fun s : String =
     encode_ok := fun d hd => have h := sealedNoteMap.encode_ok d hd; by omega
     decode_ok := sealedNoteMap.decode_ok, roundtrip := sealedNoteMap.roundtrip }
 
-#guard
+example : (
   match SecretNoteInput.parse { body := "hello" } with
   | none => false
   | some sample =>
     let ct := sealedNoteMap.encode sample
     40 <= ct.val.length && ct.val.length <= 304 &&
-    (match sealedNoteMap.toSource ct.val with | .ok d => d.body.val == "hello" | .error _ => false)
+    (match sealedNoteMap.toSource ct.val with | .ok d => d.body.val == "hello" | .error _ => false)) = true := by decide +kernel
 
 server CipherApi:
   use db : CipherDb
@@ -331,12 +331,12 @@ mapping DollarsToCentsMap:
     if c % 100 == 0: return c / 100
     fail("must be whole dollars")
 
-#guard
+example : (
   let cents := DollarsToCentsMap.encode ⟨25, by decide⟩
   cents.val == 2500 &&
   (match DollarsToCentsMap.decode cents.val with | .ok d => d.val == 25 | .error _ => false) &&
   (match DollarsToCentsMap.decode 2550 with | .error msg => msg == "must be whole dollars" | .ok _ => false) &&
-  (match DollarsToCentsMap.decode 1000100 with | .error _ => true | .ok _ => false)
+  (match DollarsToCentsMap.decode 1000100 with | .error _ => true | .ok _ => false)) = true := by decide +kernel
 
 structure TestAeadSpec where
   sealBytes   : ByteArray → ByteArray
@@ -379,13 +379,13 @@ database EncVaultDb:
     raw     : encrypted(Bytes,  key = secret("QED_TEST_ENC_KEY") ?? "qed-test-enc-key")?
     policy read, write requires some(row.ownerId) == ctx.userId
 
-#guard
+example : (
   let pg := EncVaultDb.ddl .postgres
-  pg.contains "\"body\" TEXT NOT NULL CHECK (40 <= LENGTH(\"body\") AND LENGTH(\"body\") <= 304)" &&
-  pg.contains "\"note\" TEXT NOT NULL CHECK (40 <= LENGTH(\"note\") AND LENGTH(\"note\") <= 1104)" &&
-  pg.contains "\"raw\" TEXT CHECK (40 <= LENGTH(\"raw\"))" &&
+  Qed.Str.contains pg "\"body\" TEXT NOT NULL CHECK (40 <= LENGTH(\"body\") AND LENGTH(\"body\") <= 304)" &&
+  Qed.Str.contains pg "\"note\" TEXT NOT NULL CHECK (40 <= LENGTH(\"note\") AND LENGTH(\"note\") <= 1104)" &&
+  Qed.Str.contains pg "\"raw\" TEXT CHECK (40 <= LENGTH(\"raw\"))" &&
   EncSecretDb.secrets.contains "QED_REQUIRED_ENC_KEY" &&
-  !(EncVaultDb.secrets.contains "QED_TEST_ENC_KEY")
+  !(EncVaultDb.secrets.contains "QED_TEST_ENC_KEY")) = true := by decide +kernel
 
 server EncVaultApi:
   use db : EncVaultDb
@@ -443,13 +443,13 @@ database TierCheckDb:
       minInstances <= maxInstances,
       (plan == "pro" or plan == "enterprise") or (minInstances == 0 and maxInstances <= 1)
 
-#guard
+example : (
   let pg := TierCheckDb.ddl .postgres
   let chk := Qed.Server.Db.renderDatabaseCheckDdl TierCheckDb.config.tables
-  pg.contains "CONSTRAINT \"qed_chk_scaling_0\" CHECK (\"minInstances\" <= \"maxInstances\")" &&
-  pg.contains "CONSTRAINT \"qed_chk_scaling_1\" CHECK ((((\"plan\" = 'pro' OR \"plan\" = 'enterprise')) OR ((\"minInstances\" = 0 AND \"maxInstances\" <= 1))))" &&
-  chk.contains "ADD CONSTRAINT \"qed_chk_scaling_1\" CHECK" &&
-  chk.contains "NOT VALID"
+  Qed.Str.contains pg "CONSTRAINT \"qed_chk_scaling_0\" CHECK (\"minInstances\" <= \"maxInstances\")" &&
+  Qed.Str.contains pg "CONSTRAINT \"qed_chk_scaling_1\" CHECK ((((\"plan\" = 'pro' OR \"plan\" = 'enterprise')) OR ((\"minInstances\" = 0 AND \"maxInstances\" <= 1))))" &&
+  Qed.Str.contains chk "ADD CONSTRAINT \"qed_chk_scaling_1\" CHECK" &&
+  Qed.Str.contains chk "NOT VALID") = true := by decide +kernel
 
 bad_db "Database table constraint `TierCheckDb.scaling.RowInv` failed in `badFreeWarm → TierCheckDb.scaling.insert`" TierCheckDb :
   rpc badFreeWarm(appId: String) -> TierCheckDb.scaling!:
@@ -491,23 +491,23 @@ database RoadmapDb:
     altPort : ServicePort?
   backfill projects set { note = "migrated" } where r => r.note == none
 
-#guard
+example : (
   let pg := RoadmapDb.ddl .postgres
   let sq := RoadmapDb.ddl .sqlite
   let d? := Date.mk? 2026 11 25
-  pg.contains "ON DELETE CASCADE" &&
-  pg.contains "ON DELETE SET NULL" &&
-  pg.contains "ON DELETE RESTRICT" &&
-  pg.contains "CHECK (\"stage\" IN ('queued', 'in-progress', 'live', 'failed'))" &&
-  pg.contains "\"slug\" TEXT NOT NULL PRIMARY KEY" &&
-  pg.contains "\"port\" BIGINT NOT NULL CHECK (\"port\" >= 0)" &&
-  pg.contains "\"altPort\" BIGINT" &&
-  sq.contains "\"port\" INTEGER NOT NULL CHECK (\"port\" >= 0)" &&
-  sq.contains "ON DELETE CASCADE" &&
+  Qed.Str.contains pg "ON DELETE CASCADE" &&
+  Qed.Str.contains pg "ON DELETE SET NULL" &&
+  Qed.Str.contains pg "ON DELETE RESTRICT" &&
+  Qed.Str.contains pg "CHECK (\"stage\" IN ('queued', 'in-progress', 'live', 'failed'))" &&
+  Qed.Str.contains pg "\"slug\" TEXT NOT NULL PRIMARY KEY" &&
+  Qed.Str.contains pg "\"port\" BIGINT NOT NULL CHECK (\"port\" >= 0)" &&
+  Qed.Str.contains pg "\"altPort\" BIGINT" &&
+  Qed.Str.contains sq "\"port\" INTEGER NOT NULL CHECK (\"port\" >= 0)" &&
+  Qed.Str.contains sq "ON DELETE CASCADE" &&
   (match d?.map fun d => Qed.Server.Db.FromSql.fromSql (α := Date) (Qed.Server.Db.ToSql.toSql d) with
    | some (.ok d') => some d' == d? | _ => false) &&
   RoadmapDb.config.backfills.length == 1 &&
-  (RoadmapDb.config.backfills[0]?.map fun q => (q.compile .postgres).1.contains "UPDATE \"projects\" SET \"note\" = $1 WHERE (\"note\" IS NULL)") == some true
+  (RoadmapDb.config.backfills[0]?.map fun q => Qed.Str.contains (q.compile .postgres).1 "UPDATE \"projects\" SET \"note\" = $1 WHERE (\"note\" IS NULL)") == some true) = true := by decide +kernel
 
 server RoadmapApi:
   use db : RoadmapDb
@@ -539,15 +539,15 @@ server RoadmapApi:
 example : RoadmapDb.Client := RoadmapDb.client
 
 -- Verify `sql!"..."` macro, fail-closed `SqlQuery.select` on empty columns, and explicit `.selectAll`.
-#guard
+example : (
   let tbl := sql!"projects"
   let col := sql!"owner_id"
   let emptySel := (Qed.Server.Db.SqlQuery.select tbl [] .litTrue).compile .postgres
   let explicitAll := (Qed.Server.Db.SqlQuery.selectAll tbl .litTrue).compile .postgres
   let insIgn := (Qed.Server.Db.SqlQuery.insertOrIgnore tbl [(col, .text "a")] [] [col]).compile .postgres
-  !emptySel.1.contains "*" && emptySel.1.contains "0 = 1" &&
+  !Qed.Str.contains emptySel.1 "*" && Qed.Str.contains emptySel.1 "0 = 1" &&
   explicitAll.1 == "SELECT * FROM \"projects\" WHERE TRUE" &&
-  insIgn.1 == "INSERT INTO \"projects\" (\"owner_id\") VALUES ($1) ON CONFLICT DO NOTHING RETURNING \"owner_id\""
+  insIgn.1 == "INSERT INTO \"projects\" (\"owner_id\") VALUES ($1) ON CONFLICT DO NOTHING RETURNING \"owner_id\"") = true := by decide +kernel
 
 bad_db "Nat non-underflow for `books.stock -= ...`" VaultDb :
   rpc badAtomicDec(bookId: String, qty: Nat) -> VaultDb.books?!:
@@ -579,13 +579,13 @@ database RotatingVaultDb:
     secret  : encrypted(String, key = secret("VAULT_PRIMARY_KEY"), prevKeys = [secret("VAULT_PREV_KEY"), secret("VAULT_LEGACY_KEY")]) where 1 <= secret.length <= 512
     policy read, write requires some(row.ownerId) == ctx.userId
 
-#guard
+example : (
   -- `prevKeys` are optional rotation fallbacks and MUST NOT be required at boot in `.secrets`.
   RotatingVaultDb.secrets == #["VAULT_PRIMARY_KEY"] &&
   RotatingVaultDb.entries.metaColNames == ["id", "ownerId", "label"] &&
   (let m : RotatingVaultDb.entries.Meta := { id := 7, ownerId := "u1", label := "api-key" }
    (match Qed.fromJson (α := RotatingVaultDb.entries.Meta) (Qed.toJson m) with | .ok m' => m' == m | _ => false) &&
-   (match Qed.Proto.decode (α := RotatingVaultDb.entries.Meta) (Qed.Proto.encode m) with | .ok m' => m' == m | _ => false))
+   (match Qed.Proto.decode (α := RotatingVaultDb.entries.Meta) (Qed.Proto.encode m) with | .ok m' => m' == m | _ => false))) = true := by decide +kernel
 
 server RotatingVaultApi:
   use db : RotatingVaultDb
@@ -652,12 +652,11 @@ database MultiTenantDb:
     userId : String immutable where 1 <= userId.length <= 128
     policy read, write requires ctx.userId != none
 
-#guard
-  let rls := MultiTenantDb.rlsDdl
-  rls.contains "EXISTS (SELECT 1 FROM \"app_members\" AS \"m\" WHERE" &&
-  rls.contains "\"apps\".\"id\"" &&
-  rls.contains "EXISTS (SELECT 1 FROM \"org_members\" AS \"om\" WHERE" &&
-  rls.contains "\"m\".\"role\" IN ('owner', 'admin')"
+example : strHasAll MultiTenantDb.rlsDdl [
+  "EXISTS (SELECT 1 FROM \"app_members\" AS \"m\" WHERE",
+  "\"apps\".\"id\"",
+  "EXISTS (SELECT 1 FROM \"org_members\" AS \"om\" WHERE",
+  "\"m\".\"role\" IN ('owner', 'admin')"] = true := by decide +kernel
 
 server MultiTenantApi:
   use db : MultiTenantDb
@@ -726,5 +725,233 @@ database BadCrossEncDb:
   table secrets:
     id  : String primary_key
     val : encrypted(String, key = secret("K"))
+
+/-! ## Item 5: Database `example`, `rejects`, `transition_example`, `transition_rejects`, `policy_allows`, `policy_denies` -/
+
+database VerifiedExamplesDb:
+  sqlite ".qed/verified_examples_checks.db"
+  table orders:
+    id       : String primary_key immutable where 1 <= id.length <= 64
+    ownerId  : String immutable where 1 <= ownerId.length <= 64
+    status   : String where status in ["draft", "paid", "shipped", "cancelled"]
+    amount   : Nat where amount <= 100000
+    invariant paidPositive: status != "paid" or amount > 0
+    invariant lifecycle: transition status: "draft" -> "paid" -> "shipped", "draft" -> "cancelled"
+    policy read requires some(ownerId) == ctx.userId or ctx.claim("role") == some("admin") or (any s in shares: s.orderId == row.id and some(s.userId) == ctx.userId)
+    policy write requires some(ownerId) == ctx.userId
+    example draftOrder: id = "ord-1", ownerId = "u1", status = "draft", amount = 0
+    example paidOrder from draftOrder: status = "paid", amount = 2500
+    rejects zeroPaid from draftOrder: status = "paid", amount = 0
+    rejects badStatus from draftOrder: status = "refunded"
+    rejects overLimit from draftOrder: amount = 200000
+    transition_example draftToPaid: draftOrder -> status = "paid", amount = 100
+    transition_example draftToCancelled: draftOrder -> status = "cancelled"
+    transition_rejects paidBackToDraft: paidOrder -> status = "draft"
+    transition_rejects draftSkipToShipped: draftOrder -> status = "shipped"
+    policy_allows read ownerCanRead:
+      user = "u1"
+      row = draftOrder
+    policy_allows read adminCanRead:
+      user = "u2"
+      role = "admin"
+      row = draftOrder
+    policy_allows read sharedCanRead:
+      user = "u3"
+      row = draftOrder
+      snap shares = [VerifiedExamplesDb.shares.mk("s1", "ord-1", "u3")]
+    policy_denies read strangerDenied:
+      user = "u9"
+      row = draftOrder
+    policy_denies write nonOwnerDenied:
+      user = "u2"
+      role = "admin"
+      row = draftOrder
+  table shares:
+    id      : String primary_key immutable where 1 <= id.length <= 64
+    orderId : String immutable references orders(id) on_delete cascade
+    userId  : String immutable where 1 <= userId.length <= 64
+    policy read, write requires ctx.userId != none
+
+expect_err "Database `example badRow`" in
+database BadDbExample:
+  sqlite ".qed/bad_db_ex.db"
+  table items:
+    id : String primary_key where 1 <= id.length <= 16
+    example badRow: id = ""
+
+expect_err "Database `rejects badReject`" in
+database BadDbRejects:
+  sqlite ".qed/bad_db_rej.db"
+  table items:
+    id : String primary_key where 1 <= id.length <= 16
+    rejects badReject: id = "ok"
+
+expect_err "Database `transition_example badStep`" in
+database BadDbTransEx:
+  sqlite ".qed/bad_db_tex.db"
+  table jobs:
+    id : String primary_key where 1 <= id.length <= 16
+    status : String where status in ["queued", "done"]
+    invariant flow: transition status: "queued" -> "done"
+    example doneJob: id = "j1", status = "done"
+    transition_example badStep: doneJob -> status = "queued"
+
+expect_err "Database `transition_rejects badRejStep`" in
+database BadDbTransRej:
+  sqlite ".qed/bad_db_trej.db"
+  table jobs:
+    id : String primary_key where 1 <= id.length <= 16
+    status : String where status in ["queued", "done"]
+    invariant flow: transition status: "queued" -> "done"
+    example queuedJob: id = "j1", status = "queued"
+    transition_rejects badRejStep: queuedJob -> status = "done"
+
+expect_err "Database `policy_allows read badAllow`" in
+database BadDbPolAllow:
+  sqlite ".qed/bad_db_pallow.db"
+  table docs:
+    id : String primary_key where 1 <= id.length <= 16
+    ownerId : String where 1 <= ownerId.length <= 16
+    policy read requires some(ownerId) == ctx.userId
+    example d1: id = "d1", ownerId = "alice"
+    policy_allows read badAllow:
+      user = "bob"
+      row = d1
+
+expect_err "Database `policy_denies read badDeny`" in
+database BadDbPolDeny:
+  sqlite ".qed/bad_db_pdeny.db"
+  table docs:
+    id : String primary_key where 1 <= id.length <= 16
+    ownerId : String where 1 <= ownerId.length <= 16
+    policy read requires some(ownerId) == ctx.userId
+    example d1: id = "d1", ownerId = "alice"
+    policy_denies read badDeny:
+      user = "alice"
+      row = d1
+
+/-! ## Transactional, System-Scoped, and Conditional-Where DB Upgrades -/
+
+database SysTxDb:
+  sqlite ".qed/sys_tx_checks.db"
+  table leases:
+    id      : String primary_key where 1 <= id.length <= 32
+    ownerId : String immutable   where 1 <= ownerId.length <= 32
+    status  : String             where status in ["open", "claimed", "done"]
+    retries : Nat                where retries <= 10
+    policy read, write requires ctx.isSystem or some(row.ownerId) == ctx.userId
+    invariant leaseFlow: transition row.status: "open" -> "claimed" -> "done"
+    invariant retriesMono: row.retries >= old(row.retries)
+    example openLease: id = "l1", ownerId = "alice", status = "open", retries = 0
+    policy_allows read sysCanReadAny:
+      system = true
+      row = openLease
+    policy_allows read ownerCanRead:
+      user = "alice"
+      row = openLease
+    policy_denies read otherCannotRead:
+      user = "bob"
+      row = openLease
+    policy_denies write anonCannotWrite:
+      row = openLease
+
+server stateless SysTxSrv:
+  use db : SysTxDb
+
+  fn claimInsideTx(tx: db.Tx, leaseId: String, uid: String) -> SysTxDb.leases?!:
+    requires some(uid) == ctx.userId
+    return await tx.leases.updateOne(
+      where = r => r.id == leaseId and r.ownerId == uid and r.status == "open" and r.retries < 10,
+      set = r => { status = "claimed", retries = r.retries + 1 })?
+
+  rpc claimMyLease(leaseId: String) -> SysTxDb.leases?!:
+    requires auth
+    db.transaction as tx:
+      return await claimInsideTx(tx, leaseId, uid)?
+
+  system fn claimAnyOpen(leaseId: String) -> SysTxDb.leases?!:
+    db.transaction as tx:
+      return await tx.leases.updateOne(
+        where = r => r.id == leaseId and r.status == "open" and r.retries < 10,
+        set = r => { status = "claimed", retries = r.retries + 1 })?
+
+  system fn bulkClaimOpen(onlyId: String?) -> SysTxDb.leases[]!:
+    return await db.leases.update(
+      where = r =>
+        if let some(lid) = onlyId:
+          r.id == lid and r.status == "open" and r.retries < 10
+        else:
+          r.status == "open" and r.retries < 10,
+      set = r => { status = "claimed", retries = r.retries + 1 })?
+
+  read_only rpc listMyLeases(onlyOpen: Bool, filterId: String?) -> SysTxDb.leases[]!:
+    requires auth
+    return await db.leases.select(
+      where = r =>
+        if onlyOpen:
+          (r.id == filterId.getD("") if filterId != none else true) and r.ownerId == uid and r.status == "open"
+        else:
+          r.ownerId == uid)?
+
+  read_only system fn countAllLeases(onlyOpen: Bool) -> Nat!:
+    return await db.leases.count(
+      where = r => (r.status == "open" if onlyOpen else true))?
+
+  example systemCanCount:
+    with db db.leases = [{ id = "l1", ownerId = "alice", status = "open", retries = 0 }, { id = "l2", ownerId = "bob", status = "done", retries = 1 }]
+    call countAllLeases(true)
+    expect ok(1)
+
+  example ownerConditionalSelect:
+    with user "alice"
+    with db db.leases = [{ id = "l1", ownerId = "alice", status = "open", retries = 0 }, { id = "l2", ownerId = "alice", status = "done", retries = 1 }]
+    call listMyLeases(true, none)
+    expect ok([{ id = "l1", ownerId = "alice", status = "open", retries = 0 }])
+
+expect_err "Database `policy_allows read badSysAllow`" in
+database BadSysPolAllow:
+  sqlite ".qed/bad_sys_pallow.db"
+  table leases:
+    id      : String primary_key where 1 <= id.length <= 32
+    ownerId : String             where 1 <= ownerId.length <= 32
+    policy read requires ctx.isSystem or some(ownerId) == ctx.userId
+    example l1: id = "l1", ownerId = "alice"
+    policy_allows read badSysAllow:
+      user = "bob"
+      row = l1
+
+expect_err "Database read policy `SysTxDb.leases.read` failed in `sneakyReadAll → SysTxDb.leases.select`" in
+server stateless BadNonSysRead:
+  use db : SysTxDb
+  rpc sneakyReadAll() -> SysTxDb.leases[]!:
+    return await db.leases.select()?
+
+expect_err "Database read policy `SysTxDb.leases.read` failed in `leakySelect → SysTxDb.leases.select`" in
+server stateless BadCondWhereRls:
+  use db : SysTxDb
+  read_only rpc leakySelect(onlyOpen: Bool) -> SysTxDb.leases[]!:
+    requires auth
+    return await db.leases.select(
+      where = r =>
+        if onlyOpen:
+          r.ownerId == uid and r.status == "open"
+        else:
+          r.status == "done")?
+
+expect_err "Database update policy `SysTxDb.leases.update` failed in `badTxUpdate → SysTxDb.leases.updateOne`" in
+service BadTxPolicyHelper:
+  use db : SysTxDb
+  fn badTxUpdate(tx: db.Tx, leaseId: String) -> SysTxDb.leases?!:
+    return await tx.leases.updateOne(
+      where = r => r.id == leaseId and r.status == "open" and r.retries < 10,
+      set = r => { status = "claimed" })?
+
+expect_err "Database transition/monotonicity invariant `SysTxDb.leases.TransInv` failed in `invalidReopen → SysTxDb.leases.updateOne`" in
+service BadTxTransInv:
+  use db : SysTxDb
+  system fn invalidReopen(leaseId: String) -> SysTxDb.leases?!:
+    return await db.leases.updateOne(
+      where = r => r.id == leaseId and r.status == "done",
+      set = r => { status = "open" })?
 
 end DbChecks

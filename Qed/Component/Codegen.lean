@@ -90,8 +90,18 @@ def elabStructsAndResolveTypes (spec : ComponentSpec) (hoisted : Array HoistedSu
     (formDrafts : Array FieldDecl) (resetForms : Array ResetFormSub) : CommandElabM ComponentSpec := do
   if spec.outTy?.isSome then
     let evCtors ← spec.events.mapM fun ev => mkCtor ev.id.getId ev.params
-    let bdCtors ← spec.binds.mapM fun bd => do mkCtor (bindSetName bd.id.getId) #[(mkIdent `v, ← resolveBindTy bd)]
-    elabCommand (← `(command| inductive $(spec.id `Out) where $[$(evCtors ++ bdCtors):ctor]*))
+    let bdTys ← spec.binds.mapM resolveBindTy
+    let bdCtors ← (spec.binds.zip bdTys).mapM fun (bd, ty) => mkCtor (bindSetName bd.id.getId) #[(mkIdent `v, ty)]
+    let outParamTys := spec.events.flatMap (·.params.map (·.2)) ++ bdTys
+    let allDecEq ← liftTermElabM do
+      for tyT in outParamTys do
+        let ty ← try Term.elabType tyT.raw catch _ => return false
+        if !((← Meta.trySynthInstance (← Meta.mkAppM ``DecidableEq #[ty])) matches .some _) then return false
+      return true
+    if allDecEq then
+      elabCommand (← `(command| inductive $(spec.id `Out) where $[$(evCtors ++ bdCtors):ctor]* deriving DecidableEq))
+    else
+      elabCommand (← `(command| inductive $(spec.id `Out) where $[$(evCtors ++ bdCtors):ctor]*))
   let allProps := spec.props ++ spec.binds
   let extraSession : Array FieldDecl ←
     if spec.sessionField?.isNone && hoisted.any (·.info.hasSession) then

@@ -204,7 +204,7 @@ private def findAfterScheme : List Char → Option (List Char)
 
 private def extractUrlHost (raw : String) : String :=
   let low := (((raw.toList.dropWhile (·.toNat ≤ 32)).reverse.dropWhile (·.toNat ≤ 32)).reverse).map asciiToLower
-  let auth := ((findAfterScheme low).getD low).takeWhile fun c => !("/?#\\".contains c)
+  let auth := ((findAfterScheme low).getD low).takeWhile fun c => c != '/' && c != '?' && c != '#' && c != '\\'
   let hostChars := match (splitCharAux '@' auth []).getLast?.getD [] with
     | '[' :: rest => if rest.contains ']' then (rest.takeWhile (· != ']')).takeWhile (· != '%') else []
     | cs => cs.takeWhile (· != ':')
@@ -243,7 +243,7 @@ private def isLoopbackIpv6 (host : String) : Bool :=
 def isLocalhostUrl (s : String) : Bool :=
   let host := extractUrlHost s
   if host.isEmpty then false
-  else if host == "localhost" || (host.endsWith ".localhost" && !host.startsWith ".") then true
+  else if host == "localhost" || (let hcs := host.toList; hcs.head? != some '.' && hcs.length > 10 && hcs.drop (hcs.length - 10) == ".localhost".toList) then true
   else match parseIpv4UInt32 host with | some ip => isLoopbackIpv4 ip | none => isLoopbackIpv6 host
 
 def isStrictLoopbackUrl (u : String) : Bool :=

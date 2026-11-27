@@ -103,11 +103,11 @@ example (bs : ByteArray) : Qed.Base64.decode (Qed.Base64.encode bs) = .ok bs ∧
     (Qed.Base64.encode bs).length = Qed.Base64.encodedLength bs.size ∧
     (Qed.Base64.encodeUrl bs).length = Qed.Base64.encodedUrlLength bs.size :=
   ⟨Qed.Base64.decode_encode bs, Qed.Base64.encode_length bs, Qed.Base64.encodeUrl_length bs⟩
-#guard Qed.Base64.encode (ByteArray.mk #[]) == "" && Qed.Base64.encode (ByteArray.mk #[0, 1, 2, 255]) == "AAEC/w==" &&
+example : (Qed.Base64.encode (ByteArray.mk #[]) == "" && Qed.Base64.encode (ByteArray.mk #[0, 1, 2, 255]) == "AAEC/w==" &&
   (match Qed.FileBytes.decode "{\"name\":\"pic.png\",\"mime\":\"image/png\",\"size\":4,\"base64\":\"AAEC/w==\"}" with
    | .ok fb => (fb.name, fb.mime, fb.size, fb.bytes.data) == ("pic.png", "image/png", 4, #[0, 1, 2, 255]) | .error _ => false) &&
   (match Qed.FileBytes.decode "{\"error\":\"file too large\"}" with | .error "file too large" => true | _ => false) &&
-  (match Qed.Cmd.pickFileBytes (msg := Unit) "image/*" 4096 (fun _ => ()) with | .fxResult "file.pickBytes" "image/*" "4096" _ => true | _ => false)
+  (match Qed.Cmd.pickFileBytes (msg := Unit) "image/*" 4096 (fun _ => ()) with | .fxResult "file.pickBytes" "image/*" "4096" _ => true | _ => false)) = true := by decide +kernel
 
 /-! ## 4. Verified Scheduled / Background Server Jobs -/
 external HealthPing:
@@ -142,9 +142,9 @@ bad_srv_st "cannot use `await` inside an `atomic` block" BadAwaitInAtomicJob cou
 example : Qed.LawfulJson (Qed.Dict String Nat) × Qed.LawfulJson (Qed.Dict Nat String) ×
     Qed.LawfulProto (Qed.Dict String Nat) × Qed.LawfulProto (Qed.Dict Nat (Array String)) :=
   (inferInstance, inferInstance, inferInstance, inferInstance)
-#guard let d : Qed.Dict String Nat := Qed.Dict.ofList [("alice", 10), ("bob", 20)]
+example : (let d : Qed.Dict String Nat := Qed.Dict.ofList [("alice", 10), ("bob", 20)]
   Qed.Json.render (Qed.toJson d) == "{\"alice\":10,\"bob\":20}" &&
-  (match Qed.Proto.decode (α := Qed.Dict String Nat) (Qed.Proto.encode d) with | .ok d' => d' == d | .error _ => false)
+  (match Qed.Proto.decode (α := Qed.Dict String Nat) (Qed.Proto.encode d) with | .ok d' => d' == d | .error _ => false)) = true := by decide +kernel
 component Scoreboard:
   state scores : {String: Nat}
   state preset = {"alice": 10, "bob": 20}
@@ -242,7 +242,7 @@ component HoistedEmitter:
   action hide: showPane = false
   view: <div>{<HoistedPane key="p" title="P"/> if showPane else <span/>}</div>
 
-#guard
+example : (
   let (s0, _) := HoistedDashboard.update HoistedDashboard.init (._onSession (some "alice"))
   let (s1, c1) := HoistedDashboard.update s0 (._sub_0 .tick)
   let (s2, c2) := HoistedDashboard.update s1 (.setTab .t1)
@@ -254,6 +254,112 @@ component HoistedEmitter:
   s2._sub_0.ticks == 0 && s2._sub_1.user == some "alice" && hasStart c2 &&
   s3.lastPick == "b" &&
   (match eo1 with | some (.done true) => true | _ => false) &&
-  eo2.isNone && e2.showPane == false
+  eo2.isNone && e2.showPane == false) = true := by decide +kernel
+
+/-! ## 7. Upgraded Component `example` Blocks (`with props`, `from`, `emits`, Async `on Server.rpc => ...`) -/
+
+component PropsAndEmitsCard:
+  prop step : Nat = 1
+  prop maxVal : Nat = 10
+  event changed(next: Nat)
+  state count : Nat = 0
+  invariant bounded: count <= maxVal
+  action inc:
+    if count + step <= maxVal:
+      count += step
+      changed.emit(count)
+  action reset:
+    count = 0
+    changed.emit(0)
+  example defaultProps: .inc, .inc -> count == 2
+  example customPropsAndEmits with props { step = 3, maxVal = 10 } from { count = 1 }:
+    .inc, .inc -> count == 7 emits .changed(7)
+  example parametricProp(s: Nat, m: Nat) with props { step = s, maxVal = m }:
+    .reset -> count == 0 emits .changed(0)
+  view: <button onClick={.inc}>{count}</button>
+
+server stateless LaunchRpcSrv:
+  rpc trigger(appId: String) -> String!:
+    requires auth
+    if appId == "full":
+      return fail(.quota, "limit reached")
+    if appId == "deny":
+      return fail(.forbidden)
+    return f"rel-{appId}"
+
+component AsyncLaunchPanel:
+  prop appId : String
+  session user
+  event launched(relId: String)
+  state busy : Bool = false
+  state lastRel : String = ""
+  state errMsg : String = ""
+  action start:
+    if user != none:
+      busy = true
+      errMsg = ""
+      let rel = await LaunchRpcSrv.trigger(appId) catch:
+        case .quota(msg):
+          busy = false
+          errMsg = f"quota:{msg}"
+        case .forbidden:
+          busy = false
+          errMsg = "forbidden"
+        case .failed(msg):
+          busy = false
+          errMsg = msg
+      busy = false
+      lastRel = rel
+      launched.emit(rel)
+  example happyPath with props { appId = "web" } from { user = some("alice") }:
+    .start, on LaunchRpcSrv.trigger => ok("rel-web")
+    -> not busy and lastRel == "rel-web" and errMsg == ""
+    emits .launched("rel-web")
+  example quotaDomainError with props { appId = "full" } from { user = some("alice") }:
+    .start, on LaunchRpcSrv.trigger => err(.quota, "limit reached")
+    -> not busy and errMsg == "quota:limit reached"
+  example networkError with props { appId = "web" } from { user = some("alice") }:
+    .start, on LaunchRpcSrv.trigger => error("timeout")
+    -> not busy and errMsg == "timeout"
+  example unauthNoOp with props { appId = "web" }:
+    .start -> not busy and lastRel == ""
+  view: <section><button onClick={.start}>Launch</button><span>{lastRel}</span><span>{errMsg}</span></section>
+
+expect_err "Example `BadCompExEmits.badEmits` failed" in
+component BadCompExEmits:
+  prop step : Nat = 1
+  event changed(next: Nat)
+  state count : Nat = 0
+  action inc:
+    count += step
+    changed.emit(count)
+  example badEmits with props { step = 2 }:
+    .inc -> count == 2 emits .changed(99)
+  view: <span>{count}</span>
+
+expect_err "`on ... => ...` in `example danglingReply` requires component `BadCompExNoAsync` to have `await` / async effects" in
+component BadCompExNoAsync:
+  prop appId : String
+  session user
+  state busy : Bool = false
+  action noop: pass
+  example danglingReply with props { appId = "web" }:
+    .noop, on LaunchRpcSrv.trigger => ok("rel-web") -> not busy
+  view: <span>{appId}</span>
+
+expect_err "Example `BadCompExUnmatchedRpc.danglingReply` failed" in
+component BadCompExUnmatchedRpc:
+  prop appId : String
+  session user
+  state busy : Bool = false
+  action noop: pass
+  action start:
+    if user != none:
+      let _ = await LaunchRpcSrv.trigger(appId) catch:
+        case _: pass
+      busy = false
+  example danglingReply with props { appId = "web" }:
+    .noop, on LaunchRpcSrv.trigger => ok("rel-web") -> not busy
+  view: <span>{appId}</span>
 
 end VerificationChecks

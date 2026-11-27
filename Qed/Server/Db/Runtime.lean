@@ -91,7 +91,7 @@ private def dbDecryptVal (spec : EncColSpec) : SqlVal → m (Except ApiError Sql
           MonadServer.aeadDecrypt spec.keyEnv spec.fallback? spec.aad raw >>= fun
             | .ok pt => pure (finishDecryptVal spec.isBytes (.ok pt))
             | .error err =>
-                if spec.prevKeys.isEmpty || err.message.startsWith "missing required encryption key" then
+                if spec.prevKeys.isEmpty || Qed.Str.containsBytes err.message "missing required encryption key" then
                   pure (.error err)
                 else finishDecryptVal spec.isBytes <$> dbDecryptTryPrev spec.aad raw err spec.prevKeys
   | _ => pure (.error (ApiError.internal "encrypted database column stored value must be TEXT or NULL"))
@@ -264,6 +264,158 @@ instance {σ α : Type} {P : Prop} {Q : Except ApiError α → Prop}
     SafeIOEnsures (dbRunChecked (Q := Q) (m := ThreadProg σ) cfg q txId? post hPost hErr pf encWrite encRead) Q where
   noAtomic := progSpec_dbRunChecked cfg q txId? post hPost hErr pf encWrite encRead (fun _ => trivial) (fun _ => trivial)
   ensures := progSpec_dbRunChecked cfg q txId? post hPost hErr pf encWrite encRead hPost hErr
+
+private theorem progEffSpec_map {σ α β : Type} {Inv : σ → Prop} {A : Prop} {Step : σ → σ → Prop}
+    {EffOk : ServerEffect → Prop} {Q : α → Prop} {Post : β → Prop} {p : ThreadProg σ α}
+    (f : α → β) (hp : ProgEffSpec Inv A Step EffOk Q p) (hf : ∀ a, Q a → Post (f a)) :
+    ProgEffSpec Inv A Step EffOk Post (f <$> p) :=
+  hp.bind fun a ha => .pure (f a) (hf a ha)
+
+private theorem progEffSpec_mapExceptList {σ α β : Type} {Inv : σ → Prop} {A : Prop} {Step : σ → σ → Prop}
+    {EffOk : ServerEffect → Prop} (f : α → ThreadProg σ (Except ApiError β))
+    (hf : ∀ x, ProgEffSpec Inv A Step EffOk (fun _ => True) (f x)) :
+    ∀ xs : List α, ProgEffSpec Inv A Step EffOk (fun _ => True) (mapExceptList f xs)
+  | [] => .pure _ trivial
+  | x :: xs => (hf x).bind fun
+      | .error _, _ => .pure _ trivial
+      | .ok _, _ => progEffSpec_map _ (progEffSpec_mapExceptList f hf xs) fun _ _ => trivial
+
+private theorem progEffSpec_dbEncryptVal {σ : Type} {Inv : σ → Prop} {A : Prop} {Step : σ → σ → Prop}
+    {EffOk : ServerEffect → Prop} (hEnc : ∀ k f a p, EffOk (.aeadEncrypt k f a p))
+    (spec : EncColSpec) (v : SqlVal) :
+    ProgEffSpec Inv A Step EffOk (fun _ => True) (dbEncryptVal (m := ThreadProg σ) spec v) := by
+  cases v with
+  | text s => exact progEffSpec_map _ (.io (.aeadEncrypt spec.keyEnv spec.fallback? spec.aad s.toUTF8) _ (hEnc _ _ _ _) fun _ => .pure _ trivial) fun _ _ => trivial
+  | bytes bs => exact progEffSpec_map _ (.io (.aeadEncrypt spec.keyEnv spec.fallback? spec.aad bs) _ (hEnc _ _ _ _) fun _ => .pure _ trivial) fun _ _ => trivial
+  | _ => exact .pure _ trivial
+
+private theorem progEffSpec_dbEncryptQuery {σ : Type} {Inv : σ → Prop} {A : Prop} {Step : σ → σ → Prop}
+    {EffOk : ServerEffect → Prop} (encWrite : List (String × EncColSpec)) (q : SqlQuery)
+    (hEnc : encWrite = [] ∨ q.isWrite = false ∨ ∀ k f a p, EffOk (.aeadEncrypt k f a p)) :
+    ProgEffSpec Inv A Step EffOk (fun r => ∀ q', r = .ok q' → q'.isWrite = q.isWrite) (dbEncryptQuery (m := ThreadProg σ) encWrite q) := by
+  unfold dbEncryptQuery
+  split
+  · exact .pure _ fun q' h => by cases h; rfl
+  · rename_i hne
+    cases q with
+    | insert _ cols _ | insertOrIgnore _ cols _ _ | upsert _ cols _ _ _ _ =>
+        have hE : ∀ k f a p, EffOk (.aeadEncrypt k f a p) := by
+          rcases hEnc with rfl | hnw | hE
+          · exact absurd rfl hne
+          · cases hnw
+          · exact hE
+        exact progEffSpec_map _ (progEffSpec_mapExceptList _ (fun (c, v) => by
+          dsimp only; cases encWrite.lookup c.raw with
+          | none => exact .pure _ trivial | some spec => exact progEffSpec_map _ (progEffSpec_dbEncryptVal hE spec v) fun _ _ => trivial) cols)
+          (fun r _ q' hq => by cases r <;> cases hq <;> rfl)
+    | update _ sets _ _ =>
+        have hE : ∀ k f a p, EffOk (.aeadEncrypt k f a p) := by
+          rcases hEnc with rfl | hnw | hE
+          · exact absurd rfl hne
+          · cases hnw
+          · exact hE
+        exact progEffSpec_map _ (progEffSpec_mapExceptList _ (fun (c, e) => by
+          dsimp only; cases encWrite.lookup c.raw with
+          | none => exact .pure _ trivial
+          | some spec => cases e <;> first | exact .pure _ trivial | exact progEffSpec_map _ (progEffSpec_dbEncryptVal hE spec _) fun _ _ => trivial) sets)
+          (fun r _ q' hq => by cases r <;> cases hq <;> rfl)
+    | _ => exact .pure _ fun q' h => by cases h; rfl
+
+private theorem progEffSpec_dbDecryptTryPrev {σ : Type} {Inv : σ → Prop} {A : Prop} {Step : σ → σ → Prop}
+    {EffOk : ServerEffect → Prop} (hEnv : ∀ v, EffOk (.readEnv v)) (hDec : ∀ k f a c, EffOk (.aeadDecrypt k f a c))
+    (aad raw : ByteArray) (origErr : ApiError) :
+    ∀ ks : List (String × Option String), ProgEffSpec Inv A Step EffOk (fun _ => True) (dbDecryptTryPrev (m := ThreadProg σ) aad raw origErr ks)
+  | [] => .pure _ trivial
+  | (kEnv, fb?) :: rest =>
+      (ProgEffSpec.exec (.readEnv kEnv) (hEnv kEnv) fun _ => trivial).bind fun _ _ => by
+        dsimp only; split
+        · exact progEffSpec_dbDecryptTryPrev hEnv hDec aad raw origErr rest
+        · exact (ProgEffSpec.exec (.aeadDecrypt kEnv fb? aad raw) (hDec kEnv fb? aad raw) fun _ => trivial).bind fun
+            | .ok _, _ => .pure _ trivial
+            | .error _, _ => progEffSpec_dbDecryptTryPrev hEnv hDec aad raw origErr rest
+
+private theorem progEffSpec_dbDecryptVal {σ : Type} {Inv : σ → Prop} {A : Prop} {Step : σ → σ → Prop}
+    {EffOk : ServerEffect → Prop} (hEnv : ∀ v, EffOk (.readEnv v)) (hDec : ∀ k f a c, EffOk (.aeadDecrypt k f a c))
+    (spec : EncColSpec) (v : SqlVal) :
+    ProgEffSpec Inv A Step EffOk (fun _ => True) (dbDecryptVal (m := ThreadProg σ) spec v) := by
+  cases v with
+  | text s =>
+      dsimp only [dbDecryptVal]; cases Qed.Base64.decode s with
+      | error _ => exact .pure _ trivial
+      | ok raw =>
+          exact (ProgEffSpec.exec (.aeadDecrypt spec.keyEnv spec.fallback? spec.aad raw) (hDec _ _ _ _) fun _ => trivial).bind fun
+            | .ok _, _ => .pure _ trivial
+            | .error err, _ => by
+                dsimp only; split
+                · exact .pure _ trivial
+                · exact progEffSpec_map _ (progEffSpec_dbDecryptTryPrev hEnv hDec spec.aad raw err spec.prevKeys) fun _ _ => trivial
+  | _ => exact .pure _ trivial
+
+private theorem progEffSpec_dbDecryptRow {σ : Type} {Inv : σ → Prop} {A : Prop} {Step : σ → σ → Prop}
+    {EffOk : ServerEffect → Prop} (hEnv : ∀ v, EffOk (.readEnv v)) (hDec : ∀ k f a c, EffOk (.aeadDecrypt k f a c)) :
+    ∀ (encRead : List (Nat × EncColSpec)) (row : DbRow), ProgEffSpec Inv A Step EffOk (fun _ => True) (dbDecryptRow (m := ThreadProg σ) encRead row)
+  | [], _ => .pure _ trivial
+  | (_, spec) :: rest, _ => by
+      dsimp only [dbDecryptRow]; split
+      · exact (progEffSpec_dbDecryptVal hEnv hDec spec _).bind fun | .error _, _ => .pure _ trivial | .ok _, _ => progEffSpec_dbDecryptRow hEnv hDec rest _
+      · exact .pure _ trivial
+
+private theorem progEffSpec_dbDecryptResult {σ : Type} {Inv : σ → Prop} {A : Prop} {Step : σ → σ → Prop}
+    {EffOk : ServerEffect → Prop} (encRead : List (Nat × EncColSpec)) (res : DbResult)
+    (hDec : encRead = [] ∨ ((∀ v, EffOk (.readEnv v)) ∧ (∀ k f a c, EffOk (.aeadDecrypt k f a c)))) :
+    ProgEffSpec Inv A Step EffOk (fun _ => True) (dbDecryptResult (m := ThreadProg σ) encRead res) := by
+  unfold dbDecryptResult; split
+  · exact .pure _ trivial
+  · rename_i hne
+    rcases hDec with rfl | ⟨hEnv, hD⟩
+    · exact absurd rfl hne
+    · exact progEffSpec_map _ (progEffSpec_mapExceptList _ (progEffSpec_dbDecryptRow hEnv hD encRead) _) fun _ _ => trivial
+
+@[reducible] def dbExecEff (cfg : DbConfig) (q : SqlQuery) (txId? : Option UInt64) : ServerEffect :=
+  match txId? with | some tid => .dbTxExec cfg tid q | none => .dbExec cfg q
+
+private theorem progEffSpec_execDbMaybeTx {σ β : Type} {Inv : σ → Prop} {A : Prop} {Step : σ → σ → Prop}
+    {EffOk : ServerEffect → Prop} {Post : β → Prop}
+    (cfg : DbConfig) (q : SqlQuery) (txId? : Option UInt64)
+    (heff : EffOk (dbExecEff cfg q txId?))
+    (k : Except ApiError DbResult → ThreadProg σ β)
+    (hk : ∀ r, ProgEffSpec Inv A Step EffOk Post (k r)) :
+    ProgEffSpec Inv A Step EffOk Post (execDbMaybeTx (m := ThreadProg σ) cfg q txId? >>= k) := by
+  cases txId? with
+  | none => exact .io (.dbExec cfg q) k heff hk
+  | some tid => exact .io (.dbTxExec cfg tid q) k heff hk
+
+theorem progEffSpec_dbRunChecked {σ α : Type} {P : Prop} {Q : Except ApiError α → Prop} {Post : Except ApiError α → Prop}
+    {Inv : σ → Prop} {A : Prop} {Step : σ → σ → Prop} {EffOk : ServerEffect → Prop}
+    (cfg : DbConfig) (q : SqlQuery) (txId? : Option UInt64)
+    (post : DbResult → Except ApiError α) (hQPost : ∀ r, Q (post r)) (hQErr : ∀ e, Q (.error e)) (pf : P)
+    (encWrite : List (String × EncColSpec)) (encRead : List (Nat × EncColSpec))
+    (hEnc : encWrite = [] ∨ q.isWrite = false ∨ ∀ k' f a p, EffOk (.aeadEncrypt k' f a p))
+    (hDb : ∀ q', q'.isWrite = q.isWrite → EffOk (dbExecEff cfg q' txId?))
+    (hDec : encRead = [] ∨ ((∀ v, EffOk (.readEnv v)) ∧ (∀ k' f a c, EffOk (.aeadDecrypt k' f a c))))
+    (hPost : ∀ a, Q a → Post a) :
+    ProgEffSpec Inv A Step EffOk Post (dbRunChecked (Q := Q) (m := ThreadProg σ) cfg q txId? post hQPost hQErr pf encWrite encRead) :=
+  (progEffSpec_dbEncryptQuery encWrite q hEnc).bind fun
+    | .error e, _ => .pure _ (hPost _ (hQErr e))
+    | .ok q', hq =>
+        progEffSpec_execDbMaybeTx (EffOk := EffOk) cfg q' txId? (hDb q' (hq q' rfl)) _ fun
+          | .error e => .pure _ (hPost _ (hQErr e))
+          | .ok raw => (progEffSpec_dbDecryptResult encRead raw hDec).bind fun
+              | .error e, _ => .pure _ (hPost _ (hQErr e))
+              | .ok dec, _ => .pure _ (hPost _ (hQPost dec))
+
+theorem progEffSpec_dbRunChecked_bind {σ α β : Type} {P : Prop} {Q : Except ApiError α → Prop} {Post : β → Prop}
+    {Inv : σ → Prop} {A : Prop} {Step : σ → σ → Prop} {EffOk : ServerEffect → Prop}
+    (cfg : DbConfig) (q : SqlQuery) (txId? : Option UInt64)
+    (post : DbResult → Except ApiError α) (hQPost : ∀ r, Q (post r)) (hQErr : ∀ e, Q (.error e)) (pf : P)
+    (encWrite : List (String × EncColSpec)) (encRead : List (Nat × EncColSpec))
+    {k : Except ApiError α → ThreadProg σ β}
+    (hEnc : encWrite = [] ∨ q.isWrite = false ∨ ∀ k' f a p, EffOk (.aeadEncrypt k' f a p))
+    (hDb : ∀ q', q'.isWrite = q.isWrite → EffOk (dbExecEff cfg q' txId?))
+    (hDec : encRead = [] ∨ ((∀ v, EffOk (.readEnv v)) ∧ (∀ k' f a c, EffOk (.aeadDecrypt k' f a c))))
+    (hk : ∀ a, Q a → ProgEffSpec Inv A Step EffOk Post (k a)) :
+    ProgEffSpec Inv A Step EffOk Post (dbRunChecked (Q := Q) (m := ThreadProg σ) cfg q txId? post hQPost hQErr pf encWrite encRead >>= k) :=
+  (progEffSpec_dbRunChecked cfg q txId? post hQPost hQErr pf encWrite encRead hEnc hDb hDec fun _ h => h).bind hk
 
 private theorem and_inv_pred {Row : Type} {RowInv : Row → Prop} {rowInvBool pred : Row → Bool}
     (hInvSound : ∀ r, rowInvBool r = true → RowInv r) (r : Row) (h : (rowInvBool r && pred r) = true) :
@@ -493,14 +645,15 @@ deriving Inhabited, DecidableEq
 @[inline] def sqlSub {α : Type} [ToSql α] (col : String) (delta : α) : String × DbSetRhs := (col, .sub (ToSql.toSql delta))
 
 structure TableHandle (Row : Type) where
-  config     : DbConfig
-  tableName  : SqlIdent
-  columns    : List SqlIdent
-  decodeRow  : DbRow → Except String Row
-  encodeRow  : Row → List (SqlIdent × SqlVal)
-  rowInvBool : Row → Bool
-  encWrite   : List (String × EncColSpec) := []
-  encRead    : List (Nat × EncColSpec) := []
+  config       : DbConfig
+  tableName    : SqlIdent
+  columns      : List SqlIdent
+  decodeRow    : DbRow → Except String Row
+  encodeRow    : Row → List (SqlIdent × SqlVal)
+  rowInvBool   : Row → Bool
+  transInvBool : Row → Row → Bool := fun _ _ => true
+  encWrite     : List (String × EncColSpec) := []
+  encRead      : List (Nat × EncColSpec) := []
 
 namespace TableHandle
 

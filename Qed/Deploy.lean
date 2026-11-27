@@ -67,8 +67,8 @@ def DeployManifest.envs (m : DeployManifest) : Qed.Cloud.EnvMap EnvFootprint :=
 abbrev isValidEnvKey : String → Bool := Qed.Server.isValidEnvVarName
 
 private def isPrivateOrMetadataHost (host : String) : Bool :=
-  let low := host.toLower
-  low == "metadata.google.internal" || [".internal", ".localdomain", ".home.arpa"].any (low.endsWith ·) ||
+  let low := Qed.Str.toLower host
+  low == "metadata.google.internal" || [".internal", ".localdomain", ".home.arpa"].any (Qed.Str.endsWith low ·) ||
   (Qed.Cloud.parseIpv4UInt32 low).any fun ip =>
     let (b0, b1) := (ip >>> 24, (ip >>> 16) &&& 0xFF)
     b0 == 0 || b0 == 10 || b0 == 127 || (b0 == 100 && 64 ≤ b1 && b1 ≤ 127) ||
@@ -77,7 +77,7 @@ private def isPrivateOrMetadataHost (host : String) : Bool :=
 def isValidEgressOrigin (s : String) : Bool :=
   match s.toList with
   | 'h' :: 't' :: 't' :: 'p' :: 's' :: ':' :: '/' :: '/' :: auth =>
-      if auth.isEmpty || auth.any (fun c => "/?#@\\*".contains c || c.toNat ≤ 32 || c.toNat == 127) then false
+      if auth.isEmpty || auth.any (fun c => c == '/' || c == '?' || c == '#' || c == '@' || c == '\\' || c == '*' || c.toNat ≤ 32 || c.toNat == 127) then false
       else
         let (hc, portOk) := match Qed.Cloud.splitCharAux ':' auth [] with
           | [h] => (h, true) | [h, p] => (h, (Qed.Cloud.parsePort? p).isSome) | _ => ([], false)

@@ -39,17 +39,23 @@ private def stepLetEqSimpNames : Array Name := #[
 private def ensPostSimpNames : Array Name := #[
   ``Qed.Server.srvEnsPost_ok, ``Qed.Server.srvEnsPost_err, ``Qed.Server.srvEnsPost_srvLetEq,
   ``Qed.Server.srvEnsPostOpt_some, ``Qed.Server.srvEnsPostOpt_none, ``Qed.Server.srvEnsPostOpt_err,
-  ``Qed.Server.srvEnsPostOpt_srvLetEq, ``Qed.Server.srvEnsPostOpt_ok_iff]
+  ``Qed.Server.srvEnsPostOpt_srvLetEq, ``Qed.Server.srvEnsPostOpt_ok_iff,
+  ``Qed.Server.srvEnsErrPost_ok, ``Qed.Server.srvEnsErrPost_err, ``Qed.Server.srvEnsErrPost_srvLetEq,
+  ``Qed.Server.srvEnsFails_ok, ``Qed.Server.srvEnsFails_err, ``Qed.Server.srvEnsFails_srvLetEq,
+  ``Qed.Server.srvEnsFailsCode_ok, ``Qed.Server.srvEnsFailsCode_err, ``Qed.Server.srvEnsFailsCode_srvLetEq]
 
 private def isSrvEqDecl (decl : LocalDecl) : Bool := !decl.userName.hasMacroScopes && let u := decl.userName.toString; u.startsWith "_srvEq" || u.startsWith "_hLet"
 def collectProofFacts (extraExprs : Array Expr) : TermElabM (Array Expr) :=
   liftMetaM <| collectFacts { scanLCtx := true, scanLCtxValues := true, includeMacroPropHyps := true, includeFin := true, skipDecl := fun d _ => isSrvEqDecl d } extraExprs
 
 private def hasUnsteppedCtrlFlow (e : Expr) : Bool :=
-  e.getUsedConstants.any fun c =>
-    c == ``Qed.Server.srvLetEq || c == ``Qed.Server.srvFinish || c == ``Qed.Server.srvFinishEmit || c == ``Qed.Server.srvSeq ||
-    c == ``Qed.Server.srvEmitSeq || c == ``Qed.Server.srvAtomicCommit || c == ``Qed.Server.srvAtomicCommitEmit ||
-    c == ``Qed.Server.srvEnsPost || c == ``Qed.Server.srvEnsPostOpt || c == ``ite || c == ``dite
+  let hasUnstepped :=
+    e.getUsedConstants.any fun c =>
+      c == ``Qed.Server.srvLetEq || c == ``Qed.Server.srvFinish || c == ``Qed.Server.srvFinishEmit || c == ``Qed.Server.srvSeq ||
+      c == ``Qed.Server.srvEmitSeq || c == ``Qed.Server.srvAtomicCommit || c == ``Qed.Server.srvAtomicCommitEmit ||
+      c == ``Qed.Server.srvEnsPost || c == ``Qed.Server.srvEnsPostOpt || c == ``Qed.Server.srvEnsErrPost ||
+      c == ``Qed.Server.srvEnsFails || c == ``Qed.Server.srvEnsFailsCode || c == ``ite || c == ``dite
+  hasUnstepped
 
 private def tryCloseSrvTrivial (g : MVarId) : MetaM Bool := tryCloseTrivial g hasUnsteppedCtrlFlow
 private def tryCloseSrvBasic (g : MVarId) : MetaM Bool := tryCloseBasic g hasUnsteppedCtrlFlow
@@ -610,8 +616,23 @@ private def stepAsyncLoop (isPreserves : Bool) (dCtx sCtx : Simp.Context) (gInit
         for (head, lem) in #[(``Qed.Server.ThreadProg.pure, ``Qed.Server.ProgSpec.pure), (``Pure.pure, ``Qed.Server.ProgSpec.pure_class),
                              (``Qed.Server.MonadAtomic.runAtomic, ``Qed.Server.ProgSpec.runAtomic), (``Qed.Server.MonadAtomic.runAtomicRead, ``Qed.Server.ProgSpec.runAtomicRead)] do
           if prog.isAppOf head then if let some sgs ← tryApplyConst g lem then return (← dropTrivialGoals sgs) ++ (← loop fuel rest)
+        for (head, lem, nDone, nBody) in #[
+            (``Qed.Server.srvForEachM, ``Qed.Server.progSpec_srvForEachM, 0, 2),
+            (``Qed.Server.srvForFoldM, ``Qed.Server.progSpec_srvForFoldM, 1, 3),
+            (``Qed.Server.srvForRangeM, ``Qed.Server.progSpec_srvForRangeM, 1, 4)] do
+          if prog.isAppOf head then
+            if let some [gDone, gBody] ← tryApplyConst g lem then
+              let dRem ← if nDone == 0 then dropTrivialGoals [gDone] else normCont gDone nDone
+              return ← loop fuel (dRem ++ (← normCont gBody nBody) ++ rest)
         if prog.isAppOf ``Bind.bind || prog.isAppOf ``Qed.Server.ThreadProg.bind then
           let pArg := (if prog.isAppOf ``Bind.bind then prog.getAppArgs[4]! else prog.getAppArgs[3]!).consumeMData
+          for (head, lem, nDone, nBody) in #[
+              (``Qed.Server.srvForEachM, ``Qed.Server.progSpec_srvForEachM_bind, 0, 2),
+              (``Qed.Server.srvForFoldM, ``Qed.Server.progSpec_srvForFoldM_bind, 1, 3),
+              (``Qed.Server.srvForRangeM, ``Qed.Server.progSpec_srvForRangeM_bind, 1, 4)] do
+            if pArg.isAppOf head then
+              if let some [gDone, gBody] ← tryApplyConst g lem then
+                return ← loop fuel ((← normCont gDone nDone) ++ (← normCont gBody nBody) ++ rest)
           let atomicLem? :=
             if pArg.isAppOf ``Qed.Server.MonadAtomic.runAtomic then some (if isPreserves then ``Qed.Server.ProgSpec.runAtomic_bind_val else ``Qed.Server.ProgSpec.runAtomic_bind)
             else if pArg.isAppOf ``Qed.Server.MonadAtomic.runAtomicRead then some (if isPreserves then ``Qed.Server.ProgSpec.runAtomicRead_bind_val else ``Qed.Server.ProgSpec.runAtomicRead_bind)
@@ -672,6 +693,14 @@ private def stepSafeIOLoop (dCtx sCtx : Simp.Context) (gInit : MVarId) : TacticM
               let gLeftRem ← match ← tryApplyConst gLeft ``Qed.Server.SafeIO.noAtomic with | some [] => pure [] | _ => pure [gLeft]
               let (_, gR1) ← gRight.intro1P
               return ← loop fuel (gLeftRem ++ (← norm1 gR1) ++ rest)
+          for (head, lem, nIntro) in #[
+              (``Qed.Server.srvForEachM, ``Qed.Server.noAtomic_srvForEachM, 1),
+              (``Qed.Server.srvForFoldM, ``Qed.Server.noAtomic_srvForFoldM, 2),
+              (``Qed.Server.srvForRangeM, ``Qed.Server.noAtomic_srvForRangeM, 2)] do
+            if prog.isAppOf head then
+              if let some [gBody] ← tryApplyConst g lem then
+                let (_, gB1) ← gBody.introN nIntro
+                return ← loop fuel ((← norm1 gB1) ++ rest)
           if prog.isAppOf ``Qed.Server.srvLetEq then
             if let some gLet ← elimSrvLetEqGoal g false then return ← loop fuel ((← norm1 gLet) ++ rest)
         match ← trySplitTarget g with
@@ -688,10 +717,157 @@ private def elabSafeIOProve (fnId : Ident) : TacticM Unit := do
   unless rem.isEmpty do
     Qed.Diag.throwUnsolvedGoals m!"Server helper `{fnConst}` could not be proved `SafeIO` (no atomic state mutation):" m!"" (maxShown? := some 1) (goals? := some rem)
 
+private def effWrapperUnfoldNames : Array Name := #[
+  ``Qed.Server.srvFinishM, ``Qed.Server.srvSeqM, ``Qed.Server.dbRunTx, ``Qed.Server.newId,
+  ``Qed.Server.hashBearerToken, ``Qed.Server.mintBearerToken, ``Qed.Server.flushWsEmits,
+  `Qed.Server.Db.dbSelect, `Qed.Server.Db.dbSelectMeta, `Qed.Server.Db.dbSelectOne, `Qed.Server.Db.dbSelectJoin,
+  `Qed.Server.Db.dbCount, `Qed.Server.Db.dbAggregate, `Qed.Server.Db.dbInsert, `Qed.Server.Db.dbInsertOrIgnore,
+  `Qed.Server.Db.dbUpsert, `Qed.Server.Db.dbUpdateRun, `Qed.Server.Db.dbDeleteRun, `Qed.Server.Db.dbRun,
+  `Qed.Server.Db.withTransaction]
+
+private def tryCloseHypContradiction (g : MVarId) : TacticM Bool := do
+  if ← tryRestoreM false id (g.contradictionCore {}) then return true
+  let saved ← getGoals
+  setGoals [g]
+  let ok ← tryTac (requireClosed := true) `(tactic| (
+    try simp_all only [Bool.not_eq_true', Bool.not_eq_false', not_true_eq_false, not_false_eq_true,
+      decide_eq_true_eq, decide_eq_false_iff_not, beq_iff_eq, bne_iff_ne, Qed.Lang.QedVal.val_id,
+      Qed.qedIterable_toList_array, Qed.qedIterable_toList_list, Qed.qedIterable_toList_range,
+      Qed.Lang.QedSeqLit.ofList, Array.toList_empty, Array.toList_mk, List.mem_nil_iff, List.not_mem_nil]
+    first | contradiction | omega))
+  setGoals saved
+  return ok
+
+private def tryCloseEffSideGoal (g : MVarId) : TacticM Bool := do
+  let saved ← getGoals
+  setGoals [g]
+  let ok ← tryTac (requireClosed := true) `(tactic| (
+    first
+    | (left; rfl)
+    | (right; left; rfl)
+    | (right; right; intros; first | rfl | trivial | decide | simp_all)
+    | (right; constructor <;> (intros; first | rfl | trivial | decide | simp_all))
+    | (intros
+       try simp only [Qed.Server.ServerEffect.isHttp, Qed.Server.ServerEffect.isDecrypt,
+         Qed.Server.ServerEffect.isCrypto, Qed.Server.ServerEffect.isDbWrite,
+         Qed.Server.Db.SqlQuery.isWrite, Qed.Server.Db.dbExecEff] at *
+       try split
+       all_goals (try simp_all only [Qed.Server.ServerEffect.isHttp, Qed.Server.ServerEffect.isDecrypt,
+         Qed.Server.ServerEffect.isCrypto, Qed.Server.ServerEffect.isDbWrite,
+         Qed.Server.Db.SqlQuery.isWrite]; first | rfl | trivial | decide | omega))))
+  setGoals saved
+  return ok
+
+private def stepEffSpecLoop (dCtx sCtx : Simp.Context) (gInit : MVarId) : TacticM (List MVarId) := do
+  let env ← getEnv
+  let hasDbLem := env.contains `Qed.Server.Db.progEffSpec_dbRunChecked_bind
+  let normCont (g : MVarId) (n : Nat) : MetaM (List MVarId) := do
+    let g1 ← if n == 0 then pure g else Prod.snd <$> g.introN n
+    return (← normAsyncContGoal g1 dCtx sCtx).toList
+  let normSplits (sgs : List MVarId) := sgs.filterMapM (normAsyncContGoal · dCtx sCtx)
+  let rec loop : Nat → List MVarId → TacticM (List MVarId)
+    | 0, gs => return gs | _, [] => return []
+    | fuel + 1, g :: rest => do
+        if ← tryCloseHypContradiction g then return ← loop fuel rest
+        let tgtC := (← goalType g).consumeMData
+        let prog? := #[(``Qed.Server.ProgEffSpec, 8, 7), (``Qed.Server.ProgEnsuresEff, 6, 5),
+          (``Qed.Server.ProgAllowsEff, 4, 3), (``Qed.Server.ProgNoHttp, 3, 2),
+          (``Qed.Server.ProgNoDecrypt, 3, 2), (``Qed.Server.ProgNoCrypto, 3, 2),
+          (``Qed.Server.ProgNoDbWrite, 3, 2)].findSome? fun (c, a, i) =>
+            if tgtC.isAppOfArity c a then some tgtC.getAppArgs[i]! else none
+        let some progRaw := prog? | return g :: (← loop fuel rest)
+        let prog := progRaw.consumeMData
+        for (head, lem) in #[(``Qed.Server.ThreadProg.pure, ``Qed.Server.ProgEffSpec.pure),
+                             (``Pure.pure, ``Qed.Server.ProgEffSpec.pure_class),
+                             (``Qed.Server.MonadAtomic.runAtomic, ``Qed.Server.ProgEffSpec.runAtomic),
+                             (``Qed.Server.MonadAtomic.runAtomicRead, ``Qed.Server.ProgEffSpec.runAtomicRead)] do
+          if prog.isAppOf head then
+            if let some sgs ← tryApplyConst g lem then
+              let sgs' ← normSplits (← dropTrivialGoals sgs)
+              return ← loop fuel (sgs' ++ rest)
+        for (head, lem, nDone, nBody) in #[
+            (``Qed.Server.srvForEachM, ``Qed.Server.progEffSpec_srvForEachM, 0, 2),
+            (``Qed.Server.srvForFoldM, ``Qed.Server.progEffSpec_srvForFoldM, 1, 3),
+            (``Qed.Server.srvForRangeM, ``Qed.Server.progEffSpec_srvForRangeM, 1, 4)] do
+          if prog.isAppOf head then
+            if let some [gDone, gBody] ← tryApplyConst g lem then
+              let dRem ← if nDone == 0 then dropTrivialGoals [gDone] else normCont gDone nDone
+              return ← loop fuel (dRem ++ (← normCont gBody nBody) ++ rest)
+        if prog.isAppOf ``Qed.Server.MonadServer.exec then
+          if let some [gEff, gPost] ← tryApplyConst g ``Qed.Server.ProgEffSpec.exec then
+            let effRem ← if ← tryCloseEffSideGoal gEff then pure [] else pure [gEff]
+            return effRem ++ (← dropTrivialGoals [gPost]) ++ (← loop fuel rest)
+        if hasDbLem && prog.isAppOf `Qed.Server.Db.dbRunChecked then
+          if let some [gEnc, gDb, gDec, gPost] ← tryApplyConst g `Qed.Server.Db.progEffSpec_dbRunChecked then
+            let mut sideRem : List MVarId := []
+            for sg in [gEnc, gDb, gDec] do if !(← tryCloseEffSideGoal sg) then sideRem := sideRem ++ [sg]
+            return sideRem ++ (← dropTrivialGoals [gPost]) ++ (← loop fuel rest)
+        if prog.isAppOf ``Bind.bind || prog.isAppOf ``Qed.Server.ThreadProg.bind then
+          let pArg := (if prog.isAppOf ``Bind.bind then prog.getAppArgs[4]! else prog.getAppArgs[3]!).consumeMData
+          if pArg.isAppOf ``Qed.Server.MonadAtomic.runAtomic then
+            if let some (gCont :: gExtra) ← tryApplyConst g ``Qed.Server.ProgEffSpec.runAtomic_bind then
+              return ← loop fuel ((← normCont gCont 2) ++ (← dropTrivialGoals gExtra) ++ rest)
+          if pArg.isAppOf ``Qed.Server.MonadAtomic.runAtomicRead then
+            if let some (gCont :: gExtra) ← tryApplyConst g ``Qed.Server.ProgEffSpec.runAtomicRead_bind then
+              return ← loop fuel ((← normCont gCont 2) ++ (← dropTrivialGoals gExtra) ++ rest)
+          if pArg.isAppOf ``Qed.Server.MonadServer.exec then
+            if let some [gEff, gCont] ← tryApplyConst g ``Qed.Server.ProgEffSpec.exec_bind then
+              let effRem ← if ← tryCloseEffSideGoal gEff then pure [] else pure [gEff]
+              return effRem ++ (← loop fuel ((← normCont gCont 1) ++ rest))
+          if hasDbLem && pArg.isAppOf `Qed.Server.Db.dbRunChecked then
+            if let some [gEnc, gDb, gDec, gCont] ← tryApplyConst g `Qed.Server.Db.progEffSpec_dbRunChecked_bind then
+              let mut sideRem : List MVarId := []
+              for sg in [gEnc, gDb, gDec] do if !(← tryCloseEffSideGoal sg) then sideRem := sideRem ++ [sg]
+              return sideRem ++ (← loop fuel ((← normCont gCont 2) ++ rest))
+          for (head, lem, nDone, nBody) in #[
+              (``Qed.Server.srvForEachM, ``Qed.Server.progEffSpec_srvForEachM_bind, 0, 2),
+              (``Qed.Server.srvForFoldM, ``Qed.Server.progEffSpec_srvForFoldM_bind, 1, 3),
+              (``Qed.Server.srvForRangeM, ``Qed.Server.progEffSpec_srvForRangeM_bind, 1, 4)] do
+            if pArg.isAppOf head then
+              if let some [gDone, gBody] ← tryApplyConst g lem then
+                return ← loop fuel ((← normCont gDone nDone) ++ (← normCont gBody nBody) ++ rest)
+          if exprHasSplittable pArg then
+            if let some sgs ← trySplitTarget g then return ← loop fuel ((← normSplits sgs) ++ rest)
+          if let some fnNm := pArg.getAppFn.constName? then
+            if fnNm != ``Qed.Server.MonadServer.exec && fnNm != `Qed.Server.Db.dbRunChecked &&
+               fnNm != ``Qed.Server.MonadAtomic.runAtomic && fnNm != ``Qed.Server.MonadAtomic.runAtomicRead &&
+               fnNm != ``Qed.Server.srvForEachM && fnNm != ``Qed.Server.srvForFoldM && fnNm != ``Qed.Server.srvForRangeM then
+              if let some (.defnInfo _) := env.find? fnNm then
+                if let some g' ← tryGoalOptM g (simpGoalOnly · (← mkDynamicSimpCtx #[fnNm])) then
+                  if let some g'' ← normAsyncContGoal g' dCtx sCtx then
+                    if (← goalType g'') != tgtC then return ← loop fuel (g'' :: rest)
+        if prog.isAppOf ``Qed.Server.srvLetEq then
+          if let some gLet ← elimSrvLetEqGoal g false then return ← loop fuel ((← normCont gLet 0) ++ rest)
+        if let some fnNm := prog.getAppFn.constName? then
+          if fnNm != ``Qed.Server.ThreadProg.pure && fnNm != ``Pure.pure && fnNm != ``Bind.bind &&
+             fnNm != ``Qed.Server.ThreadProg.bind && fnNm != ``Qed.Server.MonadServer.exec &&
+             fnNm != `Qed.Server.Db.dbRunChecked && fnNm != ``ite && fnNm != ``dite &&
+             fnNm != ``Qed.Server.srvForEachM && fnNm != ``Qed.Server.srvForFoldM && fnNm != ``Qed.Server.srvForRangeM then
+            if let some (.defnInfo _) := env.find? fnNm then
+              if let some g' ← tryGoalOptM g (simpGoalOnly · (← mkDynamicSimpCtx #[fnNm])) then
+                if let some g'' ← normAsyncContGoal g' dCtx sCtx then
+                  if (← goalType g'') != tgtC then return ← loop fuel (g'' :: rest)
+        match ← trySplitTarget g with
+        | some sgs => return ← loop fuel ((← normSplits sgs) ++ rest)
+        | none => return g :: (← loop fuel rest)
+  loop 256 [gInit]
+
+@[noinline]
+private def elabEffSpecProve (handlerId : Ident) (invUnfoldIds : Array Ident) (fnLabel invLabel : String) (throwOnRem : Bool := true) : TacticM Unit := do
+  let g0 ← getMainGoal
+  let handlerConst ← resolveGlobalConstNoOverload handlerId; let userNames ← invUnfoldIds.mapM resolveGlobalConstNoOverload
+  let (helperConsts, invConsts) := userNames.partition fun n => n.getString!.startsWith "_fn_"
+  let env ← getEnv
+  let presentWrappers := effWrapperUnfoldNames.filter env.contains
+  let (dCtx, sCtx, some gInit) ← initAsyncSimpAndNorm g0 (#[handlerConst] ++ helperConsts ++ presentWrappers) | replaceMainGoal []; return
+  runProveStepOnGoals (← stepEffSpecLoop dCtx sCtx gInit) invConsts fnLabel invLabel throwOnRem
+
 elab_rules : tactic
   | `(tactic| qedSrvProveAsync $handlerId:ident [$[$invUnfoldIds:ident],*] $fnLabel:str $invLabel:str) => elabAsyncProve true handlerId invUnfoldIds fnLabel.getString invLabel.getString
   | `(tactic| qedSrvProveAsyncEnsures $handlerId:ident [$[$invUnfoldIds:ident],*] $fnLabel:str $invLabel:str) => elabAsyncProve false handlerId invUnfoldIds fnLabel.getString invLabel.getString
   | `(tactic| qedSrvPrepAsyncEnsures $handlerId:ident [$[$invUnfoldIds:ident],*]) => elabAsyncProve false handlerId invUnfoldIds "" "" (throwOnRem := false)
+  | `(tactic| qedSrvProveEffSpec $handlerId:ident [$[$invUnfoldIds:ident],*] $fnLabel:str $invLabel:str) => elabEffSpecProve handlerId invUnfoldIds fnLabel.getString invLabel.getString
+  | `(tactic| qedSrvPrepEffSpec $handlerId:ident [$[$invUnfoldIds:ident],*]) => elabEffSpecProve handlerId invUnfoldIds "" "" (throwOnRem := false)
   | `(tactic| qedSrvProveSafeIO $fnId:ident) => elabSafeIOProve fnId
 
 /-! ## Client RPC Precondition Prover (`qedProveRpcReq`) -/

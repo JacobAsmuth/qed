@@ -188,15 +188,15 @@ component VerifiedWsEnsures:
     on_message(v): lastVal = v
   action sendOk(n: Nat): if n <= 50: g.send(n)
   view: <span>{lastVal}</span>
-#guard
+example : (
   let ck := (Qed.Server.SetCookie.mkSafe "qed_session" "tok\r\nX-Evil: 1" (maxAge? := some 3600) (secure := true)).render
   let parseGz (h : String) := (Qed.Server.Http.parseRequestHead s!"GET /app.js HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: {h}".toUTF8).toOption.map (·.acceptsGzip)
   let doc := Qed.renderDocument "Default" "<p>ok</p>" "/qed_host.mjs" (headMeta := { title := some "Page </title><script>alert(1)</script>", description := some "Desc \"quoted\" <tag>", metaTags := [("og:title", "OG \"bad\"")], canonical := some "https://example.com/posts/1" })
   let badDoc := Qed.renderDocument "Default" "<p>ok</p>" "/qed_host.mjs" (headMeta := { canonical := some "javascript:alert(1)" })
-  ["qed_session=tokX-Evil: 1", "HttpOnly", "SameSite=Lax", "Secure", "Max-Age=3600"].all (ck.contains ·) && !ck.contains '\r' && !ck.contains '\n' &&
+  strHasAll ck ["qed_session=tokX-Evil: 1", "HttpOnly", "SameSite=Lax", "Secure", "Max-Age=3600"] && !ck.toList.contains '\r' && !ck.toList.contains '\n' &&
   parseGz "br, gzip, deflate" == some true && parseGz "gzip;q=0" == some false &&
-  ["<title>Page &lt;/title&gt;&lt;script&gt;alert(1)&lt;/script&gt;</title>", "<meta name=\"description\" content=\"Desc &quot;quoted&quot; &lt;tag&gt;\">", "<meta name=\"og:title\" content=\"OG &quot;bad&quot;\">", "<link rel=\"canonical\" href=\"https://example.com/posts/1\">"].all (doc.contains ·) &&
-  !doc.contains "<script>alert(1)</script>" && !badDoc.contains "rel=\"canonical\"" && !badDoc.contains "javascript:"
+  strHasAll doc ["<title>Page &lt;/title&gt;&lt;script&gt;alert(1)&lt;/script&gt;</title>", "<meta name=\"description\" content=\"Desc &quot;quoted&quot; &lt;tag&gt;\">", "<meta name=\"og:title\" content=\"OG &quot;bad&quot;\">", "<link rel=\"canonical\" href=\"https://example.com/posts/1\">"] &&
+  !strHas doc "<script>alert(1)</script>" && !strHas badDoc "rel=\"canonical\"" && !strHas badDoc "javascript:") = true := by decide +kernel
 server WebEssentialsSrv:
   state hits : Nat = 0
   invariant hitsBounded: hits <= 1000
@@ -279,7 +279,7 @@ example := @RedactedHub.room_project_ensures
 example := @RedactedHub.room_project_blindTo
 example := @RedactedHub.room_project_channel_ensures
 
-#guard
+example : (
   let raw : RawGameRoom := { code := "ABCD", secretLocation := "Casino", secretPack := "Classic", spyIds := #["bob"] }
   let params := Qed.Proto.encode "ABCD"
   let payload := Qed.Proto.encode raw
@@ -290,7 +290,7 @@ example := @RedactedHub.room_project_channel_ensures
     some { code := "ABCD", secretLocation := some "Casino", secretPack := some "Classic", isSpy := false } &&
   (bobOut.bind fun bs => (Qed.Proto.decode (α := RedactedGameView) bs).toOption) ==
     some { code := "ABCD", secretLocation := none, secretPack := none, isSpy := true } &&
-  otherOut == Qed.Server.WsProjectOut.passthrough
+  otherOut == Qed.Server.WsProjectOut.passthrough) = true := by decide +kernel
 
 expect_err "`server stateless BadStatelessSrv` forbids in-memory `state` field `count`" in
 server stateless BadStatelessSrv:
@@ -330,7 +330,7 @@ external GcpIdExt:
   auth gcpMetadata("https://my-svc.run.app")
   get "/health" health() -> String
 
-#guard GcpAdcExt.secrets.isEmpty && GcpIdExt.secrets.isEmpty
+example : (GcpAdcExt.secrets.isEmpty && GcpIdExt.secrets.isEmpty) = true := by decide +kernel
 
 router GuardedRoute:
   home    = "/"
@@ -403,7 +403,7 @@ server GuardedApi:
     on_send(msg: String):
       feed.emit(msg)
 
-#guard
+example : (
   !GuardedApi.methods.contains "bump" &&
   !GuardedApi.methods.contains "formatGreeting" &&
   !GuardedApi.methods.contains "mintAndHash" &&
@@ -420,7 +420,7 @@ server GuardedApi:
   (Qed.Server.HttpResponse.redirect "/raw").headers == [("Location", "/raw")] &&
   (Qed.Server.HttpResponse.redirect (Qed.Server.WebhookUrl.make "https://hooks.example.com/ok")).headers == [("Location", "https://hooks.example.com/ok")] &&
   (Qed.Server.WebhookUrl.parse? "http://insecure.example.com").isNone &&
-  ({ query := "?a=1&tag=hi+qed", body := "{\"msg\":\"yo\"}" : Qed.Server.RequestCtx }).queryParam "tag" == some "hi qed"
+  ({ query := "?a=1&tag=hi+qed", body := "{\"msg\":\"yo\"}" : Qed.Server.RequestCtx }).queryParam "tag" == some "hi qed") = true := by decide +kernel
 
 example := @Qed.Server.ApiError.wireMessage_prod_5xx
 
@@ -495,10 +495,10 @@ service Webhooks:
   env region = "APP_REGION" ?? "us-central1"
 
   fn parseSigHeader(hdr: String) -> (Nat, String)?:
-    let parts = hdr.splitOn(",")
+    let parts = Qed.Str.splitChar(hdr, ',')
     match parts:
       case [tsStr, sig]:
-        let some(ts) = tsStr.toNat? else return none
+        let some(ts) = Qed.Str.parseNat?(tsStr) else return none
         return some((ts, sig))
       case _:
         return none
@@ -559,7 +559,7 @@ server stateless ServiceHost:
     let res = await billing.syncSecret(project, id, raw)?
     return res.render
 
-#guard
+example : (
   Webhooks.secrets == #["WEBHOOK_SECRET"] &&
   ServiceHost.secrets.contains "WEBHOOK_SECRET" &&
   ServiceHost.secrets.contains "STRIPE_API_KEY" &&
@@ -577,6 +577,343 @@ server stateless ServiceHost:
     [("starting_after", Qed.Server.ToQueryVal.toQueryVal (none : Option String)), ("limit", Qed.Server.ToQueryVal.toQueryVal (some (25 : Nat)))]).toOption ==
     some "v1/customers?limit=25" &&
   String.fromUTF8? (Qed.Server.encodeFormBodyOf ({ mode := "payment", successUrl := "https://a.test/ok", quantity := 2, coupon := none : StripeCheckoutReq })) ==
-    some "mode=payment&successUrl=https%3A%2F%2Fa.test%2Fok&quantity=2"
+    some "mode=payment&successUrl=https%3A%2F%2Fa.test%2Fok&quantity=2") = true := by decide +kernel
+
+/-! ## Effect-Aware Contracts (`no_http`, `no_decrypt`, `no_crypto`, `no_db_write`, `ensures_fails`), `for ... in ...:`, and Kernel-Checked Service/Server `example` Blocks -/
+
+external ItemSyncApi:
+  base "https://items.example.com"
+  post "/v1/sync/{id}" syncOne(id: String) -> String
+
+database ExVaultDb:
+  sqlite ".qed/ex_vault_checks.db"
+  table vault_items:
+    id      : String primary_key immutable where 1 <= id.length <= 64
+    ownerId : String immutable where 1 <= ownerId.length <= 64
+    label   : String where 1 <= label.length <= 120
+    payload : encrypted(String, key = secret("VAULT_KEY"))
+    policy read, write requires some(ownerId) == ctx.userId
+
+service BatchSyncSvc:
+  env region = "SYNC_REGION" ?? "us-west1"
+
+  fn syncAll(ids: String[]) -> Nat!:
+    if ids == []:
+      no_http
+    no_db_write
+    no_crypto
+    for id in ids:
+      let _ = await ItemSyncApi.syncOne(id)?
+    return ids.size
+
+  fn rejectEmpty(name: String) -> String!:
+    if name == "":
+      ensures_fails 400
+    no_http, no_crypto, no_db_write
+    if name == "":
+      return fail(400, "empty name")
+    return f"{region}:{name}"
+
+  example emptyNoHttp:
+    call syncAll([])
+    expect ok(0)
+    expect http_calls == 0
+
+  example batchCallsUpstream:
+    with http POST "https://items.example.com/v1/sync/a" => 200 "ok"
+    with http POST "https://items.example.com/v1/sync/b" => 200 "ok"
+    call syncAll(["a", "b"])
+    expect ok(2)
+    expect http_calls == 2
+    expect http[0].method == "POST"
+    expect http[0].url == "https://items.example.com/v1/sync/a"
+
+  example upstreamErrorPropagates:
+    with http_error POST "https://items.example.com/v1/sync/bad" => 502 "upstream down"
+    call syncAll(["bad"])
+    expect error(502)
+    expect http_calls == 1
+
+  example customEnvRegion:
+    with env "SYNC_REGION" = "eu-central1"
+    call rejectEmpty("alpha")
+    expect ok("eu-central1:alpha")
+
+  example emptyNameFails:
+    call rejectEmpty("")
+    expect error(400)
+
+server VaultExApi:
+  use db : ExVaultDb
+  use syncer : BatchSyncSvc
+  state counter : Nat = 0
+  invariant counterCap: counter <= 100
+
+  read_only rpc listMeta() -> ExVaultDb.vault_items.Meta[]!:
+    requires auth
+    no_http, no_decrypt, no_db_write
+    return await db.vault_items.selectMeta(where = r => r.ownerId == uid, orderBy = "id")?
+
+  rpc saveItem(id: String, label: String, payload: String) -> ExVaultDb.vault_items!:
+    requires auth, 1 <= id.length <= 64, 1 <= label.length <= 120, 1 <= uid.length <= 64
+    no_http
+    return await db.vault_items.insert(id = id, ownerId = uid, label = label, payload = payload)?
+
+  rpc bumpAndStamp() -> Nat!:
+    requires auth
+    no_http, no_db_write
+    let now = await Time.nowMs()
+    setCookie("last_seen", f"{now}")
+    atomic:
+      if counter < 100: counter += 1
+      return counter
+
+  get "/health":
+    no_http, no_db_write, no_crypto
+    return text("alive")
+
+  post "/echo":
+    requires auth
+    no_http, no_db_write
+    let hdr = if let some(h) = ctx.header("x-tag"): h else: "none"
+    return text(f"{hdr}:{ctx.query}:{ctx.body}")
+
+  example seedAndListMeta:
+    with user "alice"
+    with db vault_items = [{ id = "v1", ownerId = "alice", label = "prod-db", payload = "sec1" }, { id = "v2", ownerId = "bob", label = "other", payload = "sec2" }]
+    call listMeta()
+    expect ok([{ id = "v1", ownerId = "alice", label = "prod-db" }])
+    expect decrypt_calls == 0
+    expect http_calls == 0
+
+  example insertEncryptsAndPersists:
+    with env "VAULT_KEY" = "test-vault-key"
+    with user "alice"
+    call saveItem("v9", "api-key", "secret-val")
+    expect ok
+    expect encrypt_calls == 1
+    expect db_count("vault_items") == 1
+
+  example insertMissingKeyFails:
+    with user "alice"
+    call saveItem("v9", "api-key", "secret-val")
+    expect error(500)
+
+  example unauthBlocked:
+    call listMeta()
+    expect error(401)
+
+  example statefulBumpSetsCookie:
+    with user "alice"
+    with role "admin"
+    with now = 1700000000000
+    with state = { counter = 4 }
+    call bumpAndStamp()
+    expect ok(5)
+    expect state.counter == 5
+    expect cookies.size == 1
+
+  example httpHealthRoute:
+    get "/health"
+    expect status == 200
+
+  example httpEchoRoute:
+    with user "alice"
+    with header "x-tag" = "v1"
+    with query = "q=1"
+    with body = "hi"
+    post "/echo"
+    expect status == 200
+
+expect_err "Server invariant `no_http` failed in `sneaky`" in
+service BadNoHttpSvc:
+  fn sneaky(id: String) -> String!:
+    no_http
+    return await ItemSyncApi.syncOne(id)?
+
+expect_err "Server invariant `no_decrypt` failed in `readSecret`" in
+server stateless BadNoDecryptSrv:
+  use db : ExVaultDb
+  read_only rpc readSecret() -> ExVaultDb.vault_items[]!:
+    requires auth
+    no_decrypt
+    return await db.vault_items.select(where = r => r.ownerId == uid)?
+
+expect_err "Server invariant `no_db_write` failed in `sneakyInsert`" in
+server stateless BadNoDbWriteSrv:
+  use db : ExVaultDb
+  rpc sneakyInsert(id: String, label: String, payload: String) -> ExVaultDb.vault_items!:
+    requires auth, 1 <= id.length <= 64, 1 <= label.length <= 120, 1 <= uid.length <= 64
+    no_db_write
+    return await db.vault_items.insert(id = id, ownerId = uid, label = label, payload = payload)?
+
+expect_err "Server postcondition `ensures ensures_fails 400` failed in `actuallySucceeds`" in
+service BadEnsuresFailsSvc:
+  fn actuallySucceeds(n: Nat) -> Nat!:
+    ensures_fails 400
+    return n + 1
+
+expect_err "proved that the proposition" in
+service BadSrvExampleSvc:
+  fn inc(n: Nat) -> Nat!:
+    return n + 1
+  example wrongResult:
+    call inc(1)
+    expect ok(99)
+
+/-! ## Multi-Origin External, Async Loops/Retry, and Verified `every` Jobs -/
+
+enum CloudRegion:
+  usEast = "us-east1"
+  euWest = "europe-west1"
+
+enum PayloadEnum:
+  one(v: Nat)
+
+external CloudRunApi:
+  base "https://{region}-run.googleapis.com" where region : CloudRegion
+  get "/v2/services/{svcId}" getService(region: CloudRegion, svcId: String) -> String
+
+external RegionalCdnApi:
+  base "https://{tier}.{zone}.cdn.example.com" where tier in ["edge", "origin"], zone : CloudRegion
+  get "/health" health(tier: String, zone: CloudRegion) -> String
+
+example : (
+  CloudRunApi.allowedBaseOrigins == #["https://us-east1-run.googleapis.com", "https://europe-west1-run.googleapis.com"] &&
+  CloudRunApi.resolveBaseOrigin .usEast == "https://us-east1-run.googleapis.com" &&
+  RegionalCdnApi.allowedBaseOrigins.size == 4 &&
+  (match RegionalCdnApi.resolveBaseOrigin "edge" .euWest with | .ok s => s == "https://edge.europe-west1.cdn.example.com" | .error _ => false) &&
+  (match RegionalCdnApi.resolveBaseOrigin "evil" .usEast with | .error _ => true | .ok _ => false)) = true := by decide +kernel
+
+example : ∀ r, Qed.Server.isValidBaseOrigin (CloudRunApi.resolveBaseOrigin r) = true :=
+  CloudRunApi.resolveBaseOrigin_valid
+
+example : ∀ t z o, RegionalCdnApi.resolveBaseOrigin t z = .ok o → Qed.Server.isValidBaseOrigin o = true :=
+  RegionalCdnApi.resolveBaseOrigin_valid
+
+service RetryLoopSvc:
+  fn fetchWithRetry(region: CloudRegion, svcId: String) -> String!:
+    let mut lastErr = "no attempts"
+    for attempt in range(0, 6, 2):
+      let res = await CloudRunApi.getService(region, svcId)
+        catch err:
+          lastErr = err.message
+          continue
+      return res
+    return fail(503, lastErr)
+
+  fn collectFiltered(xs: Nat[]) -> Nat!:
+    no_http
+    let mut total = 0
+    for x in xs:
+      if x == 0: continue
+      if x > 50: break
+      total += x
+    return total
+
+  example retrySucceedsSecond:
+    with http_error GET "https://us-east1-run.googleapis.com/v2/services/app1" => 503 "busy"
+    with http GET "https://us-east1-run.googleapis.com/v2/services/app1" => 200 "ready"
+    call fetchWithRetry(.usEast, "app1")
+    expect ok("ready")
+
+  example retryExhaustsAll:
+    with http_error GET "https://us-east1-run.googleapis.com/v2/services/app1" => 503 "down"
+    call fetchWithRetry(.usEast, "app1")
+    expect error(503)
+
+  example loopSkipsAndBreaks:
+    call collectFiltered([0, 4, 6, 99, 10])
+    expect ok(10)
+
+server WorkerLoopSrv:
+  state processed : Nat = 0
+  state pending   : Nat = 3
+
+  system fn isElevated() -> Bool!:
+    return ctx.isSystem
+
+  rpc checkSystemFlag() -> Bool!:
+    return ctx.isSystem
+
+  every 5s drainOne -> Bool:
+    no_http, no_decrypt
+    let mut didWork = false
+    atomic:
+      if pending > 0:
+        pending -= 1
+        processed += 1
+        didWork = true
+    return didWork
+
+  every 30s heartbeat:
+    no_http, no_decrypt
+    atomic:
+      processed += 0
+
+  example systemFnAlwaysElevates:
+    call isElevated()
+    expect ok(true)
+
+  example systemExampleDefault:
+    with system
+    call checkSystemFlag()
+    expect ok(true)
+
+  example systemExampleExplicit:
+    with system = true
+    call checkSystemFlag()
+    expect ok(true)
+
+  example nonSystemDefault:
+    call checkSystemFlag()
+    expect ok(false)
+
+example : (WorkerLoopSrv.jobs.size == 2 && (WorkerLoopSrv.jobs[0]?.map (·.name) == some "drainOne") && (WorkerLoopSrv.jobs[0]?.map (·.runWorkM?.isSome) == some true)) = true := by decide +kernel
+
+expect_err "has no matching `where region : Enum` or `where region in [...]` allowlist" in
+external BadMissingBaseWhere:
+  base "https://{region}-run.googleapis.com"
+  get "/ping" ping(region: String) -> String
+
+expect_err "must be a unit `enum`" in
+external BadPayloadEnumWhere:
+  base "https://{p}.example.com" where p : PayloadEnum
+  get "/ping" ping(p: PayloadEnum) -> String
+
+expect_err "invalid expanded `base` origin" in
+external BadExpandedOrigin:
+  base "https://{host}.example.com" where host in ["good", "bad@evil"]
+  get "/ping" ping(host: String) -> String
+
+expect_err "requires a matching parameter `region` on endpoint `ping`" in
+external BadMissingEndpointBaseParam:
+  base "https://{region}-run.googleapis.com" where region : CloudRegion
+  get "/ping" ping() -> String
+
+expect_err "Server invariant `no_http` failed in `badJob`" in
+server stateless BadEveryNoHttpSrv:
+  every 10s badJob -> Bool:
+    no_http
+    let _ = await PingApi.ping()
+      catch _err:
+        return false
+    return true
+
+expect_err "`every` job `badRet` return type must be `Bool`" in
+server stateless BadEveryRetTypeSrv:
+  every 10s badRet -> String:
+    return "nope"
+
+expect_err "missing `return` on fallthrough path of `-> Bool` job `badFallthrough`" in
+server stateless BadEveryFallthroughSrv:
+  every 10s badFallthrough -> Bool:
+    let _x = 1
+
+expect_err "`break` can only be used inside a `for` loop" in
+service BadAsyncBreakSvc:
+  fn bad() -> Nat!:
+    break
+    return 1
 
 end ServerChecks

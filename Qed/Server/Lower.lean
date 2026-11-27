@@ -76,6 +76,7 @@ structure SrvHelperSig where
   minParamCount : Nat
   paramCount    : Nat
   isMonadic     : Bool
+  isFallible    : Bool := true
   takesAtomic   : Bool
   takesEnvs     : Bool := true
   takesCtx      : Bool := true
@@ -104,8 +105,11 @@ structure LowerCtx where
   services         : Array (String × ServiceInfo) := #[]
   ctxTerm?         : Option Lean.Term := none
   activeDbTx?      : Option (String × Lean.Ident) := none
+  txDbAliases      : Array (String × DatabaseInfo × Lean.Term) := #[]
   isHttpRoute      : Bool := false
   isStreamRoute    : Bool := false
+  mutLocals        : Array Lean.Ident := #[]
+  loopMuts?        : Option (Array Lean.Ident) := none
 
 inductive HoistedStep where
   | awaitUnwrap (ref : Lean.Syntax) (tmp : Lean.Ident) (callTerm : Lean.Term)
@@ -131,11 +135,13 @@ private def recordExtRoot (n : Lean.Name) : LowerM Unit := modify fun s => { s w
 
 /-! ## Static AST Queries -/
 
-private def matchTxStmt? (stx : Lean.Syntax) : Option (Lean.Syntax × String × Array Lean.Syntax) :=
+private def matchTxStmt? (stx : Lean.Syntax) : Option (Lean.Syntax × String × Option Lean.Ident × Array Lean.Syntax) :=
   if stx.getKind == ``qedStmtDbTransaction then
     let dotStx := stx.getArg 0; let idNode := if dotStx.isIdent then dotStx else dotStx.getArg 0
     let aliasName := match idNode.getId.eraseMacroScopes with | .str (.str .anonymous a) "transaction" => a | _ => ""
-    some (dotStx, aliasName, suiteStmts (stx.getArg 2))
+    let optAs := stx.getArg 1
+    let txVar? : Option Lean.Ident := if optAs.getNumArgs == 2 then some ⟨optAs.getArg 1⟩ else none
+    some (dotStx, aliasName, txVar?, suiteStmts (stx.getArg 3))
   else none
 
 private def matchNamedStmtCall? (stx : Lean.Syntax) : Option (String × Array Lean.Syntax) := do
@@ -156,17 +162,22 @@ def blockHasEmit (stmts : Array Lean.Syntax) : Bool := stmts.any (stxAny fun s =
 def blockHasAtomic (stmts : Array Lean.Syntax) : Bool := stmts.any (stxAny (·.getKind == ``qedStmtAtomic))
 
 mutual
-  partial def stmtAlwaysReturns (stx : Lean.Syntax) : Bool :=
+  partial def stmtAlwaysTerminates (allowLoopExit : Bool) (stx : Lean.Syntax) : Bool :=
     let k := stx.getKind
-    if k == ``qedStmtReturn then true
-    else if k == ``qedStmtAtomic then blockAlwaysReturns (suiteStmts (stx.getArg 2))
-    else if let some (_, _, tx) := matchTxStmt? stx then blockAlwaysReturns tx
-    else if k == ``qedStmtIf then (desugarElifs (stx.getArg 4).getArgs (stx.getArg 5)).any fun e => blockAlwaysReturns (suiteStmts (stx.getArg 3)) && blockAlwaysReturns e
-    else if k == ``qedStmtIfLet then (extractElseSuite (stx.getArg 7)).any fun e => blockAlwaysReturns (suiteStmts (stx.getArg 6)) && blockAlwaysReturns e
-    else if k == ``qedStmtMatch then let cs := (stx.getArg 3).getArgs; !cs.isEmpty && cs.all fun c => blockAlwaysReturns (suiteStmts (c.getArg 3))
+    if k == ``qedStmtReturn || (allowLoopExit && (k == ``qedStmtBreak || k == ``qedStmtContinue)) then true
+    else if k == ``qedStmtAtomic then blockAlwaysTerminates allowLoopExit (suiteStmts (stx.getArg 2))
+    else if let some (_, _, _, tx) := matchTxStmt? stx then blockAlwaysTerminates false tx
+    else if k == ``qedStmtIf then (desugarElifs (stx.getArg 4).getArgs (stx.getArg 5)).any fun e => blockAlwaysTerminates allowLoopExit (suiteStmts (stx.getArg 3)) && blockAlwaysTerminates allowLoopExit e
+    else if k == ``qedStmtIfLet then (extractElseSuite (stx.getArg 7)).any fun e => blockAlwaysTerminates allowLoopExit (suiteStmts (stx.getArg 6)) && blockAlwaysTerminates allowLoopExit e
+    else if k == ``qedStmtMatch then let cs := (stx.getArg 3).getArgs; !cs.isEmpty && cs.all fun c => blockAlwaysTerminates allowLoopExit (suiteStmts (c.getArg 3))
     else false
-  partial def blockAlwaysReturns (stmts : Array Lean.Syntax) : Bool := stmts.any stmtAlwaysReturns
+  partial def blockAlwaysTerminates (allowLoopExit : Bool) (stmts : Array Lean.Syntax) : Bool := stmts.any (stmtAlwaysTerminates allowLoopExit)
 end
+abbrev blockAlwaysReturns := blockAlwaysTerminates false
+abbrev blockAlwaysExits   := blockAlwaysTerminates true
+
+def blockHasBreakOrContinue (stmts : Array Lean.Syntax) : Bool :=
+  stmts.any (stxAny fun s => s.getKind == ``qedStmtBreak || s.getKind == ``qedStmtContinue)
 
 def ensureUnitReturn (ref : Lean.Syntax) (stmts : Array Lean.Syntax) : Array Lean.Syntax :=
   if blockAlwaysReturns stmts then stmts
@@ -279,8 +290,12 @@ private def lowerSrvCallHook (stx calleeStx : Syntax) (rawArgs : Array Syntax) (
   let ctx ← read
   if let some chain := extractDottedChain? calleeStx then
     if let some aliasName := chain.head? then
-      if let some (_, dbInfo) := ctx.dbs.find? (·.1 == aliasName) then
-        let txIdTerm? := ctx.activeDbTx?.bind fun (a, tid) => if a == aliasName then some ⟨tid.raw⟩ else none
+      let dbHit? : Option (DatabaseInfo × Option Term) :=
+        match ctx.txDbAliases.find? (·.1 == aliasName) with
+        | some (_, dbi, txT) => some (dbi, some txT)
+        | none => (ctx.dbs.find? (·.1 == aliasName)).map fun (_, dbi) =>
+            (dbi, ctx.activeDbTx?.bind fun (a, tid) => if a == aliasName then some ⟨tid.raw⟩ else none)
+      if let some (dbInfo, txIdTerm?) := dbHit? then
         let (dbTerm, isWrite) ← Db.lowerDbCall (go .val) (fun locs e => withReader (fun c => { c with locals := c.locals ++ locs }) (go .val e)) ctx.fnName dbInfo stx chain rawArgs txIdTerm? (fun t => `(srvAutoField($t))) ctx.ctxTerm?
         if isWrite then modify fun s => { s with dbWrite := true }
         return some dbTerm
@@ -497,18 +512,37 @@ private inductive BlockMode where
 section BlockLowering
 open Lean Elab Command
 
+private def mkLoopStepWrap (mode : BlockMode) (t : Term) : CommandElabM Term :=
+  match mode with | .pure .. => pure t | .async _ => `(Pure.pure $t)
+
 private def mkOkLeaf (mode : BlockMode) (ctx : LowerCtx) (valTerm : Term) : CommandElabM Term := do
   let ok ← wrapOkValue ctx valTerm
+  if let some lm := ctx.loopMuts? then
+    let stPack ← liftMacroM (mkMutPack lm.toList)
+    return ← mkLoopStepWrap mode (← `(Qed.QedLoopStep.ret $stPack $ok))
   match mode with | .pure _ _ _ m => mkPureLeaf ctx m (← `(some $ok)) | .async _ => `(Pure.pure (some $ok))
-private def mkErrLeaf (mode : BlockMode) (ctx : LowerCtx) (errTerm : Term) : CommandElabM Term :=
+private def mkErrLeaf (mode : BlockMode) (ctx : LowerCtx) (errTerm : Term) : CommandElabM Term := do
+  if let some lm := ctx.loopMuts? then
+    let stPack ← liftMacroM (mkMutPack lm.toList)
+    return ← mkLoopStepWrap mode (← `(Qed.QedLoopStep.ret $stPack (Except.error $errTerm)))
   match mode with | .pure _ s₀ _ _ => mkPureErrLeaf ctx s₀ errTerm | .async _ => `(Pure.pure (some (Except.error $errTerm)))
-private def mkEmptyLeaf (mode : BlockMode) (ctx : LowerCtx) : CommandElabM Term :=
-  match mode with | .pure _ _ _ m => do mkPureLeaf ctx m (← `(none)) | .async _ => `(Pure.pure none)
+private def mkEmptyLeaf (mode : BlockMode) (ctx : LowerCtx) : CommandElabM Term := do
+  if let some lm := ctx.loopMuts? then
+    let stPack ← liftMacroM (mkMutPack lm.toList)
+    return ← mkLoopStepWrap mode (← `(Qed.QedLoopStep.next $stPack))
+  match mode with | .pure _ _ _ m => mkPureLeaf ctx m (← `(none)) | .async _ => `(Pure.pure none)
+private def mkBreakLeaf (mode : BlockMode) (lm : Array Ident) : CommandElabM Term := do
+  let stPack ← liftMacroM (mkMutPack lm.toList)
+  mkLoopStepWrap mode (← `(Qed.QedLoopStep.breakLoop $stPack))
 
 @[noinline]
 private def wrapUnwrapStep (mode : BlockMode) (ctx : LowerCtx) (tmp : Ident) (valTerm acc : Term) : CommandElabM Term := do
   if !ctx.hasFallible then
     if let some innerTy := ctx.innerOptTy? then
+      if let some lm := ctx.loopMuts? then
+        let stPack ← liftMacroM (mkMutPack lm.toList)
+        let earlyLeaf ← mkLoopStepWrap mode (← `(Qed.QedLoopStep.ret $stPack _early))
+        return ← `(match Qed.Server.SrvUnwrapOpt.unwrapOpt (Inner := $innerTy) $valTerm with | Except.error _early => $earlyLeaf | Except.ok $tmp:ident => $acc)
       match mode with
       | .pure _ s₀ _ m =>
           return ← `(match Qed.Server.SrvUnwrapOpt.unwrapOpt (Inner := $innerTy) $valTerm with
@@ -540,7 +574,16 @@ private def bindLet (mode : BlockMode) (xStx : Syntax) (val cont : Term) : Lower
       `(Qed.Server.srvLetEq $val (fun $xId:ident $(← freshIdent "_srvEq"):ident => $cont))
   | .async _ => liftM <| bindOptIdent xStx val cont
 
-private def pushOptLocal (ctx : LowerCtx) (xStx : Syntax) : LowerCtx := if xStx.isIdent then { ctx with locals := ctx.locals.push xStx.getId.toString } else ctx
+private def dropMutLocals (names : Array Name) (muts : Array Ident) : Array Ident :=
+  muts.filter fun m => !names.contains m.getId.eraseMacroScopes
+
+private def pushOptLocal (ctx : LowerCtx) (xStx : Syntax) : LowerCtx :=
+  if xStx.isIdent then
+    { ctx with locals := ctx.locals.push xStx.getId.toString, mutLocals := dropMutLocals #[xStx.getId.eraseMacroScopes] ctx.mutLocals }
+  else ctx
+
+private def pushPatLocals (ctx : LowerCtx) (patIds : Array Name) : LowerCtx :=
+  { ctx with locals := ctx.locals ++ patIds.map (·.toString), mutLocals := dropMutLocals patIds ctx.mutLocals }
 
 private def isBareUnwrapExpr (allowAwait : Bool) (eStx : Syntax) : Bool :=
   let u := unwrapParens1 eStx
@@ -571,11 +614,13 @@ private partial def lowerCatchFallback? (ctx : LowerCtx) (stmts : Array Syntax) 
 private def lowerMatchScrutineesAndAlts (ctx : LowerCtx) (stmt : Syntax) (rest : Array Syntax)
     (lowerArm : LowerCtx → Array Syntax → LowerM Term) : LowerM (Term × Array HoistedStep) := do
   let (scrutTerms, allSteps) ← withCollectedHoists <| (stmt.getArg 1).getSepArgs.mapM (lowerExpr ctx .val)
-  let cases := (stmt.getArg 3).getArgs; let allRet := cases.all fun c => blockAlwaysReturns (suiteStmts (c.getArg 3))
+  let cases := (stmt.getArg 3).getArgs
+  let termCheck := blockAlwaysTerminates ctx.loopMuts?.isSome
   let alts ← cases.mapM fun c => do
     let altTerms ← liftMacroM (lowerCasePatAlts (c.getArg 1))
-    let pIds := (collectCasePatIds (extractCasePatAlts (c.getArg 1))).map (·.toString)
-    let rhs ← lowerArm { ctx with locals := ctx.locals ++ pIds } (suiteStmts (c.getArg 3) ++ if allRet then #[] else rest)
+    let pIds := collectCasePatIds (extractCasePatAlts (c.getArg 1))
+    let cStmts := suiteStmts (c.getArg 3)
+    let rhs ← lowerArm (pushPatLocals ctx pIds) (if termCheck cStmts then cStmts else cStmts ++ rest)
     mkMatchAltFromAlts altTerms rhs
   return (← `(match $[$scrutTerms:term],* with $[$alts:matchAlt]*), allSteps)
 
@@ -598,9 +643,14 @@ private def rejectSrvAssignPredict (stmt : Syntax) : LowerM Unit := do
 private def lowerBranch (mode : BlockMode) (ctx : LowerCtx) (rest thenStmts : Array Syntax) (thenCtx : LowerCtx)
     (elseStmts? : Option (Array Syntax)) (allowPureLetJoin : Bool) (mkBranch : Term → Term → CommandElabM Term)
     (recSame : LowerCtx → Array Syntax → LowerM Term) (recWithState : LowerCtx → Ident → Array Syntax → LowerM Term) : LowerM Term := do
-  let thenRet := blockAlwaysReturns thenStmts; let elseRet := elseStmts?.any blockAlwaysReturns
+  let termCheck := blockAlwaysTerminates ctx.loopMuts?.isSome
+  let thenRet := termCheck thenStmts; let elseRet := elseStmts?.any termCheck
   let lowerElseOpt := elseStmts?.elim (liftM <| mkEmptyLeaf mode ctx) (recSame ctx)
   if rest.isEmpty then liftM =<< (mkBranch <$> recSame thenCtx thenStmts <*> lowerElseOpt)
+  else if ctx.loopMuts?.isSome || !ctx.mutLocals.isEmpty then
+    let tArm ← recSame thenCtx (if thenRet then thenStmts else thenStmts ++ rest)
+    let eArm ← recSame ctx (if elseRet then elseStmts?.getD #[] else (elseStmts?.getD #[]) ++ rest)
+    liftM <| mkBranch tArm eArm
   else if thenRet && !elseRet then liftM =<< (mkBranch <$> recSame thenCtx thenStmts <*> recSame ctx ((elseStmts?.getD #[]) ++ rest))
   else if !thenRet && elseRet then liftM =<< (mkBranch <$> recSame thenCtx (thenStmts ++ rest) <*> recSame ctx (elseStmts?.getD #[]))
   else
@@ -628,10 +678,13 @@ private def lowerReturn (mode : BlockMode) (ctx : LowerCtx) (stmt : Syntax) : Lo
     | .async _ =>
         if uRet.getKind == ``qedAwait && !(unwrapParens1 (uRet.getArg 1)).isOfKind ``qedUnwrap && ctx.hasFallible then
           let (callTerm, steps) ← lowerExprCollectingHoists ctx .val (uRet.getArg 1); let rawId ← freshIdent "_retAw"; let errTy ← liftM <| errTyOf ctx
-          let leaf ← match ctx.innerOptTy? with
-            | some innerTy => `($callTerm >>= fun $rawId:ident => Pure.pure (some (match Qed.Server.SrvRetAwait.liftRet (E := $errTy) $rawId with | Except.ok _v => Except.ok (Qed.Server.SrvLiftOpt.liftOpt (Inner := $innerTy) _v) | Except.error _e => Except.error _e)))
-            | none => `($callTerm >>= fun $rawId:ident => Pure.pure (some (Qed.Server.SrvRetAwait.liftRet (E := $errTy) $rawId)))
-          return ← wrapHoists mode ctx steps leaf
+          let innerRes ← match ctx.innerOptTy? with
+            | some innerTy => `(match Qed.Server.SrvRetAwait.liftRet (E := $errTy) $rawId with | Except.ok _v => Except.ok (Qed.Server.SrvLiftOpt.liftOpt (Inner := $innerTy) _v) | Except.error _e => Except.error _e)
+            | none => `(Qed.Server.SrvRetAwait.liftRet (E := $errTy) $rawId)
+          let wrappedRes ← match ctx.loopMuts? with
+            | none => `(some ($innerRes))
+            | some lm => let stPack ← liftMacroM (mkMutPack lm.toList); `(Qed.QedLoopStep.ret $stPack ($innerRes))
+          return ← wrapHoists mode ctx steps (← `($callTerm >>= fun $rawId:ident => Pure.pure $wrappedRes))
     let isFail := isFailCall retExpr
     if isFail && !ctx.hasFallible then throwErrorAt retExpr s!"`fail(...)` can only be returned from a fallible `T!` function (`{ctx.fnName}` is not declared `-> ...!`)"
     let (term, steps) ← lowerExprCollectingHoists ctx .val retExpr
@@ -657,7 +710,8 @@ private def lowerLet (mode : BlockMode) (ctx : LowerCtx) (stmt : Syntax) (rest :
     let innerTerm ← if let some fbTerm ← lowerCatchFallback? catchCtx catchStmts then
         let okValId ← freshIdent "_catchOk"; bindLet mode xStx (← liftM <| mkUnwrapMatch fbTerm okValId ⟨okValId.raw⟩) okTerm
       else
-        unless blockAlwaysReturns catchStmts do throwErrorAt stmt "the `catch` block must either `return` on all paths or end with a fallback value expression"
+        unless blockAlwaysTerminates ctx.loopMuts?.isSome catchStmts do
+          throwErrorAt stmt (if ctx.loopMuts?.isSome then "the `catch` block must end with `return`, `break`, `continue`, or a fallback value expression" else "the `catch` block must either `return` on all paths or end with a fallback value expression")
         liftM <| mkUnwrapMatch (← recBlock catchCtx catchStmts) (if xStx.isIdent then ⟨xStx⟩ else mkIdent `_srvDiscard) okTerm
     let awaitedTerm ← match awaitCall? with | some (c, r) => `($c >>= fun $r:ident => $innerTerm) | none => pure innerTerm
     wrapHoists mode ctx steps awaitedTerm
@@ -702,17 +756,26 @@ private def lowerAtomicStmt (aCtx : LowerCtx) (stateTyTerm? : Option Term) (stmt
       let id : Ident := ⟨s.getArg 1⟩; let nm := id.getId.eraseMacroScopes.toString
       if rest.any (stxMentionsVar nm) then ids.filter (·.getId.eraseMacroScopes.toString != nm) |>.push id else ids
     else ids
+  let mkLoopAwareRet (retTerm : Term) : CommandElabM Term := match aCtx.loopMuts? with
+    | none => `(Pure.pure (some $retTerm))
+    | some lm => do let stPack ← liftMacroM (mkMutPack lm.toList); `(Pure.pure (Qed.QedLoopStep.ret $stPack $retTerm))
+  let baseAtomCtx := { aCtx with loopMuts? := none }
   let (atomCtx, bodyStmts, isFinish, mkOnResult) : LowerCtx × Array Syntax × Bool × (Term → LowerM Term) ←
-    if alwaysRet then pure (aCtx, atomStmts, true, fun res => `(Pure.pure (some $res)))
+    if alwaysRet then pure (baseAtomCtx, atomStmts, true, fun res => liftM <| mkLoopAwareRet res)
     else if !exportedIds.isEmpty then
       let hasEarlyOk := atomStmts.any (stxAny fun s => s.getKind == ``qedStmtReturn && ((s.getArg 1).getNumArgs == 0 || !isFailCall ((s.getArg 1).getArg 0)))
       let expTuple ← buildTupleVal (exportedIds.map (⟨·.raw⟩))
       let exportStmt := Syntax.node (.fromRef stmt) `Qed.Server.atomicExport #[expTuple.raw]
-      pure (if hasEarlyOk then { aCtx with wrapReturnSumInl := true } else { aCtx with innerOptTy? := none }, atomStmts.push exportStmt, true, fun res => do
+      pure (if hasEarlyOk then { baseAtomCtx with wrapReturnSumInl := true } else { baseAtomCtx with innerOptTy? := none }, atomStmts.push exportStmt, true, fun res => do
         let cont ← lowerRest { aCtx with locals := aCtx.locals ++ exportedIds.map (·.getId.eraseMacroScopes.toString) } rest
-        if hasEarlyOk then `(match $res:term with | Except.error _e => Pure.pure (some (Except.error _e)) | Except.ok (Sum.inl _v) => Pure.pure (some (Except.ok _v)) | Except.ok (Sum.inr $expTuple:term) => $cont)
-        else `(match $res:term with | Except.error _e => Pure.pure (some (Except.error _e)) | Except.ok $expTuple:term => $cont))
-    else pure (aCtx, atomStmts, false, fun early => do `(match $early:term with | some _r => Pure.pure (some _r) | none => $(← lowerRest aCtx rest)))
+        let errRet ← liftM <| mkLoopAwareRet (← `(Except.error _e))
+        if hasEarlyOk then
+          let okRet ← liftM <| mkLoopAwareRet (← `(Except.ok _v))
+          `(match $res:term with | Except.error _e => $errRet | Except.ok (Sum.inl _v) => $okRet | Except.ok (Sum.inr $expTuple:term) => $cont)
+        else `(match $res:term with | Except.error _e => $errRet | Except.ok $expTuple:term => $cont))
+    else pure (baseAtomCtx, atomStmts, false, fun early => do
+      let earlyRet ← liftM <| mkLoopAwareRet (← `(_r))
+      `(match $early:term with | some _r => $earlyRet | none => $(← lowerRest aCtx rest)))
   let some stateTyTerm := stateTyTerm? | throwErrorAt stmt "`atomic` is only valid in a `server` with `state` declarations"
   if blockHasAwait bodyStmts then throwErrorAt stmt "cannot use `await` inside an `atomic` block; perform external I/O outside `atomic` so shared locks never span network calls"
   let s0Id ← freshIdent "_sAtom"; let hasEmit := blockHasEmit bodyStmts; let es0Id ← freshIdent "_es0"
@@ -760,14 +823,96 @@ private def lowerSideEffectCall (ctx : LowerCtx) (stmt : Syntax) (fn : String) (
   return (`Qed.Server.MonadServer.setCookie, argT, steps)
 
 @[noinline]
-private def lowerTxStmt (aCtx : LowerCtx) (stmt aliasRef : Syntax) (aliasName : String) (txStmts rest : Array Syntax)
+private def lowerTxStmt (aCtx : LowerCtx) (stmt aliasRef : Syntax) (aliasName : String) (txVar? : Option Ident) (txStmts rest : Array Syntax)
     (recAsync : LowerCtx → Array Syntax → LowerM Term) : LowerM Term := do
   let some (_, dbInfo) := aCtx.dbs.find? (·.1 == aliasName)
     | throwErrorAt aliasRef s!"unknown database alias `{aliasName}` in `transaction` (declared `use` databases: [{String.intercalate ", " (aCtx.dbs.toList.map Prod.fst)}])"
   if let some (curAlias, _) := aCtx.activeDbTx? then throwErrorAt stmt s!"nested database transactions are not supported (already inside `{curAlias}.transaction:`)"
-  let txId ← freshIdent "_dbTxId"; let bodyTerm ← recAsync { aCtx with activeDbTx? := some (aliasName, txId) } txStmts
+  let txId ← freshIdent "_dbTxId"
+  let (innerCtx, wrapTxVar) ← match txVar? with
+    | none => pure ({ aCtx with activeDbTx? := some (aliasName, txId), loopMuts? := none }, fun b => pure b)
+    | some tv =>
+        let tvName := tv.getId.eraseMacroScopes.toString
+        if aCtx.dbs.any (·.1 == tvName) || aCtx.txDbAliases.any (·.1 == tvName) then
+          throwErrorAt tv s!"transaction variable `{tvName}` collides with an existing database alias"
+        let txTagLit := Syntax.mkStrLit dbInfo.dbName.toString
+        let nextCtx := { aCtx with
+          activeDbTx? := some (aliasName, txId),
+          txDbAliases := aCtx.txDbAliases.push (tvName, dbInfo, ⟨txId.raw⟩),
+          locals := aCtx.locals.push tvName,
+          loopMuts? := none }
+        pure (nextCtx, fun b => `(let $tv:ident : Qed.Server.Db.DbTx $txTagLit := Qed.Server.Db.DbTx.mk $txId; $b))
+  let bodyTerm ← wrapTxVar (← recAsync innerCtx txStmts)
   let txRun ← `(Qed.Server.dbRunTx $(mkIdentFrom aliasRef dbInfo.configConst) (fun ($txId:ident : UInt64) => $bodyTerm))
-  if rest.isEmpty || blockAlwaysReturns txStmts then return txRun else `(Qed.Server.srvSeqM $txRun (fun _ => $(← recAsync aCtx rest)))
+  match aCtx.loopMuts? with
+  | some lm =>
+      let stPack ← liftMacroM (mkMutPack lm.toList)
+      let restTerm ← recAsync aCtx rest
+      `($txRun >>= fun | Option.some _txRet => Pure.pure (Qed.QedLoopStep.ret $stPack _txRet) | Option.none => $restTerm)
+  | none =>
+      if rest.isEmpty || blockAlwaysReturns txStmts then return txRun else `(Qed.Server.srvSeqM $txRun (fun _ => $(← recAsync aCtx rest)))
+
+@[noinline]
+private def lowerSrvLetMutStmt (ctx : LowerCtx) (stmt : Syntax) (rest : Array Syntax)
+    (wrapH : Array HoistedStep → Term → LowerM Term) (recBlock : LowerCtx → Array Syntax → LowerM Term) : LowerM Term := do
+  let lId : Ident := ⟨stmt.getArg 2⟩; let nm := lId.getId.eraseMacroScopes
+  if ctx.mutLocals.any (·.getId.eraseMacroScopes == nm) then
+    throwErrorAt lId s!"mutable variable `{nm}` is already declared in this scope; update it with `{nm} = ...`"
+  let (rhsTerm, steps) ← lowerExprCollectingHoists ctx .val (stmt.getArg 5)
+  let checkedRhs ← if steps.isEmpty then `(srvRejectUnhandledErr($rhsTerm)) else pure rhsTerm
+  let nextCtx := { ctx with locals := ctx.locals.push nm.toString, mutLocals := ctx.mutLocals.push lId }
+  let cont ← recBlock nextCtx rest
+  let bound ← if (stmt.getArg 3).getNumArgs == 2 then
+      let lTy ← liftMacroM (return (← lowerQedType ((stmt.getArg 3).getArg 1) false).1)
+      `(let $lId:ident : $lTy := $checkedRhs; $cont)
+    else `(let $lId:ident := $checkedRhs; $cont)
+  wrapH steps bound
+
+@[noinline]
+private def lowerSrvLocalMutStmt (ctx : LowerCtx) (stmt : Syntax) (act : LocalMutAction) (rest : Array Syntax)
+    (wrapH : Array HoistedStep → Term → LowerM Term) (recBlock : LowerCtx → Array Syntax → LowerM Term) : LowerM Term := do
+  rejectSrvAssignPredict stmt
+  let (rhsTerm, steps) ← lowerExprCollectingHoists ctx .val act.rhsSyntax
+  let newVal ← liftMacroM (applyLocalMutRhs act rhsTerm)
+  let lId := act.targetIdent
+  let cont ← recBlock ctx rest
+  wrapH steps (← `(let $lId:ident := $newVal; $cont))
+
+@[noinline]
+private def lowerSrvForFoldCore (isPure : Bool) (ctx : LowerCtx) (stmt : Syntax) (rest : Array Syntax)
+    (wrapH : Array HoistedStep → Term → LowerM Term)
+    (mkOuterRet : Ident → CommandElabM Term)
+    (recBlock : LowerCtx → Array Syntax → LowerM Term) : LowerM Term := do
+  let binderStx := stmt.getArg 1; let iterStx := stmt.getArg 3; let bodyStmts := suiteStmts (stmt.getArg 5)
+  if binderStx.isIdent then
+    let bNm := binderStx.getId.eraseMacroScopes
+    if ctx.mutLocals.any (·.getId.eraseMacroScopes == bNm) then
+      throwErrorAt binderStx s!"`for` loop variable `{bNm}` shadows mutable variable `{bNm}`; use a different loop variable name"
+  let (iterTerm, steps) ← lowerExprCollectingHoists ctx .val iterStx
+  let mutated := collectMutatedIds bodyStmts
+  let usedMuts := ctx.mutLocals.filter fun m => mutated.contains m.getId.eraseMacroScopes
+  let initSt ← liftMacroM (mkMutPack usedMuts.toList)
+  let stParam ← freshIdent "_srvLoopSt"; let resSt ← freshIdent "_srvLoopStOut"
+  let resRet ← freshIdent "_srvLoopRetOut"; let retValId ← freshIdent "_srvLoopRet"
+  let bodyInner ← recBlock { pushOptLocal ctx binderStx with loopMuts? := some usedMuts } bodyStmts
+  let bodyWithUnpack ← liftMacroM (wrapMutUnpack stParam usedMuts.toList bodyInner)
+  let lam ← if binderStx.isIdent then `(fun $stParam:ident $(⟨binderStx⟩):ident => $bodyWithUnpack) else `(fun $stParam:ident _ => $bodyWithUnpack)
+  let restTerm ← recBlock ctx rest
+  let someArm ← match ctx.loopMuts? with
+    | none => liftM <| mkOuterRet retValId
+    | some outerMuts =>
+        let outerPack ← liftMacroM (mkMutPack outerMuts.toList)
+        let rTerm ← `(Qed.QedLoopStep.ret $outerPack $retValId)
+        if isPure then pure rTerm else `(Pure.pure $rTerm)
+  let matchTerm ← `(match $resRet:ident with | Option.some $retValId:ident => $someArm | Option.none => $restTerm)
+  let afterLoop ← liftMacroM (wrapMutUnpack resSt usedMuts.toList matchTerm)
+  let fullTerm ← if isPure then
+      let loopCall ← if isRangeCallExpr iterStx then `(Qed.qedForRange $iterTerm $initSt $lam) else `(Qed.qedForFold $iterTerm $initSt $lam)
+      `(let ($resSt:ident, $resRet:ident) := $loopCall; $afterLoop)
+    else
+      let loopCall ← if isRangeCallExpr iterStx then `(Qed.Server.srvForRangeM $iterTerm $initSt $lam) else `(Qed.Server.srvForFoldM (Qed.QedIterable.toList $iterTerm) $initSt $lam)
+      `($loopCall >>= fun ($resSt:ident, $resRet:ident) => $afterLoop)
+  wrapH steps fullTerm
 
 private partial def lowerBlock (isPure inAtomic : Bool) (s₀ sCur : Ident) (stateTyTerm? : Option Term)
     (ctx : LowerCtx) (stmts : Array Syntax) : LowerM Term := do
@@ -779,6 +924,16 @@ private partial def lowerBlock (isPure inAtomic : Bool) (s₀ sCur : Ident) (sta
   let recSame := fun c st => lowerBlock isPure inAtomic s₀ sCur stateTyTerm? c st
   let recWithState := fun c s st => lowerBlock isPure inAtomic s₀ s stateTyTerm? c st
   if k == ``qedStmtPass then recSame bCtx rest
+  else if k == ``qedStmtBreak then
+    let some lm := bCtx.loopMuts? | throwErrorAt stmt "`break` can only be used inside a `for` loop"
+    liftM <| mkBreakLeaf mode lm
+  else if k == ``qedStmtContinue then
+    let some _ := bCtx.loopMuts? | throwErrorAt stmt "`continue` can only be used inside a `for` loop"
+    liftM <| mkEmptyLeaf mode bCtx
+  else if k == ``qedStmtLetMut then
+    lowerSrvLetMutStmt bCtx stmt rest (wrapHoists mode bCtx) recSame
+  else if let some act := tryMatchLocalMut? bCtx.mutLocals stmt then
+    lowerSrvLocalMutStmt bCtx stmt act rest (wrapHoists mode bCtx) recSame
   else if let some (chId, rawArgs) := matchSrvEmitStmt? stmt then
     let (emitTerm, steps) ← lowerEmitCall bCtx stmt chId rawArgs
     let body ← match mode with
@@ -799,9 +954,9 @@ private partial def lowerBlock (isPure inAtomic : Bool) (s₀ sCur : Ident) (sta
     if isPure then throwErrorAt stmt (if fn == "send" then "cannot call `send(...)` inside an `atomic:` block; emit SSE events outside `atomic:`" else "cannot call `setCookie`/`clearCookie` inside an `atomic:` block; emit cookies outside `atomic:`")
     let (effNm, argT, steps) ← lowerSideEffectCall bCtx stmt fn rawArgs
     wrapHoists mode bCtx steps (← `($(mkIdent effNm) $argT >>= fun _ => $(← recSame bCtx rest)))
-  else if let some (aliasRef, aliasName, txStmts) := matchTxStmt? stmt then
+  else if let some (aliasRef, aliasName, txVar?, txStmts) := matchTxStmt? stmt then
     if isPure then throwErrorAt stmt "cannot start a database `transaction` inside an `atomic:` block; run database transactions outside `atomic:`"
-    lowerTxStmt bCtx stmt aliasRef aliasName txStmts rest recSame
+    lowerTxStmt bCtx stmt aliasRef aliasName txVar? txStmts rest recSame
   else if k == ``qedStmtAtomic then
     if isPure then
       if inAtomic then throwErrorAt stmt "nested `atomic` blocks are forbidden"
@@ -814,13 +969,17 @@ private partial def lowerBlock (isPure inAtomic : Bool) (s₀ sCur : Ident) (sta
     let patStx := stmt.getArg 1; let patTerm ← liftMacroM (lowerQedPat patStx)
     let (scrutTerm, steps) ← lowerExprCollectingHoists bCtx .val (stmt.getArg 3)
     let elseStmts := extractLetElseStmts stmt
-    unless blockAlwaysReturns elseStmts do throwErrorAt stmt "guard `let ... = ... else` branch must `return` on all paths"
+    unless blockAlwaysTerminates bCtx.loopMuts?.isSome elseStmts do
+      throwErrorAt stmt (if bCtx.loopMuts?.isSome then "guard `let ... = ... else` branch must `return`, `break`, or `continue` on all paths" else "guard `let ... = ... else` branch must `return` on all paths")
     let hMatch ← freshIdent "_srvM"
-    let thenTerm ← recSame { bCtx with locals := bCtx.locals ++ (collectQedPatIds patStx).map (·.toString) } rest
+    let thenTerm ← recSame (pushPatLocals bCtx (collectQedPatIds patStx)) rest
     let elseTerm ← recSame bCtx elseStmts
     wrapHoists mode bCtx steps (← `(match $hMatch:ident : $scrutTerm:term with | $patTerm => $thenTerm | _ => $elseTerm))
   else if let some targetStx := (if k == ``qedStmtAssign then some (stmt.getArg 0) else if k == ``qedStmtExpr then ((matchPushCall? (stmt.getArg 0)).orElse fun _ => matchRemoveCall? (stmt.getArg 0)).map Prod.fst else none) then
-    if isPure then lowerPureMutationStmt mode bCtx sCur stmt rest recSame
+    if isPure then
+      if bCtx.loopMuts?.isSome then
+        throwErrorAt stmt "cannot mutate server `state` field inside a synchronous `for` loop; mutate a `let mut` local or wrap server mutations in `atomic:`"
+      lowerPureMutationStmt mode bCtx sCur stmt rest recSame
     else
       rejectSrvAssignPredict stmt; let _ ← parseLValPath bCtx targetStx
       throwErrorAt stmt s!"cannot mutate server state outside an `atomic:` block in `{ctx.fnName}` because `{ctx.fnName}` uses `await`"
@@ -835,10 +994,25 @@ private partial def lowerBlock (isPure inAtomic : Bool) (s₀ sCur : Ident) (sta
   else if k == ``qedStmtIfLet then
     let patStx := stmt.getArg 2; let patTerm ← liftMacroM (lowerQedPat patStx)
     let (scrutTerm, steps) ← lowerExprCollectingHoists bCtx .val (stmt.getArg 4); let hMatch ← freshIdent "_srvM"
-    wrapHoists mode bCtx steps (← lowerBranch mode bCtx rest (suiteStmts (stmt.getArg 6)) { bCtx with locals := bCtx.locals ++ (collectQedPatIds patStx).map (·.toString) }
+    wrapHoists mode bCtx steps (← lowerBranch mode bCtx rest (suiteStmts (stmt.getArg 6)) (pushPatLocals bCtx (collectQedPatIds patStx))
       (extractElseSuite (stmt.getArg 7)) false (fun t e => `(match $hMatch:ident : $scrutTerm:term with | $patTerm => $t | _ => $e)) recSame recWithState)
   else if k == ``qedStmtMatch then
     let (matchT, allSteps) ← lowerMatchScrutineesAndAlts bCtx stmt rest recSame; wrapHoists mode bCtx allSteps matchT
+  else if k == ``qedStmtFor then
+    let iterStx := stmt.getArg 3; let bodyStmts := suiteStmts (stmt.getArg 5)
+    let useFold := isPure || !bCtx.mutLocals.isEmpty || bCtx.loopMuts?.isSome || isRangeCallExpr iterStx || blockHasBreakOrContinue bodyStmts
+    if useFold then
+      lowerSrvForFoldCore isPure bCtx stmt rest (wrapHoists mode bCtx)
+        (fun retId => do match mode with | .pure _ _ _ matCur => mkPureLeaf bCtx matCur (← `(Option.some $retId)) | .async _ => `(Pure.pure (Option.some $retId)))
+        recSame
+    else
+      let binderStx := stmt.getArg 1
+      let (iterTerm, steps) ← lowerExprCollectingHoists bCtx .val iterStx
+      let bodyTerm ← recSame (pushOptLocal bCtx binderStx) bodyStmts
+      let elemLam ← if binderStx.isIdent then `(fun $(⟨binderStx⟩):ident => $bodyTerm) else `(fun _ => $bodyTerm)
+      let loopTerm ← `(Qed.Server.srvForEachM (Qed.QedIterable.toList $iterTerm) $elemLam)
+      let fullTerm ← if rest.isEmpty then pure loopTerm else `(Qed.Server.srvSeqM $loopTerm (fun _ => $(← recSame bCtx rest)))
+      wrapHoists mode bCtx steps fullTerm
   else
     let sn := stxSnippet stmt
     throwErrorAt stmt s!"unsupported statement{if sn.isEmpty then s!"({k})" else s!" `{sn}`"} in {if isPure then "server" else "async server"} function `{ctx.fnName}`"
@@ -856,16 +1030,35 @@ private def wrapInfallibleHoists (steps : Array HoistedStep) (body : Term) : Low
 /-- Direct monadic block lowering for infallible `service` functions (`m RetTy`, no `Option`/`Except` wrapper). -/
 @[noinline]
 partial def lowerInfallibleAsyncBlock (ctx : LowerCtx) (stmts : Array Syntax) : LowerM Term := do
-  if stmts.isEmpty then throwError s!"missing `return` on fallthrough path of `{ctx.fnName}`"
+  if stmts.isEmpty then
+    if let some lm := ctx.loopMuts? then
+      let stPack ← liftMacroM (mkMutPack lm.toList); return ← `(Pure.pure (Qed.QedLoopStep.next $stPack))
+    throwError s!"missing `return` on fallthrough path of `{ctx.fnName}`"
   let stmt := stmts[0]!; let rest := stmts.extract 1 stmts.size; let k := stmt.getKind
+  let wrapInfRet (valT : Term) : CommandElabM Term := match ctx.loopMuts? with
+    | none => `(Pure.pure $valT)
+    | some lm => do let stPack ← liftMacroM (mkMutPack lm.toList); `(Pure.pure (Qed.QedLoopStep.ret $stPack $valT))
+  let termCheck := blockAlwaysTerminates ctx.loopMuts?.isSome
   if k == ``qedStmtPass then lowerInfallibleAsyncBlock ctx rest
+  else if k == ``qedStmtBreak then
+    let some lm := ctx.loopMuts? | throwErrorAt stmt "`break` can only be used inside a `for` loop"
+    let stPack ← liftMacroM (mkMutPack lm.toList); `(Pure.pure (Qed.QedLoopStep.breakLoop $stPack))
+  else if k == ``qedStmtContinue then
+    let some lm := ctx.loopMuts? | throwErrorAt stmt "`continue` can only be used inside a `for` loop"
+    let stPack ← liftMacroM (mkMutPack lm.toList); `(Pure.pure (Qed.QedLoopStep.next $stPack))
+  else if k == ``qedStmtLetMut then
+    lowerSrvLetMutStmt ctx stmt rest wrapInfallibleHoists lowerInfallibleAsyncBlock
+  else if let some act := tryMatchLocalMut? ctx.mutLocals stmt then
+    lowerSrvLocalMutStmt ctx stmt act rest wrapInfallibleHoists lowerInfallibleAsyncBlock
+  else if k == ``qedStmtFor then
+    lowerSrvForFoldCore false ctx stmt rest wrapInfallibleHoists (fun retId => `(Pure.pure $retId)) lowerInfallibleAsyncBlock
   else if k == ``qedStmtReturn then
-    let valTerm ← if (stmt.getArg 1).getNumArgs == 0 then `(()) else
+    if (stmt.getArg 1).getNumArgs == 0 then liftM <| wrapInfRet (← `(()))
+    else
       let retExpr := (stmt.getArg 1).getArg 0
       if isFailCall retExpr then throwErrorAt retExpr s!"`fail(...)` can only be returned from a fallible `T!` function (`{ctx.fnName}` is not declared `-> ...!`)"
       let (t, steps) ← lowerExprCollectingHoists ctx .val retExpr
-      return ← wrapInfallibleHoists steps (← `(Pure.pure (srvAutoField($t))))
-    `(Pure.pure $valTerm)
+      wrapInfallibleHoists steps (← liftM <| wrapInfRet (← `(srvAutoField($t))))
   else if k == ``qedStmtLet then
     let xStx := stmt.getArg 1; let rhsRaw := stmt.getArg 4
     if let some catchNode ← extractSrvLetCatch? (stmt.getArg 5) then
@@ -881,7 +1074,8 @@ partial def lowerInfallibleAsyncBlock (ctx : LowerCtx) (stmts : Array Syntax) : 
       let innerTerm ← if let some fbTerm ← lowerCatchFallback? catchCtx catchStmts then
           let okValId ← freshIdent "_catchOk"; liftM <| bindOptIdent xStx (← liftM <| mkUnwrapMatch fbTerm okValId ⟨okValId.raw⟩) okTerm
         else
-          unless blockAlwaysReturns catchStmts do throwErrorAt stmt "the `catch` block must either `return` on all paths or end with a fallback value expression"
+          unless termCheck catchStmts do
+            throwErrorAt stmt (if ctx.loopMuts?.isSome then "the `catch` block must end with `return`, `break`, `continue`, or a fallback value expression" else "the `catch` block must either `return` on all paths or end with a fallback value expression")
           liftM <| mkUnwrapMatch (← lowerInfallibleAsyncBlock catchCtx catchStmts) (if xStx.isIdent then ⟨xStx⟩ else mkIdent `_srvDiscard) okTerm
       let awaitedTerm ← match awaitCall? with | some (c, r) => `($c >>= fun $r:ident => $innerTerm) | none => pure innerTerm
       wrapInfallibleHoists steps awaitedTerm
@@ -893,24 +1087,25 @@ partial def lowerInfallibleAsyncBlock (ctx : LowerCtx) (stmts : Array Syntax) : 
     let patStx := stmt.getArg 1; let patTerm ← liftMacroM (lowerQedPat patStx)
     let (scrutTerm, steps) ← lowerExprCollectingHoists ctx .val (stmt.getArg 3)
     let elseStmts := extractLetElseStmts stmt
-    unless blockAlwaysReturns elseStmts do throwErrorAt stmt "guard `let ... = ... else` branch must `return` on all paths"
+    unless termCheck elseStmts do
+      throwErrorAt stmt (if ctx.loopMuts?.isSome then "guard `let ... = ... else` branch must `return`, `break`, or `continue` on all paths" else "guard `let ... = ... else` branch must `return` on all paths")
     let hMatch ← freshIdent "_srvM"
-    let thenTerm ← lowerInfallibleAsyncBlock { ctx with locals := ctx.locals ++ (collectQedPatIds patStx).map (·.toString) } rest
+    let thenTerm ← lowerInfallibleAsyncBlock (pushPatLocals ctx (collectQedPatIds patStx)) rest
     let elseTerm ← lowerInfallibleAsyncBlock ctx elseStmts
     wrapInfallibleHoists steps (← `(match $hMatch:ident : $scrutTerm:term with | $patTerm => $thenTerm | _ => $elseTerm))
   else if k == ``qedStmtIf then
     let (condTerm, steps) ← lowerExprCollectingHoists ctx .propGuard (stmt.getArg 1); let hGuard ← freshIdent "_srvG"
     let thenStmts := suiteStmts (stmt.getArg 3); let elseStmts := (desugarElifs (stmt.getArg 4).getArgs (stmt.getArg 5)).getD #[]
-    let thenT ← lowerInfallibleAsyncBlock ctx (if blockAlwaysReturns thenStmts then thenStmts else thenStmts ++ rest)
-    let elseT ← lowerInfallibleAsyncBlock ctx (if blockAlwaysReturns elseStmts then elseStmts else elseStmts ++ rest)
+    let thenT ← lowerInfallibleAsyncBlock ctx (if termCheck thenStmts then thenStmts else thenStmts ++ rest)
+    let elseT ← lowerInfallibleAsyncBlock ctx (if termCheck elseStmts then elseStmts else elseStmts ++ rest)
     wrapInfallibleHoists steps (← `(if $hGuard:ident : $condTerm then $thenT else $elseT))
   else if k == ``qedStmtIfLet then
     let patStx := stmt.getArg 2; let patTerm ← liftMacroM (lowerQedPat patStx)
     let (scrutTerm, steps) ← lowerExprCollectingHoists ctx .val (stmt.getArg 4); let hMatch ← freshIdent "_srvM"
     let thenStmts := suiteStmts (stmt.getArg 6); let elseStmts := (extractElseSuite (stmt.getArg 7)).getD #[]
-    let thenCtx := { ctx with locals := ctx.locals ++ (collectQedPatIds patStx).map (·.toString) }
-    let thenT ← lowerInfallibleAsyncBlock thenCtx (if blockAlwaysReturns thenStmts then thenStmts else thenStmts ++ rest)
-    let elseT ← lowerInfallibleAsyncBlock ctx (if blockAlwaysReturns elseStmts then elseStmts else elseStmts ++ rest)
+    let thenCtx := pushPatLocals ctx (collectQedPatIds patStx)
+    let thenT ← lowerInfallibleAsyncBlock thenCtx (if termCheck thenStmts then thenStmts else thenStmts ++ rest)
+    let elseT ← lowerInfallibleAsyncBlock ctx (if termCheck elseStmts then elseStmts else elseStmts ++ rest)
     wrapInfallibleHoists steps (← `(match $hMatch:ident : $scrutTerm:term with | $patTerm => $thenT | _ => $elseT))
   else if k == ``qedStmtMatch then
     let (matchT, allSteps) ← lowerMatchScrutineesAndAlts ctx stmt rest lowerInfallibleAsyncBlock

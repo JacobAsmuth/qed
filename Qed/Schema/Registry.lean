@@ -68,7 +68,10 @@ structure StructFieldSpec where mk :: (ident : Ident) (wireKey : String) (valTy 
 structure StructJsonOpts where mk ::
   (ctxBinders : Array (Ident × Term) := #[]) (emitNamedDefs : Bool := true) (emitStringCodec : Bool := false)
   (emitNonNull emitLawful : Bool := true) (fixedDepthBound : Option Nat := none)
-structure StructProtoOpts where mk :: (ctxBinders : Array (Ident × Term) := #[]) (emitBytesCodec : Bool := false) (emitLawful : Bool := true)
+  (invCheck? : Option (Term × String) := none)
+structure StructProtoOpts where mk ::
+  (ctxBinders : Array (Ident × Term) := #[]) (emitBytesCodec : Bool := false) (emitLawful : Bool := true)
+  (invCheck? : Option (Term × String) := none)
 
 private def numLit (n : Nat) : TSyntax `num := Syntax.mkNumLit (toString n)
 
@@ -86,9 +89,11 @@ def mkStructJsonCmds (t : Ident) (fields : Array StructFieldSpec) (opts : Struct
   let jsonDecodes ← fields.mapM fun f => let kLit := Syntax.mkStrLit f.wireKey; match f.codecTerm? with
     | some inp => `(($inp).fromJsonField $jId $kLit) | none => `(Qed.FromJsonField.fromField (α := $(f.valTy)) $jId $kLit)
   let toBody ← `(Qed.Json.obj [$[$jsonPairs:term],*])
-  let fromBody ← `(do
-    $[let $fs:ident ← $jsonDecodes:term]*
-    return { $[$fs:ident],* })
+  let fromBody ← match opts.invCheck? with
+    | none => `(do $[let $fs:ident ← $jsonDecodes:term]* return { $[$fs:ident],* })
+    | some (invTerm, errMsg) =>
+        `(do $[let $fs:ident ← $jsonDecodes:term]*
+             if _hInv : $invTerm then return { $[$fs:ident],*, _inv := _hInv } else Except.error $(Syntax.mkStrLit errMsg))
   if !opts.emitNamedDefs then return #[
     ← `(command| instance $(mkIdent (tId ++ `instToJson)):ident : Qed.ToJson $t := ⟨fun $xId:ident => $toBody⟩),
     ← `(command| instance $(mkIdent (tId ++ `instFromJson)):ident : Qed.FromJson $t := ⟨fun $jId:ident => $fromBody⟩) ]
@@ -112,7 +117,10 @@ def mkStructJsonCmds (t : Ident) (fields : Array StructFieldSpec) (opts : Struct
   let fieldEqs ← fields.mapM fun f => let (kLit, fId) := (Syntax.mkStrLit f.wireKey, f.ident); match f.codecTerm? with
     | some inp => `(term| $(mkIdent `Qed.Codec.fromJsonField_of_field) $inp ($toId $xId) $kLit ($xId.$fId:ident) rfl)
     | none     => `(term| Qed.LawfulJson.fromField_of_field ($toId $xId) $kLit ($xId.$fId:ident) rfl)
-  let roundtripPf ← fieldEqs.foldrM (init := ← `(term| rfl)) fun eqPf acc => `(term| Qed.exceptBind_eq $eqPf $acc)
+  let leafPf ← match opts.invCheck? with
+    | none => `(term| rfl)
+    | some _ => `(term| dite_eq_left ($xId:ident)._inv)
+  let roundtripPf ← fieldEqs.foldrM (init := leafPf) fun eqPf acc => `(term| Qed.exceptBind_eq $eqPf $acc)
   let thmId := mkIdent (tId ++ `_fromJson_toJson)
   return cmds ++ #[
     ← `(command| private theorem $thmId ($xId:ident : $t) : $fromId ($toId $xId) = .ok $xId := by unfold $fromId; exact $roundtripPf),
@@ -159,11 +167,14 @@ def mkStructProtoCmds (t : Ident) (fields : Array StructFieldSpec) (opts : Struc
   let protoBody := tails[0]!
   let protoDecodes ← fields.zipIdx.mapM fun (f, i) => let kLit := numLit (i + 1); match f.codecTerm? with
     | some inp => `(($inp).fromProtoField $kLit $fsId) | none => `(Qed.FromProtoField.decodeProtoField (α := $(f.valTy)) $kLit $fsId)
+  let protoFromBody ← match opts.invCheck? with
+    | none => `(do $[let $fs:ident ← $protoDecodes:term]* return { $[$fs:ident],* })
+    | some (invTerm, errMsg) =>
+        `(do $[let $fs:ident ← $protoDecodes:term]*
+             if _hInv : $invTerm then return { $[$fs:ident],*, _inv := _hInv } else Except.error $(Syntax.mkStrLit errMsg))
   let mut cmds : Array (TSyntax `command) := #[
     ← `(command| def $toId $[($cbns:ident : $cbts:term)]* ($xId:ident : $tApp) : List (Nat × Qed.Proto.WireVal) := $protoBody),
-    ← `(command| def $fromId $[($cbns:ident : $cbts:term)]* ($fsId:ident : List (Nat × Qed.Proto.WireVal)) : Except String $tApp := do
-          $[let $fs:ident ← $protoDecodes:term]*
-          return { $[$fs:ident],* }) ]
+    ← `(command| def $fromId $[($cbns:ident : $cbts:term)]* ($fsId:ident : List (Nat × Qed.Proto.WireVal)) : Except String $tApp := $protoFromBody) ]
   if opts.emitBytesCodec then cmds := cmds ++ #[
     ← `(command| def $(mkIdent (tId ++ `encodeBytes)) $[($cbns:ident : $cbts:term)]* ($xId:ident : $tApp) : Qed.Bytes := Qed.Proto.encodeFieldsSpec ($toApp $xId)),
     ← `(command| def $(mkIdent (tId ++ `decodeBytes)) $[($cbns:ident : $cbts:term)]* (b : Qed.Bytes) : Except String $tApp := (Qed.Proto.decodeFieldsSpec b).bind ($fromApp)) ]
@@ -172,7 +183,10 @@ def mkStructProtoCmds (t : Ident) (fields : Array StructFieldSpec) (opts : Struc
                     ← `(command| instance $(mkIdent (tId ++ `instFromProto)):ident : Qed.FromProto $t := .ofFields $fromId)]
   if !opts.emitLawful then return cmds
   let (pIdents, pHaveTacs) ← mkProtoFieldRoundtripTacs fields reads tails (some xId)
-  let roundtripPf ← pIdents.foldrM (init := ← `(term| rfl)) fun hp acc => `(term| Qed.exceptBind_eq $hp $acc)
+  let pLeafPf ← match opts.invCheck? with
+    | none => `(term| rfl)
+    | some _ => `(term| dite_eq_left ($xId:ident)._inv)
+  let roundtripPf ← pIdents.foldrM (init := pLeafPf) fun hp acc => `(term| Qed.exceptBind_eq $hp $acc)
   let thmId := mkIdent (tId ++ `_fromProto_toProto)
   return cmds ++ #[
     ← `(command| private theorem $thmId ($xId:ident : $t) : $fromId ($toId $xId) = Except.ok $xId := by

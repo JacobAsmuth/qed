@@ -50,6 +50,11 @@ private def forbiddenTokenCases : Array (String × Array (Nat × String)) :=
   hit 5 "sorry" (ss "macro \"mk\" a:str b:str : command => `(syntax $a:str term $b:str : term)\ndef dummy := 0\nmk \"x/-\" \"-/x\"\nmacro_rules | `(x/- $t -/x) => `($t)\ndef p : Nat := x/- sorry -/x\n\n§§\nsyntax \"[\" : term\nmacro_rules | `([) => `(1)\nsyntax \"!--\" : term\nmacro_rules | `(!--) => `(fun (x : False) => x)\nexample : False := !-- sorry\n\n§§\nmacro \"open_b\" \"[\" : term => `(0)\ndef u : Nat := open_b [\nopen Nat in syntax \"a\\\"\" : term\nmacro_rules | `(a\") => `(0)\ntheorem boom : False := sorry\n-- \"\n") ++
   ((ss "def y := r##\"sorry \"# still raw\"##\n\n§§\ndef sorry? := 1\ndef sorry! := 2\n\n§§\ndef ok := f \"sorry\"\n\n§§\ndef t := '\\''\ndef ok := \"sorry\"\n\n§§\nmacro \"(r\" s:str : term => `(0)\ndef ok := (return \"sorry\")\n\n§§\n/-- doc comment mentioning sorry -/\ndef ok : Nat := 1\n").map (·, #[])) ++
   #[("def n := f! \"{(by native_decide : Bool)}\"\n", #[(1, "native_decide")]),
+    ("#guard true\n", #[(1, "#guard")]),
+    ("-- eof\n#guard 1 + 1 == 2", #[(2, "#guard")]),
+    ("def s := s!\"{#guard true}\"\n", #[(1, "#guard")]),
+    ("#guard_msgs in def ok : Nat := 1\n", #[]),
+    ("-- #guard true\n/- #guard false -/\ndef s := \"#guard true\"\n", #[]),
     ("syntax \"t1/-\" : term\ndef a1 := t1/-\nsyntax \"t2/-\" : term\ndef a2 := t2/-\nsyntax \"t3/-\" : term\ndef a3 := t3/-\nsyntax \"t4/-\" : term\ndef a4 := t4/-\nsyntax \"t5/-\" : term\ndef a5 : Nat := t5/- + sorry -- -/\n", #[(10, "sorry")])]
 
 private structure MockReq where

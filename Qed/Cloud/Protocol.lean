@@ -28,7 +28,7 @@ def isValidAppSlug (s : String) : Bool :=
       let cs := c :: rest
       2 ≤ cs.length && cs.length ≤ 48 && 'a' ≤ c && c ≤ 'z' &&
       cs.all (fun ch => ('a' ≤ ch && ch ≤ 'z') || ('0' ≤ ch && ch ≤ '9') || ch == '-') &&
-      cs.getLastD '-' != '-' && !s.contains "--"
+      cs.getLastD '-' != '-' && !Qed.Str.contains s "--"
   | [] => false
 
 def isValidEnvName (s : String) : Bool :=
@@ -79,43 +79,43 @@ private def textSourceExts : List String :=
   [".lean", ".css", ".html", ".js", ".mjs", ".json", ".txt", ".xml", ".webmanifest", ".svg"]
 
 private def hasExtIn (exts : List String) (seg : String) : Bool :=
-  let lower := seg.toLower
-  exts.any fun ext => lower.length > ext.length && lower.endsWith ext
+  let lower := Qed.Str.toLower seg
+  exts.any fun ext => lower.length > ext.length && Qed.Str.endsWith lower ext
 
 def isBinarySourceExt (p : String) : Bool :=
-  let seg := (p.splitOn "/").getLastD p
-  !seg.startsWith "." && hasExtIn binarySourceExts seg
+  let seg := (Qed.Str.splitChar p '/').getLastD p
+  !Qed.Str.startsWith seg "." && hasExtIn binarySourceExts seg
 
 private def isAllowedSourceExt (seg : String) : Bool :=
   allowedSourceExactNames.contains seg || hasExtIn textSourceExts seg || hasExtIn binarySourceExts seg
 
 def isValidSourceRelPath (p : String) : Bool :=
-  !p.isEmpty && p.length ≤ 240 && !p.startsWith "/" && !p.endsWith "/" &&
+  !p.isEmpty && p.length ≤ 240 && !Qed.Str.startsWith p "/" && !Qed.Str.endsWith p "/" &&
   !p.toList.any (fun c => c.toNat < 0x20 || c.toNat == 0x7F || c == '\\' || c == '?' || c == '#' || c == ':') &&
-  let segs := p.splitOn "/"
+  let segs := Qed.Str.splitChar p '/'
   !segs.isEmpty &&
-  segs.all (fun seg => !seg.isEmpty && !seg.startsWith "." && !forbiddenSourceTopDirs.contains seg.toLower) &&
+  segs.all (fun seg => !seg.isEmpty && !Qed.Str.startsWith seg "." && !forbiddenSourceTopDirs.contains (Qed.Str.toLower seg)) &&
   isAllowedSourceExt (segs.getLastD "")
 
 def normalizeApiBase (raw : String) : String :=
-  let t := raw.trimAscii.toString
-  if t.endsWith "/" then (t.dropEnd 1).toString else t
+  let t := Qed.Str.trim raw
+  if Qed.Str.endsWith t "/" then Qed.Str.take t (t.length - 1) else t
 
 /-- Hosted Qed Cloud API base must be either `https://<valid-host>[:port]` (for Cloud Run `*.a.run.app`
     or custom domain) or a strict loopback HTTP URL (`http://127.0.0.1[:port]` / `http://localhost[:port]`)
     for local development. Rejects paths, queries, fragments, credentials, and control chars. -/
 def isValidCloudApiUrl (raw : String) : Bool :=
   let u := normalizeApiBase raw
-  if u.isEmpty || u.toList.any (fun c => c.isWhitespace || c.toNat < 0x20 || c.toNat == 0x7F || "@\\?#".contains c) then false
-  else if u.startsWith "http://" then isStrictLoopbackUrl u
-  else if u.startsWith "https://" then
-    let auth := (u.drop 8).toString
-    !auth.isEmpty && !auth.contains "/" &&
-    match auth.splitOn ":" with
-    | [h] => isValidHostname h.toLower
+  if u.isEmpty || u.toList.any (fun c => c.isWhitespace || c.toNat < 0x20 || c.toNat == 0x7F || c == '@' || c == '\\' || c == '?' || c == '#') then false
+  else if Qed.Str.startsWith u "http://" then isStrictLoopbackUrl u
+  else if Qed.Str.startsWith u "https://" then
+    let auth := Qed.Str.drop u 8
+    !auth.isEmpty && !Qed.Str.contains auth "/" &&
+    match Qed.Str.splitChar auth ':' with
+    | [h] => isValidHostname (Qed.Str.toLower h)
     | [h, pStr] =>
-        match pStr.toNat? with
-        | some p => 1 ≤ p && p ≤ 65535 && toString p == pStr && isValidHostname h.toLower
+        match Qed.Str.parseNat? pStr with
+        | some p => 1 ≤ p && p ≤ 65535 && Nat.repr p == pStr && isValidHostname (Qed.Str.toLower h)
         | none => false
     | _ => false
   else false
@@ -241,7 +241,7 @@ def SourceBundle.validate (b : SourceBundle) : Except String Unit := do
     totalBytes := totalBytes + sz
     if totalBytes > maxTotalSourceBytes then throw s!"source bundle exceeds max total size ({maxTotalSourceBytes} bytes)"
     seen := f.path :: seen
-  if !b.files.any (fun f => f.path.endsWith ".lean") then
+  if !b.files.any (fun f => Qed.Str.endsWith f.path ".lean") then
     throw "source bundle must include at least one `.lean` file"
 
 instance : ToJson SourceBundle where
@@ -529,30 +529,30 @@ instance : ToJson TokenRevokeResp where
 instance : FromJson TokenRevokeResp where
   fromJson j := return { revoked := ← fromField j "revoked" }
 
-#guard isValidAppSlug "my-app-1" && !isValidAppSlug "A" && !isValidAppSlug "my--app" && !isValidAppSlug "-bad"
-#guard isValidDeploymentId "dep_abc-1" && isValidDeploymentId "0123" && !isValidDeploymentId "" && !isValidDeploymentId "-bad" && !isValidDeploymentId "--help" && !isValidDeploymentId "_bad"
-#guard isValidDeployStatus "live" && isValidDeployStatus "canceled" && !isValidDeployStatus "unknown"
-#guard
-  ["App.lean", "styles/main.css", "lean-toolchain", "lakefile.lean", "lakefile.toml", "lake-manifest.json",
-   "qed.json", "robots.txt", "sitemap.xml", "manifest.json", "public/logo.png", "public/hero.jpg",
-   "public/photo.jpeg", "public/anim.gif", "public/icon.svg", "public/img.webp", "public/favicon.ico",
-   "fonts/inter.woff", "fonts/inter.woff2", "fonts/inter.ttf", "fonts/inter.otf", "public/data.json",
-   "public/notes.txt", "public/feed.xml", "public/site.webmanifest", "public/index.html",
-   "public/app.js", "public/mod.mjs"].all isValidSourceRelPath
-#guard
-  ["../secret.lean", "../logo.png", ".env", ".env.prod", ".env.json", ".ENV.txt",
-   ".git/config.txt", ".lake/a.lean", ".qed/cache.json", ".config/qed/credentials.json",
-   ".docker/config.json", ".ssh/id_rsa.txt", ".htaccess.txt", "..png", ".a.png",
-   "dist/app.mjs", "node_modules/pkg/index.js", "target/out.txt", "/etc/passwd", "public/a\\b.png",
-   "public/a.png?v=1", "public/a.png#frag", "public/a:b.png", "public/a\nb.png", ".png", "public/.png", ".json"].all (!isValidSourceRelPath ·)
-#guard isBinarySourceExt "public/logo.png" && !isBinarySourceExt "public/.png" && !isBinarySourceExt "public/.a.png" && !isBinarySourceExt ".png"
-#guard
-  [ByteArray.empty, ByteArray.mk #[0], ByteArray.mk #[0, 1], ByteArray.mk #[0, 1, 2],
-   ByteArray.mk #[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0xFF]].all fun bs =>
-    (decodeBase64? (encodeBase64 bs)).map (·.data) == some bs.data
-#guard
-  ["abc", "ab!d", "AA==AAAA", "AB==", "AP==", "AAB=", "///=", "//=="].all fun s => (decodeBase64? s).isNone
-#guard isValidCloudApiUrl "http://127.0.0.1:8080" && isValidCloudApiUrl "https://api.qed.cloud" && isValidCloudApiUrl "https://qed-cloud-abc-uc.a.run.app" && !isValidCloudApiUrl "http://example.com" && !isValidCloudApiUrl "https://a.run.app/path"
-#guard isValidDeviceUserCode "ABCD-2345" && !isValidDeviceUserCode "abcd-2345" && !isValidDeviceUserCode "ABCD2345"
+example : (isValidAppSlug "my-app-1" && !isValidAppSlug "A" && !isValidAppSlug "my--app" && !isValidAppSlug "-bad") = true := by decide +kernel
+example : (isValidDeploymentId "dep_abc-1" && isValidDeploymentId "0123" && !isValidDeploymentId "" && !isValidDeploymentId "-bad" && !isValidDeploymentId "--help" && !isValidDeploymentId "_bad") = true := by decide +kernel
+example : (isValidDeployStatus "live" && isValidDeployStatus "canceled" && !isValidDeployStatus "unknown") = true := by decide +kernel
+example :
+  (["App.lean", "styles/main.css", "lean-toolchain", "lakefile.lean", "lakefile.toml", "lake-manifest.json",
+    "qed.json", "robots.txt", "sitemap.xml", "manifest.json", "public/logo.png", "public/hero.jpg",
+    "public/photo.jpeg", "public/anim.gif", "public/icon.svg", "public/img.webp", "public/favicon.ico",
+    "fonts/inter.woff", "fonts/inter.woff2", "fonts/inter.ttf", "fonts/inter.otf", "public/data.json",
+    "public/notes.txt", "public/feed.xml", "public/site.webmanifest", "public/index.html",
+    "public/app.js", "public/mod.mjs"].all isValidSourceRelPath) = true := by decide +kernel
+example :
+  (["../secret.lean", "../logo.png", ".env", ".env.prod", ".env.json", ".ENV.txt",
+    ".git/config.txt", ".lake/a.lean", ".qed/cache.json", ".config/qed/credentials.json",
+    ".docker/config.json", ".ssh/id_rsa.txt", ".htaccess.txt", "..png", ".a.png",
+    "dist/app.mjs", "node_modules/pkg/index.js", "target/out.txt", "/etc/passwd", "public/a\\b.png",
+    "public/a.png?v=1", "public/a.png#frag", "public/a:b.png", "public/a\nb.png", ".png", "public/.png", ".json"].all (!isValidSourceRelPath ·)) = true := by decide +kernel
+example : (isBinarySourceExt "public/logo.png" && !isBinarySourceExt "public/.png" && !isBinarySourceExt "public/.a.png" && !isBinarySourceExt ".png") = true := by decide +kernel
+example :
+  ([ByteArray.empty, ByteArray.mk #[0], ByteArray.mk #[0, 1], ByteArray.mk #[0, 1, 2],
+    ByteArray.mk #[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0xFF]].all fun bs =>
+      (decodeBase64? (encodeBase64 bs)).map (·.data) == some bs.data) = true := by decide +kernel
+example :
+  (["abc", "ab!d", "AA==AAAA", "AB==", "AP==", "AAB=", "///=", "//=="].all fun s => (decodeBase64? s).isNone) = true := by decide +kernel
+example : (isValidCloudApiUrl "http://127.0.0.1:8080" && isValidCloudApiUrl "https://api.qed.cloud" && isValidCloudApiUrl "https://qed-cloud-abc-uc.a.run.app" && !isValidCloudApiUrl "http://example.com" && !isValidCloudApiUrl "https://a.run.app/path") = true := by decide +kernel
+example : (isValidDeviceUserCode "ABCD-2345" && !isValidDeviceUserCode "abcd-2345" && !isValidDeviceUserCode "ABCD2345") = true := by decide +kernel
 
 end Qed.Cloud.Protocol

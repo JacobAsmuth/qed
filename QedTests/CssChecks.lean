@@ -25,8 +25,8 @@ theme AppTheme:
   invariant textReadable:  contrast(text, surface) >= 4.5
   invariant brandReadable: contrast(brand, surface) >= 4.5
   invariant mutedReadable: contrast(muted, surface) >= 4.5
-#guard ["brand", "space-md"].all AppTheme.theme.definedTokens.contains && AppTheme.theme.darkComplete && AppTheme.style.isGlobal &&
-  [":root {", "@media (prefers-color-scheme: dark)", "[data-theme=\"dark\"]", ":where(*) { box-sizing: border-box; margin: 0; }"].all (AppTheme.style.raw.contains ·)
+example : (["brand", "space-md"].all AppTheme.theme.definedTokens.contains && AppTheme.theme.darkComplete && AppTheme.style.isGlobal &&
+  [":root {", "@media (prefers-color-scheme: dark)", "[data-theme=\"dark\"]", ":where(*) { box-sizing: border-box; margin: 0; }"].all (Qed.Str.contains AppTheme.style.raw ·)) = true := by decide +kernel
 expect_err "WCAG contrast invariant `badContrast` failed in light mode: contrast(fg=#777777, bg=#ffffff) is 4.47:1, required >= 4.50:1" in
 theme BadLightTheme:
   color fg = #777777
@@ -47,7 +47,7 @@ keyframes fadeIn:
   to:
     opacity: 1
     transform: translateY(0)
-#guard fadeIn.rule == "@keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }"
+example : fadeIn.rule = "@keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }" := by decide +kernel
 style baseBtn:
   display: inline-flex
   align-items: center
@@ -77,11 +77,11 @@ style strictCard strict_tokens:
   border-radius: AppTheme.radius
   margin: 0 auto
   max-width: 100%
-#guard baseBtn.className.startsWith "qed-baseBtn-" && primaryBtn.className.startsWith "qed-primaryBtn-" &&
+example : (Qed.Str.startsWith baseBtn.className "qed-baseBtn-" && Qed.Str.startsWith primaryBtn.className "qed-primaryBtn-" &&
   ["background-color: var(--brand);", "border: 1px solid var(--brand);", "&:hover { opacity: 1; transform: translateY(-1px); }",
-   "@media (max-width: 600px) { width: 100%; }"].all (primaryBtn.raw.contains ·) &&
-  !primaryBtn.raw.contains "#d1d5db" && primaryBtn.extraRules.any (·.contains "@keyframes fadeIn") &&
-  ["brand", "space-md"].all primaryBtn.usedTokens.contains
+   "@media (max-width: 600px) { width: 100%; }"].all (Qed.Str.contains primaryBtn.raw ·) &&
+  !Qed.Str.contains primaryBtn.raw "#d1d5db" && primaryBtn.extraRules.any (Qed.Str.contains · "@keyframes fadeIn") &&
+  ["brand", "space-md"].all primaryBtn.usedTokens.contains) = true := by decide +kernel
 bad_style "unknown CSS property `border-raduis` (did you mean `border-radius`?)" badPropTypo : border-raduis: 8px
 bad_style "type mismatch in CSS `padding`: token `CssChecks.AppTheme.brand` has kind `color`, expected `len`" badTokenType : padding: AppTheme.brand
 bad_style "in `color`: invalid hex color `#xyz`" badHexLit : color: #xyz
@@ -101,14 +101,14 @@ style modernStyle:
   background-color: rgb(255, 255, 255)
   @media (prefers-color-scheme: dark):
     background-color: #111827
-#guard ["box-sizing: border-box;", "min-height: 100dvh;", "clamp(20rem, 50vw, 45rem)",
-   "oklch(0.6 0.15 250)", "@media (prefers-color-scheme: dark)"].all (modernStyle.raw.contains ·)
+example : (["box-sizing: border-box;", "min-height: 100dvh;", "clamp(20rem, 50vw, 45rem)",
+   "oklch(0.6 0.15 250)", "@media (prefers-color-scheme: dark)"].all (Qed.Str.contains modernStyle.raw ·)) = true := by decide +kernel
 expect_err "unknown style `noSuchStyle` in `extends`" in
 style badExtends extends noSuchStyle:
   color: #ffffff
-#guard let r := renderThemeRule (.nest "@media (prefers-color-scheme: dark)" [color (hex "fff")])
-  !r.contains ":where(" && r.contains "@media (prefers-color-scheme: dark)" &&
-  ["<", "\"", "/*"].all (!(inlineStyleStr [background "red\" onclick=\"x\"/*evil*/</style>"]).contains ·)
+example : (let r := renderThemeRule (.nest "@media (prefers-color-scheme: dark)" [color (hex "fff")])
+  !Qed.Str.contains r ":where(" && Qed.Str.contains r "@media (prefers-color-scheme: dark)" &&
+  ["<", "\"", "/*"].all (!Qed.Str.contains (inlineStyleStr [background "red\" onclick=\"x\"/*evil*/</style>"]) ·)) = true := by decide +kernel
 component StyledCard:
   prop title : String
   style wrapper:
@@ -138,12 +138,12 @@ component StyledShowcase:
   invariant activeValid: roleHasOneOf("toggle", [pillActive, pill])
   invariant exclusive:   noConflictingStyles([pillActive, pill])
   view: <div {shell}><StyledCard title="Verified CSS"/><button role="toggle" {pillActive if active else pill} onClick={.toggle}>Toggle</button><div {progressBox} {inlineStyle([width(pct(progress))])} {styleVars([cssVar(AppTheme.brand, hex("0055aa"))])}>Progress: {progress}%</div></div>
-#guard let css := renderStyleSheet StyledShowcase.app.styles
+example : (let css := renderStyleSheet StyledShowcase.app.styles
   [":root {", "@media (prefers-color-scheme: dark)", StyledCard.wrapper.className, StyledShowcase.shell.className,
-   StyledShowcase.pillActive.className, "border-radius: 999px;", "padding: 0.5rem; margin-top: 1rem;"].all (css.contains ·) &&
+   StyledShowcase.pillActive.className, "border-radius: 999px;", "padding: 0.5rem; margin-top: 1rem;"].all (Qed.Str.contains css ·) &&
   StyledShowcase.app.stylesheets == ["/app.css"] &&
-  (renderDocument "Demo" "" (stylesheets := StyledShowcase.app.stylesheets)).contains "<link rel=\"stylesheet\" href=\"/app.css\">" &&
-  (StyledShowcase.app.ssrStep "/" "Demo" "/qed.js" "").contains "/app.css"
+  Qed.Str.contains (renderDocument "Demo" "" (stylesheets := StyledShowcase.app.stylesheets)) "<link rel=\"stylesheet\" href=\"/app.css\">" &&
+  Qed.Str.contains (StyledShowcase.app.ssrStep "/" "Demo" "/qed.js" "") "/app.css") = true := by decide +kernel
 verify_theme AppTheme for StyledShowcase.app
 theme OtherTheme:
   color doesNotExist = #123456

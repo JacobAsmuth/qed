@@ -1,4 +1,5 @@
 import Qed.Server.Core
+import Qed.Server.Eval
 import Qed.Server.Syntax
 import Qed.Server.Db.Core
 import Qed.Server.Db.Runtime

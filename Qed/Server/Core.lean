@@ -51,6 +51,7 @@ structure RequestCtx where
   connId      : String := ""
   query       : String := ""
   body        : String := ""
+  isSystem    : Bool := false
 deriving Inhabited, DecidableEq, Repr
 
 namespace RequestCtx
@@ -313,10 +314,10 @@ def encodeFormBodyOf {α : Type} [ToFormFields α] (val : α) : ByteArray :=
   (Qed.encodeFormBody (ToFormFields.toFormFields val)).toUTF8
 
 private def hasValidOriginBody (base : String) : Bool :=
-  !base.endsWith "/" && base.toList.all fun c => isSafeUrlChar c && c != '?' && c != '#' && c != '\\' && c != '@' && decide (32 < c.toNat ∧ c.toNat ≠ 127)
-def isValidBaseOrigin (base : String) : Bool := (base.startsWith "https://" || base.startsWith "http://") && hasValidOriginBody base
+  base.toList.getLast? != some '/' && base.toList.all fun c => isSafeUrlChar c && c != '?' && c != '#' && c != '\\' && c != '@' && decide (32 < c.toNat ∧ c.toNat ≠ 127)
+def isValidBaseOrigin (base : String) : Bool := (Qed.Str.startsWith base "https://" || Qed.Str.startsWith base "http://") && hasValidOriginBody base
 def isValidWsBaseOrigin (base : String) : Bool :=
-  (base.startsWith "wss://" || base.startsWith "ws://" || base.startsWith "https://" || base.startsWith "http://") && hasValidOriginBody base
+  (Qed.Str.startsWith base "wss://" || Qed.Str.startsWith base "ws://" || Qed.Str.startsWith base "https://" || Qed.Str.startsWith base "http://") && hasValidOriginBody base
 def toWsOrigin (base : String) : String :=
   if base.startsWith "https://" then "wss://" ++ String.ofList (base.toList.drop 8)
   else if base.startsWith "http://" then "ws://" ++ String.ofList (base.toList.drop 7) else base
@@ -416,13 +417,16 @@ structure OutboundReq where
   body         : ByteArray
   auth         : AuthSpec := .none
   ssrfGuard    : Bool := true
-deriving Inhabited
+deriving Inhabited, DecidableEq
+
+def OutboundReq.url (r : OutboundReq) : String := r.baseOrigin ++ r.pathAndQuery
+def OutboundReq.bodyStr (r : OutboundReq) : String := (String.fromUTF8? r.body).getD ""
 
 structure OutboundResp where
   status  : UInt32
   body    : ByteArray
   headers : List (String × String) := []
-deriving Inhabited
+deriving Inhabited, DecidableEq
 
 inductive ServerEffect : Type where
   | httpCall (req : OutboundReq) | dbExec (cfg : Db.DbConfig) (q : Db.SqlQuery) | dbExecDdl (cfg : Db.DbConfig)
@@ -546,6 +550,85 @@ theorem NoAtomic.io (eff : ServerEffect) (k : eff.Resp → ThreadProg σ α) (hk
 theorem ProgSpec.of_noAtomic {p : ThreadProg σ α} (h : NoAtomic p) : ProgSpec Inv A Step (fun _ => True) p := h.mono False.elim (fun _ _ => trivial) (fun h => h.elim) (fun _ _ => trivial)
 theorem progPreservesStepRel_of_const (p : ThreadProg σ α) (h : ∀ s s', Rel s s') : ProgPreservesStepRel Inv Rel p := by
   induction p with | pure a => exact .pure a trivial | io _ _ ih => exact .io _ _ ih | atomic _ _ ih => exact .atomic _ _ trivial (fun s _ => h s _) (fun s _ => ih s)
+
+@[reducible] def ServerEffect.isHttp : ServerEffect → Bool
+  | .httpCall _ => true | _ => false
+
+@[reducible] def ServerEffect.isDecrypt : ServerEffect → Bool
+  | .aeadDecrypt _ _ _ _ => true | _ => false
+
+@[reducible] def ServerEffect.isCrypto : ServerEffect → Bool
+  | .hmacSha256 _ _ | .sha256 _ | .constEq _ _ | .aeadEncrypt _ _ _ _ | .aeadDecrypt _ _ _ _ => true | _ => false
+
+@[reducible] def ServerEffect.isDbWrite : ServerEffect → Bool
+  | .dbExec _ q | .dbTxExec _ _ q => q.isWrite
+  | .dbExecDdl _ => true
+  | _ => false
+
+inductive ProgEffSpec {σ α : Type} (Inv : σ → Prop) (AllowAtomic : Prop) (Step : σ → σ → Prop)
+    (EffOk : ServerEffect → Prop) (Post : α → Prop) : ThreadProg σ α → Prop where
+  | pure (a : α) : Post a → ProgEffSpec Inv AllowAtomic Step EffOk Post (.pure a)
+  | io (eff : ServerEffect) (k : eff.Resp → ThreadProg σ α) :
+      EffOk eff → (∀ r, ProgEffSpec Inv AllowAtomic Step EffOk Post (k r)) →
+      ProgEffSpec Inv AllowAtomic Step EffOk Post (.io eff k)
+  | atomic (st : σ → σ) (next : σ → ThreadProg σ α) :
+      AllowAtomic → (∀ s, Inv s → Step s (st s)) →
+      (∀ s, Inv s → ProgEffSpec Inv AllowAtomic Step EffOk Post (next s)) →
+      ProgEffSpec Inv AllowAtomic Step EffOk Post (.atomic st next)
+
+theorem ProgEffSpec.bind {EffOk : ServerEffect → Prop} {p : ThreadProg σ α} {k : α → ThreadProg σ β}
+    (hp : ProgEffSpec Inv A Step EffOk Q p) (hk : ∀ a, Q a → ProgEffSpec Inv A Step EffOk Post (k a)) :
+    ProgEffSpec Inv A Step EffOk Post (p >>= k) := by
+  change ProgEffSpec Inv A Step EffOk Post (ThreadProg.bind p k)
+  induction hp with
+  | pure a ha => exact hk a ha
+  | io eff _ heff _ ih => exact .io eff _ heff ih
+  | atomic st _ ha hst _ ih => exact .atomic st _ ha hst ih
+
+theorem ProgEffSpec.mono {Eff₁ Eff₂ : ServerEffect → Prop} {P₁ P₂ : α → Prop} {p : ThreadProg σ α}
+    (hp : ProgEffSpec Inv₁ A₁ S₁ Eff₁ P₁ p)
+    (hA : A₁ → A₂) (hInv : ∀ s, Inv₂ s → Inv₁ s) (hS : A₁ → ∀ s s', Inv₂ s → S₁ s s' → S₂ s s')
+    (hEff : ∀ e, Eff₁ e → Eff₂ e) (hP : ∀ a, P₁ a → P₂ a) :
+    ProgEffSpec Inv₂ A₂ S₂ Eff₂ P₂ p := by
+  induction hp with
+  | pure a ha => exact .pure a (hP a ha)
+  | io eff _ heff _ ih => exact .io eff _ (hEff eff heff) ih
+  | atomic st _ ha hst _ ih => exact .atomic st _ (hA ha) (fun s hs => hS ha s _ hs (hst s (hInv s hs))) (fun s hs => ih s (hInv s hs))
+
+theorem ProgEffSpec.pure_class {EffOk : ServerEffect → Prop} (a : α) (ha : Q a) :
+    ProgEffSpec Inv A Step EffOk Q (Pure.pure a) := .pure a ha
+theorem ProgEffSpec.exec {EffOk : ServerEffect → Prop} (eff : ServerEffect) {R : eff.Resp → Prop} (heff : EffOk eff)
+    (hpost : ∀ r, R r) : ProgEffSpec Inv A Step EffOk R (MonadServer.exec (m := ThreadProg σ) eff) :=
+  .io eff _ heff fun r => .pure r (hpost r)
+theorem ProgEffSpec.exec_bind {EffOk : ServerEffect → Prop} (eff : ServerEffect) {k : eff.Resp → ThreadProg σ β}
+    (heff : EffOk eff) (hk : ∀ r, ProgEffSpec Inv A Step EffOk Post (k r)) :
+    ProgEffSpec Inv A Step EffOk Post (MonadServer.exec (m := ThreadProg σ) eff >>= k) :=
+  .io eff k heff hk
+theorem ProgEffSpec.runAtomic {EffOk : ServerEffect → Prop} (step : σ → σ × α)
+    (hstep : ∀ s, Inv s → Step s (step s).1) (hpost : ∀ s, Inv s → Q (step s).2) :
+    ProgEffSpec Inv True Step EffOk Q (MonadAtomic.runAtomic (m := ThreadProg σ) step) :=
+  .atomic _ _ trivial hstep (fun s hs => .pure _ (hpost s hs))
+theorem ProgEffSpec.runAtomicRead {EffOk : ServerEffect → Prop} (f : σ → α)
+    (hrefl : ∀ s, Inv s → Step s s) (hpost : ∀ s, Inv s → Q (f s)) :
+    ProgEffSpec Inv True Step EffOk Q (MonadAtomic.runAtomicRead (m := ThreadProg σ) f) :=
+  .atomic id _ trivial hrefl (fun s hs => .pure _ (hpost s hs))
+theorem ProgEffSpec.runAtomic_bind {EffOk : ServerEffect → Prop} (step : σ → σ × α) {k : α → ThreadProg σ β}
+    (hk : ∀ s, Inv s → ProgEffSpec Inv True Step EffOk Post (k (step s).2)) (hstep : ∀ s, Inv s → Step s (step s).1) :
+    ProgEffSpec Inv True Step EffOk Post (MonadAtomic.runAtomic (m := ThreadProg σ) step >>= k) :=
+  .atomic (fun s => (step s).1) (fun s => k (step s).2) trivial hstep hk
+theorem ProgEffSpec.runAtomicRead_bind {EffOk : ServerEffect → Prop} (f : σ → α) {k : α → ThreadProg σ β}
+    (hk : ∀ s, Inv s → ProgEffSpec Inv True Step EffOk Post (k (f s))) (hrefl : ∀ s, Inv s → Step s s) :
+    ProgEffSpec Inv True Step EffOk Post (MonadAtomic.runAtomicRead (m := ThreadProg σ) f >>= k) :=
+  .atomic id (fun s => k (f s)) trivial hrefl hk
+
+abbrev ProgAllowsEff (EffOk : ServerEffect → Prop) (p : ThreadProg σ α) : Prop :=
+  ProgEffSpec (fun _ => True) True (fun _ _ => True) EffOk (fun _ => True) p
+abbrev ProgEnsuresEff (Inv : σ → Prop) (EffOk : ServerEffect → Prop) (Post : α → Prop) (p : ThreadProg σ α) : Prop :=
+  ProgEffSpec Inv True (fun _ _ => True) EffOk Post p
+abbrev ProgNoHttp (p : ThreadProg σ α) : Prop := ProgAllowsEff (fun e => e.isHttp = false) p
+abbrev ProgNoDecrypt (p : ThreadProg σ α) : Prop := ProgAllowsEff (fun e => e.isDecrypt = false) p
+abbrev ProgNoCrypto (p : ThreadProg σ α) : Prop := ProgAllowsEff (fun e => e.isCrypto = false) p
+abbrev ProgNoDbWrite (p : ThreadProg σ α) : Prop := ProgAllowsEff (fun e => e.isDbWrite = false) p
 
 class SafeIO {σ α : Type} (p : ThreadProg σ α) : Prop where noAtomic : NoAtomic p
 instance (a : α) : SafeIO (Pure.pure (f := ThreadProg σ) a) := ⟨.pure a⟩
@@ -711,35 +794,74 @@ structure JobMeta where
   intervalMs  : Nat
   intervalPos : 0 < intervalMs
 structure ServerJob (σ : Type) extends JobMeta where
-  runM : {m : Type → Type} → [Monad m] → [MonadServer m] → [MonadAtomic σ m] → m (Except ApiError Unit)
+  runM      : {m : Type → Type} → [Monad m] → [MonadServer m] → [MonadAtomic σ m] → m (Except ApiError Unit)
+  runWorkM? : Option ({m : Type → Type} → [Monad m] → [MonadServer m] → [MonadAtomic σ m] → m (Except ApiError Bool)) := none
 structure VerifiedJob (σ : Type) (Inv : σ → Prop) extends ServerJob σ where
   preserves : ProgPreservesInv Inv (runM (m := ThreadProg σ))
 structure StatelessJob extends JobMeta where
-  runM : {m : Type → Type} → [Monad m] → [MonadServer m] → m (Except ApiError Unit)
-structure IoJob extends JobMeta where runOnce : IO (Except ApiError Unit)
+  runM      : {m : Type → Type} → [Monad m] → [MonadServer m] → m (Except ApiError Unit)
+  runWorkM? : Option ({m : Type → Type} → [Monad m] → [MonadServer m] → m (Except ApiError Bool)) := none
+structure IoJob extends JobMeta where
+  runOnce     : IO (Except ApiError Unit)
+  runWorkOnce : IO (Except ApiError Bool) := runOnce.map fun | .ok () => .ok false | .error e => .error e
 
 def StatelessJob.toUnitJob (j : StatelessJob) : ServerJob Unit :=
-  { j.toJobMeta with runM := fun {m} [Monad m] [MonadServer m] [MonadAtomic Unit m] => @j.runM m _ _ }
+  { j.toJobMeta with
+    runM := fun {m} [Monad m] [MonadServer m] [MonadAtomic Unit m] => @j.runM m _ _
+    runWorkM? := j.runWorkM?.map fun rw => fun {m} [Monad m] [MonadServer m] [MonadAtomic Unit m] => @rw m _ _ }
 def ServerJob.toIoJob {σ : Type} (srvInst : MonadServer IO) (atomicInst : MonadAtomic σ IO) (j : ServerJob σ) : IoJob :=
-  { j.toJobMeta with runOnce := @j.runM IO _ srvInst atomicInst }
-def StatelessJob.toIoJob (srvInst : MonadServer IO) (j : StatelessJob) : IoJob := { j.toJobMeta with runOnce := @j.runM IO _ srvInst }
+  { j.toJobMeta with
+    runOnce := @j.runM IO _ srvInst atomicInst
+    runWorkOnce := match j.runWorkM? with
+      | some rw => @rw IO _ srvInst atomicInst
+      | none => (@j.runM IO _ srvInst atomicInst).map fun | .ok () => .ok false | .error e => .error e }
+def StatelessJob.toIoJob (srvInst : MonadServer IO) (j : StatelessJob) : IoJob :=
+  { j.toJobMeta with
+    runOnce := @j.runM IO _ srvInst
+    runWorkOnce := match j.runWorkM? with
+      | some rw => @rw IO _ srvInst
+      | none => (@j.runM IO _ srvInst).map fun | .ok () => .ok false | .error e => .error e }
 theorem verifiedJob_spawn_step {σ : Type} {Inv : σ → Prop} (j : VerifiedJob σ Inv) (s : σ) (ts : List (ThreadProg σ (Except ApiError Unit))) :
     MultiCoreStep Inv ⟨s, ts⟩ ⟨s, j.runM (m := ThreadProg σ) :: ts⟩ := .spawn s ts (j.runM (m := ThreadProg σ)) j.preserves
 
 def defaultMaxJobTicks : Nat := 1000000000000
-def runJobLoop (name : String) (intervalMs : UInt32) (runOnce : IO (Except ApiError Unit)) (stopFlag? : Option (IO.Ref Bool) := none) : Nat → IO Unit
+def runWorkJobLoop (name : String) (intervalMs : UInt32) (runWorkOnce : IO (Except ApiError Bool))
+    (stopFlag? : Option (IO.Ref Bool) := none) (sleepFirst : Bool := true) : Nat → IO Unit
   | 0 => pure ()
   | fuel + 1 => do
       let stopped : IO Bool := match stopFlag? with | some f => f.get | none => pure false
       if ← stopped then return ()
-      IO.sleep intervalMs
-      if ← stopped then return ()
-      if let .error e ← runOnce then IO.eprintln s!"[qed job `{name}`] error: {e.message}"
-      runJobLoop name intervalMs runOnce stopFlag? fuel
+      if sleepFirst then
+        IO.sleep intervalMs
+        if ← stopped then return ()
+      match ← runWorkOnce with
+      | .ok true => runWorkJobLoop name intervalMs runWorkOnce stopFlag? false fuel
+      | .ok false => runWorkJobLoop name intervalMs runWorkOnce stopFlag? true fuel
+      | .error e =>
+          IO.eprintln s!"[qed job `{name}`] error: {e.message}"
+          runWorkJobLoop name intervalMs runWorkOnce stopFlag? true fuel
+def runJobLoop (name : String) (intervalMs : UInt32) (runOnce : IO (Except ApiError Unit)) (stopFlag? : Option (IO.Ref Bool) := none) (fuel : Nat) : IO Unit :=
+  runWorkJobLoop name intervalMs (runOnce.map fun | .ok () => .ok false | .error e => .error e) stopFlag? true fuel
 def spawnServerJobs (jobs : Array IoJob) (stopFlag? : Option (IO.Ref Bool) := none) (maxTicks : Nat := defaultMaxJobTicks) :
     IO (Array (Task (Except IO.Error Unit))) :=
-  jobs.mapM fun job => IO.asTask (prio := .dedicated) (runJobLoop job.name (min job.intervalMs 2147483647).toUInt32 job.runOnce stopFlag? maxTicks)
+  jobs.mapM fun job => IO.asTask (prio := .dedicated) (runWorkJobLoop job.name (min job.intervalMs 2147483647).toUInt32 job.runWorkOnce stopFlag? true maxTicks)
 abbrev runServerJobs := @spawnServerJobs
+
+private def drainOneJobOnce (name : String) (runWorkOnce : IO (Except ApiError Bool)) : Nat → IO Bool
+  | 0 => pure true
+  | fuel + 1 => do
+      match ← runWorkOnce with
+      | .ok true => drainOneJobOnce name runWorkOnce fuel
+      | .ok false => pure true
+      | .error e => IO.eprintln s!"[qed job `{name}`] error: {e.message}"; pure false
+
+/-- Runs each job once (or until a `-> Bool` job returns `false` / drains its queue). Returns `true` if no job errored. -/
+def runJobsOnce (jobs : Array IoJob) (maxIterPerJob : Nat := 10000) : IO Bool := do
+  let mut allOk := true
+  for job in jobs do
+    let ok ← drainOneJobOnce job.name job.runWorkOnce maxIterPerJob
+    if !ok then allOk := false
+  return allOk
 
 /-! ## Inferred Domain Errors, Control-Flow Combinators & Opaque SSA Stepping (`srvLetEq`) -/
 
@@ -809,6 +931,244 @@ theorem srvLetEq_elim {α β : Type} (P : β → Prop) (val : α) (k : (x : α) 
   match ← first with | some r => return some r | none => next ()
 @[inline, specialize] def srvFinishM {E : Type} [SrvErr E] {m : Type → Type} [Monad m] {α : Type} (res : m (Option (Except E α))) : m (Except E α) := do
   match ← res with | some r => return r | none => return .error (SrvErr.ofApi (ApiError.internal "unreachable missing return"))
+
+def srvForEachM {E α β : Type} {m : Type → Type} [Monad m]
+    (xs : List α) (body : α → m (Option (Except E β))) : m (Option (Except E β)) :=
+  match xs with
+  | [] => pure none
+  | x :: rest =>
+      body x >>= fun
+        | some r => pure (some r)
+        | none => srvForEachM rest body
+
+@[simp] theorem srvForEachM_nil {E α β : Type} {m : Type → Type} [Monad m]
+    (body : α → m (Option (Except E β))) : srvForEachM ([] : List α) body = pure none := rfl
+
+theorem noAtomic_srvForEachM {σ E α β : Type} (body : α → ThreadProg σ (Option (Except E β)))
+    (hb : ∀ x, NoAtomic (body x)) : ∀ xs : List α, NoAtomic (srvForEachM xs body)
+  | [] => .pure none
+  | x :: rest => noAtomic_bind (hb x) fun
+      | some r => .pure (some r)
+      | none => noAtomic_srvForEachM body hb rest
+
+instance {σ E α β : Type} (xs : List α) (body : α → ThreadProg σ (Option (Except E β)))
+    [hb : ∀ x, SafeIO (body x)] : SafeIO (srvForEachM xs body) :=
+  ⟨noAtomic_srvForEachM body (fun x => (hb x).noAtomic) xs⟩
+
+theorem progEffSpec_srvForEachM {σ E α β : Type} {Inv : σ → Prop} {A : Prop} {Step : σ → σ → Prop}
+    {EffOk : ServerEffect → Prop} {Post : Option (Except E β) → Prop}
+    (body : α → ThreadProg σ (Option (Except E β)))
+    (hNone : Post none)
+    (xs : List α) (hb : ∀ x ∈ xs, ProgEffSpec Inv A Step EffOk Post (body x)) :
+    ProgEffSpec Inv A Step EffOk Post (srvForEachM xs body) := by
+  induction xs with
+  | nil => exact .pure none hNone
+  | cons x rest ih =>
+      exact (hb x (List.mem_cons_self ..)).bind fun
+        | some r, hr => .pure (some r) hr
+        | none, _ => ih (fun y hy => hb y (List.mem_cons_of_mem x hy))
+
+theorem progEffSpec_srvForEachM_bind {σ E α β γ : Type} {Inv : σ → Prop} {A : Prop} {Step : σ → σ → Prop}
+    {EffOk : ServerEffect → Prop} {Post : γ → Prop}
+    (xs : List α) (body : α → ThreadProg σ (Option (Except E β)))
+    {k : Option (Except E β) → ThreadProg σ γ}
+    (hNone : ProgEffSpec Inv A Step EffOk Post (k none))
+    (hb : ∀ x ∈ xs, ProgEffSpec Inv A Step EffOk
+      (fun r => match r with | some v => ProgEffSpec Inv A Step EffOk Post (k (some v)) | none => True) (body x)) :
+    ProgEffSpec Inv A Step EffOk Post (srvForEachM xs body >>= k) := by
+  induction xs with
+  | nil => simpa [srvForEachM, threadProg_pure_bind] using hNone
+  | cons x rest ih =>
+      change ProgEffSpec Inv A Step EffOk Post ((body x >>= fun | some r => pure (some r) | none => srvForEachM rest body) >>= k)
+      rw [threadProg_bind_assoc]
+      exact (hb x (List.mem_cons_self ..)).bind fun
+        | some v, hv => by simpa [threadProg_pure_bind] using hv
+        | none, _ => ih (fun y hy => hb y (List.mem_cons_of_mem x hy))
+
+theorem progSpec_srvForEachM {σ E α β : Type} {Inv : σ → Prop} {A : Prop} {Step : σ → σ → Prop}
+    {Post : Option (Except E β) → Prop} (body : α → ThreadProg σ (Option (Except E β)))
+    (hNone : Post none) (xs : List α) (hb : ∀ x ∈ xs, ProgSpec Inv A Step Post (body x)) :
+    ProgSpec Inv A Step Post (srvForEachM xs body) := by
+  induction xs with
+  | nil => exact .pure none hNone
+  | cons x rest ih =>
+      exact (hb x (List.mem_cons_self ..)).bind fun
+        | some r, hr => .pure (some r) hr
+        | none, _ => ih (fun y hy => hb y (List.mem_cons_of_mem x hy))
+
+theorem progSpec_srvForEachM_bind {σ E α β γ : Type} {Inv : σ → Prop} {A : Prop} {Step : σ → σ → Prop}
+    {Post : γ → Prop} (xs : List α) (body : α → ThreadProg σ (Option (Except E β)))
+    {k : Option (Except E β) → ThreadProg σ γ} (hNone : ProgSpec Inv A Step Post (k none))
+    (hb : ∀ x ∈ xs, ProgSpec Inv A Step
+      (fun r => match r with | some v => ProgSpec Inv A Step Post (k (some v)) | none => True) (body x)) :
+    ProgSpec Inv A Step Post (srvForEachM xs body >>= k) := by
+  induction xs with
+  | nil => simpa [srvForEachM, threadProg_pure_bind] using hNone
+  | cons x rest ih =>
+      change ProgSpec Inv A Step Post ((body x >>= fun | some r => pure (some r) | none => srvForEachM rest body) >>= k)
+      rw [threadProg_bind_assoc]
+      exact (hb x (List.mem_cons_self ..)).bind fun
+        | some v, hv => by simpa [threadProg_pure_bind] using hv
+        | none, _ => ih (fun y hy => hb y (List.mem_cons_of_mem x hy))
+
+def srvForFoldM {σS ρ α : Type} {m : Type → Type} [Monad m]
+    (xs : List α) (st : σS) (body : σS → α → m (Qed.QedLoopStep σS ρ)) : m (σS × Option ρ) :=
+  match xs with
+  | [] => pure (st, none)
+  | x :: rest =>
+      body st x >>= fun
+        | .next st' => srvForFoldM rest st' body
+        | .breakLoop st' => pure (st', none)
+        | .ret st' r => pure (st', some r)
+
+def srvForRangeAuxM {σS ρ : Type} {m : Type → Type} [Monad m]
+    (cur step : Nat) : Nat → σS → (σS → Nat → m (Qed.QedLoopStep σS ρ)) → m (σS × Option ρ)
+  | 0, st, _ => pure (st, none)
+  | k + 1, st, body =>
+      body st cur >>= fun
+        | .next st' => srvForRangeAuxM (cur + step) step k st' body
+        | .breakLoop st' => pure (st', none)
+        | .ret st' r => pure (st', some r)
+
+def srvForRangeM {σS ρ : Type} {m : Type → Type} [Monad m]
+    (r : Qed.QedRange) (st : σS) (body : σS → Nat → m (Qed.QedLoopStep σS ρ)) : m (σS × Option ρ) :=
+  srvForRangeAuxM r.start r.step r.count st body
+
+theorem srvForRangeAuxM_eq_srvForFoldM {σS ρ : Type} {m : Type → Type} [Monad m]
+    (step : Nat) (body : σS → Nat → m (Qed.QedLoopStep σS ρ)) :
+    ∀ (k cur : Nat) (st : σS), srvForRangeAuxM cur step k st body = srvForFoldM (Qed.QedRange.toListAux cur step k) st body
+  | 0, _, _ => rfl
+  | k + 1, cur, st => by
+      simp only [srvForRangeAuxM, Qed.QedRange.toListAux, srvForFoldM]
+      congr 1; funext res; cases res with
+      | next st' => exact srvForRangeAuxM_eq_srvForFoldM step body k (cur + step) st'
+      | breakLoop _ | ret _ _ => rfl
+
+theorem srvForRangeM_eq_srvForFoldM {σS ρ : Type} {m : Type → Type} [Monad m]
+    (r : Qed.QedRange) (st : σS) (body : σS → Nat → m (Qed.QedLoopStep σS ρ)) :
+    srvForRangeM r st body = srvForFoldM r.toList st body :=
+  srvForRangeAuxM_eq_srvForFoldM r.step body r.count r.start st
+
+theorem noAtomic_srvForFoldM {σ σS ρ α : Type} (body : σS → α → ThreadProg σ (Qed.QedLoopStep σS ρ))
+    (hb : ∀ s x, NoAtomic (body s x)) : ∀ (xs : List α) (st : σS), NoAtomic (srvForFoldM xs st body)
+  | [], st => .pure (st, none)
+  | x :: rest, st => noAtomic_bind (hb st x) fun
+      | .next st' => noAtomic_srvForFoldM body hb rest st'
+      | .breakLoop st' => .pure (st', none)
+      | .ret st' r => .pure (st', some r)
+
+instance {σ σS ρ α : Type} (xs : List α) (st : σS) (body : σS → α → ThreadProg σ (Qed.QedLoopStep σS ρ))
+    [hb : ∀ s x, SafeIO (body s x)] : SafeIO (srvForFoldM xs st body) :=
+  ⟨noAtomic_srvForFoldM body (fun s x => (hb s x).noAtomic) xs st⟩
+
+theorem noAtomic_srvForRangeM {σ σS ρ : Type} (r : Qed.QedRange) (st : σS)
+    (body : σS → Nat → ThreadProg σ (Qed.QedLoopStep σS ρ))
+    (hb : ∀ s i, NoAtomic (body s i)) : NoAtomic (srvForRangeM r st body) := by
+  rw [srvForRangeM_eq_srvForFoldM]; exact noAtomic_srvForFoldM body hb r.toList st
+
+instance {σ σS ρ : Type} (r : Qed.QedRange) (st : σS) (body : σS → Nat → ThreadProg σ (Qed.QedLoopStep σS ρ))
+    [hb : ∀ s i, SafeIO (body s i)] : SafeIO (srvForRangeM r st body) :=
+  ⟨noAtomic_srvForRangeM r st body (fun s i => (hb s i).noAtomic)⟩
+
+theorem progSpec_srvForFoldM {σ σS ρ α : Type} {Inv : σ → Prop} {A : Prop} {Step : σ → σ → Prop}
+    {Post : σS × Option ρ → Prop} (body : σS → α → ThreadProg σ (Qed.QedLoopStep σS ρ))
+    (hDone : ∀ st, Post (st, none)) (xs : List α) (st : σS)
+    (hb : ∀ st' x, x ∈ xs → ProgSpec Inv A Step
+      (fun r => match r with | .next _ | .breakLoop _ => True | .ret s' v => Post (s', some v)) (body st' x)) :
+    ProgSpec Inv A Step Post (srvForFoldM xs st body) := by
+  induction xs generalizing st with
+  | nil => exact .pure (st, none) (hDone st)
+  | cons x rest ih =>
+      exact (hb st x (List.mem_cons_self ..)).bind fun
+        | .next st', _ => ih st' (fun s' y hy => hb s' y (List.mem_cons_of_mem x hy))
+        | .breakLoop st', _ => .pure (st', none) (hDone st')
+        | .ret st' v, hv => .pure (st', some v) hv
+
+theorem progSpec_srvForFoldM_bind {σ σS ρ α γ : Type} {Inv : σ → Prop} {A : Prop} {Step : σ → σ → Prop}
+    {Post : γ → Prop} (xs : List α) (st : σS) (body : σS → α → ThreadProg σ (Qed.QedLoopStep σS ρ))
+    {k : σS × Option ρ → ThreadProg σ γ} (hDone : ∀ st', ProgSpec Inv A Step Post (k (st', none)))
+    (hb : ∀ st' x, x ∈ xs → ProgSpec Inv A Step
+      (fun r => match r with | .next _ | .breakLoop _ => True | .ret s' v => ProgSpec Inv A Step Post (k (s', some v))) (body st' x)) :
+    ProgSpec Inv A Step Post (srvForFoldM xs st body >>= k) := by
+  induction xs generalizing st with
+  | nil => simpa [srvForFoldM, threadProg_pure_bind] using hDone st
+  | cons x rest ih =>
+      change ProgSpec Inv A Step Post ((body st x >>= fun | .next st' => srvForFoldM rest st' body | .breakLoop st' => pure (st', none) | .ret st' r => pure (st', some r)) >>= k)
+      rw [threadProg_bind_assoc]
+      exact (hb st x (List.mem_cons_self ..)).bind fun
+        | .next st', _ => ih st' (fun s' y hy => hb s' y (List.mem_cons_of_mem x hy))
+        | .breakLoop st', _ => by simpa [threadProg_pure_bind] using hDone st'
+        | .ret st' v, hv => by simpa [threadProg_pure_bind] using hv
+
+theorem progSpec_srvForRangeM {σ σS ρ : Type} {Inv : σ → Prop} {A : Prop} {Step : σ → σ → Prop}
+    {Post : σS × Option ρ → Prop} (body : σS → Nat → ThreadProg σ (Qed.QedLoopStep σS ρ))
+    (hDone : ∀ st, Post (st, none)) (r : Qed.QedRange) (st : σS)
+    (hb : ∀ st' i, r.start ≤ i → i < r.stop → ProgSpec Inv A Step
+      (fun res => match res with | .next _ | .breakLoop _ => True | .ret s' v => Post (s', some v)) (body st' i)) :
+    ProgSpec Inv A Step Post (srvForRangeM r st body) := by
+  rw [srvForRangeM_eq_srvForFoldM]
+  exact progSpec_srvForFoldM body hDone r.toList st fun st' i hi => let hbnd := r.mem_toList_bounds hi; hb st' i hbnd.1 hbnd.2
+
+theorem progSpec_srvForRangeM_bind {σ σS ρ γ : Type} {Inv : σ → Prop} {A : Prop} {Step : σ → σ → Prop}
+    {Post : γ → Prop} (r : Qed.QedRange) (st : σS) (body : σS → Nat → ThreadProg σ (Qed.QedLoopStep σS ρ))
+    {k : σS × Option ρ → ThreadProg σ γ} (hDone : ∀ st', ProgSpec Inv A Step Post (k (st', none)))
+    (hb : ∀ st' i, r.start ≤ i → i < r.stop → ProgSpec Inv A Step
+      (fun res => match res with | .next _ | .breakLoop _ => True | .ret s' v => ProgSpec Inv A Step Post (k (s', some v))) (body st' i)) :
+    ProgSpec Inv A Step Post (srvForRangeM r st body >>= k) := by
+  rw [srvForRangeM_eq_srvForFoldM]
+  exact progSpec_srvForFoldM_bind r.toList st body hDone fun st' i hi => let hbnd := r.mem_toList_bounds hi; hb st' i hbnd.1 hbnd.2
+
+theorem progEffSpec_srvForFoldM {σ σS ρ α : Type} {Inv : σ → Prop} {A : Prop} {Step : σ → σ → Prop}
+    {EffOk : ServerEffect → Prop} {Post : σS × Option ρ → Prop}
+    (body : σS → α → ThreadProg σ (Qed.QedLoopStep σS ρ))
+    (hDone : ∀ st, Post (st, none)) (xs : List α) (st : σS)
+    (hb : ∀ st' x, x ∈ xs → ProgEffSpec Inv A Step EffOk
+      (fun r => match r with | .next _ | .breakLoop _ => True | .ret s' v => Post (s', some v)) (body st' x)) :
+    ProgEffSpec Inv A Step EffOk Post (srvForFoldM xs st body) := by
+  induction xs generalizing st with
+  | nil => exact .pure (st, none) (hDone st)
+  | cons x rest ih =>
+      exact (hb st x (List.mem_cons_self ..)).bind fun
+        | .next st', _ => ih st' (fun s' y hy => hb s' y (List.mem_cons_of_mem x hy))
+        | .breakLoop st', _ => .pure (st', none) (hDone st')
+        | .ret st' v, hv => .pure (st', some v) hv
+
+theorem progEffSpec_srvForFoldM_bind {σ σS ρ α γ : Type} {Inv : σ → Prop} {A : Prop} {Step : σ → σ → Prop}
+    {EffOk : ServerEffect → Prop} {Post : γ → Prop}
+    (xs : List α) (st : σS) (body : σS → α → ThreadProg σ (Qed.QedLoopStep σS ρ))
+    {k : σS × Option ρ → ThreadProg σ γ} (hDone : ∀ st', ProgEffSpec Inv A Step EffOk Post (k (st', none)))
+    (hb : ∀ st' x, x ∈ xs → ProgEffSpec Inv A Step EffOk
+      (fun r => match r with | .next _ | .breakLoop _ => True | .ret s' v => ProgEffSpec Inv A Step EffOk Post (k (s', some v))) (body st' x)) :
+    ProgEffSpec Inv A Step EffOk Post (srvForFoldM xs st body >>= k) := by
+  induction xs generalizing st with
+  | nil => simpa [srvForFoldM, threadProg_pure_bind] using hDone st
+  | cons x rest ih =>
+      change ProgEffSpec Inv A Step EffOk Post ((body st x >>= fun | .next st' => srvForFoldM rest st' body | .breakLoop st' => pure (st', none) | .ret st' r => pure (st', some r)) >>= k)
+      rw [threadProg_bind_assoc]
+      exact (hb st x (List.mem_cons_self ..)).bind fun
+        | .next st', _ => ih st' (fun s' y hy => hb s' y (List.mem_cons_of_mem x hy))
+        | .breakLoop st', _ => by simpa [threadProg_pure_bind] using hDone st'
+        | .ret st' v, hv => by simpa [threadProg_pure_bind] using hv
+
+theorem progEffSpec_srvForRangeM {σ σS ρ : Type} {Inv : σ → Prop} {A : Prop} {Step : σ → σ → Prop}
+    {EffOk : ServerEffect → Prop} {Post : σS × Option ρ → Prop}
+    (body : σS → Nat → ThreadProg σ (Qed.QedLoopStep σS ρ))
+    (hDone : ∀ st, Post (st, none)) (r : Qed.QedRange) (st : σS)
+    (hb : ∀ st' i, r.start ≤ i → i < r.stop → ProgEffSpec Inv A Step EffOk
+      (fun res => match res with | .next _ | .breakLoop _ => True | .ret s' v => Post (s', some v)) (body st' i)) :
+    ProgEffSpec Inv A Step EffOk Post (srvForRangeM r st body) := by
+  rw [srvForRangeM_eq_srvForFoldM]
+  exact progEffSpec_srvForFoldM body hDone r.toList st fun st' i hi => let hbnd := r.mem_toList_bounds hi; hb st' i hbnd.1 hbnd.2
+
+theorem progEffSpec_srvForRangeM_bind {σ σS ρ γ : Type} {Inv : σ → Prop} {A : Prop} {Step : σ → σ → Prop}
+    {EffOk : ServerEffect → Prop} {Post : γ → Prop}
+    (r : Qed.QedRange) (st : σS) (body : σS → Nat → ThreadProg σ (Qed.QedLoopStep σS ρ))
+    {k : σS × Option ρ → ThreadProg σ γ} (hDone : ∀ st', ProgEffSpec Inv A Step EffOk Post (k (st', none)))
+    (hb : ∀ st' i, r.start ≤ i → i < r.stop → ProgEffSpec Inv A Step EffOk
+      (fun res => match res with | .next _ | .breakLoop _ => True | .ret s' v => ProgEffSpec Inv A Step EffOk Post (k (s', some v))) (body st' i)) :
+    ProgEffSpec Inv A Step EffOk Post (srvForRangeM r st body >>= k) := by
+  rw [srvForRangeM_eq_srvForFoldM]
+  exact progEffSpec_srvForFoldM_bind r.toList st body hDone fun st' i hi => let hbnd := r.mem_toList_bounds hi; hb st' i hbnd.1 hbnd.2
 @[inline, specialize] def dbRunTx {E : Type} [SrvErr E] {m : Type → Type} [Monad m] [MonadServer m] {α : Type}
     (cfg : Db.DbConfig) (body : UInt64 → m (Option (Except E α))) : m (Option (Except E α)) := do
   match ← MonadServer.dbTxBegin cfg with
@@ -824,6 +1184,9 @@ theorem srvLetEq_elim {α β : Type} (P : β → Prop) (val : α) (k : (x : α) 
 @[inline] def srvWithNewState {σ : Type} (sNew : σ) (P : σ → Prop) : Prop := P sNew
 @[inline] def srvEnsPost {ε α : Type} (P : α → Prop) : Except ε α → Prop | .ok r => P r | .error _ => True
 @[inline] def srvEnsPostOpt {ε α : Type} (P : α → Prop) : Except ε (Option α) → Prop | .ok (some r) => P r | _ => True
+@[inline] def srvEnsErrPost {ε α : Type} (P : ε → Prop) : Except ε α → Prop | .ok _ => True | .error e => P e
+@[inline] def srvEnsFails {ε α : Type} : Except ε α → Prop | .ok _ => False | .error _ => True
+@[inline] def srvEnsFailsCode {α : Type} (code : Nat) : Except ApiError α → Prop | .ok _ => False | .error e => e.code = code
 
 section SrvStepSimps
 variable {E ε σ α β γ ρ : Type}
@@ -850,6 +1213,9 @@ simp3 srvFinishEmit_ok [SrvErr E] (s₀ s' : σ) (es : List WsEmit) (v : α) : s
 simp3 srvAtomicCommitEmit_none (s₀ s' : σ) (es : List WsEmit) : srvAtomicCommitEmit (E := E) (α := α) s₀ (s', es, none) = (s', none, es) ; srvAtomicCommitEmit_ok (s₀ s' : σ) (es : List WsEmit) (v : α) : srvAtomicCommitEmit (E := E) s₀ (s', es, some (.ok v)) = (s', some (.ok v), es) ; srvAtomicCommitEmit_err (s₀ s' : σ) (es : List WsEmit) (e : E) : srvAtomicCommitEmit (E := E) (α := α) s₀ (s', es, some (.error e)) = (s₀, some (.error e), [])
 simp3 srvGetAt_eq (xs : Array α) (i : Nat) (h : i < xs.size) : srvGetAt xs i h = xs[i]'h ; srvEnsPost_ok (P : α → Prop) (r : α) : srvEnsPost (ε := ε) P (.ok r) = P r ; srvEnsPost_err (P : α → Prop) (e : ε) : srvEnsPost P (.error e) = True
 simp3 srvEnsPostOpt_some (P : α → Prop) (r : α) : srvEnsPostOpt (ε := ε) P (.ok (some r)) = P r ; srvEnsPostOpt_none (P : α → Prop) : srvEnsPostOpt (ε := ε) P (.ok none) = True ; srvEnsPostOpt_err (P : α → Prop) (e : ε) : srvEnsPostOpt P (.error e) = True
+simp2 srvEnsErrPost_ok (P : ε → Prop) (r : α) : srvEnsErrPost P (.ok r) = True ; srvEnsErrPost_err (P : ε → Prop) (e : ε) : srvEnsErrPost (α := α) P (.error e) = P e
+simp2 srvEnsFails_ok (r : α) : srvEnsFails (ε := ε) (.ok r) = False ; srvEnsFails_err (e : ε) : srvEnsFails (α := α) (.error e) = True
+simp2 srvEnsFailsCode_ok (c : Nat) (r : α) : srvEnsFailsCode c (.ok r) = False ; srvEnsFailsCode_err (c : Nat) (e : ApiError) : srvEnsFailsCode (α := α) c (.error e) = (e.code = c)
 theorem srvFinishEmit_err_no_emits [SrvErr E] (s₀ s' : σ) (es : List WsEmit) (e : E) : (srvFinishEmit (E := E) (α := α) s₀ (s', es, some (.error e))).2.2 = [] := rfl
 theorem srvAtomicCommitEmit_err_no_emits (s₀ s' : σ) (es : List WsEmit) (e : E) : (srvAtomicCommitEmit (E := E) (α := α) s₀ (s', es, some (.error e))).2.2 = [] := rfl
 theorem srvWithNewState_apply (s : σ) (P : σ → Prop) : srvWithNewState s P = P s := rfl
@@ -858,6 +1224,8 @@ letEq2L srvFinish_srvLetEq [SrvErr E] (s₀ : σ) | σ × Option (Except E α) |
 letEq2L srvFinishEmit_srvLetEq [SrvErr E] (s₀ : σ) | σ × List WsEmit × Option (Except E α) | srvFinishEmit s₀ ; srvAtomicCommitEmit_srvLetEq (s₀ : σ) | σ × List WsEmit × Option (Except E α) | srvAtomicCommitEmit s₀
 letEq2L prod_fst_srvLetEq | α × β | Prod.fst ; prod_snd_srvLetEq | α × β | Prod.snd
 letEq2L srvEnsPost_srvLetEq (P : α → Prop) | Except ε α | srvEnsPost P ; srvEnsPostOpt_srvLetEq (P : α → Prop) | Except ε (Option α) | srvEnsPostOpt P
+letEq2L srvEnsErrPost_srvLetEq (P : ε → Prop) | Except ε α | srvEnsErrPost P ; srvEnsFails_srvLetEq | Except ε α | srvEnsFails
+@[simp] theorem srvEnsFailsCode_srvLetEq (c : Nat) (val : γ) (k : (x : γ) → x = val → Except ApiError α) : srvEnsFailsCode c (srvLetEq val k) = srvLetEq val (fun x hx => srvEnsFailsCode c (k x hx)) := rfl
 letEqR srvSeq_srvLetEq | σ × Option ρ | next : σ → σ × Option ρ | srvSeq
 letEqR srvEmitSeq_srvLetEq | σ × List WsEmit × Option ρ | next : σ → List WsEmit → σ × List WsEmit × Option ρ | srvEmitSeq
 letEqR srvWithNewState_srvLetEq | σ | P : σ → Prop | srvWithNewState

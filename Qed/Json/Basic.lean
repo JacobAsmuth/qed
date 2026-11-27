@@ -239,6 +239,7 @@ def Json.str?  : Json → Option String                 | .str s  => some s | _ 
 def Json.num?  : Json → Option JsonNumber             | .num n  => some n | _ => none
 def Json.arr?  : Json → Option (List Json)            | .arr es => some es | _ => none
 def Json.obj?  : Json → Option (List (String × Json)) | .obj ms => some ms | _ => none
+def Json.object (entries : Array (String × Json)) : Json := .obj entries.toList
 def Json.field (j : Json) (key : String) : Except String Json :=
   match j with | .obj ms => (ms.foldl (fun acc kv => if kv.1 == key then some kv.2 else acc) none).elim (.error s!"missing key '{key}'") .ok | _ => .error "expected an object"
 def Json.get? (j : Json) (key : String) : Option Json := (j.field key).toOption
@@ -249,7 +250,7 @@ def Json.natAt? (j : Json) (k : String) : Option Nat := (j.get? k).bind (·.num?
 def Json.arrAt (j : Json) (k : String) : List Json := ((j.get? k).bind (·.arr?)).getD []
 /-- Walks a dot-separated path (object keys and numeric array indices, e.g. `"choices.0.delta.content"`). -/
 def Json.atPath (j : Json) (path : String) : Option Json :=
-  (path.splitOn ".").foldlM (init := j) fun cur seg => match cur with | .arr es => seg.toNat?.bind (es[·]?) | .obj _ => cur.get? seg | _ => none
+  (Str.splitChar path '.').foldlM (init := j) fun cur seg => match cur with | .arr es => (Str.parseNat? seg).bind (es[·]?) | .obj _ => cur.get? seg | _ => none
 def Json.pathStr? (j : Json) (path : String) : Option String := (j.atPath path).bind (·.str?)
 def Json.path? (raw : String) (path : String) : Option Json := (Json.parse raw).toOption.bind (·.atPath path)
 def Json.pathStr (raw : String) (path : String) (default : String := "") : String := ((Json.path? raw path).bind (·.str?)).getD default

@@ -955,4 +955,32 @@ def runStaticDir (staticDir : String) (port : UInt16) (devMode : Bool := false) 
       | some (fsize, _, bytes) => maybeGzipResponse 200 "text/html; charset=utf-8" bytes isHead req.keepAlive true req.acceptsGzip true (extraHeaders := loop.htmlCspHdrs ++ [("Vary", "Accept-Encoding")]) (contentLen := fsize)
       | none => return formatTextResponse 404 "not found" isHead req.keepAlive
     return (fun req _ _ _ => finishHeadWire req <$> dispatchReq req ByteArray.empty "", dispatchReq, closedWsBytes, fun _ _ _ => pure (), none)
+
+private def runJobsMainCore (requiredSecrets : Array String) (args : List String) (primaryDb? : Option Db.DbConfig)
+    (mkJobs : MonadServer IO → IO (Array IoJob)) : IO UInt32 := do
+  if !(← verifyRequiredSecrets requiredSecrets) then return 1
+  let devMode := args.contains "--dev"
+  let gcpCache ← Prim.mkStateBox (#[] : Array GcpTokenCacheEntry)
+  let dbCache ← mkDbResolveCache primaryDb?
+  let srvInst := mkNativeServerInstWith (some gcpCache) none none (some dbCache) (!devMode)
+  let ioJobs ← mkJobs srvInst
+  if args.contains "--once" then
+    let ok ← runJobsOnce ioJobs
+    return if ok then 0 else 1
+  let tasks ← spawnServerJobs ioJobs
+  for t in tasks do
+    if let .error e ← IO.wait t then
+      IO.eprintln s!"[qed job runner] task error: {e}"
+  return 0
+
+def runStatelessJobsMain (requiredSecrets : Array String) (jobs : Array StatelessJob) (args : List String)
+    (primaryDb? : Option Db.DbConfig := none) : IO UInt32 :=
+  runJobsMainCore requiredSecrets args primaryDb? fun srvInst => pure (jobs.map (·.toIoJob srvInst))
+
+def runStatefulJobsMain {σ : Type} (initState : σ) (requiredSecrets : Array String) (jobs : Array (ServerJob σ))
+    (args : List String) (primaryDb? : Option Db.DbConfig := none) : IO UInt32 :=
+  runJobsMainCore requiredSecrets args primaryDb? fun srvInst => do
+    let box ← Prim.mkStateBox initState
+    return jobs.map (·.toIoJob srvInst (withStateBox box))
+
 end Qed.Server.Native

@@ -31,6 +31,10 @@ structure ParsedServerBlock where
   jobClauses             : Array Lean.Syntax := #[]
   onCreateAccountClause? : Option Lean.Syntax := none
   onSignInClause?        : Option Lean.Syntax := none
+  routesAuthInvs         : Array (Lean.Ident × String × Array String) := #[]
+  rpcsAuthInvs           : Array (Lean.Ident × Array String) := #[]
+  noSecretsInvs          : Array Lean.Ident := #[]
+  exampleClauses         : Array Lean.Syntax := #[]
 
 structure SrvElabCtx where
   priorRep          : Nat
@@ -92,15 +96,18 @@ def deferSrvCmd (cmd : TSyntax `command) : SrvElabM Unit := do
 
 def mkBaseLowerCtx (fnName : String) (locals : Array String) (allowAwait allowUnwrap hasFallible : Bool)
     (innerOptTy? : Option Term := none) (domainErrTy? : Option Term := none)
-    (isHttpRoute := false) (isStreamRoute := false) (includeDbs := true) (ctxTerm? : Option Term := none) : SrvElabM LowerCtx := do
+    (isHttpRoute := false) (isStreamRoute := false) (includeDbs := true) (ctxTerm? : Option Term := none)
+    (txParams : Array (Ident × DatabaseInfo) := #[]) : SrvElabM LowerCtx := do
   let c ← read
+  let txDbAliases ← txParams.mapM fun (pid, dbi) => do
+    return (pid.getId.eraseMacroScopes.toString, dbi, ← `(($pid).id))
   return {
     fnName, stateFields := c.stateFieldNames, envVars := c.envVarNames, envIdents := c.envIdents, locals,
     stateRule := if c.hasState then .pureStep (mkIdent `_s0) else .statelessServer,
     allowAwait, allowUnwrap, hasFallible, innerOptTy?, domainErrTy?, channels := c.chanSigs, helpers := c.helpers,
     dbs := if includeDbs then c.dbDecls.map fun (a, i) => (a.getId.toString, i) else #[],
     services := c.serviceDecls.map fun (a, i) => (a.getId.toString, i),
-    ctxTerm?, isHttpRoute, isStreamRoute }
+    ctxTerm?, txDbAliases, isHttpRoute, isStreamRoute }
 
 def mkProtoDecodeBind (bytesVar tupleVar : Ident) (tupleTy : Term) (pIdents : Array Ident) (projs : Array Term) (body : Term) : CommandElabM Term := do
   let bound ← (pIdents.zip projs).foldrM (init := body) fun (pid, prj) acc => `(let $pid:ident := $prj; $acc)
@@ -137,6 +144,7 @@ structure ParsedFnParams where
   minParamCount  : Nat
   hasExplicitCtx : Bool
   defaultExprs   : Array Syntax
+  txParams       : Array (Ident × DatabaseInfo) := #[]
 
 def parseSrvFnParams (ctxLabel tyDescPrefix : String) (rawParams : Array Syntax)
     (reserved extraShadow : Array String := #[]) (allowExplicitCtx := false) : SrvElabM ParsedFnParams := do
@@ -144,12 +152,23 @@ def parseSrvFnParams (ctxLabel tyDescPrefix : String) (rawParams : Array Syntax)
   let mut idents : Array Ident := #[]; let mut tyTerms : Array Term := #[]; let mut names : Array String := #[]
   let mut defBinders : Array (TSyntax `Lean.Parser.Term.bracketedBinder) := #[]
   let mut minParamCount : Nat := 0; let mut seenDefault := false; let mut hasExplicitCtx := false
-  let mut defaultExprs : Array Syntax := #[]
+  let mut defaultExprs : Array Syntax := #[]; let mut txParams : Array (Ident × DatabaseInfo) := #[]
   for rp in rawParams do
     let pid : Ident := ⟨rp.getArg 0⟩
     let pstr ← checkSrvParamName ctxLabel pid reserved names extraShadow allowExplicitCtx
     if pstr == "ctx" then hasExplicitCtx := true
-    let pty ← liftMacroM <| lowerSrvType (rp.getArg 2) false s!"{tyDescPrefix} `{pstr}`"
+    let tyStx := rp.getArg 2
+    let pty ← liftMacroM <| lowerSrvType tyStx false s!"{tyDescPrefix} `{pstr}`"
+    let mut tyTerm := pty.term
+    if pty.mods.isEmpty && !pty.isProto && !pty.isForm then
+      if let .str pre "Tx" := pty.baseName then
+        let dbInfo? : Option DatabaseInfo ←
+          match c.dbDecls.find? (fun (al, _) => al.getId.eraseMacroScopes == pre) with
+          | some (_, dbi) => pure (some dbi)
+          | none => pure (lookupDatabase? (← getEnv) (← getCurrNamespace) (← getOpenDecls) pre)
+        if let some dbi := dbInfo? then
+          tyTerm ← `(Qed.Server.Db.DbTx $(Syntax.mkStrLit dbi.dbName.toString))
+          txParams := txParams.push (pid, dbi)
     let optDef := rp.getArg 3
     if optDef.getNumArgs == 2 then
       seenDefault := true
@@ -157,13 +176,13 @@ def parseSrvFnParams (ctxLabel tyDescPrefix : String) (rawParams : Array Syntax)
       defaultExprs := defaultExprs.push dExpr
       let (defT, dSt) ← liftM <| (lowerExpr { fnName := ctxLabel, envVars := c.envVarNames, locals := names, stateRule := .statelessServer } .val dExpr).run {}
       recordSrvExtRoots dSt.extRoots
-      defBinders := defBinders.push (← `(bracketedBinder| ($pid:ident : $(pty.term) := srvAutoField($defT))))
+      defBinders := defBinders.push (← `(bracketedBinder| ($pid:ident : $tyTerm := srvAutoField($defT))))
     else
       if seenDefault then throwErrorAt pid s!"non-default parameter `{pstr}` cannot follow a parameter with a default value in {ctxLabel}"
       minParamCount := minParamCount + 1
-      defBinders := defBinders.push (← `(bracketedBinder| ($pid:ident : $(pty.term))))
-    idents := idents.push pid; tyTerms := tyTerms.push pty.term; names := names.push pstr
-  return { idents, tyTerms, defBinders, names, minParamCount, hasExplicitCtx, defaultExprs }
+      defBinders := defBinders.push (← `(bracketedBinder| ($pid:ident : $tyTerm)))
+    idents := idents.push pid; tyTerms := tyTerms.push tyTerm; names := names.push pstr
+  return { idents, tyTerms, defBinders, names, minParamCount, hasExplicitCtx, defaultExprs, txParams }
 
 private def lowerSrvExpr (ctx : LowerCtx) (mode : ExprMode) (stx : Syntax) : SrvElabM Term := return (← liftM <| (lowerExpr ctx mode stx).run {}).1
 
@@ -197,6 +216,10 @@ def parseServerClauses (srvIdent : Ident) (srvName : Name) (clauses : Array Synt
   let mut helperClauses : Array Syntax := #[]; let mut beforeClause? : Option Syntax := none
   let mut fnClauses : Array Syntax := #[]; let mut chanClauses : Array Syntax := #[]; let mut httpClauses : Array Syntax := #[]; let mut jobClauses : Array Syntax := #[]
   let mut onCreateAccountClause? : Option Syntax := none; let mut onSignInClause? : Option Syntax := none
+  let mut routesAuthInvs : Array (Ident × String × Array String) := #[]
+  let mut rpcsAuthInvs : Array (Ident × Array String) := #[]
+  let mut noSecretsInvs : Array Ident := #[]
+  let mut exampleClauses : Array Syntax := #[]
   for c in clauses do
     let k := c.getKind
     let hasDecl (nm : Name) := dbDecls.any (·.1.getId == nm) || serviceDecls.any (·.1.getId == nm) || authDecl?.any (·.1.getId == nm) || envDecls.any (·.ident.getId == nm) || stateDecls.any (·.1.getId == nm)
@@ -228,8 +251,29 @@ def parseServerClauses (srvIdent : Ident) (srvName : Name) (clauses : Array Synt
       if hasDecl id.getId then throwErrorAt id s!"duplicate declaration `{id.getId}` in `{blockKind} {srvName}`"
       envDecls := envDecls.push { ident := id, osKey, default? := none, isSecret := true }
     else if k == ``srvHelperFnClause then helperClauses := helperClauses.push c
+    else if k == ``srvInvNoSecretsClause then
+      let nameId : Ident := ⟨c.getArg 1⟩
+      if seenInvNames.contains nameId.getId then throwErrorAt nameId s!"duplicate invariant `{nameId.getId}` in `{blockKind} {srvName}`"
+      seenInvNames := seenInvNames.push nameId.getId
+      noSecretsInvs := noSecretsInvs.push nameId
+    else if k == ``srvExampleClause then exampleClauses := exampleClauses.push c
     else if isService then
-      throwErrorAt c s!"only `use`, `env`, `secret`, and `fn` declarations are allowed in stateless `service {srvName}`"
+      throwErrorAt c s!"only `use`, `env`, `secret`, `fn`, `example`, and `invariant ... : no_required_secrets` declarations are allowed in stateless `service {srvName}`"
+    else if k == ``srvInvRoutesAuthClause then
+      let nameId : Ident := ⟨c.getArg 1⟩
+      if seenInvNames.contains nameId.getId then throwErrorAt nameId s!"duplicate invariant `{nameId.getId}` in `server {srvName}`"
+      seenInvNames := seenInvNames.push nameId.getId
+      let pfxStr := (⟨c.getArg 4⟩ : TSyntax `str).getString
+      let excOpt := c.getArg 5
+      let excs := if excOpt.getNumArgs == 4 then (excOpt.getArg 2).getSepArgs.map fun s => (⟨s⟩ : TSyntax `str).getString else #[]
+      routesAuthInvs := routesAuthInvs.push (nameId, pfxStr, excs)
+    else if k == ``srvInvRpcsAuthClause then
+      let nameId : Ident := ⟨c.getArg 1⟩
+      if seenInvNames.contains nameId.getId then throwErrorAt nameId s!"duplicate invariant `{nameId.getId}` in `server {srvName}`"
+      seenInvNames := seenInvNames.push nameId.getId
+      let excOpt := c.getArg 4
+      let excs := if excOpt.getNumArgs == 4 then (excOpt.getArg 2).getSepArgs.map fun s => (⟨s⟩ : TSyntax `str).getString else #[]
+      rpcsAuthInvs := rpcsAuthInvs.push (nameId, excs)
     else if k == ``srvStateClause then
       let id : Ident := ⟨c.getArg 1⟩; let ty ← liftMacroM <| lowerSrvType (c.getArg 3) false s!"state field `{id.getId}`"
       if hasDecl id.getId then throwErrorAt id s!"duplicate declaration `{id.getId}` in `server {srvName}`"
@@ -258,7 +302,7 @@ def parseServerClauses (srvIdent : Ident) (srvName : Name) (clauses : Array Synt
     else throwErrorAt c "unexpected clause in `server` block"
   if isService then
     if helperClauses.isEmpty then throwErrorAt srvIdent s!"`service {srvName}` must declare at least one `fn`"
-    return { dbDecls, serviceDecls, authDecl? := none, envDecls, stateDecls := #[], mutInvs := #[], invs := #[], helperClauses, fnClauses := #[], chanClauses := #[] }
+    return { dbDecls, serviceDecls, authDecl? := none, envDecls, stateDecls := #[], mutInvs := #[], invs := #[], helperClauses, fnClauses := #[], chanClauses := #[], noSecretsInvs, exampleClauses }
   for (hookNm, hook?) in #[("onCreateAccount", onCreateAccountClause?), ("onSignIn", onSignInClause?)] do
     if let some c := hook? then if authDecl?.isNone then throwErrorAt c s!"`{hookNm}` in `server {srvName}` requires `use auth : <Auth>`"
   if fnClauses.isEmpty && chanClauses.isEmpty && httpClauses.isEmpty && jobClauses.isEmpty && onCreateAccountClause?.isNone && onSignInClause?.isNone then
@@ -267,7 +311,7 @@ def parseServerClauses (srvIdent : Ident) (srvName : Name) (clauses : Array Synt
   for (fldId, _, _) in mutInvs do
     unless stateDecls.any (·.1.getId == fldId.getId) do
       throwErrorAt fldId s!"`invariant mutating {fldId.getId}` does not match any `state` field of `{srvName}` (`state` fields: {String.intercalate ", " (stateDecls.toList.map fun s => s!"`{s.1.getId}`")})"
-  return { dbDecls, serviceDecls, authDecl?, envDecls, stateDecls, mutInvs, invs, helperClauses, beforeClause?, fnClauses, chanClauses, httpClauses, jobClauses, onCreateAccountClause?, onSignInClause? }
+  return { dbDecls, serviceDecls, authDecl?, envDecls, stateDecls, mutInvs, invs, helperClauses, beforeClause?, fnClauses, chanClauses, httpClauses, jobClauses, onCreateAccountClause?, onSignInClause?, routesAuthInvs, rpcsAuthInvs, noSecretsInvs, exampleClauses }
 
 partial def scanCtxEnv (envVars locals : Array String) (stx : Syntax) : Bool × Bool :=
   let k := stx.getKind
@@ -674,6 +718,10 @@ private def deferInvProofs (isA : Bool) (fnStr : String) (fnIdent targetId : Ide
 
 structure ElabHandlerRes where
   runExpr      : Term
+  targetId     : Ident
+  isAsync      : Bool
+  allBinderIds : Array Ident
+  allBinderTys : Array Term
   mutatesState : Bool
   dbWrite      : Bool
   hasEmit      : Bool
@@ -706,6 +754,7 @@ private def elabPureHandler (fnStr : String) (fnIdent invThmId : Ident) (fnLit s
       $postGoal := by $ensTac))
   let sSnap := mkIdent `_sSnap
   return some { runExpr := ← liftM <| mkAtomicRunTerm sSnap ⟨c.stateId.raw⟩ (← mkAppTerms (← `($stepId $sSnap)) callArgs) isReadOnly hasEmit,
+                targetId := stepId, isAsync := false, allBinderIds, allBinderTys,
                 mutatesState := !isReadOnly, dbWrite := lSt.dbWrite, hasEmit, hasCookieOp := lSt.hasCookieOp }
 
 @[noinline]
@@ -730,7 +779,9 @@ private def elabAsyncHandler (fnStr : String) (fnIdent invThmId : Ident) (fnLit 
     let ensTac ← liftM <| mkAsyncEnsProofTac handlerId unfoldIds fnLit ens.labelStr ens.tac?
     deferSrvCmd (← `(command| theorem $(c.fnSubId fnIdent "_ensures") $[($allBinderIds:ident : $allBinderTys:term)]* :
       Qed.Server.ProgEnsures $invT (fun ($outVar:ident : Except $errTyTerm $payloadTerm) => $postBody) ($hCall : Qed.Server.ThreadProg $tyT _) := by $ensTac))
-  return some { runExpr := ← mkAppTerms handlerId callArgs, mutatesState := !lSt.mutated.isEmpty, dbWrite := lSt.dbWrite, hasEmit, hasCookieOp := lSt.hasCookieOp }
+  return some { runExpr := ← mkAppTerms handlerId callArgs,
+                targetId := handlerId, isAsync := true, allBinderIds, allBinderTys,
+                mutatesState := !lSt.mutated.isEmpty, dbWrite := lSt.dbWrite, hasEmit, hasCookieOp := lSt.hasCookieOp }
 
 def elabServerHandler (isAsync : Bool) (fnStr : String) (fnIdent : Ident)
     (extraBinderIds : Array Ident) (extraBinderTys extraCallArgs : Array Term)

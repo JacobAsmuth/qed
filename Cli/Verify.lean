@@ -150,7 +150,7 @@ private def forbiddenAt? (cs : Array Char) (s e : Nat) : Option String :=
   | _,  _   => none
 
 private def hasForbiddenSubstr (s : String) : Bool :=
-  s.contains "sorry" || s.contains "admit" || s.contains "native_decide"
+  s.contains "sorry" || s.contains "admit" || s.contains "native_decide" || s.contains "#guard"
 
 private partial def skipSpaces (cs : Array Char) (stop i : Nat) : Nat :=
   if i < stop && (cs[i]! == ' ' || cs[i]! == '\t') then skipSpaces cs stop (i + 1) else i
@@ -485,6 +485,8 @@ private partial def scanForbiddenLoop (ctx : ScanCtx) (i line : Nat) (sfl ic : U
         let (ni, nl, enterB) := scanStrLoop cs n (inc && (ctx.allInterp || (ic &&& 1) != 0)) (i + 1) line
         scanForbiddenLoop ctx ni nl 0 0 gs (if enterB then ib.push (0, gs.size) else ib) hits
     else if c == '\'' && !prevId && i + 1 < n && cs[i + 1]! != '\'' then scanForbiddenLoop ctx (scanCharLit cs n i) line 0 0 gs ib hits
+    else if c == '#' && i + 6 <= n && matchWord cs i (i + 6) "#guard" && (i + 6 >= n || !Lean.isIdRest cs[i + 6]!) then
+      scanForbiddenLoop ctx (i + 6) line 0 0 gs ib (hits.push (line, "#guard"))
     else if Lean.isIdFirst c then
       let ni := scanIdentEnd cs n (i + 1)
       let hits' := match forbiddenAt? cs i ni with | some f => hits.push (line, f) | none => hits
@@ -615,7 +617,7 @@ def buildGraphClean : IO Bool := do
     return false
   let mut ok := true
   let pureExact := #["Qed.Html", "Qed.Render", "Qed.View.Core", "Qed.Ssr", "Qed.Resource", "Qed.Socket", "Qed.Driver", "Qed.Speculative",
-    "Qed.Runtime.AppCore", "Qed.Runtime.LocalCore", "Qed.Runtime.Cmd", "Qed.Server.Core", "Qed.Server.Http", "Qed.Server.Net",
+    "Qed.Runtime.AppCore", "Qed.Runtime.LocalCore", "Qed.Runtime.Cmd", "Qed.Server.Core", "Qed.Server.Eval", "Qed.Server.Http", "Qed.Server.Net",
     "Qed.Server.Prim", "Qed.Server.Native", "Qed.Server.Ensured", "Qed.Server.Db.Core", "Qed.Server.Db.HttpSql", "Qed.Server.Db.PgWire"]
   for (mod, _) in adj.toList do
     if (pureExact.contains mod || #["Qed.Driver.", "Qed.Socket.", "Qed.Speculative.", "Qed.Proofs."].any (mod.startsWith ·)) && reaches mod "Lean" then

@@ -175,7 +175,7 @@ private def runTrace {S M C : Type} (upd : S → M → S × C) (st : S) (ms : Li
 private def mkOrderOk (qty v : Nat) (h : v ≤ 10000) : StoreSrv.placeOrder_Outcome qty := .ok ⟨v, h⟩
 private def mkSpecBook (slot : Nat) (hSlot : slot ≤ 1000) (stock : Nat) (hStock : stock ≤ 10000) : SpecBook :=
   { slot := ⟨slot, by simp [Codec.refine, Codec.nat]; exact hSlot⟩, title := ⟨"Lean 4", by simp [Codec.refine, Codec.text]; decide⟩, stock := ⟨stock, by simp [Codec.refine, Codec.nat]; exact hStock⟩ }
-#guard
+example : (
   let u := CheckoutSpec.app.update
   let snap (s : Qed.SpecState CheckoutSpec.State CheckoutSpec.Msg) := (s.visible.remaining, s.confirmed.remaining, s.visible.status, s.visible.note, s.visible.confirmedCount, s.visible.clicks, s.confirmed.clicks, s.log.length)
   let sDisp := runTrace u CheckoutSpec.app.init.1 [._onSession (some "alice"), .buy 2]
@@ -202,7 +202,7 @@ private def mkSpecBook (slot : Nat) (hSlot : slot ≤ 1000) (stock : Nat) (hStoc
   (clHit.visible.owned, clHit.visible.confirmed, clHit.visible.status, clHit.log.isEmpty) == (#[7], 1, "Claimed", true) &&
   catUnpred.log.isEmpty && catUnpred.visible.lastOrdered.isNone && (catPred.log.length, catPred.visible.lastOrdered.map (·.stock.val), catPred.visible.statusMsg) == (1, some 9, "Ordered Lean 4") &&
   (catReconciled.log.isEmpty, catReconciled.visible.lastOrdered.map (·.stock.val)) == (true, some 6) &&
-  rs1.log.length == 1 && rs1.visible.items.get? == some #[1, 2, 3] && rs2.log.isEmpty && rs2.visible.items.get? == some #[10, 20] && rs4.log.isEmpty && (match rs4.visible.items with | .failed "boom" => true | _ => false)
+  rs1.log.length == 1 && rs1.visible.items.get? == some #[1, 2, 3] && rs2.log.isEmpty && rs2.visible.items.get? == some #[10, 20] && rs4.log.isEmpty && (match rs4.visible.items with | .failed "boom" => true | _ => false)) = true := by decide +kernel
 
 /-! ## 3. Kernel-Enforced Soundness Checks -/
 example : PProd (LawfulBEq SpecBook ∧ LawfulBEq Date) (SpecEq SpecBook × SpecEq Date) := ⟨⟨inferInstance, inferInstance⟩, (inferInstance, inferInstance)⟩

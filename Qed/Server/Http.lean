@@ -43,10 +43,10 @@ private theorem isHostHeader_imp_toLower (k : String) (h : isHostHeader k = true
   · rw [beq_iff_eq.1 h2]; exact beq_iff_eq.2 (by unfold String.toLower; apply String.ext; simp [Char.toLower])
   · exact h3
 private def acceptEncodingHasGzip (v : String) : Bool :=
-  (v.splitOn ",").any fun item => match item.splitOn ";" with
+  (Qed.Str.splitChar v ',').any fun item => match Qed.Str.splitChar item ';' with
     | [] => false
-    | tok :: params => eqCI (trimWs tok) "gzip" && !(params.any fun p => match p.splitOn "=" with
-        | [k, qv] => let lq := trimWs qv; (trimWs k).toLower == "q" && (lq == "0" || lq == "0.0" || lq == "0.00" || lq == "0.000")
+    | tok :: params => eqCI (trimWs tok) "gzip" && !(params.any fun p => match Qed.Str.splitChar p '=' with
+        | [k, qv] => let lq := trimWs qv; eqCI (trimWs k) "q" && (lq == "0" || lq == "0.0" || lq == "0.00" || lq == "0.000")
         | _ => false)
 
 private def parseOtherHeader (k v : String) (st : HdrFoldState) : HdrFoldState :=

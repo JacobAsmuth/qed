@@ -88,7 +88,7 @@ def multiEnvManifest : Qed.Deploy.DeployManifest := {
     secrets := #["PROD_DB_URL", "STAGING_DB_URL", "PREVIEW_DB_URL"], tables := #[],
     envSpecs := { dev := .byoSqlite ".qed/dev.db", preview := .byoPostgres { envVar := "PREVIEW_DB_URL", scope := .pinned .preview },
                   staging := .byoPostgres { envVar := "STAGING_DB_URL", scope := .pinned .staging }, prod := .byoPostgres { envVar := "PROD_DB_URL", scope := .pinned .prod } } }] }
-#guard
+example : (
   let sh : ShardProject := ⟨"s1-prod", "s1-nonprod", by decide⟩
   let (k, kp) : DeployKey × DeployKey := ({ shard := sh, tenant := ⟨1, by decide⟩, app := ⟨1, by decide⟩, env := .prod }, { shard := sh, tenant := ⟨1, by decide⟩, app := ⟨1, by decide⟩, env := .preview ⟨42, by decide⟩ })
   let (plan, prevPlan) := (compileInfra k "h1" NotesDeploy.spec { version := 1, secrets := ["K"], egress := ["https://a.com"] }, compileInfra kp "h1" NotesDeploy.spec { version := 1, secrets := ["K"], egress := ["https://a.com"] })
@@ -118,7 +118,7 @@ def multiEnvManifest : Qed.Deploy.DeployManifest := {
   [.setEgressRules k ["https://a.com", "https://b.com"], .narrowEgressRules k ["https://a.com"], .deleteSecret k "OLD"].all acts.contains &&
   plan.bindings.contains { principal := .allUsers, role := .storageLegacyObjectReader, resource := .assetPrefix k "h1" true } &&
   prevPlan.bindings.contains { principal := .edgeRouter, role := .storageLegacyObjectReader, resource := .assetPrefix kp "h1" false } && !prevPlan.bindings.any (·.principal == .allUsers) &&
-  [.deleteEgressPolicy kp, .pruneDenyException kp, .deleteServiceAccount kp].all td.contains && !td.any fun | .revokeBinding b => b.resource.isAsset | _ => false
+  [.deleteEgressPolicy kp, .pruneDenyException kp, .deleteServiceAccount kp].all td.contains && !td.any fun | .revokeBinding b => b.resource.isAsset | _ => false) = true := by decide +kernel
 
 /-! ## 3. Negative Elaborator Guard Tests -/
 bad_deploy1 "`deploy BadStatefulMultiRegion`: server `StatefulApi` uses in-memory `state`, which can only run in a single region" BadStatefulMultiRegion StatefulApi : regions [us_central1, europe_west1]

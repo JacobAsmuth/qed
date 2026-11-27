@@ -37,17 +37,8 @@ def findMatchingJwk (keys : Array JwkKey) (alg : JwtAlg) (kid? : Option String) 
   | some kid => keys.find? fun k => k.alg == alg && k.kid == kid
   | none => let compat := keys.filter (·.alg == alg); if compat.size == 1 then compat[0]? else none
 
-structure JwtHeader where
-  alg  : JwtAlg
-  kid? : Option String := none
-  typ? : Option String := none
-deriving Inhabited, DecidableEq
-
-structure CompactJwt where
-  signingInput : String
-  signature    : ByteArray
-  header       : JwtHeader
-  payloadJson  : Json
+structure JwtHeader where (alg : JwtAlg) (kid? typ? : Option String := none) deriving Inhabited
+structure CompactJwt where (signingInput : String) (signature : ByteArray) (header : JwtHeader) (payloadJson : Json)
 
 def splitCompactJwt (token : String) : Except String (String × String × String) :=
   match token.splitOn "." with
@@ -67,17 +58,9 @@ private def jsonToClaimString : Json → Option String
   | .num n => some (if n.exponent == 0 then toString n.mantissa else Json.render (.num n)) | _ => none
 
 structure JwtClaims where
-  iss           : String
-  sub           : String
-  aud           : List String
-  exp           : Nat
-  nbf?          : Option Nat := none
-  iat?          : Option Nat := none
-  nonce?        : Option String := none
-  email?        : Option String := none
-  emailVerified : Bool := false
-  flatClaims    : List (String × String) := []
-deriving Inhabited, DecidableEq
+  (iss sub : String) (aud : List String) (exp : Nat) (nbf? iat? : Option Nat := none)
+  (nonce? email? : Option String := none) (emailVerified : Bool := false) (flatClaims : List (String × String) := [])
+deriving Inhabited
 
 def JwtClaims.claim (c : JwtClaims) (key : String) : Option String := Qed.lookupClaim c.flatClaims key
 def parseJwtClaims (j : Json) : Except String JwtClaims := do
@@ -91,21 +74,13 @@ def parseJwtClaims (j : Json) : Except String JwtClaims := do
         email? := j.strAt? "email", emailVerified, flatClaims := rawFlat ++ [("email_verified", if emailVerified then "true" else "false")] }
 
 structure OidcValidationCfg where
-  issuer         : String
-  audience       : String
-  clockSkewSec   : Nat := 60
-  expectedNonce? : Option String := none
-deriving Inhabited, DecidableEq
+  (issuer audience : String) (clockSkewSec : Nat := 60) (expectedNonce? : Option String := none)
+deriving Inhabited
 
 structure VerifiedClaims (cfg : OidcValidationCfg) (nowSec : Nat) where
-  claims      : JwtClaims
-  alg         : JwtAlg
-  hIss        : claims.iss = cfg.issuer
-  hAud        : cfg.audience ∈ claims.aud
-  hNotExpired : nowSec < claims.exp + cfg.clockSkewSec
-  hNbf        : ∀ n, claims.nbf? = some n → n ≤ nowSec + cfg.clockSkewSec
-  hSub        : claims.sub ≠ ""
-  hNonce      : ∀ en, cfg.expectedNonce? = some en → claims.nonce? = some en
+  (claims : JwtClaims) (alg : JwtAlg) (hIss : claims.iss = cfg.issuer) (hAud : cfg.audience ∈ claims.aud)
+  (hNotExpired : nowSec < claims.exp + cfg.clockSkewSec) (hNbf : ∀ n, claims.nbf? = some n → n ≤ nowSec + cfg.clockSkewSec)
+  (hSub : claims.sub ≠ "") (hNonce : ∀ en, cfg.expectedNonce? = some en → claims.nonce? = some en)
 
 section JwtValidation
 variable (cfg : OidcValidationCfg) (nowSec : Nat) (alg : JwtAlg) (c : JwtClaims)
@@ -152,10 +127,8 @@ theorem isSafeReturnTo_rejects_javascript : isSafeReturnTo "javascript:alert(1)"
 theorem sanitizeReturnTo_safe (raw? : Option String) : isSafeReturnTo (sanitizeReturnTo raw?) = true := by
   unfold sanitizeReturnTo; cases raw? with | none => exact isSafeReturnTo_root | some s => dsimp only; split <;> simp_all [isSafeReturnTo_root]
 
-structure SessionPayloadV2 where
-  userId : String
-  claims : List (String × String) := []
-deriving Inhabited, DecidableEq, Repr
+structure SessionPayloadV2 where (userId : String) (claims : List (String × String) := []) deriving Inhabited, BEq
+instance : Repr SessionPayloadV2 where reprPrec p _ := s!"\{ userId := {repr p.userId}, claims := {repr p.claims} }"
 
 def encodeSessionPayloadV2 (p : SessionPayloadV2) : String :=
   base64UrlEncode (Json.render (Json.obj [("sub", .str p.userId), ("claims", Json.obj (p.claims.map fun (k, v) => (k, .str v)))])).toUTF8
@@ -165,35 +138,22 @@ def decodeSessionPayloadV2 (b64 : String) : Except String SessionPayloadV2 := do
   if uid.isEmpty then .error "session: empty `sub`"
   else .ok { userId := uid, claims := match j.get? "claims" with | some (.obj kvs) => kvs.filterMap fun (k, v) => v.str?.map (k, ·) | _ => [] }
 
-abbrev urlEncodeComponent : String → String := Qed.encodeSeg
-abbrev urlDecodeComponent : String → String := Qed.urlDecodeComponent
 abbrev parseQueryParams : String → List (String × String) := Qed.parseQueryParams
 abbrev encodeFormBody : List (String × String) → String := Qed.encodeFormBody
+def mkAuthActionUrl (pfx : String) (returnTo : Qed.HrefTarget := Qed.HrefTarget.root) : Qed.Url :=
+  (Qed.Url.parse? (pfx ++ Qed.encodeSeg (sanitizeReturnTo (some returnTo.raw)))).getD Qed.Url.root
 
-structure AuthClaimSpec where
-  name         : String
-  typeName     : String
-  defaultValue : String := ""
-deriving Inhabited, DecidableEq
+structure AuthClaimSpec where (name typeName : String) (defaultValue : String := "") deriving Inhabited
 
 structure OidcAuthSpec where
-  name             : String
-  isManaged        : Bool := false
-  issuerEnv        : String := "QED_AUTH_ISSUER"
-  issuerDefault?   : Option String := none
-  audienceEnv      : String := "QED_AUTH_AUDIENCE"
-  audienceDefault? : Option String := none
-  clientIdEnv?     : Option String := some "QED_AUTH_CLIENT_ID"
-  clientIdDefault? : Option String := none
-  clientSecretEnv? : Option String := none
-  providers        : List String := []
-  sessionTtlSec    : Nat := 86400
-  loginPath        : String := "/_qed/auth/login"
-  callbackPath     : String := "/_qed/auth/callback"
-  logoutPath       : String := "/_qed/auth/logout"
-  mePath           : String := "/_qed/auth/me"
-  claims           : List AuthClaimSpec := []
-deriving Inhabited, DecidableEq
+  (name : String) (isManaged : Bool := false)
+  (issuerEnv : String := "QED_AUTH_ISSUER") (issuerDefault? : Option String := none)
+  (audienceEnv : String := "QED_AUTH_AUDIENCE") (audienceDefault? : Option String := none)
+  (clientIdEnv? : Option String := some "QED_AUTH_CLIENT_ID") (clientIdDefault? clientSecretEnv? : Option String := none)
+  (providers : List String := []) (sessionTtlSec : Nat := 86400)
+  (loginPath : String := "/_qed/auth/login") (callbackPath : String := "/_qed/auth/callback")
+  (logoutPath : String := "/_qed/auth/logout") (mePath : String := "/_qed/auth/me") (claims : List AuthClaimSpec := [])
+deriving Inhabited
 
 def parseBoolClaim (raw? : Option String) (defaultVal : Bool := false) : Bool := match raw? with | some "true" | some "1" => true | some "false" | some "0" => false | _ => defaultVal
 def parseNatClaim (raw? : Option String) (defaultVal : Nat := 0) : Nat := (raw?.bind String.toNat?).getD defaultVal

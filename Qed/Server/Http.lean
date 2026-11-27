@@ -8,32 +8,13 @@ def maxReqHeaders   : Nat := 96
 def maxWsMsgBytes   : Nat := 4 * 1024 * 1024
 
 structure ReqHdrMeta where
-  keepAlive      : Bool
-  headers        : Array (String × String)
-  upgrade?       : Option String := none
-  conn?          : Option String := none
-  wsKey?         : Option String := none
-  wsVer?         : Option String := none
-  host?          : Option String := none
-  origin?        : Option String := none
-  dupOrigin      : Bool := false
-  secFetchSite?  : Option String := none
-  dupSfs         : Bool := false
-  contentType?   : Option String := none
-  dupCt          : Bool := false
-  hasCookie      : Bool := false
-  auth?          : Option String := none
-  hasIfNoneMatch : Bool := false
-  acceptsGzip    : Bool := false
+  (keepAlive : Bool) (headers : Array (String × String))
+  (upgrade? conn? wsKey? wsVer? host? origin? : Option String := none) (dupOrigin : Bool := false)
+  (secFetchSite? : Option String := none) (dupSfs : Bool := false) (contentType? : Option String := none)
+  (dupCt hasCookie : Bool := false) (auth? : Option String := none) (hasIfNoneMatch acceptsGzip : Bool := false)
 
-structure ParsedReqHead extends ReqHdrMeta where
-  method     : String
-  target     : String
-  isHttp11   : Bool
-  contentLen : Nat
-private structure HdrFoldState extends ReqHdrMeta where
-  contentLen? : Option Nat
-  hostCount   : Nat
+structure ParsedReqHead extends ReqHdrMeta where (method target : String) (isHttp11 : Bool) (contentLen : Nat)
+private structure HdrFoldState extends ReqHdrMeta where (contentLen? : Option Nat) (hostCount : Nat)
 
 @[inline] private def isHostHeader (k : String) : Bool := k.utf8ByteSize == 4 && (k == "Host" || k == "host" || k.toLower == "host")
 private theorem isHostHeader_imp_toLower (k : String) (h : isHostHeader k = true) : (k.toLower == "host") = true := by
@@ -201,13 +182,7 @@ def formatErrorResponse (status : Nat) (msg : String) : ByteArray := formatTextR
 def formatWsUpgradeResponse (acceptB64 : String) : ByteArray := s!"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {acceptB64}\r\n\r\n".toUTF8
 def setCookieHeaders (cookies : List SetCookie) : List (String × String) := cookies.map fun c => ("Set-Cookie", c.render)
 
-structure StaticTarget where
-  relPath   : String
-  mime      : String
-  isHead    : Bool
-  noStore   : Bool
-  isBuildId : Bool
-deriving DecidableEq
+structure StaticTarget where (relPath mime : String) (isHead noStore isBuildId : Bool) deriving BEq
 
 def guessMimeType (path : String) : Option String :=
   match (path.splitOn ".").reverse with

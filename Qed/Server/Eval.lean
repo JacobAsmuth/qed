@@ -42,11 +42,7 @@ def mockAeadDecrypt (envVars : List (String × String)) (keyEnv : String) (fallb
 
 /-! ### 2. Pure In-Memory SQL Database & `SqlQuery` Evaluator -/
 
-structure MemTable where
-  name    : String
-  columns : List String
-  rows    : List DbRow := []
-deriving Inhabited, DecidableEq
+structure MemTable where (name : String) (columns : List String) (rows : List DbRow := []) deriving Inhabited
 abbrev MemDb := List MemTable
 
 namespace MemDb
@@ -178,12 +174,7 @@ def evalSqlQuery (cfg : DbConfig) (db0 : MemDb) (q : SqlQuery) : MemDb × Except
 
 /-! ### 3. Pure `ThreadProg` Evaluator (`EvalEnv`, `EvalState`, `EvalTrace`, `evalProg`) -/
 
-structure HttpStub where
-  method : String := ""
-  url    : String
-  resp   : Except ApiError OutboundResp
-  once   : Bool := false
-deriving Inhabited
+structure HttpStub where (method : String := "") (url : String) (resp : Except ApiError OutboundResp) (once : Bool := false) deriving Inhabited
 def HttpStub.ok (method url : String) (status : UInt32 := 200) (body : String := "") (headers : List (String × String) := []) (once : Bool := false) : HttpStub :=
   { method, url, resp := .ok { status, body := body.toUTF8, headers }, once }
 def HttpStub.err (method url : String) (code : Nat := 502) (msg : String := "upstream error") (once : Bool := false) : HttpStub :=
@@ -195,35 +186,19 @@ private def matchHttpStub (req : OutboundReq) : List HttpStub → Option (Except
   | [] => none
   | s :: rest => if stubMatches s req then some (s.resp, if s.once || rest.any (stubMatches · req) then rest else s :: rest) else (matchHttpStub req rest).map fun (r, rest') => (r, s :: rest')
 
-structure EvalEnv where
-  envVars : List (String × String) := []
-  nowMs   : UInt64 := 1700000000000
-deriving Inhabited, DecidableEq
+structure EvalEnv where (envVars : List (String × String) := []) (nowMs : UInt64 := 1700000000000) deriving Inhabited
 
 structure EvalTrace where
-  httpCalls    : List OutboundReq := []
-  dbQueries    : List SqlQuery := []
-  cookies      : List SetCookie := []
-  sseEvents    : List SseEvent := []
-  wsBroadcasts : List WsEmit := []
-  encryptCount : Nat := 0
-  decryptCount : Nat := 0
-deriving Inhabited, DecidableEq
+  (httpCalls : List OutboundReq := []) (dbQueries : List SqlQuery := []) (cookies : List SetCookie := [])
+  (sseEvents : List SseEvent := []) (wsBroadcasts : List WsEmit := []) (encryptCount decryptCount : Nat := 0)
+deriving Inhabited
 
 structure EvalState (σ : Type) where
-  shared     : σ
-  db         : MemDb := []
-  httpStubs  : List HttpStub := []
-  txSaved    : List (UInt64 × MemDb) := []
-  nextTxId   : UInt64 := 1
-  rngCounter : Nat := 0
-  trace      : EvalTrace := {}
+  (shared : σ) (db : MemDb := []) (httpStubs : List HttpStub := []) (txSaved : List (UInt64 × MemDb) := [])
+  (nextTxId : UInt64 := 1) (rngCounter : Nat := 0) (trace : EvalTrace := {})
 deriving Inhabited
 
-structure EvalResult (σ α : Type) where
-  value : α
-  state : EvalState σ
-deriving Inhabited
+structure EvalResult (σ α : Type) where (value : α) (state : EvalState σ) deriving Inhabited
 
 private def stepEffect {σ : Type} (env : EvalEnv) (st : EvalState σ) (eff : ServerEffect) : EvalState σ × eff.Resp :=
   let withTr {α : Type} (f : EvalTrace → EvalTrace) (r : α) := ({ st with trace := f st.trace }, r)

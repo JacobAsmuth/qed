@@ -12,43 +12,21 @@ namespace Qed
     Qed.Lang.QedVal.val e = Field.val e := rfl
 
 structure ServerMethodInfo where
-  name            : String
-  paramNames      : Array Lean.Name := #[]
-  paramCount      : Nat
-  isReadOnly      : Bool
-  isAsync         : Bool
-  isFallible      : Bool
-  isOption        : Bool
-  hasClientReq    : Bool := false
-  requiresAuth    : Bool := false
-  clientReqConst  : Option Lean.Name := none
-  clientReqLabel  : String := ""
-  hasEnsures      : Bool := false
-  ensPredConst    : Option Lean.Name := none
-  domainErrTags   : Array String := #[]
-  rawRpcConst     : Lean.Name := .anonymous
-  outcomeConst    : Lean.Name := .anonymous
-  paramTypeConsts : Array Lean.Name := #[]
+  (name : String) (paramNames : Array Lean.Name := #[]) (paramCount : Nat)
+  (isReadOnly isAsync isFallible isOption : Bool) (hasClientReq requiresAuth : Bool := false)
+  (clientReqConst : Option Lean.Name := none) (clientReqLabel : String := "")
+  (hasEnsures : Bool := false) (ensPredConst : Option Lean.Name := none)
+  (domainErrTags : Array String := #[]) (rawRpcConst outcomeConst : Lean.Name := .anonymous)
+  (paramTypeConsts : Array Lean.Name := #[])
 deriving Inhabited
 
 structure ServerInfo where
-  serverName         : Lean.Name
-  shortName          : String
-  hasState           : Bool
-  secrets            : Array String
-  ownSecrets         : Array String := #[]
-  envVars            : Array (String × String × Option String)
-  externalServices   : Array (String × String)
-  methods            : Array ServerMethodInfo
-  channels           : Array String := #[]
-  jobs               : Array String := #[]
-  databases          : Array Lean.Name := #[]
-  authName?          : Option Lean.Name := none
-  authConfig?        : Option Lean.Name := none
-  hasOnCreateAccount : Bool := false
-  hasOnSignIn        : Bool := false
-  hasHttpRoutes      : Bool := false
-  hasWsProject       : Bool := false
+  (serverName : Lean.Name) (shortName : String) (hasState : Bool)
+  (secrets : Array String) (ownSecrets : Array String := #[])
+  (envVars : Array (String × String × Option String)) (externalServices : Array (String × String))
+  (methods : Array ServerMethodInfo) (channels jobs : Array String := #[]) (databases : Array Lean.Name := #[])
+  (authName? authConfig? : Option Lean.Name := none)
+  (hasOnCreateAccount hasOnSignIn hasHttpRoutes hasWsProject : Bool := false)
 deriving Inhabited
 
 initialize serverRegistry : Lean.SimplePersistentEnvExtension ServerInfo (Lean.NameMap ServerInfo) ← Qed.Diag.mkNameMapExt (·.serverName)
@@ -66,39 +44,21 @@ def lookupServerMethod? (env : Lean.Environment) (currNs : Lean.Name) (openDecls
           (srv.methods.find? (·.name == mStr)).map (srv, ·)
     | _ => none
 
-inductive ExtWsCodec where | json | proto | text | bytes deriving Inhabited, DecidableEq
+inductive ExtWsCodec where | json | proto | text | bytes deriving Inhabited, BEq
 inductive ChannelKind where
   | fullstack (serverName : Lean.Name) (serverShort : String) (wsPath : String)
   | external  (serviceName : Lean.Name) (isBinary : Bool) (eventCodec : ExtWsCodec) (sendCodec : ExtWsCodec)
-deriving Inhabited, DecidableEq
+deriving Inhabited
 
 structure ChannelInfo where
-  fullName            : Lean.Name
-  ownerName           : Lean.Name
-  ownerShort          : String
-  channelName         : String
-  kind                : ChannelKind
-  paramNames          : Array Lean.Name := #[]
-  paramCount          : Nat := 0
-  paramTypeConsts     : Array Lean.Name := #[]
-  eventTypeConst      : Lean.Name := .anonymous
-  hasJoinSnapshot     : Bool := false
-  joinTypeConst       : Lean.Name := .anonymous
-  hasSend             : Bool := false
-  sendParamCount      : Nat := 0
-  sendParamTypeConsts : Array Lean.Name := #[]
-  sendReqConst        : Option Lean.Name := none
-  sendReqLabel        : String := ""
-  requiresAuth        : Bool := false
-  clientReqConst      : Option Lean.Name := none
-  clientReqLabel      : String := ""
-  hasEnsures          : Bool := false
-  ensPredConst        : Option Lean.Name := none
-  defaultReconnect    : Reconnect := .defaultPolicy
-  keyHelperConst      : Lean.Name := .anonymous
-  subHelperConst      : Lean.Name := .anonymous
-  sendHelperConst     : Lean.Name := .anonymous
-  unsubHelperConst    : Lean.Name := .anonymous
+  (fullName ownerName : Lean.Name) (ownerShort channelName : String) (kind : ChannelKind)
+  (paramNames : Array Lean.Name := #[]) (paramCount : Nat := 0) (paramTypeConsts : Array Lean.Name := #[])
+  (eventTypeConst : Lean.Name := .anonymous) (hasJoinSnapshot : Bool := false) (joinTypeConst : Lean.Name := .anonymous)
+  (hasSend : Bool := false) (sendParamCount : Nat := 0) (sendParamTypeConsts : Array Lean.Name := #[])
+  (sendReqConst : Option Lean.Name := none) (sendReqLabel : String := "")
+  (requiresAuth : Bool := false) (clientReqConst : Option Lean.Name := none) (clientReqLabel : String := "")
+  (hasEnsures : Bool := false) (ensPredConst : Option Lean.Name := none) (defaultReconnect : Reconnect := .defaultPolicy)
+  (keyHelperConst subHelperConst sendHelperConst unsubHelperConst : Lean.Name := .anonymous)
 deriving Inhabited
 
 def ChannelInfo.mkDefault (ownerName : Lean.Name) (ownerShort : String) (chName : Lean.Name) (kind : ChannelKind)
@@ -133,33 +93,29 @@ private def parseOptNatLitArg (stx : Syntax) : MacroM (Option Nat) :=
   if u.getKind == ``qedIdent && (u.getArg 0).getId == `none then pure none
   else if u.getKind == ``qedCall && (u.getArg 0).getKind == ``qedIdent && ((u.getArg 0).getArg 0).getId == `some then
     let args := (u.getArg 2).getSepArgs
-    if args.size == 1 && args[0]!.getKind == ``qedCallArgPos then some <$> parseNatLitArg args[0]![0]
-    else Macro.throwErrorAt stx "expected `some(<nat>)` or `<nat>`"
+    if args.size == 1 && args[0]!.getKind == ``qedCallArgPos then some <$> parseNatLitArg args[0]![0] else Macro.throwErrorAt stx "expected `some(<nat>)` or `<nat>`"
   else some <$> parseNatLitArg u
 
 def parseReconnectExpr (exprStx : Syntax) : MacroM Reconnect := do
   let u := unwrapParens1 exprStx
-  if u.getKind == ``qedIdent then
-    match (u.getArg 0).getId.eraseMacroScopes with
+  if u.getKind == ``qedIdent then match (u.getArg 0).getId.eraseMacroScopes with
     | `off | `none => return .off | `default | `backoff => return .defaultPolicy
     | nm => Macro.throwErrorAt u s!"unknown `reconnect` policy `{nm}`; use `off`, `fixed(ms[, max])`, or `backoff(initMs, maxMs[, max])`"
   else if u.getKind == ``qedCall && (u.getArg 0).getKind == ``qedIdent then
     let fn := ((u.getArg 0).getArg 0).getId.eraseMacroScopes
-    let (pos, named) ← match splitCallArgsPure "reconnect" (u.getArg 2).getSepArgs (some ["maxRetries", "max"]) with
-      | .ok r => pure r | .error (r, mg) => Macro.throwErrorAt r mg
+    let (pos, named) ← match splitCallArgsPure "reconnect" (u.getArg 2).getSepArgs (some ["maxRetries", "max"]) with | .ok r => pure r | .error (r, mg) => Macro.throwErrorAt r mg
     let maxRet? ← named.foldlM (init := none) fun _ (_, v) => some <$> parseOptNatLitArg v
     let getMax (i : Nat) := if pos.size == i + 1 then parseOptNatLitArg pos[i]! else pure (maxRet?.getD none)
     match fn with
     | `fixed =>
         if pos.size == 1 || (pos.size == 2 && maxRet?.isNone) then return .fixed (← parseNatLitArg pos[0]!) (← getMax 1)
-        Macro.throwErrorAt u "`reconnect fixed(...)` expects 1 or 2 arguments: `fixed(delayMs)` or `fixed(delayMs, maxRetries)`"
+        else Macro.throwErrorAt u "`reconnect fixed(...)` expects 1 or 2 arguments: `fixed(delayMs)` or `fixed(delayMs, maxRetries)`"
     | `backoff =>
         if pos.size == 0 then return .backoff 250 30000 (maxRet?.getD none)
-        if pos.size == 2 || (pos.size == 3 && maxRet?.isNone) then
+        else if pos.size == 2 || (pos.size == 3 && maxRet?.isNone) then
           let (initMs, maxMs) := (← parseNatLitArg pos[0]!, ← parseNatLitArg pos[1]!)
-          if maxMs < initMs then Macro.throwErrorAt u s!"`reconnect backoff({initMs}, {maxMs})` requires `initialMs <= maxMs`"
-          return .backoff initMs maxMs (← getMax 2)
-        Macro.throwErrorAt u "`reconnect backoff(...)` expects `backoff(initialMs, maxMs)` or `backoff(initialMs, maxMs, maxRetries)`"
+          if maxMs < initMs then Macro.throwErrorAt u s!"`reconnect backoff({initMs}, {maxMs})` requires `initialMs <= maxMs`" else return .backoff initMs maxMs (← getMax 2)
+        else Macro.throwErrorAt u "`reconnect backoff(...)` expects `backoff(initialMs, maxMs)` or `backoff(initialMs, maxMs, maxRetries)`"
     | _ => Macro.throwErrorAt u s!"unknown `reconnect` policy `{fn}`; use `off`, `fixed(...)`, or `backoff(...)`"
   else Macro.throwErrorAt u "expected `reconnect` policy: `off`, `fixed(ms[, max])`, or `backoff(initMs, maxMs[, max])`"
 
@@ -172,10 +128,7 @@ end ReconnectParser
 namespace Server
 
 structure ExternalServiceInfo where
-  serviceName : Lean.Name
-  baseOrigin  : String
-  secrets     : Array String
-  methods     : Array Lean.Name
+  (serviceName : Lean.Name) (baseOrigin : String) (secrets : Array String) (methods : Array Lean.Name)
 deriving Inhabited
 initialize externalRegistry : Lean.SimplePersistentEnvExtension ExternalServiceInfo (Lean.NameMap ExternalServiceInfo) ← Qed.Diag.mkNameMapExt (·.serviceName)
 
@@ -183,93 +136,46 @@ def exprCallsOld (stx : Lean.Syntax) : Bool :=
   Qed.Lang.stxAny (fun s => s.getKind == ``Qed.Lang.qedCall && (s.getArg 0).getKind == ``Qed.Lang.qedIdent && ((s.getArg 0).getArg 0).getId.eraseMacroScopes == `old) stx
 
 structure DbEncKeyInfo where
-  keyEnv    : String
-  fallback? : Option String := none
-  isBytes   : Bool := false
-  prevKeys  : List (String × Option String) := []
+  (keyEnv : String) (fallback? : Option String := none) (isBytes : Bool := false) (prevKeys : List (String × Option String) := [])
 deriving Inhabited
 
 structure DbColumnInfo where
-  name         : String
-  isPrimaryKey : Bool := false
-  isImmutable  : Bool := false
-  isUnique     : Bool := false
-  isNullable   : Bool := false
-  isNat        : Bool := false
-  isInt        : Bool := false
-  refs?        : Option (String × String) := none
-  encKey?      : Option DbEncKeyInfo := none
+  (name : String) (isPrimaryKey isImmutable isUnique isNullable isNat isInt : Bool := false)
+  (refs? : Option (String × String) := none) (encKey? : Option DbEncKeyInfo := none)
 deriving Inhabited
 
 structure DbTableInfo where
-  tableName            : String
-  rowTypeConst         : Lean.Name
-  columns              : Array DbColumnInfo
-  hasMeta              : Bool := false
-  hasReadPolicy        : Bool := false
-  hasInsertPolicy      : Bool := false
-  hasUpdatePolicy      : Bool := false
-  hasDeletePolicy      : Bool := false
-  hasCrossReadPolicy   : Bool := false
-  hasCrossInsertPolicy : Bool := false
-  hasCrossUpdatePolicy : Bool := false
-  hasCrossDeletePolicy : Bool := false
-  hasTransInv          : Bool := false
-  readPolicyLabel      : String := ""
-  insertPolicyLabel    : String := ""
-  updatePolicyLabel    : String := ""
-  deletePolicyLabel    : String := ""
+  (tableName : String) (rowTypeConst : Lean.Name) (columns : Array DbColumnInfo)
+  (hasMeta hasReadPolicy hasInsertPolicy hasUpdatePolicy hasDeletePolicy : Bool := false)
+  (hasCrossReadPolicy hasCrossInsertPolicy hasCrossUpdatePolicy hasCrossDeletePolicy hasTransInv : Bool := false)
+  (readPolicyLabel insertPolicyLabel updatePolicyLabel deletePolicyLabel : String := "")
 deriving Inhabited
 
 structure DatabaseInfo where
-  dbName            : Lean.Name
-  shortName         : String
-  configConst       : Lean.Name
-  ensureSchemaConst : Lean.Name
-  snapTypeConst?    : Option Lean.Name := none
-  secrets           : Array String
-  hasDevFallback    : Bool := false
-  isManaged         : Bool := false
-  envSpecs          : Qed.Cloud.EnvMap Qed.Cloud.DbEnvSpec := Qed.Cloud.EnvMap.ofDefault (.byoSqlite "")
-  tables            : Array DbTableInfo
+  (dbName : Lean.Name) (shortName : String) (configConst ensureSchemaConst : Lean.Name) (snapTypeConst? : Option Lean.Name := none)
+  (secrets : Array String) (hasDevFallback isManaged : Bool := false)
+  (envSpecs : Qed.Cloud.EnvMap Qed.Cloud.DbEnvSpec := Qed.Cloud.EnvMap.ofDefault (.byoSqlite "")) (tables : Array DbTableInfo)
 deriving Inhabited
 initialize databaseRegistry : Lean.SimplePersistentEnvExtension DatabaseInfo (Lean.NameMap DatabaseInfo) ← Qed.Diag.mkNameMapExt (·.dbName)
 abbrev lookupDatabase? (env : Lean.Environment) (currNs : Lean.Name) (openDecls : List Lean.OpenDecl) (dbRef : Lean.Name) : Option DatabaseInfo :=
   Qed.Diag.lookupNameMapExt? databaseRegistry env currNs openDecls dbRef (some `config)
 
 structure AuthInfo where
-  authName    : Lean.Name
-  shortName   : String
-  configConst : Lean.Name
-  secrets     : Array String := #[]
-  spec        : Qed.Auth.OidcAuthSpec := default
+  (authName : Lean.Name) (shortName : String) (configConst : Lean.Name) (secrets : Array String := #[]) (spec : Qed.Auth.OidcAuthSpec := default)
 deriving Inhabited
 initialize authRegistry : Lean.SimplePersistentEnvExtension AuthInfo (Lean.NameMap AuthInfo) ← Qed.Diag.mkNameMapExt (·.authName)
 abbrev lookupAuth? (env : Lean.Environment) (currNs : Lean.Name) (openDecls : List Lean.OpenDecl) (authRef : Lean.Name) : Option AuthInfo :=
   Qed.Diag.lookupNameMapExt? authRegistry env currNs openDecls authRef (some `config)
 
 structure ServiceMethodInfo where
-  name          : String
-  defConst      : Lean.Name
-  minParamCount : Nat
-  paramCount    : Nat
-  isMonadic     : Bool
-  isFallible    : Bool
-  takesCtx      : Bool := false
-  dbWrite       : Bool := false
-  hasCookieOp   : Bool := false
-  hasEnsures    : Bool := false
+  (name : String) (defConst : Lean.Name) (minParamCount paramCount : Nat) (isMonadic isFallible : Bool)
+  (takesCtx dbWrite hasCookieOp hasEnsures : Bool := false)
 deriving Inhabited
 
 structure ServiceInfo where
-  serviceName      : Lean.Name
-  shortName        : String
-  secrets          : Array String := #[]
-  ownSecrets       : Array String := #[]
-  envVars          : Array (String × String × Option String) := #[]
-  externalServices : Array (String × String) := #[]
-  databases        : Array Lean.Name := #[]
-  methods          : Array ServiceMethodInfo := #[]
+  (serviceName : Lean.Name) (shortName : String) (secrets ownSecrets : Array String := #[])
+  (envVars : Array (String × String × Option String) := #[]) (externalServices : Array (String × String) := #[])
+  (databases : Array Lean.Name := #[]) (methods : Array ServiceMethodInfo := #[])
 deriving Inhabited
 initialize serviceRegistry : Lean.SimplePersistentEnvExtension ServiceInfo (Lean.NameMap ServiceInfo) ← Qed.Diag.mkNameMapExt (·.serviceName)
 initialize failedServiceRegistry : Lean.SimplePersistentEnvExtension Lean.Name (Lean.NameMap Lean.Name) ← Qed.Diag.mkNameMapExt id
@@ -277,9 +183,7 @@ abbrev lookupService? (env : Lean.Environment) (currNs : Lean.Name) (openDecls :
   Qed.Diag.lookupNameMapExt? serviceRegistry env currNs openDecls svcRef (some `_qed_service_marker)
 
 structure FullstackInfo where
-  fullstackName : Lean.Name
-  serverName    : Lean.Name
-  title         : String
+  (fullstackName serverName : Lean.Name) (title : String)
 deriving Inhabited
 initialize fullstackRegistry : Lean.SimplePersistentEnvExtension FullstackInfo (Lean.NameMap FullstackInfo) ← Qed.Diag.mkNameMapExt (·.fullstackName)
 def findNamedArg? (named : Array (String × Lean.Syntax)) (key : String) : Option Lean.Syntax := (named.find? (·.1 == key)).map Prod.snd
@@ -295,28 +199,43 @@ def resolveAppTargetIdent (env : Environment) (currNs : Name) (id : Ident) : Ide
   if env.contains (currNs ++ id.getId ++ `app) || env.contains (id.getId ++ `app) then mkIdentFrom id (id.getId ++ `app) else id
 
 @[noinline] def errAt {α : Type} (ref : Syntax) (msg : String) : CommandElabM α := throwErrorAt ref msg
-@[noinline] def runPQ {α : Type} (k : PureQuotM α) : CommandElabM α := runPureQuot k
 @[noinline] def liftMacroCmd {α : Type} (m : MacroM α) : CommandElabM α := liftMacroM m
-@[noinline] def foldlPQ {α β : Type} (xs : Array α) (init : β) (f : β → α → PureQuotM β) : PureQuotM β :=
-  let rec go : Nat → β → PureQuotM β | 0, acc => pure acc | r + 1, acc => do let i := xs.size - (r + 1); if h : i < xs.size then go r (← f acc xs[i]) else pure acc
-  go xs.size init
-@[noinline] def foldrPQ {α β : Type} (xs : Array α) (init : β) (f : α → β → PureQuotM β) : PureQuotM β :=
-  let rec go : Nat → β → PureQuotM β | 0, acc => pure acc | j + 1, acc => do if h : j < xs.size then go j (← f xs[j] acc) else pure acc
-  go xs.size init
-@[noinline] def mapPQ {α β : Type} (xs : Array α) (f : α → PureQuotM β) : PureQuotM (Array β) := foldlPQ xs (Array.mkEmpty xs.size) fun acc x => return acc.push (← f x)
-@[noinline] def mapIdxPQ {α β : Type} (xs : Array α) (f : α → Nat → PureQuotM β) : PureQuotM (Array β) :=
-  let rec go : Nat → Array β → PureQuotM (Array β) | 0, acc => pure acc | r + 1, acc => do let i := xs.size - (r + 1); if h : i < xs.size then go r (acc.push (← f xs[i] i)) else pure acc
-  go xs.size (Array.mkEmpty xs.size)
-@[noinline] def foldlCmd {α β : Type} (xs : Array α) (init : β) (f : β → α → CommandElabM β) : CommandElabM β :=
-  let rec go : Nat → β → CommandElabM β | 0, acc => pure acc | r + 1, acc => do let i := xs.size - (r + 1); if h : i < xs.size then go r (← f acc xs[i]) else pure acc
-  go xs.size init
-@[noinline] def mapCmd {α β : Type} (xs : Array α) (f : α → CommandElabM β) : CommandElabM (Array β) := foldlCmd xs (Array.mkEmpty xs.size) fun acc x => return acc.push (← f x)
-@[noinline] def elabPureCmd (k : PureQuotM (TSyntax `command)) : CommandElabM Unit := do elabCommand (← runPQ k)
-@[noinline] def elabPureCmds (k : PureQuotM (Array (TSyntax `command))) : CommandElabM Unit := do foldlCmd (← runPQ k) () fun _ c => elabCommand c
-@[noinline] def noUnusedVarsPure (cmd : TSyntax `command) : PureQuotM (TSyntax `command) := `(command| set_option linter.unusedVariables false in $cmd)
-@[noinline] def mkMarkerThmPure (id : Ident) : PureQuotM (TSyntax `command) := `(command| theorem $id : True := True.intro)
-@[noinline] def mkStrArrDefPure (id : Ident) (xs : Array String) : PureQuotM (TSyntax `command) := do
-  let lits : Array Term := xs.map (Syntax.mkStrLit ·); `(command| @[noinline] def $id : Array String := #[$[$lits],*])
+@[noinline, nospecialize] def setOptOnce {m : Type → Type} [Monad m] [MonadError m] {α : Type} (cur : Option α) (ref : Syntax) (what : String) (mk : m α) : m (Option α) :=
+  if cur.isSome then throwErrorAt ref s!"duplicate {what}" else some <$> mk
+abbrev runPQ            := @Qed.Lang.runPQ
+abbrev foldlPQ          := @Qed.Lang.foldlPQ
+abbrev foldrPQ          := @Qed.Lang.foldrPQ
+abbrev mapPQ            := @Qed.Lang.mapPQ
+abbrev mapIdxPQ         := @Qed.Lang.mapIdxPQ
+abbrev foldlCmd         := @Qed.Lang.foldlCmd
+abbrev mapCmd           := @Qed.Lang.mapCmd
+abbrev elabPureCmd      := @Qed.Lang.elabPureCmd
+abbrev elabPureCmds     := @Qed.Lang.elabPureCmds
+abbrev noUnusedVarsPure := @Qed.Lang.noUnusedVarsPure
+abbrev mkMarkerThmPure  := @Qed.Lang.mkMarkerThmPure
+abbrev mkStrArrDefPure  := @Qed.Lang.mkStrArrDefPure
+
+@[noinline] def mkAppC (fn : Name) (args : Array Term) : PureQuotM Term := Qed.Lang.mkAppTermsPure (mkCIdent fn) args
+@[noinline] def mkOptTermPure (o? : Option Term) : PureQuotM Term := match o? with | some t => mkAppC ``Option.some #[t] | none => pure (mkCIdent ``Option.none)
+@[noinline] def mkPureOk (v : Term) : PureQuotM Term := do mkAppC ``Pure.pure #[← mkAppC ``Except.ok #[v]]
+@[noinline] def mkPureErr (ctor : Name) (msg : Term) (pureWrap : Bool := true) : PureQuotM Term := do
+  let e ← mkAppC ``Except.error #[← mkAppC ctor #[msg]]; if pureWrap then mkAppC ``Pure.pure #[e] else pure e
+@[noinline] def mkAscribePure (t ty : Term) : PureQuotM Term := `(($t : $ty))
+@[noinline] def mkPropEqTrue (lhs : Term) : PureQuotM Term := `($lhs = true)
+@[noinline] def mkPairPure (a b : Term) : PureQuotM Term := `(($a, $b))
+@[noinline] def mkListLitPure (ts : Array Term) : PureQuotM Term := `([$[$ts:term],*])
+@[noinline] def mkArrLitPure (ts : Array Term) : PureQuotM Term := `(#[$[$ts:term],*])
+@[noinline] def mkTypedBindersPure (ids : Array Ident) (tys : Array Term) : PureQuotM (Array (TSyntax `Lean.Parser.Term.bracketedBinder)) :=
+  mapPQ (ids.zip tys) fun (i, t) => `(bracketedBinder| ($i:ident : $t:term))
+@[noinline] def mkSrvThmPure (thmId : Ident) (bs : Array (TSyntax `Lean.Parser.Term.bracketedBinder))
+    (ty : Term) (tac : TSyntax ``Lean.Parser.Tactic.tacticSeq) (noUnused : Bool := false) : PureQuotM (TSyntax `command) := do
+  let cmd ← `(command| theorem $thmId $[$bs:bracketedBinder]* : $ty := by $tac)
+  if noUnused then noUnusedVarsPure cmd else pure cmd
+@[noinline] def mkDefValPure (defId : Ident) (bs : Array (TSyntax `Lean.Parser.Term.bracketedBinder))
+    (retTy body : Term) (noUnused : Bool := false) (noinline : Bool := true) : PureQuotM (TSyntax `command) := do
+  let cmd ← if noinline then `(command| @[noinline] def $defId $[$bs:bracketedBinder]* : $retTy := $body)
+    else `(command| def $defId $[$bs:bracketedBinder]* : $retTy := $body)
+  if noUnused then noUnusedVarsPure cmd else pure cmd
 @[noinline] def mkWsDecodeCb (onOk onStatus : Ident) (mkDec : Ident → PureQuotM Term) : PureQuotM Term := do
   let a := mkIdent `_wsMsg; `(fun $a:ident => match $(← mkDec a):term with | Except.ok v => $onOk v | Except.error e => $onStatus (Qed.SocketStatus.failed e))
 
@@ -325,33 +244,25 @@ def resolveAppTargetIdent (env : Environment) (currNs : Name) (id : Ident) : Ide
   return (Array.range tyTerms.size).map fun i => fullOwnerName ++ itemName.appendAfter s!"{suffix}{i}"
 
 structure WsClientSpec where
-  refIdent    : Ident
-  ownerName   : Name
-  chName      : Name
-  pIdents     : Array Ident
-  pTyTerms    : Array Term
-  evTyTerm?   : Option Term := none
-  joinAbbrev? : Option Term := none
-  joinCbTy    : Term
-  wireEvTy    : Term
-  keyBody     : Term
-  subBody     : Term
-  unsubBody   : Term
-  sendSpec?   : Option (Array Ident × Array Term × Term) := none
+  (refIdent : Ident) (ownerName chName : Name) (pIdents : Array Ident) (pTyTerms : Array Term)
+  (evTyTerm? joinAbbrev? : Option Term := none) (joinCbTy wireEvTy keyBody subBody unsubBody : Term)
+  (sendSpec? : Option (Array Ident × Array Term × Term) := none)
 
 @[noinline] def elabWsClientCommon (s : WsClientSpec) : CommandElabM Unit := elabPureCmds do
   let mkCh (suf : String) := mkIdentFrom s.refIdent (s.ownerName ++ s.chName.appendAfter suf)
-  let (slotId, recId, onJoinId, onMsgId, onStatusId, cmdTy, pIds, pTys) := (mkIdent `slot, mkIdent `rec, mkIdent `onJoin, mkIdent `onMsg, mkIdent `onStatus, mkCIdent `Qed.Cmd, s.pIdents, s.pTyTerms)
+  let (slotId, recId, onJoinId, onMsgId, onStatusId, cmdTy) := (mkIdent `slot, mkIdent `rec, mkIdent `onJoin, mkIdent `onMsg, mkIdent `onStatus, mkCIdent `Qed.Cmd)
+  let pBs ← mkTypedBindersPure s.pIdents s.pTyTerms
   let mut cmds : Array (TSyntax `command) := #[]
   if let some evTy := s.evTyTerm? then cmds := cmds.push (← `(command| abbrev $(mkCh "_Event") : Type := $evTy))
   if let some jTy := s.joinAbbrev? then cmds := cmds.push (← `(command| abbrev $(mkCh "_Join") : Type := $jTy))
   cmds := cmds ++ #[
-    ← `(command| def $(mkCh "_key") $[($pIds:ident : $pTys:term)]* : String := $(s.keyBody)),
-    ← noUnusedVarsPure (← `(command| def $(mkCh "_sub") {msg : Type} ($slotId:ident : String) $[($pIds:ident : $pTys:term)]*
+    ← `(command| def $(mkCh "_key") $[$pBs:bracketedBinder]* : String := $(s.keyBody)),
+    ← noUnusedVarsPure (← `(command| def $(mkCh "_sub") {msg : Type} ($slotId:ident : String) $[$pBs:bracketedBinder]*
       ($recId:ident : Qed.Reconnect) ($onJoinId:ident : $(s.joinCbTy) → msg) ($onMsgId:ident : $(s.wireEvTy) → msg) ($onStatusId:ident : Qed.SocketStatus → msg) : $cmdTy msg := $(s.subBody))),
     ← `(command| def $(mkCh "_unsub") {msg : Type} ($slotId:ident : String) : $cmdTy msg := $(s.unsubBody))]
   if let some (spIds, spTys, sendBody) := s.sendSpec? then
-    cmds := cmds.push (← `(command| def $(mkCh "_send") {msg : Type} ($slotId:ident : String) $[($spIds:ident : $spTys:term)]* : $cmdTy msg := $sendBody))
+    let spBs ← mkTypedBindersPure spIds spTys
+    cmds := cmds.push (← `(command| def $(mkCh "_send") {msg : Type} ($slotId:ident : String) $[$spBs:bracketedBinder]* : $cmdTy msg := $sendBody))
   return cmds
 
 end SyntaxHelpers

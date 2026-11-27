@@ -7,10 +7,7 @@ import Qed.Server.Registry
 namespace Qed.Auth
 
 section AuthParsers
-open Lean Parser Qed.Lang PrettyPrinter Parenthesizer Formatter
-private def opaqueP (p : Parser) : Parser := p
-@[combinator_parenthesizer opaqueP] private def opaqueP.parenthesizer : Parenthesizer := pure ()
-@[combinator_formatter opaqueP] private def opaqueP.formatter : Formatter := pure ()
+open Lean Parser Qed.Lang
 private def kwNode (k kw : Name) (p : Parser) : Parser := node k (withPosition (atomic (identEq kw) >> p))
 private def authClaimLineP : Parser :=
   node `Qed.Auth.authClaimLine (withPosition (ident >> ":" >> categoryParser `qedType 91 >> optional (checkLineEq >> "=" >> categoryParser `qedExpr 0)))
@@ -26,97 +23,89 @@ end AuthParsers
 
 open Lean Elab Command Qed.Lang Qed.Server
 
-private inductive AuthClaimKind where | str | bool | nat | int | optStr deriving DecidableEq
+private inductive AuthClaimKind where | str | bool | nat | int | optStr
 private structure ParsedClaimDecl where
-  ident      : Ident
-  name       : String
-  kind       : AuthClaimKind
-  typeName   : String
-  tyTm       : Term
-  defaultStr : String
-  defaultTm  : Term
+  (ident : Ident) (name typeName defaultStr : String) (kind : AuthClaimKind) (tyTm defaultTm : Term)
+
+private def claimTypeSpecs : Array (String × AuthClaimKind × String × String) := #[
+  ("String", .str, "String", "\"\""), ("Bool", .bool, "Bool", "false"),
+  ("Nat", .nat, "Nat", "0"), ("Int", .int, "Int", "0"),
+  ("String?", .optStr, "Option String", "none"), ("OptionString", .optStr, "Option String", "none")]
 
 @[noinline] private def claimTyDefPure : AuthClaimKind → PureQuotM (Term × Term)
-  | .str => do return (← `(String), ← `((""))) | .bool => do return (← `(Bool), ← `(false))
-  | .nat => do return (← `(Nat), ← `((0 : Nat))) | .int => do return (← `(Int), ← `((0 : Int)))
-  | .optStr => do return (← `(Option String), ← `((Option.none : Option String)))
+  | .str => pure (mkCIdent ``String, Syntax.mkStrLit "") | .bool => pure (mkCIdent ``Bool, mkCIdent ``Bool.false)
+  | .nat => do return (mkCIdent ``Nat, ← mkAscribePure (Syntax.mkNumLit "0") (mkCIdent ``Nat))
+  | .int => do return (mkCIdent ``Int, ← mkAscribePure (Syntax.mkNumLit "0") (mkCIdent ``Int))
+  | .optStr => do let ty ← mkAppC ``Option #[mkCIdent ``String]; return (ty, ← mkAscribePure (mkCIdent ``Option.none) ty)
 
 @[noinline] private def parseClaimDecl (stx : Syntax) : CommandElabM ParsedClaimDecl := do
   let id : Ident := ⟨stx.getArg 0⟩; let name := id.getId.eraseMacroScopes.toString
   if name == "id" then errAt id "claim name `id` is reserved for the OIDC `sub` subject identifier"
   if name == "emailVerified" then errAt id "claim name `emailVerified` is built-in on `<Auth>.User` (populated from OIDC `email_verified`)"
   let tyStx := stx.getArg 2; let tyRepr := ((tyStx.reprint.getD "").replace " " "").trimAscii.toString
-  let some (kind, typeName, defStr0) := (match tyRepr with
-    | "String" => some (AuthClaimKind.str, "String", "\"\"") | "Bool" => some (.bool, "Bool", "false")
-    | "Nat" => some (.nat, "Nat", "0") | "Int" => some (.int, "Int", "0") | "String?" | "OptionString" => some (.optStr, "Option String", "none") | _ => none)
+  let some (_, kind, typeName, defStr0) := claimTypeSpecs.find? (·.1 == tyRepr)
     | errAt tyStx s!"unsupported `auth` claim type `{tyRepr}` (supported: `String`, `Bool`, `Nat`, `Int`, `String?`)"
   let (tyTm, defTm0) ← runPQ (claimTyDefPure kind); let defOpt := stx.getArg 3
   let (defaultStr, defaultTm) ← if defOpt.getNumArgs == 2 then
-      let valStx := defOpt.getArg 1; pure ((valStx.reprint.getD "").trimAscii.toString, ← liftMacroCmd (lowerSimpleQedExpr .val valStx))
+      let v := defOpt.getArg 1; pure ((v.reprint.getD "").trimAscii.toString, ← liftMacroCmd (lowerSimpleQedExpr .val v))
     else pure (defStr0, defTm0)
   return { ident := id, name, kind, typeName, tyTm, defaultStr, defaultTm }
 
 @[noinline] private def oidcAuthSpecToTermPure (s : OidcAuthSpec) : PureQuotM Term := do
-  let provs : Array Term := s.providers.toArray.map quote
-  let claimTms ← mapPQ s.claims.toArray fun cl => `({ name := $(quote cl.name), typeName := $(quote cl.typeName), defaultValue := $(quote cl.defaultValue) : Qed.Auth.AuthClaimSpec })
-  `({ name := $(quote s.name), isManaged := $(quote s.isManaged), issuerEnv := $(quote s.issuerEnv), issuerDefault? := $(quote s.issuerDefault?),
-      audienceEnv := $(quote s.audienceEnv), audienceDefault? := $(quote s.audienceDefault?), clientIdEnv? := $(quote s.clientIdEnv?),
-      clientIdDefault? := $(quote s.clientIdDefault?), clientSecretEnv? := $(quote s.clientSecretEnv?), providers := [$[$provs],*],
-      sessionTtlSec := $(quote s.sessionTtlSec), claims := [$[$claimTms],*] : Qed.Auth.OidcAuthSpec })
+  let claimTms ← mapPQ s.claims.toArray fun cl => mkAppC ``Qed.Auth.AuthClaimSpec.mk #[quote cl.name, quote cl.typeName, quote cl.defaultValue]
+  mkAppC ``Qed.Auth.OidcAuthSpec.mk #[
+    quote s.name, quote s.isManaged, quote s.issuerEnv, quote s.issuerDefault?, quote s.audienceEnv, quote s.audienceDefault?,
+    quote s.clientIdEnv?, quote s.clientIdDefault?, quote s.clientSecretEnv?, ← mkListLitPure (s.providers.toArray.map quote),
+    quote s.sessionTtlSec, quote s.loginPath, quote s.callbackPath, quote s.logoutPath, quote s.mePath, ← mkListLitPure claimTms]
 
 @[noinline] private def claimExtractTermPure (c : ParsedClaimDecl) (lookupFn : Term) : PureQuotM Term := do
-  let (kLit, defTm) := (Syntax.mkStrLit c.name, c.defaultTm)
+  let lk ← mkAppTermsPure lookupFn #[Syntax.mkStrLit c.name]
   match c.kind with
-  | .str => `(($lookupFn $kLit).getD $defTm) | .bool => `(Qed.Auth.parseBoolClaim ($lookupFn $kLit) $defTm)
-  | .nat => `(Qed.Auth.parseNatClaim ($lookupFn $kLit) $defTm) | .int => `(Qed.Auth.parseIntClaim ($lookupFn $kLit) $defTm)
-  | .optStr => `(($lookupFn $kLit).orElse (fun _ => $defTm))
+  | .str => mkAppC ``Option.getD #[lk, c.defaultTm] | .bool => mkAppC ``Qed.Auth.parseBoolClaim #[lk, c.defaultTm]
+  | .nat => mkAppC ``Qed.Auth.parseNatClaim #[lk, c.defaultTm] | .int => mkAppC ``Qed.Auth.parseIntClaim #[lk, c.defaultTm]
+  | .optStr => mkAppC ``Option.orElse #[lk, ← `(fun _ => $(c.defaultTm))]
 
-private abbrev UserFieldsAcc :=
-  Array (TSyntax `Lean.Parser.Command.structSimpleBinder) × Term × Term × Term × Array (TSyntax `Lean.Parser.Term.structInstField) × Array (TSyntax `Lean.Parser.Term.structInstField)
-
-@[noinline] private def addClaimFieldPure (lookupTm : Term) (acc : UserFieldsAcc) (clIdx : ParsedClaimDecl × Nat) : PureQuotM UserFieldsAcc := do
-  let ((cl, idx), (fStxs, tTy, tVal, tPat, fInits, lInits)) := (clIdx, acc)
-  let (fId, v) := (mkIdentFrom cl.ident cl.ident.getId.eraseMacroScopes, mkIdent (Name.mkSimple s!"_f{idx + 2}"))
-  return (fStxs.push (← `(Lean.Parser.Command.structSimpleBinder| $fId:ident : $(cl.tyTm) := $(cl.defaultTm))),
-    ← `($tTy × $(cl.tyTm)), ← `(($tVal, u.$fId)), ← `(($tPat, $v)),
-    fInits.push (← `(Lean.Parser.Term.structInstField| $fId:ident := $v)),
-    lInits.push (← `(Lean.Parser.Term.structInstField| $fId:ident := $(← claimExtractTermPure cl lookupTm))))
+@[noinline] private def mkStructBinderPure (fId : Ident) (tyTm defTm : Term) : PureQuotM (TSyntax `Lean.Parser.Command.structSimpleBinder) :=
+  `(Lean.Parser.Command.structSimpleBinder| $fId:ident : $tyTm := $defTm)
+@[noinline] private def mkStructFieldPure (id : Ident) (val : Term) : PureQuotM (TSyntax `Lean.Parser.Term.structInstField) :=
+  `(Lean.Parser.Term.structInstField| $id:ident := $val)
 
 @[noinline] private def mkAuthCmdsPure (authIdent : Ident) (authName : Name) (claims : Array ParsedClaimDecl)
     (secrets : Array String) (spec : OidcAuthSpec) : PureQuotM (Array (TSyntax `command)) := do
   let mkSub (leaf : Name) := mkIdentFrom authIdent (authName ++ leaf)
-  let (userTyId, fromLookupId, fromClaimsId, fromCtxId, lookupTm) := (mkSub `User, mkSub `fromLookup, mkSub `fromClaims, mkSub `fromCtx, ← `(lookup))
-  let initAcc : UserFieldsAcc := (
-    #[← `(Lean.Parser.Command.structSimpleBinder| id : String := ""), ← `(Lean.Parser.Command.structSimpleBinder| emailVerified : Bool := false)],
-    ← `(String × Bool), ← `((u.id, u.emailVerified)), ← `(($(mkIdent `_f0), $(mkIdent `_f1))),
-    #[← `(Lean.Parser.Term.structInstField| id := $(mkIdent `_f0)), ← `(Lean.Parser.Term.structInstField| emailVerified := $(mkIdent `_f1))],
-    #[← `(Lean.Parser.Term.structInstField| id := uid), ← `(Lean.Parser.Term.structInstField| emailVerified := Qed.Auth.parseBoolClaim (lookup "email_verified") false)])
-  let (fStxs, tTy, tVal, tPat, fInits, lInits) ← foldlPQ claims.zipIdx initAcc (addClaimFieldPure lookupTm)
-  let (toFn, fromFn, leftInv) := (← `(fun (u : $userTyId) => ($tVal : $tTy)), ← `(fun ($tPat : $tTy) => ({ $[$fInits:structInstField],* } : $userTyId)), ← `(fun u => by cases u; rfl))
-  let mkUrlCmd (leaf : Name) (pfx : String) := `(command| def $(mkSub leaf) (returnTo : Qed.HrefTarget := Qed.HrefTarget.root) : Qed.Url :=
-    (Qed.Url.parse? ($(Syntax.mkStrLit pfx) ++ Qed.Auth.urlEncodeComponent (Qed.Auth.sanitizeReturnTo (some returnTo.raw)))).getD Qed.Url.root)
+  let (userTyId, fromLookupId, fromClaimsId, fromCtxId) := (mkSub `User, mkSub `fromLookup, mkSub `fromClaims, mkSub `fromCtx)
+  let (uidId, lookupId, uId, f0, f1, ctxId) := (mkIdent `uid, mkIdent `lookup, mkIdent `u, mkIdent `_f0, mkIdent `_f1, mkIdent `ctx)
+  let (strTy, boolTy) := (mkCIdent ``String, mkCIdent ``Bool)
+  let evExtract ← mkAppC ``Qed.Auth.parseBoolClaim #[← mkAppTermsPure lookupId #[Syntax.mkStrLit "email_verified"], mkCIdent ``Bool.false]
+  let initAcc := (
+    #[← mkStructBinderPure (mkIdent `id) strTy (Syntax.mkStrLit ""), ← mkStructBinderPure (mkIdent `emailVerified) boolTy (mkCIdent ``Bool.false)],
+    ← mkAppC ``Prod #[strTy, boolTy], ← mkPairPure (← `(($uId).id)) (← `(($uId).emailVerified)), ← mkPairPure f0 f1,
+    #[← mkStructFieldPure (mkIdent `id) f0, ← mkStructFieldPure (mkIdent `emailVerified) f1],
+    #[← mkStructFieldPure (mkIdent `id) uidId, ← mkStructFieldPure (mkIdent `emailVerified) evExtract])
+  let (fStxs, tTy, tVal, tPat, fInits, lInits) ← foldlPQ claims.zipIdx initAcc fun (fStxs, tTy, tVal, tPat, fInits, lInits) (cl, idx) => do
+    let (fId, v) := (mkIdentFrom cl.ident cl.ident.getId.eraseMacroScopes, mkIdent (Name.mkSimple s!"_f{idx + 2}"))
+    return (fStxs.push (← mkStructBinderPure fId cl.tyTm cl.defaultTm), ← mkAppC ``Prod #[tTy, cl.tyTm],
+      ← mkPairPure tVal (← `(($uId).$fId)), ← mkPairPure tPat v, fInits.push (← mkStructFieldPure fId v), lInits.push (← mkStructFieldPure fId (← claimExtractTermPure cl lookupId)))
+  let (toFn, fromFn, leftInv) := (← `(fun ($uId:ident : $userTyId) => ($tVal : $tTy)), ← `(fun ($tPat : $tTy) => ({ $[$fInits:structInstField],* } : $userTyId)), ← `(fun u => by cases u; rfl))
+  let mkInst (leaf cls : Name) (rhs : Term) := `(command| instance $(mkSub leaf):ident : $(mkCIdent cls) $userTyId := $rhs)
+  let mkUrlCmd (leaf : Name) (pfx : String) := `(command| def $(mkSub leaf) (returnTo : Qed.HrefTarget := Qed.HrefTarget.root) : Qed.Url := Qed.Auth.mkAuthActionUrl $(Syntax.mkStrLit pfx) returnTo)
+  let mkCtxThm (leaf : Name) (goal pf : Term) := `(command| theorem $(mkSub leaf) ($ctxId:ident : Qed.Server.RequestCtx) ($uId:ident : $userTyId) (h : $fromCtxId $ctxId = Option.some $uId) : $goal := $pf)
   return #[
     ← `(command| structure $userTyId where $[$fStxs]* deriving Inhabited, DecidableEq, Repr),
-    ← `(command| instance $(mkSub `instLawfulJsonUser):ident : Qed.LawfulJson $userTyId := Qed.LawfulJson.iso inferInstance $toFn $fromFn $leftInv),
-    ← `(command| instance $(mkSub `instLawfulProtoUser):ident : Qed.LawfulProto $userTyId := Qed.LawfulProto.ofEquiv $toFn $fromFn $leftInv),
-    ← noUnusedVarsPure (← `(command| private def $fromLookupId (uid : String) (lookup : String → Option String) : $userTyId := { $[$lInits:structInstField],* })),
+    ← mkInst `instLawfulJsonUser ``Qed.LawfulJson (← mkAppC ``Qed.LawfulJson.iso #[mkCIdent ``inferInstance, toFn, fromFn, leftInv]),
+    ← mkInst `instLawfulProtoUser ``Qed.LawfulProto (← mkAppC ``Qed.LawfulProto.ofEquiv #[toFn, fromFn, leftInv]),
+    ← noUnusedVarsPure (← `(command| private def $fromLookupId ($uidId:ident : String) ($lookupId:ident : String → Option String) : $userTyId := { $[$lInits:structInstField],* })),
     ← `(command| def $fromClaimsId (c : Qed.Auth.JwtClaims) : $userTyId := $fromLookupId c.sub c.claim),
-    ← `(command| def $fromCtxId (ctx : Qed.Server.RequestCtx) : Option $userTyId := ctx.userId.map ($fromLookupId · ctx.claim)),
-    ← `(command| theorem $(mkSub `fromCtx_userId) (ctx : Qed.Server.RequestCtx) (u : $userTyId) (h : $fromCtxId ctx = some u) : some u.id = ctx.userId := Qed.Auth.option_map_eq_some_elim h fun _ hu hf => hf ▸ hu.symm),
-    ← `(command| theorem $(mkSub `fromCtx_emailVerified) (ctx : Qed.Server.RequestCtx) (u : $userTyId) (h : $fromCtxId ctx = some u) : u.emailVerified = Qed.Auth.parseBoolClaim (ctx.claim "email_verified") false := Qed.Auth.option_map_eq_some_elim h fun _ _ hf => hf ▸ rfl),
+    ← `(command| def $fromCtxId ($ctxId:ident : Qed.Server.RequestCtx) : Option $userTyId := ($ctxId).userId.map ($fromLookupId · ($ctxId).claim)),
+    ← mkCtxThm `fromCtx_userId (← `(Option.some ($uId).id = ($ctxId).userId)) (← `(Qed.Auth.option_map_eq_some_elim h fun _ hu hf => hf ▸ hu.symm)),
+    ← mkCtxThm `fromCtx_emailVerified (← `(($uId).emailVerified = Qed.Auth.parseBoolClaim (($ctxId).claim "email_verified") false)) (← `(Qed.Auth.option_map_eq_some_elim h fun _ _ hf => hf ▸ rfl)),
     ← mkUrlCmd `loginUrl "/_qed/auth/login?returnTo=", ← mkUrlCmd `logoutUrl "/_qed/auth/logout?returnTo=",
     ← mkMarkerThmPure (mkSub `_qed_auth_marker), ← mkStrArrDefPure (mkSub `secrets) secrets,
-    ← `(command| @[noinline] def $(mkSub `config) : Qed.Auth.OidcAuthSpec := $(← oidcAuthSpecToTermPure spec))]
+    ← mkDefValPure (mkSub `config) #[] (mkCIdent ``Qed.Auth.OidcAuthSpec) (← oidcAuthSpecToTermPure spec)]
 
 private structure AuthParseAcc where
-  isManaged       : Bool := false
-  hasExplicitOidc : Bool := false
-  envRefs         : Array (Name × String × Option String) := #[]
-  sessionTtlSec   : Nat := 86400
-  seen            : Array Name := #[]
-  providers       : Array String := #[]
-  claims          : Array ParsedClaimDecl := #[]
-  secrets         : Array String := #[]
+  (isManaged hasExplicitOidc : Bool := false) (sessionTtlSec : Nat := 86400) (envRefs : Array (Name × String × Option String) := #[])
+  (seen : Array Name := #[]) (providers secrets : Array String := #[]) (claims : Array ParsedClaimDecl := #[])
 
 @[noinline] private def parseOneAuthClause (authShort : String) (acc : AuthParseAcc) (c : Syntax) : CommandElabM AuthParseAcc := do
   let k := c.getKind; let seenKey := if k == `Qed.Auth.authEnvClause then (c.getArg 0).getId.eraseMacroScopes else k

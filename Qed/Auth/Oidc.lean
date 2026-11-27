@@ -12,43 +12,26 @@ open Qed.Auth Qed.Server Qed.Server.Net Qed.Server.Http
 abbrev HttpExecFn := String → String → Array (String × String) → ByteArray → Bool → IO (Except String (Nat × ByteArray × Array (String × String)))
 
 structure OidcDiscovery where
-  issuer                : String
-  authorizationEndpoint : String
-  tokenEndpoint         : String
-  jwksUri               : String
-  fetchedAtSec          : Nat
+  (issuer authorizationEndpoint tokenEndpoint jwksUri : String) (fetchedAtSec : Nat)
 deriving Inhabited
 
 structure OidcCacheState where
-  discovery?      : Option OidcDiscovery := none
-  jwks            : Array JwkKey := #[]
-  jwksFetchedAt   : Nat := 0
-  lastMissRefresh : Nat := 0
+  (discovery? : Option OidcDiscovery := none) (jwks : Array JwkKey := #[]) (jwksFetchedAt lastMissRefresh : Nat := 0)
 deriving Inhabited
 
 structure ResolvedOidcConfig where
-  name           : String
-  issuer         : String
-  audience       : String
-  clientId       : String
-  clientSecret?  : Option String := none
-  sessionSecrets : List String := []
-  sessionTtlSec  : Nat := 86400
-  loginPath      : String := "/_qed/auth/login"
-  callbackPath   : String := "/_qed/auth/callback"
-  logoutPath     : String := "/_qed/auth/logout"
-  mePath         : String := "/_qed/auth/me"
-  claimNames     : List String := []
-  devMode        : Bool := false
+  (name issuer audience clientId : String) (clientSecret? : Option String := none)
+  (sessionSecrets : List String := []) (sessionTtlSec : Nat := 86400)
+  (loginPath : String := "/_qed/auth/login") (callbackPath : String := "/_qed/auth/callback")
+  (logoutPath : String := "/_qed/auth/logout") (mePath : String := "/_qed/auth/me")
+  (claimNames : List String := []) (devMode : Bool := false)
 deriving Inhabited
 
 def ResolvedOidcConfig.googleOneTapEnabled (cfg : ResolvedOidcConfig) : Bool := cfg.issuer == "https://accounts.google.com" && !cfg.clientId.isEmpty
 private def ResolvedOidcConfig.ssrfGuard (cfg : ResolvedOidcConfig) : Bool :=
   !(cfg.devMode && ["http://127.0.0.1", "http://localhost"].any fun p => cfg.issuer == p || cfg.issuer.startsWith (p ++ ":"))
 
-structure OidcRuntime where
-  cfg   : ResolvedOidcConfig
-  cache : Prim.StateBox OidcCacheState
+structure OidcRuntime where (cfg : ResolvedOidcConfig) (cache : Prim.StateBox OidcCacheState)
 
 abbrev nowSec : IO Nat := Prim.nowSec
 def loadNonEmptyEnv (envName : String) : IO (Option String) := do return (← Prim.getEnv envName).bind fun v => let t := trimWs v; if t.isEmpty then none else some t
@@ -76,16 +59,13 @@ def verifyJwtWithKeys (cfg : OidcValidationCfg) (keys : Array JwkKey) (token : S
   match parseCompactJwt token with | .error e => pure (.error e) | .ok p => verifyParsedJwtWithKeys cfg keys p now
 
 structure HttpJsonOpts where
-  headers         : Array (String × String) := #[("Accept", "application/json")]
-  body            : ByteArray := ByteArray.empty
-  ssrfGuard       : Bool := true
-  okStatus        : Nat → Bool := fun st => 200 ≤ st && st < 300
-  allowEmptyBody  : Bool := false
-  requireUtf8     : Bool := true
-  fmtTransportErr : String → String → String := fun url e => s!"HTTP error calling `{url}`: {e}"
-  fmtStatusErr    : String → Nat → String → String := fun url st raw => s!"`{url}` returned HTTP {st}{if raw.isEmpty then "" else s!": {raw}"}"
-  fmtJsonErr      : String → Nat → String → String := fun url _ e => s!"invalid JSON from `{url}`: {e}"
-  fmtNonUtf8Err   : String → String := fun url => s!"`{url}` returned non-UTF-8 body"
+  (headers : Array (String × String) := #[("Accept", "application/json")]) (body : ByteArray := ByteArray.empty)
+  (ssrfGuard : Bool := true) (okStatus : Nat → Bool := fun st => 200 ≤ st && st < 300)
+  (allowEmptyBody : Bool := false) (requireUtf8 : Bool := true)
+  (fmtTransportErr : String → String → String := fun url e => s!"HTTP error calling `{url}`: {e}")
+  (fmtStatusErr : String → Nat → String → String := fun url st raw => s!"`{url}` returned HTTP {st}{if raw.isEmpty then "" else s!": {raw}"}")
+  (fmtJsonErr : String → Nat → String → String := fun url _ e => s!"invalid JSON from `{url}`: {e}")
+  (fmtNonUtf8Err : String → String := fun url => s!"`{url}` returned non-UTF-8 body")
 
 def execJsonHttpStatusWith (httpExec : HttpExecFn) (method url : String) (opts : HttpJsonOpts := {}) : IO (Except String (Nat × Json)) := do
   match ← httpExec method url opts.headers opts.body opts.ssrfGuard with
@@ -189,25 +169,27 @@ private def filterSessionClaims (claimNames : List String) (c : JwtClaims) : Lis
     let extraHookCookies ← match onCallbackAuthenticated? with | some onAuth => setCookieHeaders <$> Array.toList <$> ExceptT.mk (onAuth sessPayload.userId sessPayload.claims) | none => pure []
     let sessTok ← signSessionCookieV2 signKey sessPayload cfg.sessionTtlSec
     return setCookieHeaders [SetCookie.clear clearCookie "/", mkHardenedCookie "qed_session" sessTok cfg.sessionTtlSec cfg.devMode] ++ extraHookCookies
+  let signEnvCookie (signKey tag cookieName : String) (payload : ByteArray) : ExceptT (Nat × String) IO (List (String × String)) := do
+    let v ← signHmacEnvelope signKey tag ((← nowSec) + 600) (base64UrlEncode payload)
+    return setCookieHeaders [mkHardenedCookie cookieName v 600 cfg.devMode]
+  let readEnvCookie (tag cookieName missingMsg invalidMsg : String) : ExceptT (Nat × String) IO String := do
+    let raw ← reqOpt 400 missingMsg (cookies.lookup cookieName)
+    reqOpt 400 invalidMsg (← verifyHmacEnvelope cfg.sessionSecrets tag raw (← nowSec))
   if req.method == "GET" && pathOnly == cfg.loginPath then
     runRoute do
       let (signKey, disc) := (← requireSignKey, ← liftErr 502 (fetchDiscovery httpExec rt false))
-      let returnTo := sanitizeReturnTo ((parseQueryParams queryStr).lookup "returnTo")
-      let (state, nonce, codeVerifier) := (← Prim.randomHex 24, ← Prim.randomHex 24, ← Prim.randomHex 32)
+      let (returnTo, state, nonce, codeVerifier) := (sanitizeReturnTo ((parseQueryParams queryStr).lookup "returnTo"), ← Prim.randomHex 24, ← Prim.randomHex 24, ← Prim.randomHex 32)
       let host := (req.host?.map trimWs).getD "127.0.0.1:8000"
       let redirectUri := s!"{if cfg.devMode || host.startsWith "127.0.0.1" || host.startsWith "localhost" then "http" else "https"}://{host}{cfg.callbackPath}"
       let txJson := Json.render (.obj [("state", .str state), ("nonce", .str nonce), ("verifier", .str codeVerifier), ("returnTo", .str returnTo), ("redirectUri", .str redirectUri)])
-      let txVal ← signHmacEnvelope signKey "tx1" ((← nowSec) + 600) (base64UrlEncode txJson.toUTF8)
       let authQuery := encodeFormBody [("response_type", "code"), ("client_id", cfg.clientId), ("redirect_uri", redirectUri), ("scope", "openid email profile"),
         ("state", state), ("nonce", nonce), ("code_challenge", base64UrlEncode (← Prim.sha256 codeVerifier.toUTF8)), ("code_challenge_method", "S256")]
-      return redirectResp (sanitizeHeader (disc.authorizationEndpoint ++ (if disc.authorizationEndpoint.contains "?" then "&" else "?") ++ authQuery)) (setCookieHeaders [mkHardenedCookie "qed_auth_tx" txVal 600 cfg.devMode])
+      return redirectResp (sanitizeHeader (disc.authorizationEndpoint ++ (if disc.authorizationEndpoint.contains "?" then "&" else "?") ++ authQuery)) (← signEnvCookie signKey "tx1" "qed_auth_tx" txJson.toUTF8)
   else if req.method == "GET" && pathOnly == cfg.callbackPath then
     runRoute do
-      let (signKey, qParams) := (← requireSignKey, parseQueryParams queryStr)
+      let (signKey, qParams, badTx) := (← requireSignKey, parseQueryParams queryStr, "auth callback invalid or expired transaction cookie")
       let code ← reqOpt 400 "auth callback missing `code`" (qParams.lookup "code"); let state ← reqOpt 400 "auth callback missing `state`" (qParams.lookup "state")
-      let rawTx ← reqOpt 400 "auth callback missing transaction cookie" (cookies.lookup "qed_auth_tx")
-      let badTx := "auth callback invalid or expired transaction cookie"
-      let txB64 ← reqOpt 400 badTx (← verifyHmacEnvelope cfg.sessionSecrets "tx1" rawTx (← nowSec))
+      let txB64 ← readEnvCookie "tx1" "qed_auth_tx" "auth callback missing transaction cookie" badTx
       let txJ ← reqOpt 400 badTx (decodeBase64UrlJson txB64 "tx").toOption
       let (txState, txNonce, txVer, txRedir) ← reqOpt 400 badTx (do some (← txJ.strAt? "state", ← txJ.strAt? "nonce", ← txJ.strAt? "verifier", ← txJ.strAt? "redirectUri"))
       if state != txState then throw (403, "auth callback state mismatch")
@@ -220,13 +202,12 @@ private def filterSessionClaims (claimNames : List String) (c : JwtClaims) : Lis
     if resolvedUser?.isSome || !cfg.googleOneTapEnabled then return some (jsonResp 200 "{\"enabled\":false}" [("Cache-Control", "no-store")])
     runRoute do
       let (signKey, nonce) := (← requireSignKey, ← Prim.randomHex 24)
-      let cookieVal ← signHmacEnvelope signKey "ot1" ((← nowSec) + 600) (base64UrlEncode nonce.toUTF8)
-      return jsonResp 200 (Json.render (Json.obj [("enabled", .bool true), ("clientId", .str cfg.clientId), ("nonce", .str nonce)])) (("Cache-Control", "no-store") :: setCookieHeaders [mkHardenedCookie "qed_onetap_nonce" cookieVal 600 cfg.devMode])
+      return jsonResp 200 (Json.render (Json.obj [("enabled", .bool true), ("clientId", .str cfg.clientId), ("nonce", .str nonce)])) (("Cache-Control", "no-store") :: (← signEnvCookie signKey "ot1" "qed_onetap_nonce" nonce.toUTF8))
   else if req.method == "POST" && pathOnly == "/_qed/auth/onetap" then
     if !cfg.googleOneTapEnabled then return some (jsonResp 404 "{\"error\":\"Google One Tap not enabled\"}")
     runRoute do
-      let signKey ← requireSignKey; let rawNonce ← reqOpt 400 "missing One Tap nonce cookie" (cookies.lookup "qed_onetap_nonce")
-      let nonceB64 ← reqOpt 400 "invalid or expired One Tap nonce cookie" (← verifyHmacEnvelope cfg.sessionSecrets "ot1" rawNonce (← nowSec))
+      let signKey ← requireSignKey
+      let nonceB64 ← readEnvCookie "ot1" "qed_onetap_nonce" "missing One Tap nonce cookie" "invalid or expired One Tap nonce cookie"
       let expectedNonce ← reqOpt 400 "corrupt One Tap nonce cookie" ((base64UrlDecode nonceB64).toOption.bind String.fromUTF8?)
       let bodyJson ← reqOpt 400 "invalid JSON body" ((String.fromUTF8? reqBody).bind fun s => (Json.parse s).toOption)
       let credential ← reqOpt 400 "missing `credential`" (bodyJson.strAt? "credential")

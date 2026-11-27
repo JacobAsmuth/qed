@@ -29,7 +29,7 @@ def stripTrailingSlashes (s : String) : String :=
   let hi := rtrimPos (· == 47) s 0 s.utf8ByteSize (Nat.le_refl _)
   if hi == s.utf8ByteSize then s else String.Pos.Raw.extract s ⟨0⟩ ⟨hi⟩
 
-@[inline] def asciiLowerByte (b : UInt8) : UInt8 := if b >= 65 && b <= 90 then b + 32 else b
+@[inline] def asciiLowerByte (b : UInt8) : UInt8 := if b >= 65 && b <= 90 then b ||| 32 else b
 
 @[inline] def eqCIRange (a : String) (aLo aHi : Nat) (b : String) (bLo bHi : Nat) : Bool :=
   let len := aHi - aLo
@@ -191,37 +191,25 @@ def isBlockedIpBytes (addr : ByteArray) : Bool :=
   else true
 private theorem isBlockedIpBytes_v4 (b0 b1 b2 b3 : UInt8) : isBlockedIpBytes (ByteArray.mk #[b0, b1, b2, b3]) = isBlockedIpv4 b0 b1 b2 b3 := by
   simp only [isBlockedIpBytes, ByteArray.getElem_eq_getElem_data]; simp [ByteArray.size, -ByteArray.size_data]
-local macro "blockedV4 " n1:ident bs1:ident* " => " a1:term "," b1:term "," c1:term "," d1:term " ; "
-                         n2:ident bs2:ident* " => " a2:term "," b2:term "," c2:term "," d2:term : command =>
-  `(theorem $n1 ($bs1* : UInt8) : isBlockedIpBytes (ByteArray.mk #[$a1, $b1, $c1, $d1]) = true := by rw [isBlockedIpBytes_v4]; simp [isBlockedIpv4]; try decide
-    theorem $n2 ($bs2* : UInt8) : isBlockedIpBytes (ByteArray.mk #[$a2, $b2, $c2, $d2]) = true := by rw [isBlockedIpBytes_v4]; simp [isBlockedIpv4]; try decide)
-local macro "blockedV6 " n1:ident " => " xs1:term,* " ; " n2:ident " => " xs2:term,* : command =>
-  `(theorem $n1 : isBlockedIpBytes (ByteArray.mk #[$xs1,*]) = true := rfl
-    theorem $n2 : isBlockedIpBytes (ByteArray.mk #[$xs2,*]) = true := rfl)
-blockedV4 isBlockedIpBytes_loopback_v4 b1 b2 b3 => 127, b1, b2, b3 ; isBlockedIpBytes_metadata_v4 b2 b3 => 169, 254, b2, b3
-blockedV4 isBlockedIpBytes_rfc1918_10 b1 b2 b3 => 10, b1, b2, b3 ; isBlockedIpBytes_testnet_v4 b3 => 192, 0, 2, b3
+theorem isBlockedIpBytes_loopback_v4 (b1 b2 b3 : UInt8) : isBlockedIpBytes (ByteArray.mk #[127, b1, b2, b3]) = true := by rw [isBlockedIpBytes_v4]; simp [isBlockedIpv4]
+theorem isBlockedIpBytes_metadata_v4 (b2 b3 : UInt8) : isBlockedIpBytes (ByteArray.mk #[169, 254, b2, b3]) = true := by rw [isBlockedIpBytes_v4]; simp [isBlockedIpv4]
+theorem isBlockedIpBytes_rfc1918_10 (b1 b2 b3 : UInt8) : isBlockedIpBytes (ByteArray.mk #[10, b1, b2, b3]) = true := by rw [isBlockedIpBytes_v4]; simp [isBlockedIpv4]
+theorem isBlockedIpBytes_testnet_v4 (b3 : UInt8) : isBlockedIpBytes (ByteArray.mk #[192, 0, 2, b3]) = true := by rw [isBlockedIpBytes_v4]; simp [isBlockedIpv4]
 theorem isBlockedIpBytes_benchmark_v4 (b2 b3 : UInt8) : isBlockedIpBytes (ByteArray.mk #[198, 18, b2, b3]) = true := by rw [isBlockedIpBytes_v4]; simp [isBlockedIpv4]
-blockedV6 isBlockedIpBytes_loopback_v6 => 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1 ; isBlockedIpBytes_v4mapped_metadata => 0,0,0,0,0,0,0,0,0,0,0xFF,0xFF,169,254,169,254
-blockedV6 isBlockedIpBytes_nat64_metadata => 0,0x64,0xFF,0x9B,0,0,0,0,0,0,0,0,169,254,169,254 ; isBlockedIpBytes_nat64_local_v6 => 0,0x64,0xFF,0x9B,0,1,0,0,0,0,0,0,10,0,0,1
-blockedV6 isBlockedIpBytes_6to4_v6 => 0x20,0x02,169,254,169,254,0,0,0,0,0,0,0,0,0,1 ; isBlockedIpBytes_teredo_v6 => 0x20,0x01,0,0,0,0,0,0,0,0,0,0,0,0,0,1
+theorem isBlockedIpBytes_loopback_v6 : isBlockedIpBytes (ByteArray.mk #[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]) = true := rfl
+theorem isBlockedIpBytes_v4mapped_metadata : isBlockedIpBytes (ByteArray.mk #[0,0,0,0,0,0,0,0,0,0,0xFF,0xFF,169,254,169,254]) = true := rfl
+theorem isBlockedIpBytes_nat64_metadata : isBlockedIpBytes (ByteArray.mk #[0,0x64,0xFF,0x9B,0,0,0,0,0,0,0,0,169,254,169,254]) = true := rfl
+theorem isBlockedIpBytes_nat64_local_v6 : isBlockedIpBytes (ByteArray.mk #[0,0x64,0xFF,0x9B,0,1,0,0,0,0,0,0,10,0,0,1]) = true := rfl
+theorem isBlockedIpBytes_6to4_v6 : isBlockedIpBytes (ByteArray.mk #[0x20,0x02,169,254,169,254,0,0,0,0,0,0,0,0,0,1]) = true := rfl
+theorem isBlockedIpBytes_teredo_v6 : isBlockedIpBytes (ByteArray.mk #[0x20,0x01,0,0,0,0,0,0,0,0,0,0,0,0,0,1]) = true := rfl
 theorem isBlockedIpBytes_badLen (addr : ByteArray) (h4 : addr.size ≠ 4) (h16 : addr.size ≠ 16) : isBlockedIpBytes addr = true := by simp [isBlockedIpBytes, h4, h16]
 
-/-! ## Unified RFC 4648 Base64 & Base64URL Encoder -/
-
-abbrev isBase64UrlChar : Char → Bool := Qed.Base64.isUrlChar
-abbrev base64Encode    : ByteArray → String := Qed.Base64.encode
-abbrev base64UrlEncode : ByteArray → String := Qed.Base64.encodeUrl
-theorem base64UrlEncode_safe (bs : ByteArray) : (base64UrlEncode bs).toList.all isBase64UrlChar = true := Qed.Base64.encodeUrl_safe bs
+abbrev base64Encode : ByteArray → String := Qed.Base64.encode
+theorem base64UrlEncode_safe (bs : ByteArray) : (Qed.Base64.encodeUrl bs).toList.all Qed.Base64.isUrlChar = true := Qed.Base64.encodeUrl_safe bs
 
 /-! ## Outbound HTTP/1.1 URL Parser, Request Serializer & Response Head Parser -/
 
-structure ParsedUrl where
-  isTls        : Bool
-  host         : String
-  isIpv6       : Bool
-  port         : UInt16
-  pathAndQuery : String
-deriving Repr, DecidableEq
+structure ParsedUrl where (isTls : Bool) (host : String) (isIpv6 : Bool) (port : UInt16) (pathAndQuery : String)
 
 private def parsePortU16 (s : String) : Option UInt16 := do let n ← parseStrictU64 s 65535; if n == 0 then none else some (UInt16.ofNat n)
 private def splitAuthorityAndPathGo (authRev : List Char) : List Char → Option (String × String)
@@ -278,21 +266,15 @@ def formatOutboundRequest (method : String) (u : ParsedUrl) (headers : Array (St
   if u.host.isEmpty || hasCtlOrCrlf u.host false || u.host.contains ' ' || u.port == 0 ||
      !u.pathAndQuery.startsWith "/" || hasCtlOrCrlf u.pathAndQuery false || u.pathAndQuery.contains ' ' then
     throw "invalid outbound HTTP URL fields"
-  for (k, v) in headers do if !isValidHttpToken k || hasCtlOrCrlf v true then throw "invalid outbound HTTP header (CRLF/control chars)"
+  if headers.any fun (k, v) => !isValidHttpToken k || hasCtlOrCrlf v true then throw "invalid outbound HTTP header (CRLF/control chars)"
   let defaultPort := (u.isTls && u.port == 443) || (!u.isTls && u.port == 80)
   let hostHdr := (if u.isIpv6 then s!"[{u.host}]" else u.host) ++ (if defaultPort then "" else s!":{u.port}")
-  let mut head := s!"{method} {u.pathAndQuery} HTTP/1.1\r\nHost: {hostHdr}\r\nConnection: keep-alive\r\nContent-Length: {body.size}\r\n"
-  for (k, v) in headers do
-    let kl := k.toLower
-    if kl != "host" && kl != "content-length" && kl != "connection" && kl != "transfer-encoding" then head := head ++ s!"{k}: {v}\r\n"
+  let head := headers.foldl (init := s!"{method} {u.pathAndQuery} HTTP/1.1\r\nHost: {hostHdr}\r\nConnection: keep-alive\r\nContent-Length: {body.size}\r\n") fun acc (k, v) =>
+    if eqCI k "host" || eqCI k "content-length" || eqCI k "connection" || eqCI k "transfer-encoding" then acc else acc ++ s!"{k}: {v}\r\n"
   return (head ++ "\r\n").toUTF8 ++ body
 
 structure ParsedRespHead where
-  status     : Nat
-  headers    : Array (String × String)
-  isChunked  : Bool
-  connClose  : Bool
-  contentLen : Option Nat
+  (status : Nat) (headers : Array (String × String)) (isChunked connClose : Bool) (contentLen : Option Nat)
 private def parseStatusCode (s : String) : Option Nat :=
   match s.toList with
   | d0 :: d1 :: d2 :: rest =>
@@ -300,6 +282,24 @@ private def parseStatusCode (s : String) : Option Nat :=
          '1' ≤ d0 && d0 ≤ '9' && '0' ≤ d1 && d1 ≤ '9' && '0' ≤ d2 && d2 ≤ '9' then
         some ((d0.toNat - 48) * 100 + (d1.toNat - 48) * 10 + (d2.toNat - 48)) else none
   | _ => none
+private def parseRespHdrLines (lines : Array String) (status : Nat) (idx : Nat) (hdrs : Array (String × String))
+    (isChunked connClose : Bool) (contentLen? : Option Nat) : Except String ParsedRespHead :=
+  if h : idx < lines.size then
+    match splitHeaderKv lines[idx] with
+    | none => parseRespHdrLines lines status (idx + 1) hdrs isChunked connClose contentLen?
+    | some (k, v) =>
+        if eqCI k "content-length" then
+          match parseStrictU64 v (256 * 1024 * 1024) with
+          | none => .error "invalid Content-Length in HTTP response"
+          | some cl =>
+              if contentLen?.any (· != cl) then .error "conflicting Content-Length in HTTP response"
+              else parseRespHdrLines lines status (idx + 1) (hdrs.push (k, v)) isChunked connClose (some cl)
+        else
+          let ch := isChunked || (eqCI k "transfer-encoding" && containsCI v "chunked")
+          let cc := connClose || (eqCI k "connection" && containsCI v "close")
+          parseRespHdrLines lines status (idx + 1) (hdrs.push (k, v)) ch cc contentLen?
+  else .ok { status, headers := hdrs, isChunked, connClose, contentLen := contentLen? }
+termination_by lines.size - idx
 def parseHttpResponseHead (headBytes : ByteArray) : Except String ParsedRespHead := do
   let lines ← splitCrlfLines headBytes
   if h0 : lines.size = 0 then throw "empty HTTP response status line"
@@ -309,19 +309,7 @@ def parseHttpResponseHead (headBytes : ByteArray) : Except String ParsedRespHead
     let status ← match statusLine.splitOn " " with
       | _ :: codeRest :: _ => (parseStatusCode codeRest).elim (.error "invalid HTTP status code") .ok
       | _ => throw "invalid HTTP status line"
-    let mut hdrs : Array (String × String) := Array.mkEmpty (lines.size - 1)
-    let mut isChunked := false; let mut connClose := false; let mut contentLen? : Option Nat := none
-    for idx in [1:lines.size] do
-      if h : idx < lines.size then
-        if let some (k, v) := splitHeaderKv lines[idx] then
-          if eqCI k "content-length" then
-            let some cl := parseStrictU64 v (256 * 1024 * 1024) | throw "invalid Content-Length in HTTP response"
-            if contentLen?.any (· != cl) then throw "conflicting Content-Length in HTTP response"
-            contentLen? := some cl
-          else if eqCI k "transfer-encoding" && containsCI v "chunked" then isChunked := true
-          else if eqCI k "connection" && containsCI v "close" then connClose := true
-          hdrs := hdrs.push (k, v)
-    return { status, headers := hdrs, isChunked, connClose, contentLen := contentLen? }
+    parseRespHdrLines lines status 1 (Array.mkEmpty (lines.size - 1)) false false none
 @[inline] def liftE  {ε α : Type} (x : IO (Except ε α)) : ExceptT ε IO α := ExceptT.mk x
 @[inline] def liftP  {ε α : Type} (x : Except ε α)      : ExceptT ε IO α := ExceptT.mk (pure x)
 @[inline] def liftIO {ε α : Type} (x : IO α)            : ExceptT ε IO α := liftM x

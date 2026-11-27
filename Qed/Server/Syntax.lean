@@ -9,11 +9,7 @@ declare_syntax_cat extClause
 declare_syntax_cat srvClause
 
 section SrvParsers
-open Lean Parser Qed.Lang PrettyPrinter Parenthesizer Formatter
-
-private def opaqueP (p : Parser) : Parser := p
-@[combinator_parenthesizer opaqueP] private def opaqueP.parenthesizer : Parenthesizer := pure ()
-@[combinator_formatter opaqueP] private def opaqueP.formatter : Formatter := pure ()
+open Lean Parser Qed.Lang
 
 private def qExpr : Parser := categoryParser `qedExpr 0
 private def qType : Parser := withPosition (categoryParser `qedType 0)

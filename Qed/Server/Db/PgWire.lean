@@ -100,7 +100,7 @@ def parseCommandTag (payload : ByteArray) : String :=
 
 /-! ### `postgres://` URL Parser & SCRAM-SHA-256 Auth -/
 
-inductive PgSslMode where | disable | prefer | require deriving Inhabited, DecidableEq, Repr
+inductive PgSslMode where | disable | prefer | require deriving Inhabited, DecidableEq
 structure PgConnParams where
   user      : String := "postgres"
   password  : String := ""
@@ -109,7 +109,7 @@ structure PgConnParams where
   database  : String := "postgres"
   sslMode   : PgSslMode := .prefer
   ssrfGuard : Bool := false
-deriving Inhabited, Repr
+deriving Inhabited
 
 def parsePgUrl (rawUrl : String) : Except String PgConnParams := do
   let split2 (s sep : String) : String × Option String := match s.splitOn sep with | a :: b :: _ => (a, some b) | _ => (s, none)
@@ -121,11 +121,10 @@ def parsePgUrl (rawUrl : String) : Except String PgConnParams := do
   let (userInfo?, hostPort) := match split2 authAndHost "@" with | (a, some b) => (some a, b) | (_, none) => (none, authAndHost)
   let (user, password) := match userInfo? with
     | none => ("postgres", "") | some ui => let (u, p?) := split2 ui ":"; (Qed.decodeSeg u, (p?.map Qed.decodeSeg).getD "")
-  let (host, port) ← match split2 hostPort ":" with
-    | (h, some pStr) => match Net.parseStrictU64 pStr 65535 with
-        | some pn => if pn > 0 then .ok (h, UInt16.ofNat pn) else .error s!"invalid postgres port `{pStr}`"
-        | none    => .error s!"invalid postgres port `{pStr}`"
-    | (h, none) => .ok (h, (5432 : UInt16))
+  let (host, portStr?) := split2 hostPort ":"
+  let port ← match portStr? with
+    | none => .ok (5432 : UInt16)
+    | some pStr => ((Net.parseStrictU64 pStr 65535).filter (· > 0)).elim (.error s!"invalid postgres port `{pStr}`") (.ok ∘ UInt16.ofNat)
   let sslMode : PgSslMode := (queryOpt.getD "").splitOn "&" |>.foldl (init := .prefer) fun acc kv => match kv.splitOn "=" with
     | ["sslmode", "disable"] => .disable | ["sslmode", "require"] | ["sslmode", "verify-ca"] | ["sslmode", "verify-full"] => .require | _ => acc
   if host.isEmpty then .error "missing postgres host"
@@ -134,8 +133,6 @@ def parsePgUrl (rawUrl : String) : Except String PgConnParams := do
     .ok { user := if user.isEmpty then "postgres" else user, password, host, port,
           database := if dbPart.isEmpty then "postgres" else Qed.decodeSeg dbPart, sslMode }
 
-def base64Decode (s : String) : ByteArray :=
-  (Qed.Base64.decode (String.ofList (s.toList.filter (!·.isWhitespace)))).toOption.getD ByteArray.empty
 private def xorBytes (a b : ByteArray) : ByteArray := ByteArray.mk <| (Array.range (min a.size b.size)).map fun i => a.get! i ^^^ b.get! i
 
 /-! ### Live Wire Execution & Per-DSN Connection Pool -/
@@ -160,7 +157,9 @@ private def parseScramServerFirst (s : String) : Except String (String × ByteAr
     let rest := String.ofList (p.toList.drop 2)
     if p.startsWith "r=" then (some rest, s?, i?) else if p.startsWith "s=" then (r?, some rest, i?)
     else if p.startsWith "i=" then (r?, s?, rest.toNat?) else (r?, s?, i?)
-  match r?, s?, i? with | some r, some sb, some it => .ok (r, base64Decode sb, it) | _, _, _ => .error "invalid SCRAM-SHA-256 server-first-message"
+  match r?, s?, i? with
+  | some r, some sb, some it => .ok (r, (Qed.Base64.decode (String.ofList (sb.toList.filter (!·.isWhitespace)))).toOption.getD ByteArray.empty, it)
+  | _, _, _ => .error "invalid SCRAM-SHA-256 server-first-message"
 
 private def authLoop (handle : UInt64) (cfg : PgConnParams) (buf : ByteArray) (off : Nat)
     (clientNonce clientFirstBare : String) : Nat → PgM (ByteArray × Nat)
@@ -261,27 +260,24 @@ def releaseConn (conn : PgConn) : IO Unit := do
   let nowMs := (← Prim.nowMs).toNat
   let evicted ← pgPoolBox.modifyGet fun m =>
     let (live, expired) := partitionPoolEntries (m[conn.poolKey]?.getD #[]) nowMs
-    if live.size < pgPoolMaxIdlePerDsn then (expired, m.insert conn.poolKey (live.push (conn.handle, nowMs)))
-    else let (ev, kept) := if h : 0 < live.size then (live[0].1 :: expired, live.extract 1 live.size) else (expired, live)
-         (ev, m.insert conn.poolKey (kept.push (conn.handle, nowMs)))
+    let (ev, kept) := if h : pgPoolMaxIdlePerDsn ≤ live.size ∧ 0 < live.size then (live[0].1 :: expired, live.extract 1 live.size) else (expired, live)
+    (ev, m.insert conn.poolKey (kept.push (conn.handle, nowMs)))
   evicted.forM (closePgHandle · true)
 
-private def runWireOnConn (conn : PgConn) (wire : ByteArray) (errPrefix : String) (fuel : Nat) : IO (Except String (DbResult × String × PgConn) × PgConn) := do
+private def runWireProj {α : Type} (conn : PgConn) (wire : ByteArray) (errPfx : String) (fuel : Nat)
+    (proj : DbResult → String → PgConn → α) : IO (Except String α × PgConn) := do
   match ← Prim.outboundWriteAll conn.handle wire with
-  | .error e => return (.error s!"{errPrefix}: {e}", { conn with healthy := false })
+  | .error e => return (.error s!"{errPfx}: {e}", { conn with healthy := false })
   | .ok () => match ← (collectQueryResultLoop conn.handle conn.buf conn.off #[] #[] 0 "" none fuel).run with
-      | .error transportErr => return (.error transportErr, { conn with healthy := false })
-      | .ok (qRes, b', o', status) => let conn' := { conn with buf := b', off := o', txStatus := status, healthy := true }; return (qRes.map fun (r, tag) => (r, tag, conn'), conn')
-def execOnConn (conn : PgConn) (sql : String) (params : Array SqlVal) : IO (Except String (DbResult × PgConn) × PgConn) := do
-  let (res, conn') ← runWireOnConn conn (encodeParse sql ++ encodeBind params ++ encodeMsg 0x44 (pushCString (ByteArray.empty.push 0x50) "") ++
-    encodeMsg 0x45 (pushU32BE (pushCString ByteArray.empty "") 0) ++ encodeMsg 0x53 ByteArray.empty) "postgres query write failed" 65536
-  return (res.map fun (r, _, c) => (r, c), conn')
-def execSimpleOnConnTag (conn : PgConn) (sql : String) : IO (Except String (String × PgConn) × PgConn) := do
-  let (res, conn') ← runWireOnConn conn (encodeMsg 0x51 (pushCString ByteArray.empty sql)) "postgres simple query write failed" 4096
-  return (res.map fun (_, tag, c) => (tag, c), conn')
-def execSimpleOnConn (conn : PgConn) (sql : String) : IO (Except String PgConn × PgConn) := do
-  let (res, conn') ← execSimpleOnConnTag conn sql
-  return (res.map Prod.snd, conn')
+      | .error e => return (.error e, { conn with healthy := false })
+      | .ok (qRes, b', o', status) => let c' := { conn with buf := b', off := o', txStatus := status, healthy := true }; return (qRes.map fun (r, tag) => proj r tag c', c')
+def execOnConn (conn : PgConn) (sql : String) (params : Array SqlVal) : IO (Except String (DbResult × PgConn) × PgConn) :=
+  runWireProj conn (encodeParse sql ++ encodeBind params ++ encodeMsg 0x44 (pushCString (ByteArray.empty.push 0x50) "") ++
+    encodeMsg 0x45 (pushU32BE (pushCString ByteArray.empty "") 0) ++ encodeMsg 0x53 ByteArray.empty) "postgres query write failed" 65536 fun r _ c => (r, c)
+def execSimpleOnConnTag (conn : PgConn) (sql : String) : IO (Except String (String × PgConn) × PgConn) :=
+  runWireProj conn (encodeMsg 0x51 (pushCString ByteArray.empty sql)) "postgres simple query write failed" 4096 fun _ tag c => (tag, c)
+def execSimpleOnConn (conn : PgConn) (sql : String) : IO (Except String PgConn × PgConn) :=
+  (fun (res, c) => (res.map Prod.snd, c)) <$> execSimpleOnConnTag conn sql
 
 private def execParameterizedAttempt (cfg : PgConnParams) (sql : String) (params : Array SqlVal) : Nat → PgM DbResult
   | 0 => throw "postgres query failed after retry"

@@ -71,7 +71,7 @@ def isSafeSqlIdent (s : String) : Bool :=
 structure SqlIdent where
   raw   : String
   valid : isSafeSqlIdent raw = true
-deriving DecidableEq, Repr
+deriving DecidableEq
 instance : Inhabited SqlIdent := ⟨⟨"id", rfl⟩⟩
 
 /-- Compile-time validated `SqlIdent` literal macro (`sql!"col_name"`).
@@ -105,10 +105,10 @@ theorem SqlIdent.quoteIdent_no_semicolon (id : SqlIdent) : ∀ c ∈ id.quoteIde
 
 /-! ## Typed Parameterized SQL AST (`SqlExpr`, `SqlQuery`, `SqlDialect`) -/
 
-inductive SqlDialect  where | postgres | sqlite deriving Inhabited, DecidableEq, Repr
-inductive SqlBinOp    where | eq | ne | lt | le | gt | ge | and | or | add | sub | mul deriving Inhabited, DecidableEq, Repr
-inductive SqlOrderDir where | asc | desc deriving Inhabited, DecidableEq, Repr
-inductive SqlAggOp    where | sum | min | max deriving Inhabited, DecidableEq, Repr
+inductive SqlDialect  where | postgres | sqlite deriving Inhabited, DecidableEq
+inductive SqlBinOp    where | eq | ne | lt | le | gt | ge | and | or | add | sub | mul deriving Inhabited, DecidableEq
+inductive SqlOrderDir where | asc | desc deriving Inhabited, DecidableEq
+inductive SqlAggOp    where | sum | min | max deriving Inhabited, DecidableEq
 
 @[inline] private def SqlDialect.pick (d : SqlDialect) (pg sq : String) : String := match d with | .postgres => pg | .sqlite => sq
 private theorem SqlDialect.pick_no_semi (d : SqlDialect) {pg sq : String} (h1 : NoSemi pg) (h2 : NoSemi sq) : NoSemi (d.pick pg sq) := by
@@ -444,8 +444,6 @@ def SqlQuery.compile (d : SqlDialect) : SqlQuery → String × Array SqlVal
       let (wSql, params) := whereExpr.compile d #[]
       ("DELETE FROM " ++ tbl.quoteIdent ++ " WHERE " ++ wSql ++ renderReturning ret, params)
 
-instance : Repr SqlQuery := ⟨fun q _ => repr (q.compile .postgres).1⟩
-
 private theorem map_eraseColVals_fst (cols : List (SqlIdent × SqlVal)) :
     (cols.map fun (c, _) => (c, SqlVal.null)).map Prod.fst = cols.map Prod.fst := by
   simp only [List.map_map, Function.comp_def]
@@ -592,11 +590,11 @@ abbrev aeadBase64Len (plainBytes : Nat) : Nat := 4 * ((plainBytes + aeadOverhead
 theorem aeadBase64Len_mono {a b : Nat} (h : a ≤ b) : aeadBase64Len a ≤ aeadBase64Len b := by
   simp only [aeadBase64Len, aeadOverhead]; omega
 
-inductive SqlColType where | text | int | bool | bytes deriving Inhabited, DecidableEq, Repr
+inductive SqlColType where | text | int | bool | bytes deriving Inhabited, DecidableEq
 def SqlColType.render (d : SqlDialect) : SqlColType → String
   | .text => "TEXT" | .int => d.pick "BIGINT" "INTEGER" | .bool => d.pick "BOOLEAN" "INTEGER" | .bytes => d.pick "BYTEA" "BLOB"
 
-inductive OnDeleteAction where | noAction | cascade | setNull | restrict deriving Inhabited, DecidableEq, Repr
+inductive OnDeleteAction where | noAction | cascade | setNull | restrict deriving Inhabited, DecidableEq
 def OnDeleteAction.render : OnDeleteAction → String
   | .noAction => "" | .cascade => " ON DELETE CASCADE" | .setNull => " ON DELETE SET NULL" | .restrict => " ON DELETE RESTRICT"
 
@@ -610,7 +608,7 @@ structure ColumnSchema where
   references?  : Option (SqlIdent × SqlIdent) := none
   onDelete     : OnDeleteAction := .noAction
   checkSql?    : Option String := none
-deriving Inhabited, Repr
+deriving Inhabited
 
 structure TableSchema where
   name      : SqlIdent
@@ -619,7 +617,7 @@ structure TableSchema where
   checks    : List String := []
   rlsRead?  : Option String := none
   rlsWrite? : Option String := none
-deriving Inhabited, Repr
+deriving Inhabited
 
 private def optClause (opt : Option α) (f : α → String) : String := opt.map f |>.getD ""
 private def joinSqlStmts (stmts : List String) : String := if stmts.isEmpty then "" else String.intercalate ";\n" stmts ++ ";\n"
@@ -662,7 +660,7 @@ inductive MigrationStep where
   | createTable (table : TableSchema)
   | addColumn   (table : SqlIdent) (col : ColumnSchema) (defaultSql? : Option String := none)
   | createIndex (table : SqlIdent) (idxName : String) (cols : List SqlIdent)
-deriving Inhabited, Repr
+deriving Inhabited
 
 private def ColumnSchema.isUnconstrained (c : ColumnSchema) : Bool := !c.isPrimaryKey && !c.isUnique && c.references?.isNone
 def ColumnSchema.isAdditiveSafe (c : ColumnSchema) : Bool :=
@@ -728,7 +726,7 @@ inductive DbEndpoint where
   | turso        (urlEnv : String) (tokenSecret : String)
   | httpSql      (urlEnv : String) (tokenSecret? : Option String := none)
   | managedPostgres (dbName : String) (env : Qed.Cloud.DeployEnv)
-deriving Inhabited, DecidableEq, Repr
+deriving Inhabited, DecidableEq
 
 structure DbConfig where
   name          : String
@@ -738,17 +736,12 @@ structure DbConfig where
   isManaged     : Bool := false
   tables        : List TableSchema := []
   backfills     : List SqlQuery := []
-deriving Inhabited, Repr
+deriving Inhabited
 
 def DbConfig.endpointForEnv (cfg : DbConfig) (env : Qed.Cloud.DeployEnv) : DbEndpoint :=
   match cfg.envEndpoints? with
   | some em => em.get env
   | none    => match env with | .dev => cfg.devFallback?.getD cfg.endpoint | _ => cfg.endpoint
-theorem DbConfig.endpointForEnv_prod_no_devFallback (cfg : DbConfig) (hnone : cfg.envEndpoints? = none) :
-    cfg.endpointForEnv .prod = cfg.endpoint := by simp [DbConfig.endpointForEnv, hnone]
-theorem DbConfig.endpointForEnv_envMap (cfg : DbConfig) (em : Qed.Cloud.EnvMap DbEndpoint)
-    (h : cfg.envEndpoints? = some em) (env : Qed.Cloud.DeployEnv) :
-    cfg.endpointForEnv env = em.get env := by simp [DbConfig.endpointForEnv, h]
 
 abbrev DbRow := Array SqlVal
 structure DbResult where
@@ -802,6 +795,6 @@ def decodeTaggedResultJson (raw : String) : Except String DbResult := do
 /-- Branded transaction handle carrying a live transaction ID for a specific `database`. -/
 structure DbTx (dbTag : String) where
   id : UInt64
-deriving Inhabited, DecidableEq, Repr
+deriving Inhabited, DecidableEq
 
 end Qed.Server.Db

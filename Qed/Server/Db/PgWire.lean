@@ -55,17 +55,21 @@ private def findZeroByte (ba : ByteArray) (i : Nat) : Nat :=
   if h : i < ba.size then if ba[i]'h == 0 then i else findZeroByte ba (i + 1) else ba.size
 termination_by ba.size - i
 def parseErrorResponse (payload : ByteArray) : String :=
+  let finish (msg? sqlstate? : Option String) : String :=
+    match sqlstate?, msg? with
+    | some c, some m => s!"[{c}] {m}" | none, some m => m
+    | some c, none => s!"postgres error [{c}]" | none, none => "postgres error"
   let rec go (off : Nat) (msg? sqlstate? : Option String) : Nat → String
-    | 0 => match sqlstate?, msg? with | some c, some m => s!"[{c}] {m}" | none, some m => m | some c, none => s!"postgres error [{c}]" | none, none => "postgres error"
+    | 0 => finish msg? sqlstate?
     | fuel + 1 => if h : off < payload.size then
         let code := payload[off]'h
-        if code == 0 then go off msg? sqlstate? 0
+        if code == 0 then finish msg? sqlstate?
         else let zPos := findZeroByte payload (off + 1)
              let txt? := String.fromUTF8? (payload.extract (off + 1) zPos)
              if code == 0x4D then go (zPos + 1) (txt?.orElse fun _ => msg?) sqlstate? fuel
              else if code == 0x43 then go (zPos + 1) msg? (txt?.orElse fun _ => sqlstate?) fuel
              else go (zPos + 1) msg? sqlstate? fuel
-      else go off msg? sqlstate? 0
+      else finish msg? sqlstate?
   go 0 none none (payload.size + 1)
 def parseRowDescription (payload : ByteArray) : Array Nat :=
   let rec go (off : Nat) (acc : Array Nat) : Nat → Array Nat
@@ -93,8 +97,6 @@ def parseDataRow (oids : Array Nat) (payload : ByteArray) : Except String DbRow 
 def parseCommandTag (payload : ByteArray) : String :=
   let trimmed := if payload.size > 0 && payload[payload.size - 1]! == 0 then payload.extract 0 (payload.size - 1) else payload
   (String.fromUTF8? trimmed).getD ""
-def parseCommandTagAffected (payload : ByteArray) : Nat :=
-  ((parseCommandTag payload).splitOn " ").reverse.head?.bind String.toNat? |>.getD 0
 
 /-! ### `postgres://` URL Parser & SCRAM-SHA-256 Auth -/
 

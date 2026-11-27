@@ -243,6 +243,7 @@ def formatTextResponse (status : Nat) (msg : String) (isHead keepAlive : Bool) (
 def formatErrorResponse (status : Nat) (msg : String) : ByteArray := formatTextResponse status msg false false
 def formatWsUpgradeResponse (acceptB64 : String) : ByteArray :=
   s!"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {acceptB64}\r\n\r\n".toUTF8
+def setCookieHeaders (cookies : List SetCookie) : List (String × String) := cookies.map fun c => ("Set-Cookie", c.render)
 
 /-! ## Static Asset Path & MIME Policy -/
 

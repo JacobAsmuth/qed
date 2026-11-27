@@ -72,11 +72,11 @@ structure SqlIdent where
   raw   : String
   valid : isSafeSqlIdent raw = true
 deriving DecidableEq, Repr
-instance : Inhabited SqlIdent := ⟨⟨"id", by decide⟩⟩
+instance : Inhabited SqlIdent := ⟨⟨"id", rfl⟩⟩
 
 /-- Compile-time validated `SqlIdent` literal macro (`sql!"col_name"`).
     Uses `noWs` so `sql` remains unreserved as an ordinary identifier. -/
-macro "sql!" noWs s:str : term => `(Qed.Server.Db.SqlIdent.mk $s (by decide))
+macro "sql!" noWs s:str : term => `(Qed.Server.Db.SqlIdent.mk $s rfl)
 
 theorem isSafeSqlIdent_all_body {s : String} (h : isSafeSqlIdent s = true) :
     ∀ c ∈ s.toList, isSqlIdentBodyChar c = true := by
@@ -446,33 +446,42 @@ def SqlQuery.compile (d : SqlDialect) : SqlQuery → String × Array SqlVal
 
 instance : Repr SqlQuery := ⟨fun q _ => repr (q.compile .postgres).1⟩
 
+private theorem map_eraseColVals_fst (cols : List (SqlIdent × SqlVal)) :
+    (cols.map fun (c, _) => (c, SqlVal.null)).map Prod.fst = cols.map Prod.fst := by
+  simp only [List.map_map, Function.comp_def]
+private theorem map_eraseColVals_snd (cols : List (SqlIdent × SqlVal)) :
+    (cols.map fun (c, _) => (c, SqlVal.null)).map Prod.snd = (cols.map Prod.snd).map fun _ => .null := by
+  simp only [List.map_map, Function.comp_def]
+
 private theorem SqlQuery.compile_eraseVals (d : SqlDialect) (q : SqlQuery) : (q.compile d).1 = (q.eraseVals.compile d).1 := by
   cases q with
   | select _ cols w _ _ _ =>
-      have ⟨h, _⟩ := w.compileQual_eraseVals d "" #[] #[] rfl
-      cases cols <;> simp [SqlQuery.eraseVals, SqlQuery.compile, SqlExpr.compile, h]
+      dsimp only [SqlQuery.eraseVals, SqlQuery.compile, SqlExpr.compile]
+      split <;> (dsimp only; rw [(w.compileQual_eraseVals d "" #[] #[] rfl).1])
   | selectAll _ w _ _ _ | count _ w | aggregate _ _ _ w | delete _ w _ =>
-      have ⟨h, _⟩ := w.compileQual_eraseVals d "" #[] #[] rfl; simp [SqlQuery.eraseVals, SqlQuery.compile, SqlExpr.compile, h]
+      dsimp only [SqlQuery.eraseVals, SqlQuery.compile, SqlExpr.compile]
+      rw [(w.compileQual_eraseVals d "" #[] #[] rfl).1]
   | joinSelect _ _ _ _ _ _ lw rw _ _ _ =>
       have ⟨hL, hszL⟩ := lw.compileQual_eraseVals d "\"_l\"." #[] #[] rfl
-      have ⟨hR, _⟩ := rw.compileQual_eraseVals d "\"_r\"." _ _ hszL; simp [SqlQuery.eraseVals, SqlQuery.compile, hL, hR]
+      have ⟨hR, _⟩ := rw.compileQual_eraseVals d "\"_r\"." _ _ hszL
+      dsimp only [SqlQuery.eraseVals, SqlQuery.compile]; rw [hL, hR]
   | insert _ cols _ | insertOrIgnore _ cols _ _ =>
-      have hfst : (cols.map fun (c, _) => (c, SqlVal.null)).map Prod.fst = cols.map Prod.fst := by simp [List.map_map, Function.comp_def]
-      have hsnd : (cols.map fun (c, _) => (c, SqlVal.null)).map Prod.snd = (cols.map Prod.snd).map fun _ => .null := by simp [List.map_map, Function.comp_def]
-      have ⟨h, _⟩ := compileInParams_eraseVals d (cols.map Prod.snd) #[] #[] rfl
-      simp [SqlQuery.eraseVals, SqlQuery.compile, hfst, hsnd, h]
+      dsimp only [SqlQuery.eraseVals, SqlQuery.compile]
+      rw [map_eraseColVals_fst, map_eraseColVals_snd, (compileInParams_eraseVals d (cols.map Prod.snd) #[] #[] rfl).1]
   | upsert tbl cols cc uc cw ret =>
-      have hfst : (cols.map fun (c, _) => (c, SqlVal.null)).map Prod.fst = cols.map Prod.fst := by simp [List.map_map, Function.comp_def]
-      have hsnd : (cols.map fun (c, _) => (c, SqlVal.null)).map Prod.snd = (cols.map Prod.snd).map fun _ => .null := by simp [List.map_map, Function.comp_def]
       have ⟨h, hsz⟩ := compileInParams_eraseVals d (cols.map Prod.snd) #[] #[] rfl
       cases cw with
-      | none => simp [SqlQuery.eraseVals, SqlQuery.compile, hfst, hsnd, h]
+      | none =>
+          dsimp only [SqlQuery.eraseVals, SqlQuery.compile, Option.map]
+          rw [map_eraseColVals_fst, map_eraseColVals_snd, h]
       | some e =>
           have ⟨he, _⟩ := e.compileQual_eraseVals d (tbl.quoteIdent ++ ".") _ _ hsz
-          simp [SqlQuery.eraseVals, SqlQuery.compile, hfst, hsnd, h, he]
+          dsimp only [SqlQuery.eraseVals, SqlQuery.compile, Option.map]
+          rw [map_eraseColVals_fst, map_eraseColVals_snd, h, he]
   | update _ sets w _ =>
       have ⟨hS, hszS⟩ := compileSets_eraseVals d sets #[] #[] rfl
-      have ⟨hW, _⟩ := w.compileQual_eraseVals d "" _ _ hszS; simp [SqlQuery.eraseVals, SqlQuery.compile, SqlExpr.compile, hS, hW]
+      have ⟨hW, _⟩ := w.compileQual_eraseVals d "" _ _ hszS
+      dsimp only [SqlQuery.eraseVals, SqlQuery.compile, SqlExpr.compile]; rw [hS, hW]
 
 /-- **SQL Injection Closure (Non-Interference Theorem):**
     Any two typed `SqlQuery` values with the same AST skeleton (`sameShape`) compile to
@@ -480,52 +489,57 @@ private theorem SqlQuery.compile_eraseVals (d : SqlDialect) (q : SqlQuery) : (q.
 theorem SqlQuery.compile_sameShape (d : SqlDialect) {q₁ q₂ : SqlQuery} (hsh : q₁.sameShape q₂) :
     (q₁.compile d).1 = (q₂.compile d).1 := by rw [q₁.compile_eraseVals d, hsh, ← q₂.compile_eraseVals d]
 
-private theorem upsertTail_no_semicolon (d : SqlDialect) (tbl : SqlIdent) (cc uc : List SqlIdent) (cw : Option SqlExpr) (p1 : Array SqlVal) :
-    NoSemi ((renderConflictTarget cc ++ if uc.isEmpty then "DO NOTHING" else "DO UPDATE SET " ++ renderUpsertSets uc) ++
-      (match cw with | none => ("", p1) | some e => let (ws, p2) := e.compileQual d (tbl.quoteIdent ++ ".") p1; (" WHERE " ++ ws, p2)).1) := by
-  refine ((renderConflictTarget_no_semicolon cc).app ?_).app ?_
-  · split
-    · exact NoSemi.lit _ rfl
-    · exact (NoSemi.lit _ rfl).app (renderUpsertSets_no_semicolon uc)
-  · cases cw with
-    | none => exact NoSemi.lit _ rfl
-    | some e => exact (NoSemi.lit _ rfl).app (e.compileQual_no_semicolon d (tbl.quoteIdent ++ ".") (NoSemi.app tbl.quoteIdent_no_semicolon (NoSemi.lit "." rfl)) p1)
+private theorem NoSemi.appL {a : String} (ha : NoSemi a) (s : String) (hs : s.toList.all (· != ';') = true) : NoSemi (a ++ s) :=
+  ha.app (NoSemi.lit s hs)
 
 theorem SqlQuery.compile_no_semicolon (d : SqlDialect) (q : SqlQuery) : ∀ c ∈ (q.compile d).1.toList, c ≠ ';' := by
+  let jqp (pfx : String) (hp : NoSemi pfx) (cs : List SqlIdent) := SqlIdent.joinQuotedPrefixed_no_semicolon pfx hp cs
+  let jq (cs : List SqlIdent) := jqp "" (NoSemi.lit "" rfl) cs
   cases q with
   | select tbl cols w ob lim off =>
-      intro c hc
-      by_cases hE : cols.isEmpty
-      · simp only [SqlQuery.compile, hE, ↓reduceIte, String.toList_append, List.mem_append] at hc
-        have hAll : NoSemi ("SELECT 1 FROM " ++ tbl.quoteIdent ++ " WHERE (0 = 1 AND (" ++ (w.compile d #[]).1 ++ "))") :=
-          ((((NoSemi.lit _ rfl).app tbl.quoteIdent_no_semicolon).app (NoSemi.lit _ rfl)).app (w.compile_no_semicolon d #[])).app (NoSemi.lit _ rfl)
-        exact hAll c (by simpa [String.toList_append, List.mem_append, or_assoc] using hc)
-      · simp only [SqlQuery.compile, hE, Bool.false_eq_true, ↓reduceIte, String.toList_append, List.mem_append] at hc
-        have hAll : NoSemi ("SELECT " ++ SqlIdent.joinQuoted cols ++ " FROM " ++ tbl.quoteIdent ++ " WHERE " ++ (w.compile d #[]).1 ++ renderOrderBy "" ob ++ renderLimitOffset d lim off) :=
-          (((((((NoSemi.lit _ rfl).app (SqlIdent.joinQuotedPrefixed_no_semicolon _ (NoSemi.lit _ rfl) cols)).app (NoSemi.lit _ rfl)).app tbl.quoteIdent_no_semicolon).app (NoSemi.lit _ rfl)).app (w.compile_no_semicolon d #[])).app (renderOrderBy_no_semicolon "" (NoSemi.lit _ rfl) ob)).app (renderLimitOffset_no_semicolon d lim off)
-        exact hAll c (by simpa [String.toList_append, List.mem_append, or_assoc] using hc)
+      dsimp only [SqlQuery.compile]; split
+      · exact (((NoSemi.lit _ rfl).app tbl.quoteIdent_no_semicolon).appL _ rfl |>.app (w.compile_no_semicolon d #[])).appL _ rfl
+      · exact ((((((NoSemi.lit _ rfl).app (jq cols)).appL _ rfl).app tbl.quoteIdent_no_semicolon).appL _ rfl).app
+          (w.compile_no_semicolon d #[]) |>.app (renderOrderBy_no_semicolon "" (NoSemi.lit "" rfl) ob)).app (renderLimitOffset_no_semicolon d lim off)
+  | selectAll tbl w ob lim off =>
+      exact ((((NoSemi.lit _ rfl).app tbl.quoteIdent_no_semicolon).appL _ rfl).app
+        (w.compile_no_semicolon d #[]) |>.app (renderOrderBy_no_semicolon "" (NoSemi.lit "" rfl) ob)).app (renderLimitOffset_no_semicolon d lim off)
+  | count tbl w =>
+      exact (((NoSemi.lit _ rfl).app tbl.quoteIdent_no_semicolon).appL _ rfl).app (w.compile_no_semicolon d #[])
+  | aggregate op tbl col w =>
+      exact ((((((NoSemi.lit _ rfl).app op.render_no_semicolon).appL _ rfl).app col.quoteIdent_no_semicolon).appL _ rfl).app
+        tbl.quoteIdent_no_semicolon |>.appL _ rfl).app (w.compile_no_semicolon d #[])
+  | joinSelect lt rt lc rc lj rj lw rw ob lim off =>
+      have hSel : NoSemi (SqlIdent.joinQuotedPrefixed "\"_l\"." lc ++ ", " ++ SqlIdent.joinQuotedPrefixed "\"_r\"." rc) :=
+        NoSemi.appL (jqp "\"_l\"." (NoSemi.lit _ rfl) lc) ", " rfl |>.app (jqp "\"_r\"." (NoSemi.lit _ rfl) rc)
+      exact (((((((((((((NoSemi.lit _ rfl).app hSel).appL _ rfl).app lt.quoteIdent_no_semicolon).appL _ rfl).app
+        rt.quoteIdent_no_semicolon |>.appL _ rfl).app lj.quoteIdent_no_semicolon).appL _ rfl).app rj.quoteIdent_no_semicolon).appL _ rfl).app
+        (lw.compileQual_no_semicolon d _ (NoSemi.lit _ rfl) #[]) |>.appL _ rfl).app
+        (rw.compileQual_no_semicolon d _ (NoSemi.lit _ rfl) _) |>.appL _ rfl).app
+        (renderOrderBy_no_semicolon _ (NoSemi.lit _ rfl) ob)).app (renderLimitOffset_no_semicolon d lim off)
+  | insert tbl cols ret =>
+      exact ((((((NoSemi.lit _ rfl).app tbl.quoteIdent_no_semicolon).appL _ rfl).app (jq (cols.map Prod.fst))).appL _ rfl).app
+        (compileInParams_no_semicolon d _ _) |>.appL _ rfl).app (renderReturning_no_semicolon ret)
+  | insertOrIgnore tbl cols cc ret =>
+      exact (((((((NoSemi.lit _ rfl).app tbl.quoteIdent_no_semicolon).appL _ rfl).app (jq (cols.map Prod.fst))).appL _ rfl).app
+        (compileInParams_no_semicolon d _ _) |>.appL _ rfl).app (renderConflictTarget_no_semicolon cc) |>.appL _ rfl).app (renderReturning_no_semicolon ret)
   | upsert tbl cols cc uc cw ret =>
-      intro c hc
-      have h1 : NoSemi ("INSERT INTO " ++ tbl.quoteIdent ++ " (" ++ SqlIdent.joinQuoted (cols.map Prod.fst) ++ ") VALUES (" ++ (compileInParams d (cols.map Prod.snd) #[]).1 ++ ")") :=
-        ((((((NoSemi.lit _ rfl).app tbl.quoteIdent_no_semicolon).app (NoSemi.lit _ rfl)).app (SqlIdent.joinQuotedPrefixed_no_semicolon _ (NoSemi.lit _ rfl) _)).app (NoSemi.lit _ rfl)).app (compileInParams_no_semicolon d _ _)).app (NoSemi.lit _ rfl)
-      have h2 := upsertTail_no_semicolon d tbl cc uc cw (compileInParams d (cols.map Prod.snd) #[]).2
-      have hAll := (h1.app h2).app (renderReturning_no_semicolon ret)
-      simpa [SqlQuery.compile, String.append_assoc] using hAll c (by simpa [SqlQuery.compile, String.append_assoc] using hc)
-  | selectAll _ _ _ _ _ | count _ _ | aggregate _ _ _ _ | joinSelect _ _ _ _ _ _ _ _ _ _ _ | insert _ _ _ | insertOrIgnore _ _ _ _ | update _ _ _ _ | delete _ _ _ =>
-      ((intro c hc); (simp only [SqlQuery.compile, String.toList_append, List.mem_append] at hc); (revert hc); (try simp only [or_imp]); repeat any_goals constructor) <;>
-        (intro hc; first
-          | with_reducible exact SqlIdent.quoteIdent_no_semicolon _ c hc
-          | with_reducible exact SqlIdent.joinQuotedPrefixed_no_semicolon _ (NoSemi.lit _ rfl) _ c hc
-          | with_reducible exact SqlAggOp.render_no_semicolon _ c hc
-          | with_reducible exact SqlExpr.compile_no_semicolon _ _ _ c hc
-          | with_reducible exact SqlExpr.compileQual_no_semicolon _ _ (NoSemi.lit _ rfl) _ _ c hc
-          | with_reducible exact compileInParams_no_semicolon _ _ _ c hc
-          | with_reducible exact compileSets_no_semicolon _ _ _ c hc
-          | with_reducible exact renderConflictTarget_no_semicolon _ c hc
-          | with_reducible exact renderReturning_no_semicolon _ c hc
-          | with_reducible exact renderLimitOffset_no_semicolon _ _ _ c hc
-          | with_reducible exact renderOrderBy_no_semicolon _ (NoSemi.lit _ rfl) _ c hc
-          | exact NoSemi.lit _ rfl c hc)
+      have hConf : NoSemi (renderConflictTarget cc ++ if uc.isEmpty then "DO NOTHING" else "DO UPDATE SET " ++ renderUpsertSets uc) := by
+        refine (renderConflictTarget_no_semicolon cc).app ?_
+        split
+        · exact NoSemi.lit _ rfl
+        · exact (NoSemi.lit _ rfl).app (renderUpsertSets_no_semicolon uc)
+      have hCw : NoSemi (match cw with | none => ("", (compileInParams d (cols.map Prod.snd) #[]).2) | some e => let (ws, p2) := e.compileQual d (tbl.quoteIdent ++ ".") (compileInParams d (cols.map Prod.snd) #[]).2; (" WHERE " ++ ws, p2)).1 := by
+        cases cw with
+        | none => exact NoSemi.lit _ rfl
+        | some e => exact (NoSemi.lit _ rfl).app (e.compileQual_no_semicolon d _ (NoSemi.appL tbl.quoteIdent_no_semicolon "." rfl) _)
+      exact (((((((NoSemi.lit _ rfl).app tbl.quoteIdent_no_semicolon).appL _ rfl).app (jq (cols.map Prod.fst))).appL _ rfl).app
+        (compileInParams_no_semicolon d _ _) |>.appL _ rfl).app hConf |>.app hCw).app (renderReturning_no_semicolon ret)
+  | update tbl sets w ret =>
+      exact ((((((NoSemi.lit _ rfl).app tbl.quoteIdent_no_semicolon).appL _ rfl).app (compileSets_no_semicolon d sets #[])).appL _ rfl).app
+        (w.compile_no_semicolon d _)).app (renderReturning_no_semicolon ret)
+  | delete tbl w ret =>
+      exact ((((NoSemi.lit _ rfl).app tbl.quoteIdent_no_semicolon).appL _ rfl).app (w.compile_no_semicolon d #[])).app (renderReturning_no_semicolon ret)
 
 /-! ## Abstract Relational Policy & Invariant Soundness Model -/
 
@@ -752,9 +766,6 @@ def SqlVal.toTaggedJson : SqlVal → Json
 def SqlVal.toPlainJson : SqlVal → Json
   | .null => .null | .int i => .num ⟨i, 0⟩ | .text s => .str s | .bool b => .bool b | .bytes bs => .str (Proto.encodeHex bs)
 
-def jsonNatAt (j : Json) (k : String) : Nat := (j.natAt? k).getD 0
-abbrev jsonStrAt := Json.strAt?
-
 def parseJsonIntCell (v? : Option Json) (badPfx missingErr : String) : Except String SqlVal :=
   match v? with
   | some (.str s) => (s.toInt?).elim (.error s!"{badPfx}: {s}") (.ok ∘ .int)
@@ -786,7 +797,7 @@ def encodeTaggedResultJson (res : DbResult) : String :=
 def decodeTaggedResultJson (raw : String) : Except String DbResult := do
   let j@(.obj _) ← Json.parse raw 128 | .error "expected JSON object from database result"
   let rows ← decodeJsonRows j "rows" (decodeJsonArrayRow SqlVal.fromTaggedJson "expected row array") "expected rows array"
-  return { rows, affected := jsonNatAt j "affected" }
+  return { rows, affected := (j.natAt? "affected").getD 0 }
 
 /-- Branded transaction handle carrying a live transaction ID for a specific `database`. -/
 structure DbTx (dbTag : String) where

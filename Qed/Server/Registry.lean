@@ -306,21 +306,29 @@ initialize failedServiceRegistry : Lean.SimplePersistentEnvExtension Lean.Name (
 abbrev lookupService? (env : Lean.Environment) (currNs : Lean.Name) (openDecls : List Lean.OpenDecl) (svcRef : Lean.Name) : Option ServiceInfo :=
   Qed.Diag.lookupNameMapExt? serviceRegistry env currNs openDecls svcRef (some `_qed_service_marker)
 
+structure FullstackInfo where
+  fullstackName : Lean.Name
+  serverName    : Lean.Name
+  title         : String
+deriving Inhabited, Repr
+
+initialize fullstackRegistry : Lean.SimplePersistentEnvExtension FullstackInfo (Lean.NameMap FullstackInfo) ← Qed.Diag.mkNameMapExt (·.fullstackName)
+
 def findNamedArg? (named : Array (String × Lean.Syntax)) (key : String) : Option Lean.Syntax := (named.find? (·.1 == key)).map Prod.snd
 
 section SyntaxHelpers
 open Lean
 
-def foldProjTerms {m : Type → Type} [Monad m] [MonadQuotation m] (ref : Syntax) (base : Term) (fs : List Name) : m Term :=
+@[noinline, nospecialize] def foldProjTerms {m : Type → Type} [Monad m] [MonadQuotation m] (ref : Syntax) (base : Term) (fs : List Name) : m Term :=
   fs.foldlM (init := base) fun acc f => `(($acc).$(mkIdentFrom ref f):ident)
 
-def mkBoolConj {m : Type → Type} [Monad m] [MonadQuotation m] (terms : Array Term) : m Term :=
+@[noinline, nospecialize] def mkBoolConj {m : Type → Type} [Monad m] [MonadQuotation m] (terms : Array Term) : m Term :=
   match terms.toList with | [] => `(true) | t :: rest => rest.foldlM (init := t) fun acc x => `($acc && $x)
 
 def resolveAppTargetIdent (env : Environment) (currNs : Name) (id : Ident) : Ident :=
   if env.contains (currNs ++ id.getId ++ `app) || env.contains (id.getId ++ `app) then mkIdentFrom id (id.getId ++ `app) else id
 
-def mkWsDecodeCb {m : Type → Type} [Monad m] [MonadQuotation m] (onOk onStatus : Ident) (mkDec : Ident → m Term) : m Term := do
+@[noinline, nospecialize] def mkWsDecodeCb {m : Type → Type} [Monad m] [MonadQuotation m] (onOk onStatus : Ident) (mkDec : Ident → m Term) : m Term := do
   let a := mkIdent `_wsMsg
   `(fun $a:ident => match $(← mkDec a):term with | Except.ok v => $onOk v | Except.error e => $onStatus (Qed.SocketStatus.failed e))
 

@@ -692,7 +692,6 @@ private def CachedStaticAsset.serve (c : CachedStaticAsset) (req : ParsedReqHead
   if req.hasIfNoneMatch && etagMatchesIfNoneMatch req.headers c.etag then formatNotModifiedResponse c.etag keepAlive
   else (if req.acceptsGzip then c.gzip?.getD c.plain else c.plain).pick isHead keepAlive
 
-private def cookieHeaders (cookies : List SetCookie) : List (String × String) := cookies.map fun c => ("Set-Cookie", c.render)
 private def tryGzip (body : ByteArray) (compressible : Bool) : IO (Option ByteArray) := do
   if compressible && body.size >= 256 then let gz ← Prim.gzipCompress body; if !gz.isEmpty && gz.size < body.size then return some gz
   return none
@@ -812,7 +811,7 @@ private def runFullstackCore {Model Msg : Type} (app : Qed.App Model Msg) (fc : 
       let textResp (code : Nat) (msg : String) (hdrs : List (String × String) := []) := formatTextResponse code msg isHead req.keepAlive hdrs
       let apiErrResp (e : ApiError) (cs : Array SetCookie) : IO ByteArray := do
         let msg ← logAndRedactApiErr fc.devMode s!"{req.method} {pathOnly}" e
-        return textResp e.httpStatus.toNat msg (cookieHeaders cs.toList)
+        return textResp e.httpStatus.toNat msg (setCookieHeaders cs.toList)
       let serveStatic (st : StaticTarget) := serveStaticAsset loop.staticDirFd (some assetCache) req st fc.devMode
       if req.method == "GET" && pathOnly == "/_qed/health" then return if req.keepAlive then loop.healthKA else loop.healthClose
       if let some st := staticTarget? then if isContentHashedAsset st.relPath then return ← serveStatic st
@@ -847,7 +846,7 @@ private def runFullstackCore {Model Msg : Type} (app : Qed.App Model Msg) (fc : 
             match res with
             | .ok respBytes =>
                 if cookies.isEmpty then return formatOkProtoResponse respBytes isHead req.keepAlive
-                else return formatHttpResponse 200 "application/x-protobuf" respBytes isHead req.keepAlive false (extraHeaders := cookieHeaders cookies.toList)
+                else return formatHttpResponse 200 "application/x-protobuf" respBytes isHead req.keepAlive false (extraHeaders := setCookieHeaders cookies.toList)
             | .error apiErr => return ← apiErrResp apiErr cookies
       if !pathOnly.startsWith "/_qed/" then if let some httpDispatchFn := fc.httpDispatchFn? then
         let (hRes, cookies) ← httpDispatchFn ctx (if isHead then "GET" else req.method) pathOnly
@@ -857,7 +856,7 @@ private def runFullstackCore {Model Msg : Type} (app : Qed.App Model Msg) (fc : 
             let cspHdrs := if startsWithCI resp.contentType "text/html" && !resp.headers.any (fun (k, _) => eqCI k "content-security-policy") then htmlSecHdrs else []
             return ← maybeGzipResponse resp.status resp.contentType resp.body isHead req.keepAlive false req.acceptsGzip
               (!startsWithCI resp.contentType "text/event-stream" && isCompressibleMime resp.contentType)
-              (extraHeaders := resp.headers ++ cspHdrs ++ cookieHeaders (cookies.toList ++ resp.cookies))
+              (extraHeaders := resp.headers ++ cspHdrs ++ setCookieHeaders (cookies.toList ++ resp.cookies))
         | .ok none => pure ()
       if let some st := staticTarget? then return ← serveStatic st
       if (req.method == "GET" || isHead) && !pathOnly.startsWith "/_qed/" then
@@ -955,32 +954,5 @@ def runStaticDir (staticDir : String) (port : UInt16) (devMode : Bool := false) 
       | some (fsize, _, bytes) => maybeGzipResponse 200 "text/html; charset=utf-8" bytes isHead req.keepAlive true req.acceptsGzip true (extraHeaders := loop.htmlCspHdrs ++ [("Vary", "Accept-Encoding")]) (contentLen := fsize)
       | none => return formatTextResponse 404 "not found" isHead req.keepAlive
     return (fun req _ _ _ => finishHeadWire req <$> dispatchReq req ByteArray.empty "", dispatchReq, closedWsBytes, fun _ _ _ => pure (), none)
-
-private def runJobsMainCore (requiredSecrets : Array String) (args : List String) (primaryDb? : Option Db.DbConfig)
-    (mkJobs : MonadServer IO → IO (Array IoJob)) : IO UInt32 := do
-  if !(← verifyRequiredSecrets requiredSecrets) then return 1
-  let devMode := args.contains "--dev"
-  let gcpCache ← Prim.mkStateBox (#[] : Array GcpTokenCacheEntry)
-  let dbCache ← mkDbResolveCache primaryDb?
-  let srvInst := mkNativeServerInstWith (some gcpCache) none none (some dbCache) (!devMode)
-  let ioJobs ← mkJobs srvInst
-  if args.contains "--once" then
-    let ok ← runJobsOnce ioJobs
-    return if ok then 0 else 1
-  let tasks ← spawnServerJobs ioJobs
-  for t in tasks do
-    if let .error e ← IO.wait t then
-      IO.eprintln s!"[qed job runner] task error: {e}"
-  return 0
-
-def runStatelessJobsMain (requiredSecrets : Array String) (jobs : Array StatelessJob) (args : List String)
-    (primaryDb? : Option Db.DbConfig := none) : IO UInt32 :=
-  runJobsMainCore requiredSecrets args primaryDb? fun srvInst => pure (jobs.map (·.toIoJob srvInst))
-
-def runStatefulJobsMain {σ : Type} (initState : σ) (requiredSecrets : Array String) (jobs : Array (ServerJob σ))
-    (args : List String) (primaryDb? : Option Db.DbConfig := none) : IO UInt32 :=
-  runJobsMainCore requiredSecrets args primaryDb? fun srvInst => do
-    let box ← Prim.mkStateBox initState
-    return jobs.map (·.toIoJob srvInst (withStateBox box))
 
 end Qed.Server.Native

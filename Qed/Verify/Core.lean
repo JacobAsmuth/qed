@@ -119,6 +119,7 @@ def mkSimpCtxWithBase (extraNames : Array Name := #[]) (cfg : Simp.Config := {})
       | none   => pure #[← addSimpNamesWithEqns base extraNames false withEqns]
   mkSimpCtx cfg thms
 
+@[noinline, nospecialize]
 def tryRestoreM {m : Type → Type} {s α : Type} [Monad m] [MonadBacktrack s m] [MonadExcept Exception m]
     (fail : α) (ok : α → Bool) (k : m α) : m α := do
   let st ← saveState
@@ -216,6 +217,13 @@ private def strLenFactRules : Array (Name × Nat × Name) := #[
   (`Qed.Str.trim, 1, `Qed.Str.trim_length_le), (`Qed.Str.trimLeft, 1, `Qed.Str.trimLeft_length_le), (`Qed.Str.trimRight, 1, `Qed.Str.trimRight_length_le),
   (`Qed.Str.toLower, 1, `Qed.Str.toLower_length), (`Qed.Str.toUpper, 1, `Qed.Str.toUpper_length)]
 
+private def skipInferFnHeads : Std.HashSet Name :=
+  #[``Eq, ``Ne, ``And, ``Or, ``Not, ``Iff, ``Exists, ``LT.lt, ``LE.le, ``GT.gt, ``GE.ge, ``BEq.beq, ``bne,
+    ``Bool.and, ``Bool.or, ``Bool.not, ``Decidable.decide, ``Membership.mem, ``String.length, ``Array.size, ``List.length,
+    ``Nat.succ, ``Nat.add, ``Nat.sub, ``Nat.mul, ``Int.ofNat, ``Int.negSucc, ``Option.some, ``Option.none,
+    ``Except.ok, ``Except.error, ``Prod.mk, ``List.cons, ``List.nil, ``Array.mk, ``Array.toList, ``List.toArray,
+    ``Fin.val, `Qed.Field.val, ``Qed.Lang.QedVal.val, ``Qed.Lang.QedAndProp, ``Qed.Lang.QedMem.mem, ``Qed.Lang.QedMemProp.memProp].foldl (·.insert ·) {}
+
 private def inspectSubtermForFacts (env : Environment) (cfg : FactScanConfig) (forallHyps : Array Expr) (sub : Expr) (addFact : Expr → MetaM Unit) : MetaM Unit := do
   if sub.hasLooseBVars then return
   match sub with | .sort _ | .lit _ | .mvar _ | .bvar _ | .forallE .. | .lam .. => return | _ => pure ()
@@ -230,19 +238,25 @@ private def inspectSubtermForFacts (env : Environment) (cfg : FactScanConfig) (f
     let a := sub.getAppArgs
     if let some (_, _, lem) := strLenFactRules.find? fun (fn, ar, _) => fn == c && ar == a.size then
       tryEmitApp env lem a addFact
+    if skipInferFnHeads.contains c || nonRefinedHeads.contains c then return
   let some t ← try some <$> inferType sub catch _ => pure none | return
   let tC := t.consumeMData
   if ← tryEmitFieldOrFin env cfg.includeFin sub tC addFact then return
   match tC.getAppFn with | .sort _ | .forallE .. => return | .const c _ => if nonRefinedHeads.contains c then return | _ => pure ()
   if let some ty ← try some <$> whnf tC catch _ => pure none then discard <| tryEmitFieldOrFin env cfg.includeFin sub ty addFact
 
-def collectFacts (cfg : FactScanConfig := {}) (extraExprs : Array Expr := #[]) : MetaM (Array Expr) := do
-  let env ← getEnv; let factsRef ← IO.mkRef (#[] : Array Expr); let factSetRef ← IO.mkRef ({} : Std.HashSet Expr)
-  let seenRef ← IO.mkRef ({} : Std.HashSet Expr); let nextScanRef ← IO.mkRef (#[] : Array Expr)
+private structure FactScanState where
+  facts    : Array Expr := #[]
+  factSet  : Std.HashSet Expr := {}
+  seen     : Std.HashSet Expr := {}
+  nextScan : Array Expr := #[]
+
+@[noinline] def collectFacts (cfg : FactScanConfig := {}) (extraExprs : Array Expr := #[]) : MetaM (Array Expr) := do
+  let env ← getEnv; let stRef ← IO.mkRef ({} : FactScanState)
   let addFact (p : Expr) : MetaM Unit := do
-    unless (← factSetRef.get).contains p do
-      factSetRef.modify (·.insert p); factsRef.modify (·.push p)
-      if cfg.rounds > 1 then nextScanRef.modify (·.push (← instantiateMVars (← inferType p)))
+    if (← stRef.get).factSet.contains p then return
+    let pTy? ← if cfg.rounds > 1 then some <$> instantiateMVars (← inferType p) else pure none
+    stRef.modify fun s => { s with factSet := s.factSet.insert p, facts := s.facts.push p, nextScan := match pTy? with | some t => s.nextScan.push t | none => s.nextScan }
   let mut scanExprs : Array Expr := #[]; let mut forallHyps : Array Expr := #[]
   if cfg.scanLCtx then
     for decl in (← getLCtx) do
@@ -258,13 +272,15 @@ def collectFacts (cfg : FactScanConfig := {}) (extraExprs : Array Expr := #[]) :
   for e in extraExprs do scanExprs := scanExprs.push (← instantiateMVars e)
   for _ in [0:cfg.rounds] do
     if scanExprs.isEmpty then break
-    nextScanRef.set #[]
+    stRef.modify fun s => { s with nextScan := #[] }
     for e in scanExprs do
       e.forEach fun sub => do
-        if !sub.hasLooseBVars then unless (← seenRef.get).contains sub do
-          seenRef.modify (·.insert sub); inspectSubtermForFacts env cfg forallHyps sub addFact
-    scanExprs ← nextScanRef.get
-  factsRef.get
+        if !sub.hasLooseBVars then
+          if !(← stRef.get).seen.contains sub then
+            stRef.modify fun s => { s with seen := s.seen.insert sub }
+            inspectSubtermForFacts env cfg forallHyps sub addFact
+    scanExprs := (← stRef.get).nextScan
+  return (← stRef.get).facts
 
 def collectAndAssertFacts (g0 : MVarId) (pfx : String) (cfg : FactScanConfig := {}) : MetaM (MVarId × Array FVarId) := do
   assertFacts g0 pfx (← g0.withContext do collectFacts cfg #[← instantiateMVars (← g0.getType)])
@@ -375,12 +391,9 @@ structure CloseFallbackConfig where
   skipTarget : Expr → Bool := fun _ => false
   trySimpStarOmega : Bool := false
   simpAllCfg : Simp.Config := { zetaDelta := false }
-  simpAllExtra : Array Name := #[]
-  simpAllSimprocs : Array Name := #[]
-  tryDeepFallback : Bool := true
   deepExtraSimpAll : Array Name := #[]
 
-def closeWithFallback (g : MVarId) (cfg : CloseFallbackConfig := {}) : TacticM Bool := do
+@[noinline] def closeWithFallback (g : MVarId) (cfg : CloseFallbackConfig := {}) : TacticM Bool := do
   if cfg.trySimpStarOmega then
     if ← tryRestoreM false id do
       let stWithHyps ← g.withContext do
@@ -392,28 +405,33 @@ def closeWithFallback (g : MVarId) (cfg : CloseFallbackConfig := {}) : TacticM B
       match ← simpGoalOnly g (← mkSimpCtx cfg.simpAllCfg #[stWithHyps]) with | none => return true | some g' => tryDirectOmega g'
     then return true
   if ← tryRestoreM false id do
-    match ← trySimpAll g (← mkSimpCtxWithBase cfg.simpAllExtra cfg.simpAllCfg) (← getCachedSimprocs cfg.simpAllSimprocs) with
+    match ← trySimpAll g (← mkSimpCtxWithBase #[] cfg.simpAllCfg) with
     | none => return true | some g' => tryCloseBasic g' cfg.skipTarget
   then return true
-  if !cfg.tryDeepFallback then return false
   let saved ← getGoals; setGoals [g]
   let ok ← tryTac (requireClosed := true) do
     let simpArgs ← namesToSimpLemmas cfg.deepExtraSimpAll
     `(tactic| first | qedNonlinearClose | (try simp_all [$[$simpArgs],*]; try (repeat' (split <;> try simp_all [$[$simpArgs],*])); all_goals (first | omega | decide | rfl)) | grind)
   setGoals saved; return ok
 
-def solveWithUnfolds (unfoldNames extraSimpNames : Array Name) (simprocNames : Array Name := #[])
+@[noinline] def solveWithUnfolds (unfoldNames extraSimpNames : Array Name) (simprocNames : Array Name := #[])
     (simpCfg : Simp.Config := { zetaDelta := true }) (harvestFacts : Bool := false)
     (scanLCtxValues : Bool := true) (clearErrorsOnFail : Bool := false) : TacticM Bool := do
+  let sp ← getCachedSimprocs simprocNames
+  let unfoldCtx? ← if unfoldNames.isEmpty then pure none else some <$> mkDynamicSimpCtx unfoldNames none simpCfg true
+  let allCtx ← mkDynamicSimpCtx (unfoldNames ++ extraSimpNames) none simpCfg
+  let extraCtx ← mkDynamicSimpCtx extraSimpNames none simpCfg
   let simplify (g0 : MVarId) (withFacts : Bool) : MetaM (Option MVarId) := do
-    let (_, g1) ← g0.intros; let sp ← getCachedSimprocs simprocNames
-    let g2 ← if unfoldNames.isEmpty then pure g1 else do
-      let some g' ← simpGoalAllHyps g1 (← mkDynamicSimpCtx unfoldNames none simpCfg true) #[] true | return none
-      pure g'
+    let (_, g1) ← g0.intros
+    let g2 ← match unfoldCtx? with
+      | none => pure g1
+      | some uCtx =>
+          let some g' ← simpGoalAllHyps g1 uCtx #[] true | return none
+          pure g'
     let g2 ← if !withFacts then pure g2 else do pure (← collectAndAssertFacts g2 "_dbFact" { scanLCtx := true, scanLCtxValues, includeFin := true }).1
-    let some g3 ← simpGoalAllHyps g2 (← mkDynamicSimpCtx (unfoldNames ++ extraSimpNames) none simpCfg) sp | return none
+    let some g3 ← simpGoalAllHyps g2 allCtx sp | return none
     let g3 := (← splitAndHypsGoal g3).1
-    trySimpAll g3 (← mkDynamicSimpCtx extraSimpNames none simpCfg) sp
+    trySimpAll g3 extraCtx sp
   let runPass (close : Bool) : TacticM Unit := forEachGoal fun g => do
     let some g' ← simplify g (close && harvestFacts) | setGoals []
     if !close then setGoals [g']

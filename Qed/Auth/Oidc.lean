@@ -147,15 +147,20 @@ def verifyOidcJwt (httpExec : HttpExecFn) (rt : OidcRuntime) (token : String) (e
 def anySecretVerify (secrets : List String) (payload sigBytes : ByteArray) : IO Bool :=
   secrets.anyM fun sec => Prim.hmacSha256Verify sec.toUTF8 payload sigBytes
 
+private def envelopeTagInfo : String → Option (String × String)
+  | "tx1" => some ("qed-tx-subkey-v1", "qed-tx\x00")
+  | "ot1" => some ("qed-ot-subkey-v1", "qed-ot\x00")
+  | _     => none
+
 private def envelopeSigningKey (secret tag : String) : IO ByteArray :=
-  if tag == "tx1" then Prim.hmacSha256 secret.toUTF8 "qed-tx-subkey-v1".toUTF8
-  else if tag == "ot1" then Prim.hmacSha256 secret.toUTF8 "qed-ot-subkey-v1".toUTF8
-  else pure secret.toUTF8
+  match envelopeTagInfo tag with
+  | some (subkey, _) => Prim.hmacSha256 secret.toUTF8 subkey.toUTF8
+  | none => pure secret.toUTF8
 
 private def envelopeMacInput (tag body : String) : ByteArray :=
-  if tag == "tx1" then s!"qed-tx\x00{body}".toUTF8
-  else if tag == "ot1" then s!"qed-ot\x00{body}".toUTF8
-  else body.toUTF8
+  match envelopeTagInfo tag with
+  | some (_, pfx) => (pfx ++ body).toUTF8
+  | none => body.toUTF8
 
 private def signHmacEnvelope (secret tag : String) (expSec : Nat) (b64 : String) : IO String := do
   let body := s!"{tag}.{expSec}.{b64}"
@@ -228,13 +233,12 @@ def handleAuthRoute (httpExec : HttpExecFn) (rt : OidcRuntime) (req : ParsedReqH
     cfg.sessionSecrets.head?.elim (throw (500, "auth error: QED_AUTH_SECRET is not configured")) pure
   let liftErr {α : Type} (st : Nat) (x : IO (Except String α)) (fmt : String → String := id) : ExceptT (Nat × String) IO α :=
     ExceptT.mk ((·.mapError fun e => (st, fmt e)) <$> x)
-  let setCookieHdrs (cs : List SetCookie) := cs.map fun c => ("Set-Cookie", c.render)
   let issueSessionHdrs (signKey clearCookieName : String) (claims : JwtClaims) : ExceptT (Nat × String) IO (List (String × String)) := do
     let sessPayload : SessionPayloadV2 := { userId := claims.sub, claims := filterSessionClaims cfg.claimNames claims }
     let extraHookCookies ← match onCallbackAuthenticated? with
-      | some onAuth => setCookieHdrs <$> Array.toList <$> ExceptT.mk (onAuth sessPayload.userId sessPayload.claims) | none => pure []
+      | some onAuth => setCookieHeaders <$> Array.toList <$> ExceptT.mk (onAuth sessPayload.userId sessPayload.claims) | none => pure []
     let sessTok ← signSessionCookieV2 signKey sessPayload cfg.sessionTtlSec
-    return setCookieHdrs [SetCookie.clear clearCookieName "/", mkHardenedCookie "qed_session" sessTok cfg.sessionTtlSec cfg.devMode] ++ extraHookCookies
+    return setCookieHeaders [SetCookie.clear clearCookieName "/", mkHardenedCookie "qed_session" sessTok cfg.sessionTtlSec cfg.devMode] ++ extraHookCookies
 
   if req.method == "GET" && pathOnly == cfg.loginPath then
     runRoute do
@@ -249,7 +253,7 @@ def handleAuthRoute (httpExec : HttpExecFn) (rt : OidcRuntime) (req : ParsedReqH
         ("response_type", "code"), ("client_id", cfg.clientId), ("redirect_uri", redirectUri), ("scope", "openid email profile"),
         ("state", state), ("nonce", nonce), ("code_challenge", base64UrlEncode (← Prim.sha256 codeVerifier.toUTF8)), ("code_challenge_method", "S256")]
       return redirectResp (sanitizeHeader (disc.authorizationEndpoint ++ (if disc.authorizationEndpoint.contains "?" then "&" else "?") ++ authQuery))
-        (setCookieHdrs [mkHardenedCookie "qed_auth_tx" txVal 600 cfg.devMode])
+        (setCookieHeaders [mkHardenedCookie "qed_auth_tx" txVal 600 cfg.devMode])
 
   else if req.method == "GET" && pathOnly == cfg.callbackPath then
     runRoute do
@@ -276,7 +280,7 @@ def handleAuthRoute (httpExec : HttpExecFn) (rt : OidcRuntime) (req : ParsedReqH
       let nonce ← Prim.randomHex 24
       let cookieVal ← signHmacEnvelope signKey "ot1" ((← nowSec) + 600) (base64UrlEncode nonce.toUTF8)
       let body := Json.render (Json.obj [("enabled", .bool true), ("clientId", .str cfg.clientId), ("nonce", .str nonce)])
-      return jsonResp 200 body (("Cache-Control", "no-store") :: setCookieHdrs [mkHardenedCookie "qed_onetap_nonce" cookieVal 600 cfg.devMode])
+      return jsonResp 200 body (("Cache-Control", "no-store") :: setCookieHeaders [mkHardenedCookie "qed_onetap_nonce" cookieVal 600 cfg.devMode])
 
   else if req.method == "POST" && pathOnly == "/_qed/auth/onetap" then
     if !cfg.googleOneTapEnabled then return some (jsonResp 404 "{\"error\":\"Google One Tap not enabled\"}")
@@ -293,7 +297,7 @@ def handleAuthRoute (httpExec : HttpExecFn) (rt : OidcRuntime) (req : ParsedReqH
       return jsonResp 200 "{\"ok\":true}" (("Cache-Control", "no-store") :: (← issueSessionHdrs signKey "qed_onetap_nonce" claims))
 
   else if (req.method == "POST" || req.method == "GET") && pathOnly == cfg.logoutPath then
-    let hdrs := setCookieHdrs [SetCookie.clear "qed_session" "/", SetCookie.clear "qed_auth_tx" "/"]
+    let hdrs := setCookieHeaders [SetCookie.clear "qed_session" "/", SetCookie.clear "qed_auth_tx" "/"]
     return some <| match (parseQueryParams queryStr).lookup "returnTo" with
       | some rawRt => redirectResp (sanitizeReturnTo (some rawRt)) hdrs | none => jsonResp 200 "{\"ok\":true}" hdrs
 

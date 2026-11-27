@@ -3,7 +3,7 @@ import Qed.Server.Lower
 namespace Qed.Server
 open Qed.Lang
 
-/-! ## `server` Command Elaborator — Context & Shared Builders (`SrvElabCtx` / `SrvElabM`) -/
+/-! ## `server` Command Elaborator: Context & Shared Builders (`SrvElabCtx` / `SrvElabM`) -/
 
 structure ParsedEnvDecl where
   ident    : Lean.Ident
@@ -59,6 +59,50 @@ structure SrvElabCtx where
 
 abbrev SrvElabM := ReaderT SrvElabCtx Lean.Elab.Command.CommandElabM
 
+structure ParsedFnParams where
+  idents         : Array Lean.Ident
+  tyTerms        : Array Lean.Term
+  defBinders     : Array (Lean.TSyntax `Lean.Parser.Term.bracketedBinder)
+  names          : Array String
+  minParamCount  : Nat
+  hasExplicitCtx : Bool
+  defaultExprs   : Array Lean.Syntax
+  txParams       : Array (Lean.Ident × DatabaseInfo) := #[]
+
+structure LoweredAuthBind where
+  binderId   : Lean.Ident
+  binderName : String
+  extraIds   : Array Lean.Ident
+  extraTys   : Array Lean.Term
+  authInfo?  : Option AuthInfo
+
+structure LoweredRequires where
+  authBind?       : Option LoweredAuthBind := none
+  reqPropTerms    : Array Lean.Term
+  reqHypIds       : Array Lean.Ident
+  reqLabels       : Array String
+  requiresAuth    : Bool
+  clientReqId?    : Option Lean.Ident
+  clientReqConst? : Option Lean.Name
+  clientReqLabel  : String
+
+structure FnEnsSpec where
+  ensId    : Lean.Ident
+  postFn   : Lean.Term → Lean.Elab.Command.CommandElabM Lean.Term
+  labelStr : String
+  tac?     : Option (Lean.TSyntax ``Lean.Parser.Tactic.tacticSeq) := none
+
+structure ElabHandlerRes where
+  runExpr      : Lean.Term
+  targetId     : Lean.Ident
+  isAsync      : Bool
+  allBinderIds : Array Lean.Ident
+  allBinderTys : Array Lean.Term
+  mutatesState : Bool
+  dbWrite      : Bool
+  hasEmit      : Bool
+  hasCookieOp  : Bool := false
+
 private def singleInvLabelStr (invs : Array ParsedInv) : String :=
   let ss := ((invs.filter (!·.2.1)).toList.map (·.2.2)).eraseDups
   if ss.isEmpty then "StateInv" else String.intercalate ", " ss
@@ -109,6 +153,7 @@ def mkBaseLowerCtx (fnName : String) (locals : Array String) (allowAwait allowUn
     services := c.serviceDecls.map fun (a, i) => (a.getId.toString, i),
     ctxTerm?, txDbAliases, isHttpRoute, isStreamRoute }
 
+@[noinline]
 def mkProtoDecodeBind (bytesVar tupleVar : Ident) (tupleTy : Term) (pIdents : Array Ident) (projs : Array Term) (body : Term) : CommandElabM Term := do
   let bound ← (pIdents.zip projs).foldrM (init := body) fun (pid, prj) acc => `(let $pid:ident := $prj; $acc)
   `(match Qed.Proto.decode (α := $tupleTy) $bytesVar with
@@ -136,16 +181,7 @@ def parseSrvParams (ctxLabel tyDescPrefix : String) (rawParams : Array Syntax) (
     idents := idents.push pid; tyTerms := tyTerms.push pty.term; names := names.push pstr
   return (idents, tyTerms, names)
 
-structure ParsedFnParams where
-  idents         : Array Ident
-  tyTerms        : Array Term
-  defBinders     : Array (TSyntax `Lean.Parser.Term.bracketedBinder)
-  names          : Array String
-  minParamCount  : Nat
-  hasExplicitCtx : Bool
-  defaultExprs   : Array Syntax
-  txParams       : Array (Ident × DatabaseInfo) := #[]
-
+@[noinline]
 def parseSrvFnParams (ctxLabel tyDescPrefix : String) (rawParams : Array Syntax)
     (reserved extraShadow : Array String := #[]) (allowExplicitCtx := false) : SrvElabM ParsedFnParams := do
   let c ← read
@@ -350,23 +386,6 @@ def wrapReqs (reqProps : Array Term) (reqHIds : Array Ident) (reqLbls : Array St
     g ← `(if $(reqHIds[ri]!):ident : $(reqProps[ri]!) then $g else $errTerm)
   return g
 
-structure LoweredAuthBind where
-  binderId   : Lean.Ident
-  binderName : String
-  extraIds   : Array Lean.Ident
-  extraTys   : Array Lean.Term
-  authInfo?  : Option AuthInfo
-
-structure LoweredRequires where
-  authBind?       : Option LoweredAuthBind := none
-  reqPropTerms    : Array Term
-  reqHypIds       : Array Ident
-  reqLabels       : Array String
-  requiresAuth    : Bool
-  clientReqId?    : Option Ident
-  clientReqConst? : Option Name
-  clientReqLabel  : String
-
 def LoweredRequires.allBinderIds (r : LoweredRequires) : Array Ident :=
   (r.authBind?.map (·.extraIds) |>.getD #[]) ++ r.reqHypIds
 def LoweredRequires.allBinderTys (r : LoweredRequires) : Array Term :=
@@ -529,6 +548,7 @@ def elabDomainErrorType (fnIdent : Ident) (tagIdents : Array Ident) : SrvElabM I
   liftM <| elabDomProtoInsts errTypeId tagIdents
   return errTypeId
 
+@[noinline]
 def collectServerSecretsAndExts :
     SrvElabM (Array String × Array String × Array (String × String) × Array Name × Array (String × String × Option String)) := do
   let c ← read; let (env, currNs, openDecls) := (← getEnv, ← getCurrNamespace, ← getOpenDecls)
@@ -697,18 +717,14 @@ def elabServerFnInvariants (isAsync : Bool) (fnStr : String) (fnIdent targetId :
     unless (← emitStepRelInv s!"_mutInv{mutIdx}" lbl (← `(($sNewId).$fldId:ident = ($sOldId).$fldId:ident ∨ $miProp)) (← `((($targetCall).1).$fldId:ident = ($sOldId).$fldId:ident ∨ $miProp))) do return false
   return true
 
-structure FnEnsSpec where
-  ensId    : Ident
-  postFn   : Term → CommandElabM Term
-  labelStr : String
-  tac?     : Option (TSyntax ``Lean.Parser.Tactic.tacticSeq) := none
-
+@[noinline]
 def mkStepEnsProofTac (unfoldIds : Array Ident) (fnLit : StrLit) (labelStr : String)
     (tac? : Option (TSyntax ``Lean.Parser.Tactic.tacticSeq)) : CommandElabM (TSyntax ``Lean.Parser.Tactic.tacticSeq) :=
   match tac? with
   | some ts => `(Lean.Parser.Tactic.tacticSeq| qedSrvPrepStep [$[$unfoldIds],*]; first | done | ($ts))
   | none    => `(Lean.Parser.Tactic.tacticSeq| qedSrvProveStep [$[$unfoldIds],*] $fnLit $(Syntax.mkStrLit s!"ensures: {labelStr}"))
 
+@[noinline]
 def mkAsyncEnsProofTac (targetId : Ident) (unfoldIds : Array Ident) (fnLit : StrLit) (labelStr : String)
     (tac? : Option (TSyntax ``Lean.Parser.Tactic.tacticSeq)) : CommandElabM (TSyntax ``Lean.Parser.Tactic.tacticSeq) :=
   match tac? with
@@ -722,17 +738,6 @@ private def deferInvProofs (isA : Bool) (fnStr : String) (fnIdent targetId : Ide
     elabCommand invCmd
     if hasNewErrors (← get).messages c.priorRep c.priorUnrep then return false
     (elabServerFnInvariants isA fnStr fnIdent targetId allBinderIds allBinderTys targetCall).run c
-
-structure ElabHandlerRes where
-  runExpr      : Term
-  targetId     : Ident
-  isAsync      : Bool
-  allBinderIds : Array Ident
-  allBinderTys : Array Term
-  mutatesState : Bool
-  dbWrite      : Bool
-  hasEmit      : Bool
-  hasCookieOp  : Bool := false
 
 def ElabHandlerRes.isReadOnly (r : ElabHandlerRes) : Bool := !r.mutatesState && !r.dbWrite
 
@@ -790,6 +795,7 @@ private def elabAsyncHandler (fnStr : String) (fnIdent invThmId : Ident) (fnLit 
                 targetId := handlerId, isAsync := true, allBinderIds, allBinderTys,
                 mutatesState := !lSt.mutated.isEmpty, dbWrite := lSt.dbWrite, hasEmit, hasCookieOp := lSt.hasCookieOp }
 
+@[noinline]
 def elabServerHandler (isAsync : Bool) (fnStr : String) (fnIdent : Ident)
     (extraBinderIds : Array Ident) (extraBinderTys extraCallArgs : Array Term)
     (payloadTerm errTyTerm : Term) (baseCtx : LowerCtx) (bodyStmts : Array Syntax)

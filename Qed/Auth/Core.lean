@@ -1,7 +1,5 @@
 import Qed.Base64
 import Qed.Json
-import Qed.Proto
-import Qed.Html
 import Qed.Router.Basic
 
 namespace Qed.Auth
@@ -243,5 +241,9 @@ def parseBoolClaim (raw? : Option String) (defaultVal : Bool := false) : Bool :=
   match raw? with | some "true" | some "1" => true | some "false" | some "0" => false | _ => defaultVal
 def parseNatClaim (raw? : Option String) (defaultVal : Nat := 0) : Nat := (raw?.bind String.toNat?).getD defaultVal
 def parseIntClaim (raw? : Option String) (defaultVal : Int := 0) : Int := (raw?.bind String.toInt?).getD defaultVal
+
+theorem option_map_eq_some_elim {α β : Type} {o : Option α} {f : α → β} {b : β} {P : Prop}
+    (h : o.map f = some b) (k : ∀ a, o = some a → f a = b → P) : P := by
+  cases o with | none => cases h | some a => cases h; exact k a rfl rfl
 
 end Qed.Auth

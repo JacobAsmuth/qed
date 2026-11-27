@@ -1,10 +1,6 @@
-import Lean
 import Qed.Base64
-import Qed.Diag
 import Qed.Server.Core
-import Qed.Server.Registry
 import Qed.Server.Db.Core
-import Qed.Verify.Core
 
 namespace Qed.Server.Db
 
@@ -47,11 +43,6 @@ private def decodeFirstCell {α β : Type} [FromSql α] (wrap : α → β) (null
 @[inline, specialize]
 def execDbMaybeTx {m : Type → Type} [MonadServer m] (cfg : DbConfig) (q : SqlQuery) (txId? : Option UInt64 := none) : m (Except ApiError DbResult) :=
   match txId? with | some tid => MonadServer.dbTxExec cfg tid q | none => MonadServer.dbExec cfg q
-
-private theorem progSpec_execDbMaybeTx {σ β : Type} {Inv : σ → Prop} {A : Prop} {Step : σ → σ → Prop} {Post : β → Prop}
-    (cfg : DbConfig) (q : SqlQuery) (txId? : Option UInt64) (k : Except ApiError DbResult → ThreadProg σ β)
-    (hk : ∀ r, ProgSpec Inv A Step Post (k r)) : ProgSpec Inv A Step Post (execDbMaybeTx (m := ThreadProg σ) cfg q txId? >>= k) := by
-  cases txId? with | none => exact .io (.dbExec cfg q) k hk | some tid => exact .io (.dbTxExec cfg tid q) k hk
 
 /-! ## Transparent AES-256-GCM Encryption & Decryption for `encrypted(...)` Columns -/
 
@@ -129,76 +120,6 @@ def dbDecryptResult (encRead : List (Nat × EncColSpec)) (res : DbResult) : m (E
 
 end DbEnc
 
-section DbEncProofs
-variable {σ : Type}
-
-private theorem noAtomic_map {α β : Type} (f : α → β) {p : ThreadProg σ α} (hp : NoAtomic p) : NoAtomic (f <$> p) := by
-  change NoAtomic (p >>= fun a => .pure (f a)); exact hp.bind fun _ _ => NoAtomic.pure _
-
-private theorem noAtomic_mapExceptList {α β : Type} (f : α → ThreadProg σ (Except ApiError β))
-    (hf : ∀ x, NoAtomic (f x)) : ∀ xs, NoAtomic (mapExceptList f xs)
-  | [] => NoAtomic.pure _
-  | x :: xs => (hf x).bind fun | .error _, _ => NoAtomic.pure _ | .ok _, _ => noAtomic_map _ (noAtomic_mapExceptList f hf xs)
-
-private theorem noAtomic_dbEncryptVal (spec : EncColSpec) (v : SqlVal) : NoAtomic (dbEncryptVal (m := ThreadProg σ) spec v) := by
-  cases v <;> first | exact NoAtomic.pure _ | exact noAtomic_map _ (NoAtomic.io _ _ fun _ => NoAtomic.pure _)
-
-private theorem noAtomic_dbDecryptTryPrev (aad raw : ByteArray) (origErr : ApiError) :
-    ∀ ks : List (String × Option String), NoAtomic (dbDecryptTryPrev (m := ThreadProg σ) aad raw origErr ks)
-  | [] => NoAtomic.pure _
-  | (kEnv, fb?) :: rest =>
-      (NoAtomic.io (.readEnv kEnv) _ NoAtomic.pure).bind fun _ _ => by
-        dsimp only; split
-        · exact noAtomic_dbDecryptTryPrev aad raw origErr rest
-        · exact (NoAtomic.io (.aeadDecrypt kEnv fb? aad raw) _ NoAtomic.pure).bind fun
-            | .ok _, _ => NoAtomic.pure _
-            | .error _, _ => noAtomic_dbDecryptTryPrev aad raw origErr rest
-
-private theorem noAtomic_dbDecryptVal (spec : EncColSpec) (v : SqlVal) : NoAtomic (dbDecryptVal (m := ThreadProg σ) spec v) := by
-  cases v <;> try exact NoAtomic.pure _
-  dsimp only [dbDecryptVal]
-  cases Qed.Base64.decode _ with
-  | error _ => exact NoAtomic.pure _
-  | ok raw =>
-      exact (NoAtomic.io (.aeadDecrypt spec.keyEnv spec.fallback? spec.aad raw) _ NoAtomic.pure).bind fun
-        | .ok _, _ => NoAtomic.pure _
-        | .error err, _ => by
-            dsimp only; split
-            · exact NoAtomic.pure _
-            · exact noAtomic_map _ (noAtomic_dbDecryptTryPrev spec.aad raw err spec.prevKeys)
-
-private theorem noAtomic_dbEncryptQuery (encWrite : List (String × EncColSpec)) (q : SqlQuery) :
-    NoAtomic (dbEncryptQuery (m := ThreadProg σ) encWrite q) := by
-  unfold dbEncryptQuery; split
-  · exact NoAtomic.pure _
-  · cases q with
-    | insert _ cols _ | insertOrIgnore _ cols _ _ | upsert _ cols _ _ _ _ =>
-        exact noAtomic_map _ (noAtomic_mapExceptList _ (fun (c, v) => by
-          dsimp only; cases encWrite.lookup c.raw with
-          | none => exact NoAtomic.pure _ | some spec => exact noAtomic_map _ (noAtomic_dbEncryptVal spec v)) cols)
-    | update _ sets _ _ =>
-        exact noAtomic_map _ (noAtomic_mapExceptList _ (fun (c, e) => by
-          dsimp only; cases encWrite.lookup c.raw with
-          | none => exact NoAtomic.pure _
-          | some spec => cases e <;> first | exact NoAtomic.pure _ | exact noAtomic_map _ (noAtomic_dbEncryptVal spec _)) sets)
-    | _ => exact NoAtomic.pure _
-
-private theorem noAtomic_dbDecryptRow :
-    ∀ (encRead : List (Nat × EncColSpec)) (row : DbRow), NoAtomic (dbDecryptRow (m := ThreadProg σ) encRead row)
-  | [], _ => NoAtomic.pure _
-  | (_, spec) :: rest, _ => by
-      dsimp only [dbDecryptRow]; split
-      · exact (noAtomic_dbDecryptVal spec _).bind fun | .error _, _ => NoAtomic.pure _ | .ok _, _ => noAtomic_dbDecryptRow rest _
-      · exact NoAtomic.pure _
-
-private theorem noAtomic_dbDecryptResult (encRead : List (Nat × EncColSpec)) (res : DbResult) :
-    NoAtomic (dbDecryptResult (m := ThreadProg σ) encRead res) := by
-  unfold dbDecryptResult; split
-  · exact NoAtomic.pure _
-  · exact noAtomic_map _ (noAtomic_mapExceptList _ (noAtomic_dbDecryptRow encRead) _)
-
-end DbEncProofs
-
 private abbrev dbArrPost {Row : Type} (P : Row → Prop) : Except ApiError (Array Row) → Prop
   | .ok rows => ∀ r ∈ rows.toList, P r | .error _ => True
 
@@ -241,29 +162,6 @@ def dbRunChecked {α : Type} {P : Prop} {Q : Except ApiError α → Prop} {m : T
 abbrev dbRun {α : Type} {P : Prop} {m : Type → Type} [Monad m] [MonadServer m]
     (cfg : DbConfig) (q : SqlQuery) (txId? : Option UInt64) (post : DbResult → Except ApiError α) (pf : P) : m (Except ApiError α) :=
   dbRunChecked (Q := fun _ => True) cfg q txId? post (fun _ => trivial) (fun _ => trivial) pf
-
-private theorem progSpec_dbRunChecked {σ α : Type} {P : Prop} {Q Post : Except ApiError α → Prop}
-    {Inv : σ → Prop} {A : Prop} {Step : σ → σ → Prop}
-    (cfg : DbConfig) (q : SqlQuery) (txId? : Option UInt64)
-    (post : DbResult → Except ApiError α) (hQPost : ∀ r, Q (post r)) (hQErr : ∀ e, Q (.error e)) (pf : P)
-    (encWrite : List (String × EncColSpec)) (encRead : List (Nat × EncColSpec))
-    (hPost : ∀ r, Post (post r)) (hErr : ∀ e, Post (.error e)) :
-    ProgSpec Inv A Step Post (dbRunChecked (Q := Q) (m := ThreadProg σ) cfg q txId? post hQPost hQErr pf encWrite encRead) :=
-  (ProgSpec.of_noAtomic (noAtomic_dbEncryptQuery encWrite q)).bind fun
-    | .error e, _ => .pure _ (hErr e)
-    | .ok q', _ => progSpec_execDbMaybeTx cfg q' txId? _ fun
-        | .error e => .pure _ (hErr e)
-        | .ok raw => (ProgSpec.of_noAtomic (noAtomic_dbDecryptResult encRead raw)).bind fun
-            | .error e, _ => .pure _ (hErr e)
-            | .ok dec, _ => .pure _ (hPost dec)
-
-instance {σ α : Type} {P : Prop} {Q : Except ApiError α → Prop}
-    (cfg : DbConfig) (q : SqlQuery) (txId? : Option UInt64)
-    (post : DbResult → Except ApiError α) (hPost : ∀ r, Q (post r)) (hErr : ∀ e, Q (.error e)) (pf : P)
-    (encWrite : List (String × EncColSpec)) (encRead : List (Nat × EncColSpec)) :
-    SafeIOEnsures (dbRunChecked (Q := Q) (m := ThreadProg σ) cfg q txId? post hPost hErr pf encWrite encRead) Q where
-  noAtomic := progSpec_dbRunChecked cfg q txId? post hPost hErr pf encWrite encRead (fun _ => trivial) (fun _ => trivial)
-  ensures := progSpec_dbRunChecked cfg q txId? post hPost hErr pf encWrite encRead hPost hErr
 
 private theorem progEffSpec_map {σ α β : Type} {Inv : σ → Prop} {A : Prop} {Step : σ → σ → Prop}
     {EffOk : ServerEffect → Prop} {Q : α → Prop} {Post : β → Prop} {p : ThreadProg σ α}
@@ -417,6 +315,16 @@ theorem progEffSpec_dbRunChecked_bind {σ α β : Type} {P : Prop} {Q : Except A
     ProgEffSpec Inv A Step EffOk Post (dbRunChecked (Q := Q) (m := ThreadProg σ) cfg q txId? post hQPost hQErr pf encWrite encRead >>= k) :=
   (progEffSpec_dbRunChecked cfg q txId? post hQPost hQErr pf encWrite encRead hEnc hDb hDec fun _ h => h).bind hk
 
+instance {σ α : Type} {P : Prop} {Q : Except ApiError α → Prop}
+    (cfg : DbConfig) (q : SqlQuery) (txId? : Option UInt64)
+    (post : DbResult → Except ApiError α) (hPost : ∀ r, Q (post r)) (hErr : ∀ e, Q (.error e)) (pf : P)
+    (encWrite : List (String × EncColSpec)) (encRead : List (Nat × EncColSpec)) :
+    SafeIOEnsures (dbRunChecked (Q := Q) (m := ThreadProg σ) cfg q txId? post hPost hErr pf encWrite encRead) Q where
+  noAtomic := progEffSpec_dbRunChecked cfg q txId? post hPost hErr pf encWrite encRead
+    (.inr (.inr fun _ _ _ _ => trivial)) (fun _ _ => trivial) (.inr ⟨fun _ => trivial, fun _ _ _ _ => trivial⟩) (fun _ _ => trivial)
+  ensures := progEffSpec_dbRunChecked cfg q txId? post hPost hErr pf encWrite encRead
+    (.inr (.inr fun _ _ _ _ => trivial)) (fun _ _ => trivial) (.inr ⟨fun _ => trivial, fun _ _ _ _ => trivial⟩) (fun _ h => h)
+
 private theorem and_inv_pred {Row : Type} {RowInv : Row → Prop} {rowInvBool pred : Row → Bool}
     (hInvSound : ∀ r, rowInvBool r = true → RowInv r) (r : Row) (h : (rowInvBool r && pred r) = true) :
     RowInv r ∧ pred r = true := by simp only [Bool.and_eq_true] at h; exact ⟨hInvSound r h.1, h.2⟩
@@ -471,25 +379,20 @@ abbrev dbFindOne := @dbSelectRun Row m (Option Row) (fun {_} => @dbRunOneRow Row
 
 /-- Policy-verified cross-table `SELECT` / `FIND ONE` / `UPDATE` / `COUNT` / `DELETE` / `AGG`:
     proves `hPolicy : P` (quantified over a database snapshot `Snap`) at compile time while checking `rowInvBool` on returned rows. -/
-abbrev dbSelectP {P : Prop} (cfg : DbConfig) (q : SqlQuery) (decode : DbRow → Except String Row)
-    (RowInv : Row → Prop) (rowInvBool : Row → Bool) (hInvSound : ∀ r, rowInvBool r = true → RowInv r)
-    (hPolicy : P) (txId? : Option UInt64 := none) (encRead : List (Nat × EncColSpec) := []) : m (Except ApiError (Array Row)) :=
-  dbRunRows cfg q decode RowInv rowInvBool hInvSound (fun _ => true) "database row violated verified table invariant" hPolicy txId? [] encRead
+private abbrev dbSelectRunP {Res : Type} (run : DbRowRunner Row Res m) {P : Prop} (cfg : DbConfig) (q : SqlQuery)
+    (decode : DbRow → Except String Row) (RowInv : Row → Prop) (rowInvBool : Row → Bool) (hInvSound : ∀ r, rowInvBool r = true → RowInv r)
+    (hPolicy : P) (txId? : Option UInt64 := none) (encRead : List (Nat × EncColSpec) := []) : m (Except ApiError Res) :=
+  run cfg q decode RowInv rowInvBool hInvSound (fun _ => true) "database row violated verified table invariant" hPolicy txId? [] encRead
 
-abbrev dbFindOneP {P : Prop} (cfg : DbConfig) (q : SqlQuery) (decode : DbRow → Except String Row)
-    (RowInv : Row → Prop) (rowInvBool : Row → Bool) (hInvSound : ∀ r, rowInvBool r = true → RowInv r)
-    (hPolicy : P) (txId? : Option UInt64 := none) (encRead : List (Nat × EncColSpec) := []) : m (Except ApiError (Option Row)) :=
-  dbRunOneRow cfg q decode RowInv rowInvBool hInvSound (fun _ => true) "database row violated verified table invariant" hPolicy txId? [] encRead
+private abbrev dbUpdateRunP {Res : Type} (run : DbRowRunner Row Res m) {P : Prop} (cfg : DbConfig) (q : SqlQuery)
+    (decode : DbRow → Except String Row) (RowInv : Row → Prop) (rowInvBool : Row → Bool) (hInvSound : ∀ r, rowInvBool r = true → RowInv r)
+    (hPolicy : P) (txId? : Option UInt64 := none) (encWrite : List (String × EncColSpec) := []) (encRead : List (Nat × EncColSpec) := []) : m (Except ApiError Res) :=
+  run cfg q decode RowInv rowInvBool hInvSound (fun _ => true) "updated database row violated verified table invariant" hPolicy txId? encWrite encRead
 
-abbrev dbUpdateP {P : Prop} (cfg : DbConfig) (q : SqlQuery) (decode : DbRow → Except String Row)
-    (RowInv : Row → Prop) (rowInvBool : Row → Bool) (hInvSound : ∀ r, rowInvBool r = true → RowInv r)
-    (hPolicy : P) (txId? : Option UInt64 := none) (encWrite : List (String × EncColSpec) := []) (encRead : List (Nat × EncColSpec) := []) : m (Except ApiError (Array Row)) :=
-  dbRunRows cfg q decode RowInv rowInvBool hInvSound (fun _ => true) "updated database row violated verified table invariant" hPolicy txId? encWrite encRead
-
-abbrev dbUpdateOneP {P : Prop} (cfg : DbConfig) (q : SqlQuery) (decode : DbRow → Except String Row)
-    (RowInv : Row → Prop) (rowInvBool : Row → Bool) (hInvSound : ∀ r, rowInvBool r = true → RowInv r)
-    (hPolicy : P) (txId? : Option UInt64 := none) (encWrite : List (String × EncColSpec) := []) (encRead : List (Nat × EncColSpec) := []) : m (Except ApiError (Option Row)) :=
-  dbRunOneRow cfg q decode RowInv rowInvBool hInvSound (fun _ => true) "updated database row violated verified table invariant" hPolicy txId? encWrite encRead
+abbrev dbSelectP := @dbSelectRunP Row m (Array Row) (fun {_} => @dbRunRows Row m _ _ _)
+abbrev dbFindOneP := @dbSelectRunP Row m (Option Row) (fun {_} => @dbRunOneRow Row m _ _ _)
+abbrev dbUpdateP := @dbUpdateRunP Row m (Array Row) (fun {_} => @dbRunRows Row m _ _ _)
+abbrev dbUpdateOneP := @dbUpdateRunP Row m (Option Row) (fun {_} => @dbRunOneRow Row m _ _ _)
 
 abbrev dbSelectProjP {Proj : Type} {P : Prop} (cfg : DbConfig) (q : SqlQuery) (decode : DbRow → Except String Proj)
     (hPolicy : P) (txId? : Option UInt64 := none) (encRead : List (Nat × EncColSpec) := []) : m (Except ApiError (Array Proj)) :=
@@ -664,7 +567,7 @@ section Ops
 variable {Row : Type} {m : Type → Type} [Monad m] [MonadServer m]
 
 private def runDec {α : Type} (h : TableHandle Row) (qRes : Except ApiError SqlQuery) (txId? : Option UInt64)
-    (dec : DbResult → Except ApiError α) (doEnc doDec : Bool) : m (Except ApiError α) := do
+    (dec : DbResult → Except ApiError α) (doEnc doDec : Bool) (encRead? : Option (List (Nat × EncColSpec)) := none) : m (Except ApiError α) := do
   match qRes with
   | .error e => return .error e
   | .ok q =>
@@ -675,15 +578,19 @@ private def runDec {α : Type} (h : TableHandle Row) (qRes : Except ApiError Sql
           match ← execDbMaybeTx h.config qEnc txId? with
           | .error e => return .error e
           | .ok dbRes =>
-              let decRes ← if doDec then dbDecryptResult h.encRead dbRes else pure (.ok dbRes)
+              let er := encRead?.getD (if doDec then h.encRead else [])
+              let decRes ← if er.isEmpty then pure (.ok dbRes) else dbDecryptResult er dbRes
               return decRes.bind dec
+
+private def mkSelectQuery (h : TableHandle Row) (cols : List SqlIdent) (where_ : DbFilter)
+    (orderBy? : Option (String × Bool)) (limit? offset? : Option Nat) : Except ApiError SqlQuery := do
+  let wExpr ← where_.toSqlExpr h.tableName.raw h.columns
+  let ob ← orderBy?.mapM fun (col, asc) => (·, if asc then SqlOrderDir.asc else SqlOrderDir.desc) <$> h.resolveCol col
+  return .select h.tableName cols wExpr ob limit? offset?
 
 def select (h : TableHandle Row) (where_ : DbFilter := .litTrue) (orderBy? : Option (String × Bool) := none)
     (limit? : Option Nat := none) (offset? : Option Nat := none) (txId? : Option UInt64 := none) : m (Except ApiError (Array Row)) :=
-  runDec h (do
-    let wExpr ← where_.toSqlExpr h.tableName.raw h.columns
-    let ob ← orderBy?.mapM fun (col, asc) => (·, if asc then SqlOrderDir.asc else SqlOrderDir.desc) <$> h.resolveCol col
-    return .select h.tableName h.columns wExpr ob limit? offset?) txId?
+  runDec h (mkSelectQuery h h.columns where_ orderBy? limit? offset?) txId?
     (decodeCheckedArr (decodeRowErr h.decodeRow) h.rowInvBool s!"database row in `{h.tableName.raw}` violated table invariant")
     (doEnc := false) (doDec := true)
 
@@ -694,23 +601,15 @@ def findOne (h : TableHandle Row) (where_ : DbFilter) (orderBy? : Option (String
 def selectProjected {Proj : Type} (h : TableHandle Row) (cols : List String)
     (decode : DbRow → Except String Proj) (where_ : DbFilter := .litTrue)
     (orderBy? : Option (String × Bool) := none) (limit? : Option Nat := none) (offset? : Option Nat := none)
-    (txId? : Option UInt64 := none) : m (Except ApiError (Array Proj)) := do
-  let qRes : Except ApiError (SqlQuery × List (Nat × EncColSpec)) := do
-    if cols.isEmpty then throw (ApiError.badRequest s!"projected select on `{h.tableName.raw}` requires at least one column")
-    let colIds ← cols.mapM h.resolveCol
-    let wExpr ← where_.toSqlExpr h.tableName.raw h.columns
-    let ob ← orderBy?.mapM fun (col, asc) => (·, if asc then SqlOrderDir.asc else SqlOrderDir.desc) <$> h.resolveCol col
-    let projEncRead : List (Nat × EncColSpec) := (colIds.zipIdx).filterMap fun (cid, i) =>
-      (h.encWrite.lookup cid.raw).map (i, ·)
-    return (.select h.tableName colIds wExpr ob limit? offset?, projEncRead)
-  match qRes with
-  | .error e => return .error e
-  | .ok (q, projEncRead) =>
-      match ← execDbMaybeTx h.config q txId? with
-      | .error e => return .error e
-      | .ok dbRes =>
-          let decRes ← if projEncRead.isEmpty then pure (.ok dbRes) else dbDecryptResult projEncRead dbRes
-          return decRes.bind fun dr => (dr.rows.toList.mapM (decodeRowErr decode)).map List.toArray
+    (txId? : Option UInt64 := none) : m (Except ApiError (Array Proj)) :=
+  match (if cols.isEmpty then .error (ApiError.badRequest s!"projected select on `{h.tableName.raw}` requires at least one column")
+         else cols.mapM h.resolveCol) with
+  | .error e => pure (.error e)
+  | .ok colIds =>
+      let projEncRead := colIds.zipIdx.filterMap fun (cid, i) => (h.encWrite.lookup cid.raw).map (i, ·)
+      runDec h (mkSelectQuery h colIds where_ orderBy? limit? offset?) txId?
+        (fun dr => (dr.rows.toList.mapM (decodeRowErr decode)).map List.toArray)
+        (doEnc := false) (doDec := false) (encRead? := some projEncRead)
 
 def count (h : TableHandle Row) (where_ : DbFilter := .litTrue) (txId? : Option UInt64 := none) : m (Except ApiError Nat) :=
   runDec h (do return .count h.tableName (← where_.toSqlExpr h.tableName.raw h.columns)) txId?
@@ -793,54 +692,5 @@ def withTransaction {m : Type → Type} {α : Type} [Monad m] [MonadServer m]
       match ← body tid with
       | .error e => MonadServer.dbTxRollback cfg tid; return .error e
       | .ok v => (·.map fun () => v) <$> MonadServer.dbTxCommit cfg tid
-
-def sqlCmpOps : Array (String × Lean.Name) := #[
-  ("==", `Qed.Server.Db.SqlBinOp.eq), ("!=", `Qed.Server.Db.SqlBinOp.ne), ("<", `Qed.Server.Db.SqlBinOp.lt),
-  ("<=", `Qed.Server.Db.SqlBinOp.le), (">", `Qed.Server.Db.SqlBinOp.gt), (">=", `Qed.Server.Db.SqlBinOp.ge)]
-
-open Lean Elab Command in
-def mkSqlIdentTerm (ref : Syntax) (raw : String) : CommandElabM Term := do
-  if !isSafeSqlIdent raw then
-    throwErrorAt ref s!"invalid SQL identifier `{raw}` (must start with an ASCII letter or `_` and contain only ASCII letters, digits, and `_`, max 63 chars)"
-  `(Qed.Server.Db.SqlIdent.mk $(Syntax.mkStrLit raw) (by decide))
-
-open Lean in
-@[noinline, nospecialize]
-def mkTypedSqlParamTerm {M : Type → Type} [Monad M] [MonadQuotation M] (rowTyId fId : Ident) (valT : Term) : M Term :=
-  `(Qed.Server.Db.SqlExpr.param (Qed.Server.Db.toSqlLike (fun (_r : $rowTyId) => _r.$fId) $valT))
-
-open Lean Elab Command in
-@[noinline]
-def mkEncColSpecTerm (tableName colName : String) (ek : DbEncKeyInfo) : CommandElabM Term := do
-  let prevTs ← ek.prevKeys.toArray.mapM fun (k, fb?) => `(($(Syntax.mkStrLit k), $(quote fb?)))
-  `({ keyEnv := $(Syntax.mkStrLit ek.keyEnv), fallback? := $(quote ek.fallback?), aad := ($(Syntax.mkStrLit s!"{tableName}.{colName}") : String).toUTF8, isBytes := $(quote ek.isBytes), prevKeys := [$[$prevTs:term],*] : Qed.Server.Db.EncColSpec })
-
-syntax (name := qedDbProveTac) "qedDbProve" "[" ident,* "]" str str str : tactic
-
-open Lean Meta Elab Tactic in
-@[tactic qedDbProveTac]
-def elabQedDbProve : Tactic := fun stx => do
-  let unfoldNames ← (stx.getArg 2).getSepArgs.mapM resolveGlobalConstNoOverload
-  let simpNames := Qed.Verify.Core.dbBaseSimpNames.push ``eq_self
-  let simprocs := #[``Qed.Server.qedReduceStrLen]
-  -- Pass 1: Keep user pure `let` bindings opaque (`zetaDelta := false`), only expanding `_insRow`,
-  -- so `whnf` never unfolds string/helper internals on symbolic inputs.
-  let okOpaque ← Qed.Verify.Core.tryRestoreM false id do
-    let g0 ← getMainGoal
-    let g1 ← g0.withContext do
-      let mut fvs : Array FVarId := #[]
-      for ld in (← getLCtx) do
-        if ld.isLet && ld.userName.eraseMacroScopes == `_insRow then fvs := fvs.push ld.fvarId
-      if fvs.isEmpty then pure g0 else g0.replaceTargetDefEq (← Meta.zetaDeltaFVars (← instantiateMVars (← g0.getType)) fvs)
-    replaceMainGoal [g1]
-    Qed.Verify.Core.solveWithUnfolds unfoldNames simpNames simprocs
-      (simpCfg := { zetaDelta := false }) (harvestFacts := true) (scanLCtxValues := false) (clearErrorsOnFail := true)
-  if okOpaque then return
-  if !(← Qed.Verify.Core.solveWithUnfolds unfoldNames simpNames simprocs (harvestFacts := true)) then
-    Qed.Diag.throwUnsolvedGoals
-      m!"Database {(⟨stx.getArg 4⟩ : TSyntax `str).getString} failed in `{(⟨stx.getArg 5⟩ : TSyntax `str).getString}`:"
-      m!"\n\nHint: {(⟨stx.getArg 6⟩ : TSyntax `str).getString}"
-      (ref? := some stx) (stripPrefixes := ["_row", "_old", "_new", "r"]) (bulletPrefix := "  • must prove: ")
-      (goals? := some [(← getUnsolvedGoals).headD (← getMainGoal)])
 
 end Qed.Server.Db

@@ -36,7 +36,7 @@ instance {σ : Type} (svc base method : String) (parts : List PathPart) (query :
     unfold execExternalRaw
     cases buildExternalSuffix parts query with
     | error e => exact .pure (Except.error e)
-    | ok sfx => exact .io (.httpCall _) _ fun res => .pure (res.bind (checkHttpOk okStatuses))
+    | ok sfx => exact NoAtomic.io (.httpCall _) _ fun res => .pure (res.bind (checkHttpOk okStatuses))
 
 @[specialize] def decodeRespBytes (res : Except ApiError OutboundResp) : Except ApiError Bytes := res.map (·.body)
 @[specialize] def decodeRespUnit (res : Except ApiError OutboundResp) : Except ApiError Unit := res.map fun _ => ()
@@ -83,32 +83,10 @@ def postBytes {m : Type → Type} [Monad m] [MonadServer m] (url : WebhookUrl) (
 
 instance {σ Payload Resp : Type} [ToJson Payload] [FromJson Resp] (url : WebhookUrl) (payload : Payload) :
     SafeIO (postJson (Payload := Payload) (Resp := Resp) (m := ThreadProg σ) url payload) where
-  noAtomic := by unfold postJson postRaw; exact .io (.httpCall _) _ fun res => .pure (decodeRespJson (res.bind checkHttpOk))
+  noAtomic := by unfold postJson postRaw; exact NoAtomic.io (.httpCall _) _ fun res => .pure (decodeRespJson (res.bind checkHttpOk))
 
 instance {σ : Type} (url : WebhookUrl) (mime : String) (body : Bytes) : SafeIO (postBytes (m := ThreadProg σ) url mime body) where
-  noAtomic := by unfold postBytes postRaw; exact .io (.httpCall _) _ fun res => .pure (decodeRespBytes (res.bind checkHttpOk))
-
-theorem progEffSpec_postRaw {σ : Type} {Inv : σ → Prop} {A : Prop} {Step : σ → σ → Prop}
-    {EffOk : ServerEffect → Prop} {Post : Except ApiError OutboundResp → Prop}
-    (url : WebhookUrl) (headers : List (String × String)) (body : Bytes)
-    (hHttp : ∀ req, EffOk (.httpCall req)) (hPost : ∀ r, Post r) :
-    ProgEffSpec Inv A Step EffOk Post (postRaw (m := ThreadProg σ) url headers body) :=
-  .io (.httpCall _) _ (hHttp _) fun res => .pure _ (hPost (res.bind checkHttpOk))
-
-theorem progEffSpec_postJson {σ Payload Resp : Type} [ToJson Payload] [FromJson Resp]
-    {Inv : σ → Prop} {A : Prop} {Step : σ → σ → Prop}
-    {EffOk : ServerEffect → Prop} {Post : Except ApiError Resp → Prop}
-    (url : WebhookUrl) (payload : Payload)
-    (hHttp : ∀ req, EffOk (.httpCall req)) (hPost : ∀ r, Post r) :
-    ProgEffSpec Inv A Step EffOk Post (postJson (Payload := Payload) (Resp := Resp) (m := ThreadProg σ) url payload) :=
-  (progEffSpec_postRaw url _ _ hHttp fun _ => trivial).bind fun res _ => .pure _ (hPost (decodeRespJson res))
-
-theorem progEffSpec_postBytes {σ : Type} {Inv : σ → Prop} {A : Prop} {Step : σ → σ → Prop}
-    {EffOk : ServerEffect → Prop} {Post : Except ApiError Bytes → Prop}
-    (url : WebhookUrl) (mime : String) (body : Bytes)
-    (hHttp : ∀ req, EffOk (.httpCall req)) (hPost : ∀ r, Post r) :
-    ProgEffSpec Inv A Step EffOk Post (postBytes (m := ThreadProg σ) url mime body) :=
-  (progEffSpec_postRaw url _ _ hHttp fun _ => trivial).bind fun res _ => .pure _ (hPost (decodeRespBytes res))
+  noAtomic := by unfold postBytes postRaw; exact NoAtomic.io (.httpCall _) _ fun res => .pure (decodeRespBytes (res.bind checkHttpOk))
 
 end Webhook
 
@@ -130,6 +108,31 @@ section ExternalElab
 open Lean Elab Command
 
 @[noinline]
+private def parseBraceTemplate (ref : Syntax) (src ctxDesc : String)
+    (onLit : String → CommandElabM Unit) (onPh : String → CommandElabM String) : CommandElabM (Array UrlSegPiece) := do
+  let mut pieces : Array UrlSegPiece := #[]
+  let mut curLit : Array Char := #[]; let mut curPh : Array Char := #[]; let mut inBrace := false
+  let flushLit (buf : Array Char) (ps : Array UrlSegPiece) : CommandElabM (Array UrlSegPiece) := do
+    if buf.isEmpty then return ps
+    let lit := String.ofList buf.toList
+    onLit lit
+    return ps.push (.lit lit)
+  for c in src.toList do
+    if inBrace then
+      if c == '{' then throwErrorAt ref s!"nested `\{` in {ctxDesc}"
+      else if c == '}' then
+        let pn ← onPh (String.ofList curPh.toList)
+        pieces := pieces.push (.param pn); curPh := #[]; inBrace := false
+      else curPh := curPh.push c
+    else
+      if c == '}' then throwErrorAt ref s!"unmatched `}` in {ctxDesc}"
+      else if c == '{' then
+        pieces ← flushLit curLit pieces; curLit := #[]; inBrace := true
+      else curLit := curLit.push c
+  if inBrace then throwErrorAt ref s!"unclosed `\{` in {ctxDesc}"
+  flushLit curLit pieces
+
+@[noinline]
 private def parseUrlTemplate (ref : Syntax) (tmpl : String) : CommandElabM (Array UrlSegSpec × Array (String × QueryValSpec) × Array String) := do
   if tmpl.contains '#' then throwErrorAt ref "external endpoint URL template must not contain `#` fragments"
   if !tmpl.startsWith "/" then throwErrorAt ref s!"external endpoint path `{tmpl}` must start with `/`"
@@ -145,35 +148,14 @@ private def parseUrlTemplate (ref : Syntax) (tmpl : String) : CommandElabM (Arra
     if (← phRef.get).contains pname then throwErrorAt ref s!"duplicate placeholder `{pname}` in `{tmpl}`"
     phRef.modify (·.push pname); return (pname, isMulti)
   let parseBraceSeg (seg : String) : CommandElabM UrlSegSpec := do
-    let mut pieces : Array UrlSegPiece := #[]
-    let mut curLit : Array Char := #[]
-    let mut curPh : Array Char := #[]
-    let mut inBrace := false
-    let mut wildName? : Option String := none
-    for c in seg.toList do
-      if inBrace then
-        if c == '{' then throwErrorAt ref s!"nested `\{` in URL path segment `{seg}` of `{tmpl}`"
-        else if c == '}' then
-          let raw := String.ofList curPh.toList
-          let (pn, isMulti) ← registerPh raw "`{...}`" true
-          if isMulti then wildName? := some pn
-          pieces := pieces.push (.param pn); curPh := #[]; inBrace := false
-        else curPh := curPh.push c
-      else
-        if c == '}' then throwErrorAt ref s!"unmatched `}` in URL path segment `{seg}` of `{tmpl}`"
-        else if c == '{' then
-          if !curLit.isEmpty then
-            let lit := String.ofList curLit.toList
-            unless lit.toList.all isSafeLitSegChar do throwErrorAt ref s!"invalid static URL path text `{lit}` in `{tmpl}`"
-            pieces := pieces.push (.lit lit); curLit := #[]
-          inBrace := true
-        else curLit := curLit.push c
-    if inBrace then throwErrorAt ref s!"unclosed `\{` in URL path segment `{seg}` of `{tmpl}`"
-    if !curLit.isEmpty then
-      let lit := String.ofList curLit.toList
-      unless lit.toList.all isSafeLitSegChar do throwErrorAt ref s!"invalid static URL path text `{lit}` in `{tmpl}`"
-      pieces := pieces.push (.lit lit)
-    if let some wn := wildName? then
+    let wildRef ← IO.mkRef (none : Option String)
+    let pieces ← parseBraceTemplate ref seg s!"URL path segment `{seg}` of `{tmpl}`"
+      (fun lit => unless lit.toList.all isSafeLitSegChar do throwErrorAt ref s!"invalid static URL path text `{lit}` in `{tmpl}`")
+      (fun raw => do
+        let (pn, isMulti) ← registerPh raw "`{...}`" true
+        if isMulti then wildRef.set (some pn)
+        return pn)
+    if let some wn ← wildRef.get then
       if pieces.size != 1 then throwErrorAt ref s!"multi-segment wildcard `\{{wn}*}` must occupy an entire path segment in `{tmpl}`"
       return .multiParam wn
     if pieces.size == 1 then match pieces[0]! with
@@ -227,26 +209,12 @@ private def ParsedBaseSpec.isTotal  (b : ParsedBaseSpec) : Bool := b.vars.all fu
 
 @[noinline]
 private def parseBaseTemplatePieces (ref : Syntax) (tmpl : String) : CommandElabM (Array UrlSegPiece × Array String) := do
-  let mut pieces : Array UrlSegPiece := #[]; let mut vars : Array String := #[]
-  let mut curLit : Array Char := #[]; let mut curVar : Array Char := #[]; let mut inBrace := false
-  for c in tmpl.toList do
-    if inBrace then
-      if c == '{' then throwErrorAt ref s!"nested `\{` in `base` URL template `{tmpl}`"
-      else if c == '}' then
-        let vn := String.ofList curVar.toList
-        if vn.isEmpty then throwErrorAt ref s!"empty `\{}` placeholder in `base` URL template `{tmpl}`"
-        if vars.contains vn then throwErrorAt ref s!"duplicate placeholder `\{{vn}}` in `base` URL template `{tmpl}`"
-        vars := vars.push vn; pieces := pieces.push (.param vn); curVar := #[]; inBrace := false
-      else curVar := curVar.push c
-    else
-      if c == '}' then throwErrorAt ref s!"unmatched `}` in `base` URL template `{tmpl}`"
-      else if c == '{' then
-        if !curLit.isEmpty then pieces := pieces.push (.lit (String.ofList curLit.toList)); curLit := #[]
-        inBrace := true
-      else curLit := curLit.push c
-  if inBrace then throwErrorAt ref s!"unclosed `\{` in `base` URL template `{tmpl}`"
-  if !curLit.isEmpty then pieces := pieces.push (.lit (String.ofList curLit.toList))
-  return (pieces, vars)
+  let varsRef ← IO.mkRef (#[] : Array String)
+  let pieces ← parseBraceTemplate ref tmpl s!"`base` URL template `{tmpl}`" (fun _ => pure ()) fun vn => do
+    if vn.isEmpty then throwErrorAt ref s!"empty `\{}` placeholder in `base` URL template `{tmpl}`"
+    if (← varsRef.get).contains vn then throwErrorAt ref s!"duplicate placeholder `\{{vn}}` in `base` URL template `{tmpl}`"
+    varsRef.modify (·.push vn); return vn
+  return (pieces, ← varsRef.get)
 
 private def expandBaseOrigins (ref : Syntax) (svcName : Name) (pieces : Array UrlSegPiece) (vars : Array BaseTemplateVar) :
     CommandElabM (Array String) := do
@@ -354,6 +322,7 @@ private def parseExternalClauses (svcIdent : Ident) (svcName : Name) (clauses : 
   if !wsClauses.isEmpty && hasAuth then throwErrorAt svcIdent s!"`external {svcName}` declares client-usable `ws` channels and cannot attach server `auth` secrets; split server-authenticated HTTP endpoints into a separate `external` block"
   return (baseSpec, authSpec, ssrfGuard?.getD true, epClauses, wsClauses)
 
+@[noinline]
 private def lowerUrlParts (ref : Syntax) (segSpecs : Array UrlSegSpec) (querySpecs : Array (String × QueryValSpec)) (paramIdents : Array Ident) :
     CommandElabM (Array Term × Array Term) := do
   let findParam (pn : String) : CommandElabM Ident := do
@@ -375,6 +344,7 @@ private def lowerUrlParts (ref : Syntax) (segSpecs : Array UrlSegSpec) (querySpe
     | .param pn => do `(($(Syntax.mkStrLit qk), Qed.Server.ToQueryVal.toQueryVal $(← findParam pn)))
   return (pathTerms, queryTerms)
 
+@[noinline]
 private def parseTypedParams (ctxLabel : String) (rawParams : Array Syntax) (allowExtKinds := false) (paramKind := "parameter") : CommandElabM (Array ParsedExtParam) := do
   let mut out : Array ParsedExtParam := #[]; let mut seen : Array String := #[]
   for rp in rawParams do
@@ -451,7 +421,7 @@ private def elabBaseOriginResolver (svcIdent : Ident) (svcName : Name) (baseSpec
       theorem $validId $[($vIds:ident : $vTys:term)]* : Qed.Server.isValidBaseOrigin ($resolveId $vIdTerms*) = true := by
         unfold $resolveId
         $[$casesTacs:tactic]*
-        all_goals decide))
+        all_goals rfl))
   else
     let strVars := baseSpec.vars.filter fun v => match v.domain with | .strList _ => true | .unitEnum .. => false
     let origId := mkIdent `_orig; let hId := mkIdent `_h
@@ -469,7 +439,7 @@ private def elabBaseOriginResolver (svcIdent : Ident) (svcName : Name) (baseSpec
           pure (t', pf')
       else
         let cTerm ← mkConcatTerm subst
-        let decPf ← if casesTacs.isEmpty then `(by decide) else `(by $[$casesTacs:tactic];*; all_goals decide)
+        let decPf ← if casesTacs.isEmpty then `(rfl) else `(by $[$casesTacs:tactic];*; all_goals rfl)
         let leafPf ← `(Qed.Server.validOrigin_of_ok (s := $cTerm) $decPf)
         pure (← `(Except.ok $cTerm), leafPf)
     let (bodyT, bodyPf) ← buildBranch 0 #[]

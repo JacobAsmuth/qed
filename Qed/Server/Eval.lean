@@ -17,23 +17,16 @@ private def hexDigitChar (n : Nat) : Char :=
   let d := n % 16
   if d < 10 then Char.ofNat (48 + d) else Char.ofNat (87 + d)
 
-private def repeatHexAux (seed : Nat) : Nat → List Char → List Char
+private def prngBytesAux (seed : Nat) : Nat → List UInt8 → List UInt8
   | 0, acc => acc.reverse
-  | n + 1, acc =>
-      let b := (seed * 31 + n * 17 + 7) % 256
-      repeatHexAux (seed + 1) n (hexDigitChar (b % 16) :: hexDigitChar (b / 16) :: acc)
+  | n + 1, acc => prngBytesAux (seed + 1) n (UInt8.ofNat ((seed * 31 + n * 17 + 7) % 256) :: acc)
 
 def mockRandomHex (counter : Nat) (bytes : UInt32) : String :=
-  String.ofList (repeatHexAux (counter + 1) bytes.toNat [])
-
-private def repeatBytesAux (seed : Nat) : Nat → List UInt8 → List UInt8
-  | 0, acc => acc.reverse
-  | n + 1, acc =>
-      let b : UInt8 := UInt8.ofNat ((seed * 31 + n * 17 + 7) % 256)
-      repeatBytesAux (seed + 1) n (b :: acc)
+  String.ofList ((prngBytesAux (counter + 1) bytes.toNat []).flatMap fun b =>
+    [hexDigitChar (b.toNat / 16), hexDigitChar (b.toNat % 16)])
 
 def mockRandomBytes (counter : Nat) (bytes : UInt32) : ByteArray :=
-  ByteArray.mk (repeatBytesAux (counter + 1) bytes.toNat []).toArray
+  ByteArray.mk (prngBytesAux (counter + 1) bytes.toNat []).toArray
 
 private def mix32List (bs : List UInt8) (acc : List UInt8) (i : Nat) : List UInt8 :=
   match bs with
@@ -304,119 +297,77 @@ private def deleteRowsAux (db : MemDb) (tn : SqlIdent) (cols : List String)
 
 def evalSqlQuery (cfg : DbConfig) (db0 : MemDb) (q : SqlQuery) : MemDb × Except ApiError DbResult :=
   let db := db0.ensureTables cfg.tables
-  let getTbl (tn : SqlIdent) : Except ApiError MemTable :=
+  let withTbl (tn : SqlIdent) (f : MemTable → MemDb × Except ApiError DbResult) : MemDb × Except ApiError DbResult :=
     match db.findTable tn.raw with
-    | some t => .ok t
-    | none => .error (ApiError.internal s!"unknown table `{tn.raw}` in in-memory evaluator")
+    | some t => f t
+    | none => (db, .error (ApiError.internal s!"unknown table `{tn.raw}` in in-memory evaluator"))
+  let filterRows (t : MemTable) (tn : SqlIdent) (w : SqlExpr) : List DbRow :=
+    t.rows.filter fun r => sqlValToBool (evalSqlExpr db [(tn.raw, t.columns, r)] 64 w)
+  let uniqueCols (tn : SqlIdent) : List SqlIdent :=
+    match cfg.tables.find? (·.name.raw == tn.raw) with
+    | some ts => (ts.columns.filter fun (c : ColumnSchema) => c.isPrimaryKey || c.isUnique).map (·.name)
+    | none => []
+  let hasSingleColConflict (t : MemTable) (cols : List SqlIdent) (newRow : DbRow) : Bool :=
+    cols.any fun pc => t.rows.any fun r => getRowCol t.columns r pc.raw == getRowCol t.columns newRow pc.raw
+  let appendRow (t : MemTable) (newRow : DbRow) (ret : List SqlIdent) : MemDb × Except ApiError DbResult :=
+    let retRows := if ret.isEmpty then #[] else #[projectRow t.columns ret newRow]
+    (db.upsertTable { t with rows := t.rows ++ [newRow] }, .ok { rows := retRows, affected := 1 })
+  let runSelect (tn : SqlIdent) (cols? : Option (List SqlIdent)) (w : SqlExpr)
+      (ob : Option (SqlIdent × SqlOrderDir)) (lim off : Option Nat) :=
+    withTbl tn fun t =>
+      let sliced := sliceRows lim off (sortRowsBy t.columns ob (filterRows t tn w))
+      let out := match cols? with | some cols => sliced.map (projectRow t.columns cols) | none => sliced
+      (db, .ok { rows := out.toArray, affected := out.length })
   match q with
-  | .select tn cols w ob lim off =>
-      match getTbl tn with
-      | .error e => (db, .error e)
-      | .ok t =>
-          let matched := t.rows.filter fun r => sqlValToBool (evalSqlExpr db [(tn.raw, t.columns, r)] 64 w)
-          let out := (sliceRows lim off (sortRowsBy t.columns ob matched)).map (projectRow t.columns cols)
-          (db, .ok { rows := out.toArray, affected := out.length })
-  | .selectAll tn w ob lim off =>
-      match getTbl tn with
-      | .error e => (db, .error e)
-      | .ok t =>
-          let matched := t.rows.filter fun r => sqlValToBool (evalSqlExpr db [(tn.raw, t.columns, r)] 64 w)
-          let out := sliceRows lim off (sortRowsBy t.columns ob matched)
-          (db, .ok { rows := out.toArray, affected := out.length })
-  | .count tn w =>
-      match getTbl tn with
-      | .error e => (db, .error e)
-      | .ok t =>
-          let n := (t.rows.filter fun r => sqlValToBool (evalSqlExpr db [(tn.raw, t.columns, r)] 64 w)).length
-          (db, .ok { rows := #[#[.int (Int.ofNat n)]], affected := 1 })
-  | .aggregate op tn col w =>
-      match getTbl tn with
-      | .error e => (db, .error e)
-      | .ok t =>
-          let vals := (t.rows.filter fun r => sqlValToBool (evalSqlExpr db [(tn.raw, t.columns, r)] 64 w)).filterMap fun r =>
-            sqlValToInt? (getRowCol t.columns r col.raw)
-          let aggVal : SqlVal := match op, vals with
-            | .sum, vs => .int (vs.foldl (· + ·) 0)
-            | .min, [] => .null
-            | .min, v :: vs => .int (vs.foldl min v)
-            | .max, [] => .null
-            | .max, v :: vs => .int (vs.foldl max v)
-          (db, .ok { rows := #[#[aggVal]], affected := 1 })
+  | .select tn cols w ob lim off => runSelect tn (some cols) w ob lim off
+  | .selectAll tn w ob lim off => runSelect tn none w ob lim off
+  | .count tn w => withTbl tn fun t =>
+      (db, .ok { rows := #[#[.int (Int.ofNat (filterRows t tn w).length)]], affected := 1 })
+  | .aggregate op tn col w => withTbl tn fun t =>
+      let vals := (filterRows t tn w).filterMap fun r => sqlValToInt? (getRowCol t.columns r col.raw)
+      let aggVal : SqlVal := match op, vals with
+        | .sum, vs => .int (vs.foldl (· + ·) 0)
+        | .min, [] | .max, [] => .null
+        | .min, v :: vs => .int (vs.foldl min v)
+        | .max, v :: vs => .int (vs.foldl max v)
+      (db, .ok { rows := #[#[aggVal]], affected := 1 })
   | .joinSelect lt rt lCols rCols lJc rJc lW rW ob lim off =>
-      match getTbl lt, getTbl rt with
-      | .ok tL, .ok tR =>
-          let pairs := tL.rows.flatMap fun rl =>
-            if !sqlValToBool (evalSqlExpr db [(lt.raw, tL.columns, rl)] 64 lW) then []
-            else
-              let lv := getRowCol tL.columns rl lJc.raw
-              tR.rows.filterMap fun rr =>
-                if getRowCol tR.columns rr rJc.raw == lv && sqlValToBool (evalSqlExpr db [(rt.raw, tR.columns, rr), (lt.raw, tL.columns, rl)] 64 rW) then
-                  some (rl, rr)
-                else none
-          let combinedCols := lCols.map (·.raw) ++ rCols.map (·.raw)
-          let rows := pairs.map fun (rl, rr) =>
-            (lCols.map (fun c => getRowCol tL.columns rl c.raw) ++ rCols.map (fun c => getRowCol tR.columns rr c.raw)).toArray
-          let out := sliceRows lim off (sortRowsBy combinedCols ob rows)
-          (db, .ok { rows := out.toArray, affected := out.length })
-      | .error e, _ | _, .error e => (db, .error e)
-  | .insert tn pairs ret =>
-      match getTbl tn with
-      | .error e => (db, .error e)
-      | .ok t =>
-          let newRow := buildRowFromPairs t.columns pairs
-          let pkCols : List SqlIdent := match cfg.tables.find? (·.name.raw == tn.raw) with
-            | some ts => (ts.columns.filter fun (c : ColumnSchema) => c.isPrimaryKey || c.isUnique).map (·.name)
-            | none => []
-          let dup := pkCols.any fun pc => t.rows.any fun r => getRowCol t.columns r pc.raw == getRowCol t.columns newRow pc.raw
-          if dup then (db, .error ⟨409, s!"unique constraint violation on `{tn.raw}`"⟩)
+      withTbl lt fun tL => withTbl rt fun tR =>
+        let pairs := tL.rows.flatMap fun rl =>
+          if !sqlValToBool (evalSqlExpr db [(lt.raw, tL.columns, rl)] 64 lW) then []
           else
-            let db' := db.upsertTable { t with rows := t.rows ++ [newRow] }
-            let retRows := if ret.isEmpty then #[] else #[projectRow t.columns ret newRow]
-            (db', .ok { rows := retRows, affected := 1 })
-  | .insertOrIgnore tn pairs conflictCols ret =>
-      match getTbl tn with
-      | .error e => (db, .error e)
-      | .ok t =>
-          let newRow := buildRowFromPairs t.columns pairs
-          let cCols : List SqlIdent := if !conflictCols.isEmpty then conflictCols
-            else match cfg.tables.find? (·.name.raw == tn.raw) with
-              | some ts => (ts.columns.filter fun (c : ColumnSchema) => c.isPrimaryKey || c.isUnique).map (·.name)
-              | none => []
-          let existsMatch :=
-            if !conflictCols.isEmpty then t.rows.any (conflictMatches t.columns cCols · newRow)
-            else cCols.any fun pc => t.rows.any fun r => getRowCol t.columns r pc.raw == getRowCol t.columns newRow pc.raw
-          if existsMatch then (db, .ok { rows := #[], affected := 0 })
-          else
-            let db' := db.upsertTable { t with rows := t.rows ++ [newRow] }
-            let retRows := if ret.isEmpty then #[] else #[projectRow t.columns ret newRow]
-            (db', .ok { rows := retRows, affected := 1 })
-  | .upsert tn pairs conflictCols updateCols conflictWhere? ret =>
-      match getTbl tn with
-      | .error e => (db, .error e)
-      | .ok t =>
-          let newRow := buildRowFromPairs t.columns pairs
-          if t.rows.any (conflictMatches t.columns conflictCols · newRow) then
-            let (updatedRows, retRows) := upsertRowsAux db tn t.columns conflictCols updateCols conflictWhere? ret newRow t.rows
-            let db' := db.upsertTable { t with rows := updatedRows }
-            (db', .ok { rows := retRows.toArray, affected := retRows.length })
-          else
-            let db' := db.upsertTable { t with rows := t.rows ++ [newRow] }
-            let retRows := if ret.isEmpty then #[] else #[projectRow t.columns ret newRow]
-            (db', .ok { rows := retRows, affected := 1 })
-  | .update tn sets w ret =>
-      match getTbl tn with
-      | .error e => (db, .error e)
-      | .ok t =>
-          let (outRows, retRows, aff) := updateRowsAux db tn t.columns sets w ret t.rows
-          let db' := db.upsertTable { t with rows := outRows }
-          (db', .ok { rows := retRows.toArray, affected := aff })
-  | .delete tn w ret =>
-      match getTbl tn with
-      | .error e => (db, .error e)
-      | .ok t =>
-          let (kept, retRows, aff) := deleteRowsAux db tn t.columns w ret t.rows
-          let db' := db.upsertTable { t with rows := kept }
-          (db', .ok { rows := retRows.toArray, affected := aff })
+            let lv := getRowCol tL.columns rl lJc.raw
+            tR.rows.filterMap fun rr =>
+              if getRowCol tR.columns rr rJc.raw == lv && sqlValToBool (evalSqlExpr db [(rt.raw, tR.columns, rr), (lt.raw, tL.columns, rl)] 64 rW) then
+                some (rl, rr)
+              else none
+        let combinedCols := lCols.map (·.raw) ++ rCols.map (·.raw)
+        let rows := pairs.map fun (rl, rr) =>
+          (lCols.map (fun c => getRowCol tL.columns rl c.raw) ++ rCols.map (fun c => getRowCol tR.columns rr c.raw)).toArray
+        let out := sliceRows lim off (sortRowsBy combinedCols ob rows)
+        (db, .ok { rows := out.toArray, affected := out.length })
+  | .insert tn pairs ret => withTbl tn fun t =>
+      let newRow := buildRowFromPairs t.columns pairs
+      if hasSingleColConflict t (uniqueCols tn) newRow then (db, .error ⟨409, s!"unique constraint violation on `{tn.raw}`"⟩)
+      else appendRow t newRow ret
+  | .insertOrIgnore tn pairs conflictCols ret => withTbl tn fun t =>
+      let newRow := buildRowFromPairs t.columns pairs
+      let existsMatch :=
+        if !conflictCols.isEmpty then t.rows.any (conflictMatches t.columns conflictCols · newRow)
+        else hasSingleColConflict t (uniqueCols tn) newRow
+      if existsMatch then (db, .ok { rows := #[], affected := 0 }) else appendRow t newRow ret
+  | .upsert tn pairs conflictCols updateCols conflictWhere? ret => withTbl tn fun t =>
+      let newRow := buildRowFromPairs t.columns pairs
+      if t.rows.any (conflictMatches t.columns conflictCols · newRow) then
+        let (updatedRows, retRows) := upsertRowsAux db tn t.columns conflictCols updateCols conflictWhere? ret newRow t.rows
+        (db.upsertTable { t with rows := updatedRows }, .ok { rows := retRows.toArray, affected := retRows.length })
+      else appendRow t newRow ret
+  | .update tn sets w ret => withTbl tn fun t =>
+      let (outRows, retRows, aff) := updateRowsAux db tn t.columns sets w ret t.rows
+      (db.upsertTable { t with rows := outRows }, .ok { rows := retRows.toArray, affected := aff })
+  | .delete tn w ret => withTbl tn fun t =>
+      let (kept, retRows, aff) := deleteRowsAux db tn t.columns w ret t.rows
+      (db.upsertTable { t with rows := kept }, .ok { rows := retRows.toArray, affected := aff })
 
 /-! ### 3. Pure `ThreadProg` Evaluator (`EvalEnv`, `EvalState`, `EvalTrace`, `evalProg`) -/
 

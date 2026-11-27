@@ -520,42 +520,6 @@ variable {σ α β γ : Type} {Inv Inv₁ Inv₂ : σ → Prop} {A A₁ A₂ : P
 @[simp] theorem threadProg_bind_assoc' (p : ThreadProg σ α) (f : α → ThreadProg σ β) (g : β → ThreadProg σ γ) :
     ThreadProg.bind (ThreadProg.bind p f) g = ThreadProg.bind p (fun x => ThreadProg.bind (f x) g) := threadProg_bind_assoc p f g
 
-inductive ProgSpec {σ α : Type} (Inv : σ → Prop) (AllowAtomic : Prop) (Step : σ → σ → Prop) (Post : α → Prop) : ThreadProg σ α → Prop where
-  | pure (a : α) : Post a → ProgSpec Inv AllowAtomic Step Post (.pure a)
-  | io (eff : ServerEffect) (k : eff.Resp → ThreadProg σ α) : (∀ r, ProgSpec Inv AllowAtomic Step Post (k r)) → ProgSpec Inv AllowAtomic Step Post (.io eff k)
-  | atomic (st : σ → σ) (next : σ → ThreadProg σ α) :
-      AllowAtomic → (∀ s, Inv s → Step s (st s)) → (∀ s, Inv s → ProgSpec Inv AllowAtomic Step Post (next s)) → ProgSpec Inv AllowAtomic Step Post (.atomic st next)
-
-theorem ProgSpec.bind {p : ThreadProg σ α} {k : α → ThreadProg σ β}
-    (hp : ProgSpec Inv A Step Q p) (hk : ∀ a, Q a → ProgSpec Inv A Step Post (k a)) : ProgSpec Inv A Step Post (p >>= k) := by
-  change ProgSpec Inv A Step Post (ThreadProg.bind p k)
-  induction hp with | pure a ha => exact hk a ha | io _ _ _ ih => exact .io _ _ ih | atomic st _ ha hst _ ih => exact .atomic st _ ha hst ih
-
-theorem ProgSpec.mono {P₁ P₂ : α → Prop} {p : ThreadProg σ α} (hp : ProgSpec Inv₁ A₁ S₁ P₁ p)
-    (hA : A₁ → A₂) (hInv : ∀ s, Inv₂ s → Inv₁ s) (hS : A₁ → ∀ s s', Inv₂ s → S₁ s s' → S₂ s s') (hP : ∀ a, P₁ a → P₂ a) :
-    ProgSpec Inv₂ A₂ S₂ P₂ p := by
-  induction hp with
-  | pure a ha => exact .pure a (hP a ha) | io _ _ _ ih => exact .io _ _ ih
-  | atomic st _ ha hst _ ih => exact .atomic st _ (hA ha) (fun s hs => hS ha s _ hs (hst s (hInv s hs))) (fun s hs => ih s (hInv s hs))
-
-theorem ProgSpec.pure_class (a : α) (ha : Q a) : ProgSpec Inv A Step Q (Pure.pure a) := .pure a ha
-theorem ProgSpec.runAtomic (step : σ → σ × α) (hstep : ∀ s, Inv s → Step s (step s).1) (hpost : ∀ s, Inv s → Q (step s).2) : ProgSpec Inv True Step Q (MonadAtomic.runAtomic (m := ThreadProg σ) step) := .atomic _ _ trivial hstep (fun s hs => .pure _ (hpost s hs))
-theorem ProgSpec.runAtomicRead (f : σ → α) (hrefl : ∀ s, Inv s → Step s s) (hpost : ∀ s, Inv s → Q (f s)) : ProgSpec Inv True Step Q (MonadAtomic.runAtomicRead (m := ThreadProg σ) f) := .atomic id _ trivial hrefl (fun s hs => .pure _ (hpost s hs))
-theorem ProgSpec.runAtomic_bind (step : σ → σ × α) {k : α → ThreadProg σ β} (hk : ∀ s, Inv s → ProgSpec Inv True Step Post (k (step s).2)) (hstep : ∀ s, Inv s → Step s (step s).1) : ProgSpec Inv True Step Post (MonadAtomic.runAtomic (m := ThreadProg σ) step >>= k) := .atomic (fun s => (step s).1) (fun s => k (step s).2) trivial hstep hk
-theorem ProgSpec.runAtomicRead_bind (f : σ → α) {k : α → ThreadProg σ β} (hk : ∀ s, Inv s → ProgSpec Inv True Step Post (k (f s))) (hrefl : ∀ s, Inv s → Step s s) : ProgSpec Inv True Step Post (MonadAtomic.runAtomicRead (m := ThreadProg σ) f >>= k) := .atomic id (fun s => k (f s)) trivial hrefl hk
-theorem ProgSpec.runAtomic_bind_val (step : σ → σ × α) {k : α → ThreadProg σ β} (hk : ∀ a, ProgSpec Inv True Step Post (k a)) (hstep : ∀ s, Inv s → Step s (step s).1) : ProgSpec Inv True Step Post (MonadAtomic.runAtomic (m := ThreadProg σ) step >>= k) := ProgSpec.runAtomic_bind step (fun s _ => hk (step s).2) hstep
-theorem ProgSpec.runAtomicRead_bind_val (f : σ → α) {k : α → ThreadProg σ β} (hk : ∀ a, ProgSpec Inv True Step Post (k a)) (hrefl : ∀ s, Inv s → Step s s) : ProgSpec Inv True Step Post (MonadAtomic.runAtomicRead (m := ThreadProg σ) f >>= k) := ProgSpec.runAtomicRead_bind f (fun s _ => hk (f s)) hrefl
-
-abbrev ProgPreservesStepRel (Inv : σ → Prop) (Rel : σ → σ → Prop) (p : ThreadProg σ α) : Prop := ProgSpec Inv True Rel (fun _ => True) p
-abbrev ProgPreservesInv (Inv : σ → Prop) (p : ThreadProg σ α) : Prop := ProgPreservesStepRel Inv (fun _ s' => Inv s') p
-abbrev ProgEnsures (Inv : σ → Prop) (Post : α → Prop) (p : ThreadProg σ α) : Prop := ProgSpec Inv True (fun _ _ => True) Post p
-abbrev NoAtomic (p : ThreadProg σ α) : Prop := ProgSpec (fun _ : σ => True) False (fun _ _ => True) (fun _ => True) p
-theorem NoAtomic.pure (a : α) : NoAtomic (σ := σ) (.pure a) := ProgSpec.pure a trivial
-theorem NoAtomic.io (eff : ServerEffect) (k : eff.Resp → ThreadProg σ α) (hk : ∀ r, NoAtomic (k r)) : NoAtomic (.io eff k) := ProgSpec.io eff k hk
-theorem ProgSpec.of_noAtomic {p : ThreadProg σ α} (h : NoAtomic p) : ProgSpec Inv A Step (fun _ => True) p := h.mono False.elim (fun _ _ => trivial) (fun h => h.elim) (fun _ _ => trivial)
-theorem progPreservesStepRel_of_const (p : ThreadProg σ α) (h : ∀ s s', Rel s s') : ProgPreservesStepRel Inv Rel p := by
-  induction p with | pure a => exact .pure a trivial | io _ _ ih => exact .io _ _ ih | atomic _ _ ih => exact .atomic _ _ trivial (fun s _ => h s _) (fun s _ => ih s)
-
 @[reducible] def ServerEffect.isHttp : ServerEffect → Bool
   | .httpCall _ => true | _ => false
 
@@ -625,6 +589,44 @@ theorem ProgEffSpec.runAtomicRead_bind {EffOk : ServerEffect → Prop} (f : σ �
     (hk : ∀ s, Inv s → ProgEffSpec Inv True Step EffOk Post (k (f s))) (hrefl : ∀ s, Inv s → Step s s) :
     ProgEffSpec Inv True Step EffOk Post (MonadAtomic.runAtomicRead (m := ThreadProg σ) f >>= k) :=
   .atomic id (fun s => k (f s)) trivial hrefl hk
+theorem ProgEffSpec.runAtomic_bind_val {EffOk : ServerEffect → Prop} (step : σ → σ × α) {k : α → ThreadProg σ β}
+    (hk : ∀ a, ProgEffSpec Inv True Step EffOk Post (k a)) (hstep : ∀ s, Inv s → Step s (step s).1) :
+    ProgEffSpec Inv True Step EffOk Post (MonadAtomic.runAtomic (m := ThreadProg σ) step >>= k) :=
+  ProgEffSpec.runAtomic_bind step (fun s _ => hk (step s).2) hstep
+theorem ProgEffSpec.runAtomicRead_bind_val {EffOk : ServerEffect → Prop} (f : σ → α) {k : α → ThreadProg σ β}
+    (hk : ∀ a, ProgEffSpec Inv True Step EffOk Post (k a)) (hrefl : ∀ s, Inv s → Step s s) :
+    ProgEffSpec Inv True Step EffOk Post (MonadAtomic.runAtomicRead (m := ThreadProg σ) f >>= k) :=
+  ProgEffSpec.runAtomicRead_bind f (fun s _ => hk (f s)) hrefl
+
+abbrev ProgSpec {σ α : Type} (Inv : σ → Prop) (AllowAtomic : Prop) (Step : σ → σ → Prop) (Post : α → Prop) : ThreadProg σ α → Prop :=
+  ProgEffSpec Inv AllowAtomic Step (fun _ => True) Post
+abbrev ProgSpec.pure := @ProgEffSpec.pure
+theorem ProgSpec.io (eff : ServerEffect) (k : eff.Resp → ThreadProg σ α) (hk : ∀ r, ProgSpec Inv A Step Q (k r)) :
+    ProgSpec Inv A Step Q (.io eff k) := ProgEffSpec.io eff k trivial hk
+theorem ProgSpec.bind {p : ThreadProg σ α} {k : α → ThreadProg σ β}
+    (hp : ProgSpec Inv A Step Q p) (hk : ∀ a, Q a → ProgSpec Inv A Step Post (k a)) : ProgSpec Inv A Step Post (p >>= k) :=
+  ProgEffSpec.bind hp hk
+theorem ProgSpec.mono {P₁ P₂ : α → Prop} {p : ThreadProg σ α} (hp : ProgSpec Inv₁ A₁ S₁ P₁ p)
+    (hA : A₁ → A₂) (hInv : ∀ s, Inv₂ s → Inv₁ s) (hS : A₁ → ∀ s s', Inv₂ s → S₁ s s' → S₂ s s') (hP : ∀ a, P₁ a → P₂ a) :
+    ProgSpec Inv₂ A₂ S₂ P₂ p := ProgEffSpec.mono hp hA hInv hS (fun _ _ => trivial) hP
+abbrev ProgSpec.pure_class := @ProgEffSpec.pure_class
+abbrev ProgSpec.runAtomic := @ProgEffSpec.runAtomic
+abbrev ProgSpec.runAtomicRead := @ProgEffSpec.runAtomicRead
+abbrev ProgSpec.runAtomic_bind := @ProgEffSpec.runAtomic_bind
+abbrev ProgSpec.runAtomicRead_bind := @ProgEffSpec.runAtomicRead_bind
+abbrev ProgSpec.runAtomic_bind_val := @ProgEffSpec.runAtomic_bind_val
+abbrev ProgSpec.runAtomicRead_bind_val := @ProgEffSpec.runAtomicRead_bind_val
+
+abbrev ProgPreservesStepRel (Inv : σ → Prop) (Rel : σ → σ → Prop) (p : ThreadProg σ α) : Prop := ProgSpec Inv True Rel (fun _ => True) p
+abbrev ProgPreservesInv (Inv : σ → Prop) (p : ThreadProg σ α) : Prop := ProgPreservesStepRel Inv (fun _ s' => Inv s') p
+abbrev ProgEnsures (Inv : σ → Prop) (Post : α → Prop) (p : ThreadProg σ α) : Prop := ProgSpec Inv True (fun _ _ => True) Post p
+abbrev NoAtomic (p : ThreadProg σ α) : Prop := ProgSpec (fun _ : σ => True) False (fun _ _ => True) (fun _ => True) p
+theorem NoAtomic.pure (a : α) : NoAtomic (σ := σ) (.pure a) := ProgEffSpec.pure a trivial
+theorem NoAtomic.io (eff : ServerEffect) (k : eff.Resp → ThreadProg σ α) (hk : ∀ r, NoAtomic (k r)) : NoAtomic (.io eff k) := ProgEffSpec.io eff k trivial hk
+theorem ProgSpec.of_noAtomic {p : ThreadProg σ α} (h : NoAtomic p) : ProgSpec Inv A Step (fun _ => True) p :=
+  ProgEffSpec.mono h False.elim (fun _ _ => trivial) (fun h => h.elim) (fun _ _ => trivial) (fun _ _ => trivial)
+theorem progPreservesStepRel_of_const (p : ThreadProg σ α) (h : ∀ s s', Rel s s') : ProgPreservesStepRel Inv Rel p := by
+  induction p with | pure a => exact .pure a trivial | io _ _ ih => exact ProgEffSpec.io _ _ trivial ih | atomic _ _ ih => exact .atomic _ _ trivial (fun s _ => h s _) (fun s _ => ih s)
 
 abbrev ProgAllowsEff (EffOk : ServerEffect → Prop) (p : ThreadProg σ α) : Prop :=
   ProgEffSpec (fun _ => True) True (fun _ _ => True) EffOk (fun _ => True) p
@@ -638,11 +640,11 @@ abbrev ProgNoDbWrite (p : ThreadProg σ α) : Prop := ProgAllowsEff (fun e => e.
 class SafeIO {σ α : Type} (p : ThreadProg σ α) : Prop where noAtomic : NoAtomic p
 instance (a : α) : SafeIO (Pure.pure (f := ThreadProg σ) a) := ⟨.pure a⟩
 instance (a : α) : SafeIO (ThreadProg.pure (σ := σ) a) := ⟨.pure a⟩
-instance (eff : ServerEffect) : @SafeIO σ (no_index eff.Resp) (MonadServer.exec (m := ThreadProg σ) eff) := ⟨.io eff _ .pure⟩
+instance (eff : ServerEffect) : @SafeIO σ (no_index eff.Resp) (MonadServer.exec (m := ThreadProg σ) eff) := ⟨NoAtomic.io eff _ .pure⟩
 theorem noAtomic_bind {p : ThreadProg σ α} {k : α → ThreadProg σ β} (hp : NoAtomic p) (hk : ∀ a, NoAtomic (k a)) : NoAtomic (p >>= k) := hp.bind fun a _ => hk a
 instance (p : ThreadProg σ α) (k : α → ThreadProg σ β) [hp : SafeIO p] [hk : ∀ a, SafeIO (k a)] : SafeIO (p >>= k) := ⟨noAtomic_bind hp.noAtomic fun a => (hk a).noAtomic⟩
 theorem noAtomic_flushWsEmits : ∀ es : List WsEmit, NoAtomic (flushWsEmits (m := ThreadProg σ) es)
-  | [] => .pure () | e :: es => noAtomic_bind (.io (.wsBroadcast e.topic e.payload) _ .pure) fun _ => noAtomic_flushWsEmits es
+  | [] => .pure () | e :: es => noAtomic_bind (NoAtomic.io (.wsBroadcast e.topic e.payload) _ .pure) fun _ => noAtomic_flushWsEmits es
 instance (es : List WsEmit) : SafeIO (flushWsEmits (m := ThreadProg σ) es) := ⟨noAtomic_flushWsEmits es⟩
 
 /-! ### Verified Server Helpers (`newId`, `mintBearerToken`, `hashBearerToken`) -/
@@ -656,7 +658,7 @@ def newId {m : Type → Type} [Monad m] [MonadServer m] (pfx : String := "") (by
     Pure.pure (if h : 1 ≤ raw.length ∧ raw.length ≤ 128 then .ok ⟨raw, h⟩ else .error (ApiError.internal "generated identifier length out of bounds (1..128)"))
 
 theorem noAtomic_newId (pfx : String) (bytes : UInt32) : NoAtomic (newId (m := ThreadProg σ) pfx bytes) :=
-  noAtomic_bind (.io (.randomHex bytes) _ .pure) fun _ => .pure _
+  noAtomic_bind (NoAtomic.io (.randomHex bytes) _ .pure) fun _ => .pure _
 instance (pfx : String) (bytes : UInt32) : SafeIO (newId (m := ThreadProg σ) pfx bytes) := ⟨noAtomic_newId pfx bytes⟩
 
 def mintBearerToken {m : Type → Type} [Monad m] [MonadServer m] (userId : String) (ttlSec : Nat := 86400 * 30)
@@ -677,16 +679,16 @@ theorem noAtomic_mintBearerToken (userId : String) (ttlSec : Nat) (secretEnv : S
     NoAtomic (mintBearerToken (m := ThreadProg σ) userId ttlSec secretEnv) := by
   unfold mintBearerToken; split
   · exact .pure _
-  · refine noAtomic_bind (.io (.readEnv secretEnv) _ .pure) fun r => ?_
+  · refine noAtomic_bind (NoAtomic.io (.readEnv secretEnv) _ .pure) fun r => ?_
     cases r with
     | none => exact .pure _
     | some sec =>
         by_cases h : sec.isEmpty
         · simp only [h, ↓reduceIte]; exact .pure _
         · simp only [h, Bool.false_eq_true, ↓reduceIte]
-          exact noAtomic_bind (.io .nowMs _ .pure) fun _ =>
-            noAtomic_bind (.io (.randomHex 16) _ .pure) fun _ =>
-              noAtomic_bind (.io (.hmacSha256 _ _) _ .pure) fun _ => .pure _
+          exact noAtomic_bind (NoAtomic.io .nowMs _ .pure) fun _ =>
+            noAtomic_bind (NoAtomic.io (.randomHex 16) _ .pure) fun _ =>
+              noAtomic_bind (NoAtomic.io (.hmacSha256 _ _) _ .pure) fun _ => .pure _
 instance (userId : String) (ttlSec : Nat) (secretEnv : String) : SafeIO (mintBearerToken (m := ThreadProg σ) userId ttlSec secretEnv) :=
   ⟨noAtomic_mintBearerToken userId ttlSec secretEnv⟩
 
@@ -695,14 +697,13 @@ def hashBearerToken {m : Type → Type} [Monad m] [MonadServer m] (token : Strin
     Pure.pure (.ok (Proto.encodeHex mac))
 
 theorem noAtomic_hashBearerToken (token : String) : NoAtomic (hashBearerToken (m := ThreadProg σ) token) :=
-  noAtomic_bind (.io (.hmacSha256 _ _) _ .pure) fun _ => .pure _
+  noAtomic_bind (NoAtomic.io (.hmacSha256 _ _) _ .pure) fun _ => .pure _
 instance (token : String) : SafeIO (hashBearerToken (m := ThreadProg σ) token) := ⟨noAtomic_hashBearerToken token⟩
 
 theorem ProgSpec.safeIO_bind (p : ThreadProg σ α) [hp : SafeIO p] {k : α → ThreadProg σ β} (hk : ∀ a, ProgSpec Inv A Step Post (k a)) :
     ProgSpec Inv A Step Post (p >>= k) := (ProgSpec.of_noAtomic hp.noAtomic).bind fun a _ => hk a
 theorem ProgSpec.of_safeIO (p : ThreadProg σ α) [hp : SafeIO p] : ProgSpec Inv A Step (fun _ => True) p :=
   ProgSpec.of_noAtomic hp.noAtomic
-theorem safeIO_preservesStepRel (p : ThreadProg σ α) [hp : SafeIO p] : ProgPreservesStepRel Inv Rel p := ProgSpec.of_noAtomic hp.noAtomic
 theorem safeIO_bind_preservesStepRel (p : ThreadProg σ α) [SafeIO p] {k : α → ThreadProg σ β} (hk : ∀ a, ProgPreservesStepRel Inv Rel (k a)) :
     ProgPreservesStepRel Inv Rel (p >>= k) := ProgSpec.safeIO_bind p hk
 
@@ -755,7 +756,7 @@ private theorem step_preserves_inv_and_pool {st₁ st₂ : MultiCoreState σ Out
   | spawn _ _ _ hp => exact ⟨hinv, fun q hq => (List.mem_cons.1 hq).elim (· ▸ hp) (hpool q)⟩
   | reap _ _ _ _ => exact ⟨hinv, fun q hq => (List.mem_append.1 hq).elim
       (fun h => hpool q (List.mem_append_left _ h)) (fun h => hpool q (List.mem_append_right _ (List.mem_cons_of_mem _ h)))⟩
-  | stepIo _ _ _ _ _ resp => cases mid hpool with | io _ _ hk => exact ⟨hinv, pool_replace_mid hpool (hk resp)⟩
+  | stepIo _ _ _ _ _ resp => cases mid hpool with | io _ _ _ hk => exact ⟨hinv, pool_replace_mid hpool (hk resp)⟩
   | stepAtomic s _ _ _ _ => cases mid hpool with | atomic _ _ _ hst hnext => exact ⟨hst s hinv, pool_replace_mid hpool (hnext s hinv)⟩
 
 theorem concurrent_schedule_preserves_inv (Inv : σ → Prop) (s₀ : σ) (st : MultiCoreState σ Out)
@@ -784,7 +785,7 @@ theorem concurrent_schedule_ensures (Inv : σ → Prop) (Post : Tgt → Prop)
     ⟨hinit, htinv, htens, fun _ hm => nomatch hm⟩ fun hstep ⟨hinv, ht1, ht2, hop⟩ => by
       cases hstep with
       | stepOther _ hs => let ⟨hi', ho'⟩ := step_preserves_inv_and_pool hs hinv hop; exact ⟨hi', ht1, ht2, ho'⟩
-      | stepTargetIo _ _ _ _ resp => cases ht1 with | io _ _ hk1 => cases ht2 with | io _ _ hk2 => exact ⟨hinv, hk1 resp, hk2 resp, hop⟩
+      | stepTargetIo _ _ _ _ resp => cases ht1 with | io _ _ _ hk1 => cases ht2 with | io _ _ _ hk2 => exact ⟨hinv, hk1 resp, hk2 resp, hop⟩
       | stepTargetAtomic s _ _ _ => cases ht1 with | atomic _ _ _ hst hn1 => cases ht2 with | atomic _ _ _ _ hn2 => exact ⟨hst s hinv, hn1 s hinv, hn2 s hinv, hop⟩
   exact ⟨h.1, fun out hout => by cases hout ▸ h.2.2.1 with | pure _ hp => exact hp⟩
 end MultiCore
@@ -845,28 +846,10 @@ def runWorkJobLoop (name : String) (intervalMs : UInt32) (runWorkOnce : IO (Exce
       | .error e =>
           IO.eprintln s!"[qed job `{name}`] error: {e.message}"
           runWorkJobLoop name intervalMs runWorkOnce stopFlag? true fuel
-def runJobLoop (name : String) (intervalMs : UInt32) (runOnce : IO (Except ApiError Unit)) (stopFlag? : Option (IO.Ref Bool) := none) (fuel : Nat) : IO Unit :=
-  runWorkJobLoop name intervalMs (runOnce.map fun | .ok () => .ok false | .error e => .error e) stopFlag? true fuel
 def spawnServerJobs (jobs : Array IoJob) (stopFlag? : Option (IO.Ref Bool) := none) (maxTicks : Nat := defaultMaxJobTicks) :
     IO (Array (Task (Except IO.Error Unit))) :=
   jobs.mapM fun job => IO.asTask (prio := .dedicated) (runWorkJobLoop job.name (min job.intervalMs 2147483647).toUInt32 job.runWorkOnce stopFlag? true maxTicks)
 abbrev runServerJobs := @spawnServerJobs
-
-private def drainOneJobOnce (name : String) (runWorkOnce : IO (Except ApiError Bool)) : Nat → IO Bool
-  | 0 => pure true
-  | fuel + 1 => do
-      match ← runWorkOnce with
-      | .ok true => drainOneJobOnce name runWorkOnce fuel
-      | .ok false => pure true
-      | .error e => IO.eprintln s!"[qed job `{name}`] error: {e.message}"; pure false
-
-/-- Runs each job once (or until a `-> Bool` job returns `false` / drains its queue). Returns `true` if no job errored. -/
-def runJobsOnce (jobs : Array IoJob) (maxIterPerJob : Nat := 10000) : IO Bool := do
-  let mut allOk := true
-  for job in jobs do
-    let ok ← drainOneJobOnce job.name job.runWorkOnce maxIterPerJob
-    if !ok then allOk := false
-  return allOk
 
 /-! ## Inferred Domain Errors, Control-Flow Combinators & Opaque SSA Stepping (`srvLetEq`) -/
 
@@ -949,17 +932,6 @@ def srvForEachM {E α β : Type} {m : Type → Type} [Monad m]
 @[simp] theorem srvForEachM_nil {E α β : Type} {m : Type → Type} [Monad m]
     (body : α → m (Option (Except E β))) : srvForEachM ([] : List α) body = pure none := rfl
 
-theorem noAtomic_srvForEachM {σ E α β : Type} (body : α → ThreadProg σ (Option (Except E β)))
-    (hb : ∀ x, NoAtomic (body x)) : ∀ xs : List α, NoAtomic (srvForEachM xs body)
-  | [] => .pure none
-  | x :: rest => noAtomic_bind (hb x) fun
-      | some r => .pure (some r)
-      | none => noAtomic_srvForEachM body hb rest
-
-instance {σ E α β : Type} (xs : List α) (body : α → ThreadProg σ (Option (Except E β)))
-    [hb : ∀ x, SafeIO (body x)] : SafeIO (srvForEachM xs body) :=
-  ⟨noAtomic_srvForEachM body (fun x => (hb x).noAtomic) xs⟩
-
 theorem progEffSpec_srvForEachM {σ E α β : Type} {Inv : σ → Prop} {A : Prop} {Step : σ → σ → Prop}
     {EffOk : ServerEffect → Prop} {Post : Option (Except E β) → Prop}
     (body : α → ThreadProg σ (Option (Except E β)))
@@ -990,31 +962,13 @@ theorem progEffSpec_srvForEachM_bind {σ E α β γ : Type} {Inv : σ → Prop} 
         | some v, hv => by simpa [threadProg_pure_bind] using hv
         | none, _ => ih (fun y hy => hb y (List.mem_cons_of_mem x hy))
 
-theorem progSpec_srvForEachM {σ E α β : Type} {Inv : σ → Prop} {A : Prop} {Step : σ → σ → Prop}
-    {Post : Option (Except E β) → Prop} (body : α → ThreadProg σ (Option (Except E β)))
-    (hNone : Post none) (xs : List α) (hb : ∀ x ∈ xs, ProgSpec Inv A Step Post (body x)) :
-    ProgSpec Inv A Step Post (srvForEachM xs body) := by
-  induction xs with
-  | nil => exact .pure none hNone
-  | cons x rest ih =>
-      exact (hb x (List.mem_cons_self ..)).bind fun
-        | some r, hr => .pure (some r) hr
-        | none, _ => ih (fun y hy => hb y (List.mem_cons_of_mem x hy))
+theorem noAtomic_srvForEachM {σ E α β : Type} (body : α → ThreadProg σ (Option (Except E β)))
+    (hb : ∀ x, NoAtomic (body x)) (xs : List α) : NoAtomic (srvForEachM xs body) :=
+  progEffSpec_srvForEachM body trivial xs fun x _ => hb x
 
-theorem progSpec_srvForEachM_bind {σ E α β γ : Type} {Inv : σ → Prop} {A : Prop} {Step : σ → σ → Prop}
-    {Post : γ → Prop} (xs : List α) (body : α → ThreadProg σ (Option (Except E β)))
-    {k : Option (Except E β) → ThreadProg σ γ} (hNone : ProgSpec Inv A Step Post (k none))
-    (hb : ∀ x ∈ xs, ProgSpec Inv A Step
-      (fun r => match r with | some v => ProgSpec Inv A Step Post (k (some v)) | none => True) (body x)) :
-    ProgSpec Inv A Step Post (srvForEachM xs body >>= k) := by
-  induction xs with
-  | nil => simpa [srvForEachM, threadProg_pure_bind] using hNone
-  | cons x rest ih =>
-      change ProgSpec Inv A Step Post ((body x >>= fun | some r => pure (some r) | none => srvForEachM rest body) >>= k)
-      rw [threadProg_bind_assoc]
-      exact (hb x (List.mem_cons_self ..)).bind fun
-        | some v, hv => by simpa [threadProg_pure_bind] using hv
-        | none, _ => ih (fun y hy => hb y (List.mem_cons_of_mem x hy))
+instance {σ E α β : Type} (xs : List α) (body : α → ThreadProg σ (Option (Except E β)))
+    [hb : ∀ x, SafeIO (body x)] : SafeIO (srvForEachM xs body) :=
+  ⟨noAtomic_srvForEachM body (fun x => (hb x).noAtomic) xs⟩
 
 def srvForFoldM {σS ρ α : Type} {m : Type → Type} [Monad m]
     (xs : List α) (st : σS) (body : σS → α → m (Qed.QedLoopStep σS ρ)) : m (σS × Option ρ) :=
@@ -1074,54 +1028,6 @@ theorem noAtomic_srvForRangeM {σ σS ρ : Type} (r : Qed.QedRange) (st : σS)
 instance {σ σS ρ : Type} (r : Qed.QedRange) (st : σS) (body : σS → Nat → ThreadProg σ (Qed.QedLoopStep σS ρ))
     [hb : ∀ s i, SafeIO (body s i)] : SafeIO (srvForRangeM r st body) :=
   ⟨noAtomic_srvForRangeM r st body (fun s i => (hb s i).noAtomic)⟩
-
-theorem progSpec_srvForFoldM {σ σS ρ α : Type} {Inv : σ → Prop} {A : Prop} {Step : σ → σ → Prop}
-    {Post : σS × Option ρ → Prop} (body : σS → α → ThreadProg σ (Qed.QedLoopStep σS ρ))
-    (hDone : ∀ st, Post (st, none)) (xs : List α) (st : σS)
-    (hb : ∀ st' x, x ∈ xs → ProgSpec Inv A Step
-      (fun r => match r with | .next _ | .breakLoop _ => True | .ret s' v => Post (s', some v)) (body st' x)) :
-    ProgSpec Inv A Step Post (srvForFoldM xs st body) := by
-  induction xs generalizing st with
-  | nil => exact .pure (st, none) (hDone st)
-  | cons x rest ih =>
-      exact (hb st x (List.mem_cons_self ..)).bind fun
-        | .next st', _ => ih st' (fun s' y hy => hb s' y (List.mem_cons_of_mem x hy))
-        | .breakLoop st', _ => .pure (st', none) (hDone st')
-        | .ret st' v, hv => .pure (st', some v) hv
-
-theorem progSpec_srvForFoldM_bind {σ σS ρ α γ : Type} {Inv : σ → Prop} {A : Prop} {Step : σ → σ → Prop}
-    {Post : γ → Prop} (xs : List α) (st : σS) (body : σS → α → ThreadProg σ (Qed.QedLoopStep σS ρ))
-    {k : σS × Option ρ → ThreadProg σ γ} (hDone : ∀ st', ProgSpec Inv A Step Post (k (st', none)))
-    (hb : ∀ st' x, x ∈ xs → ProgSpec Inv A Step
-      (fun r => match r with | .next _ | .breakLoop _ => True | .ret s' v => ProgSpec Inv A Step Post (k (s', some v))) (body st' x)) :
-    ProgSpec Inv A Step Post (srvForFoldM xs st body >>= k) := by
-  induction xs generalizing st with
-  | nil => simpa [srvForFoldM, threadProg_pure_bind] using hDone st
-  | cons x rest ih =>
-      change ProgSpec Inv A Step Post ((body st x >>= fun | .next st' => srvForFoldM rest st' body | .breakLoop st' => pure (st', none) | .ret st' r => pure (st', some r)) >>= k)
-      rw [threadProg_bind_assoc]
-      exact (hb st x (List.mem_cons_self ..)).bind fun
-        | .next st', _ => ih st' (fun s' y hy => hb s' y (List.mem_cons_of_mem x hy))
-        | .breakLoop st', _ => by simpa [threadProg_pure_bind] using hDone st'
-        | .ret st' v, hv => by simpa [threadProg_pure_bind] using hv
-
-theorem progSpec_srvForRangeM {σ σS ρ : Type} {Inv : σ → Prop} {A : Prop} {Step : σ → σ → Prop}
-    {Post : σS × Option ρ → Prop} (body : σS → Nat → ThreadProg σ (Qed.QedLoopStep σS ρ))
-    (hDone : ∀ st, Post (st, none)) (r : Qed.QedRange) (st : σS)
-    (hb : ∀ st' i, r.start ≤ i → i < r.stop → ProgSpec Inv A Step
-      (fun res => match res with | .next _ | .breakLoop _ => True | .ret s' v => Post (s', some v)) (body st' i)) :
-    ProgSpec Inv A Step Post (srvForRangeM r st body) := by
-  rw [srvForRangeM_eq_srvForFoldM]
-  exact progSpec_srvForFoldM body hDone r.toList st fun st' i hi => let hbnd := r.mem_toList_bounds hi; hb st' i hbnd.1 hbnd.2
-
-theorem progSpec_srvForRangeM_bind {σ σS ρ γ : Type} {Inv : σ → Prop} {A : Prop} {Step : σ → σ → Prop}
-    {Post : γ → Prop} (r : Qed.QedRange) (st : σS) (body : σS → Nat → ThreadProg σ (Qed.QedLoopStep σS ρ))
-    {k : σS × Option ρ → ThreadProg σ γ} (hDone : ∀ st', ProgSpec Inv A Step Post (k (st', none)))
-    (hb : ∀ st' i, r.start ≤ i → i < r.stop → ProgSpec Inv A Step
-      (fun res => match res with | .next _ | .breakLoop _ => True | .ret s' v => ProgSpec Inv A Step Post (k (s', some v))) (body st' i)) :
-    ProgSpec Inv A Step Post (srvForRangeM r st body >>= k) := by
-  rw [srvForRangeM_eq_srvForFoldM]
-  exact progSpec_srvForFoldM_bind r.toList st body hDone fun st' i hi => let hbnd := r.mem_toList_bounds hi; hb st' i hbnd.1 hbnd.2
 
 theorem progEffSpec_srvForFoldM {σ σS ρ α : Type} {Inv : σ → Prop} {A : Prop} {Step : σ → σ → Prop}
     {EffOk : ServerEffect → Prop} {Post : σS × Option ρ → Prop}

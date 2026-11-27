@@ -1,10 +1,42 @@
 import Lean
+import Qed.Lang
 import Qed.Auth.Core
-import Qed.Auth.Syntax
 import Qed.Server.Core
 import Qed.Server.Registry
 
 namespace Qed.Auth
+
+/-! ## `auth` Block Surface Syntax -/
+
+declare_syntax_cat authClause
+declare_syntax_cat authClaimClause
+
+section AuthParsers
+open Lean Parser Qed.Lang
+
+private def kwP (kw : Name) (p : Parser) : Parser :=
+  withPosition (atomic (identEq kw) >> p)
+
+private def authEnvRefParser : Parser :=
+  node `Qed.Auth.envRef ((identEq `secret <|> identEq `env) >> "(" >> strLit >> ")" >> optional (" ?? " >> strLit))
+
+@[authClause_parser] def authEnvClause : Parser := leading_parser
+  withPosition (atomic (identEq `issuer <|> identEq `audience <|> identEq `clientId <|> identEq `clientSecret) >> authEnvRefParser)
+
+@[authClause_parser] def authManagedClause : Parser := leading_parser kwP `managed ("[" >> sepBy1 ident "," >> "]")
+@[authClause_parser] def authProvidersClause : Parser := leading_parser kwP `providers ("[" >> sepBy ident "," >> "]")
+@[authClause_parser] def authSessionClause : Parser := leading_parser kwP `session (identEq `ttl >> "=" >> numLit)
+
+@[authClaimClause_parser] def authClaimLine : Parser := leading_parser
+  withPosition (ident >> ":" >> categoryParser `qedType 91 >> optional (checkLineEq >> "=" >> categoryParser `qedExpr 0))
+
+@[authClause_parser] def authClaimsClause : Parser := leading_parser
+  kwP `claims (":" >> checkColGt "expected indented `claims:` fields" >> many1Indent (categoryParser `authClaimClause 0))
+
+@[command_parser] def authCmd : Parser := leading_parser
+  withPosition (atomic (identEq `auth >> ident >> ":") >> checkColGt "expected indented `auth` clauses" >> many1Indent (categoryParser `authClause 0))
+
+end AuthParsers
 
 open Lean Elab Command Qed.Lang Qed.Server
 
@@ -22,7 +54,7 @@ private structure ParsedClaimDecl where
   defaultStr : String
   defaultTm : Term
 
-private def parseClaimDecl (stx : Syntax) : CommandElabM ParsedClaimDecl := do
+@[noinline] private def parseClaimDecl (stx : Syntax) : CommandElabM ParsedClaimDecl := do
   let id : Ident := ⟨stx.getArg 0⟩; let name := id.getId.eraseMacroScopes.toString
   if name == "id" then throwErrorAt id "claim name `id` is reserved for the OIDC `sub` subject identifier"
   if name == "emailVerified" then throwErrorAt id "claim name `emailVerified` is built-in on `<Auth>.User` (populated from OIDC `email_verified`)"
@@ -40,14 +72,14 @@ private def parseClaimDecl (stx : Syntax) : CommandElabM ParsedClaimDecl := do
     else pure (defStr0, defTm0)
   return { ident := id, name, kind, typeName, tyTm, defaultStr, defaultTm }
 
-private def claimExtractTerm (c : ParsedClaimDecl) (lookupFn : Term) : CommandElabM Term := do
+@[noinline] private def claimExtractTerm (c : ParsedClaimDecl) (lookupFn : Term) : CommandElabM Term := do
   let (kLit, defTm) := (Syntax.mkStrLit c.name, c.defaultTm)
   match c.kind with
   | .str => `(($lookupFn $kLit).getD $defTm) | .bool => `(Qed.Auth.parseBoolClaim ($lookupFn $kLit) $defTm)
   | .nat => `(Qed.Auth.parseNatClaim ($lookupFn $kLit) $defTm) | .int => `(Qed.Auth.parseIntClaim ($lookupFn $kLit) $defTm)
   | .optStr => `(($lookupFn $kLit).orElse (fun _ => $defTm))
 
-private def oidcAuthSpecToTerm (s : OidcAuthSpec) : CommandElabM Term := do
+@[noinline] private def oidcAuthSpecToTerm (s : OidcAuthSpec) : CommandElabM Term := do
   let provs : Array Term := s.providers.toArray.map quote
   let claimTms ← s.claims.toArray.mapM fun cl =>
     `({ name := $(quote cl.name), typeName := $(quote cl.typeName), defaultValue := $(quote cl.defaultValue) : Qed.Auth.AuthClaimSpec })
@@ -56,7 +88,7 @@ private def oidcAuthSpecToTerm (s : OidcAuthSpec) : CommandElabM Term := do
       clientIdDefault? := $(quote s.clientIdDefault?), clientSecretEnv? := $(quote s.clientSecretEnv?), providers := [$[$provs],*],
       sessionTtlSec := $(quote s.sessionTtlSec), claims := [$[$claimTms],*] : Qed.Auth.OidcAuthSpec })
 
-@[command_elab authCmd]
+@[noinline, command_elab authCmd]
 def elabAuthCmd : CommandElab := fun stx => do
   let authIdent : Ident := ⟨stx.getArg 1⟩; let authName := authIdent.getId.eraseMacroScopes
   let (fullAuthName, authShort) := ((← getCurrNamespace) ++ authName, authName.toString)
@@ -124,10 +156,10 @@ def elabAuthCmd : CommandElab := fun stx => do
     private def $fromLookupId (uid : String) (lookup : String → Option String) : $userTyId := { $[$lookupInits:structInstField],* }))
   elabCommand (← `(command| def $fromClaimsId (c : Qed.Auth.JwtClaims) : $userTyId := $fromLookupId c.sub c.claim))
   elabCommand (← `(command| def $fromCtxId (ctx : Qed.Server.RequestCtx) : Option $userTyId := ctx.userId.map ($fromLookupId · ctx.claim)))
-  elabCommand (← `(command| theorem $(mkSub `fromCtx_userId) (ctx : Qed.Server.RequestCtx) (u : $userTyId) (h : $fromCtxId ctx = some u) : some u.id = ctx.userId := by
-    unfold $fromCtxId at h; cases hUid : ctx.userId <;> simp [hUid] at h; cases h; rfl))
-  elabCommand (← `(command| theorem $(mkSub `fromCtx_emailVerified) (ctx : Qed.Server.RequestCtx) (u : $userTyId) (h : $fromCtxId ctx = some u) : u.emailVerified = Qed.Auth.parseBoolClaim (ctx.claim "email_verified") false := by
-    unfold $fromCtxId at h; cases hUid : ctx.userId <;> simp [hUid] at h; cases h; rfl))
+  elabCommand (← `(command| theorem $(mkSub `fromCtx_userId) (ctx : Qed.Server.RequestCtx) (u : $userTyId) (h : $fromCtxId ctx = some u) : some u.id = ctx.userId :=
+    Qed.Auth.option_map_eq_some_elim h fun _ hu hf => hf ▸ hu.symm))
+  elabCommand (← `(command| theorem $(mkSub `fromCtx_emailVerified) (ctx : Qed.Server.RequestCtx) (u : $userTyId) (h : $fromCtxId ctx = some u) : u.emailVerified = Qed.Auth.parseBoolClaim (ctx.claim "email_verified") false :=
+    Qed.Auth.option_map_eq_some_elim h fun _ _ hf => hf ▸ rfl))
   for (fnLeaf, pfx) in [(`loginUrl, "/_qed/auth/login?returnTo="), (`logoutUrl, "/_qed/auth/logout?returnTo=")] do
     elabCommand (← `(command| def $(mkSub fnLeaf) (returnTo : Qed.HrefTarget := Qed.HrefTarget.root) : Qed.Url :=
       (Qed.Url.parse? ($(Syntax.mkStrLit pfx) ++ Qed.Auth.urlEncodeComponent (Qed.Auth.sanitizeReturnTo (some returnTo.raw)))).getD Qed.Url.root))

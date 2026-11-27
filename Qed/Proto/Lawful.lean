@@ -111,19 +111,39 @@ instance {α : Type} [LawfulProto α] : LawfulProtoField (Option α) where
 
 namespace Proto
 def AllTagsGt (k : Nat) (fs : List (Nat × WireVal)) : Prop := ∀ kw ∈ fs, k < kw.1
+def AllTagsLe (k : Nat) (fs : List (Nat × WireVal)) : Prop := ∀ kw ∈ fs, kw.1 ≤ k
 @[simp] theorem allTagsGt_nil (k : Nat) : AllTagsGt k [] := fun _ h => nomatch h
-theorem allTagsGt_encodeAppend {α : Type} [LawfulProtoField α] {k j : Nat} (hj : k < j) (a : α) {rest : List (Nat × WireVal)} (hr : AllTagsGt k rest) :
-    AllTagsGt k (ToProtoField.encodeProtoField j a ++ rest) := fun kw hm =>
-  (List.mem_append.1 hm).elim (fun h1 => by rw [LawfulProtoField.encodeProtoField_tag j a kw h1]; exact hj) (hr kw)
+theorem allTagsGt_of_le {k m : Nat} {fs : List (Nat × WireVal)} (h : k ≤ m) (hgt : AllTagsGt m fs) : AllTagsGt k fs :=
+  fun kw hm => Nat.lt_of_le_of_lt h (hgt kw hm)
+theorem allTagsGt_step {α : Type} [LawfulProtoField α] {k : Nat} (a : α) {rest : List (Nat × WireVal)}
+    (hr : AllTagsGt (k + 1) rest) : AllTagsGt k (ToProtoField.encodeProtoField (k + 1) a ++ rest) := fun kw hm =>
+  (List.mem_append.1 hm).elim
+    (fun h1 => by rw [LawfulProtoField.encodeProtoField_tag (k + 1) a kw h1]; exact Nat.lt_succ_self k)
+    (fun h2 => Nat.lt_trans (Nat.lt_succ_self k) (hr kw h2))
+theorem allTagsLe_single {α : Type} [LawfulProtoField α] (k : Nat) (a : α) :
+    AllTagsLe k (ToProtoField.encodeProtoField k a) := fun kw hm => by
+  rw [LawfulProtoField.encodeProtoField_tag k a kw hm]; exact Nat.le_refl k
+theorem allTagsLe_append_step {α : Type} [LawfulProtoField α] {k : Nat} {pre : List (Nat × WireVal)}
+    (hp : AllTagsLe k pre) (a : α) : AllTagsLe (k + 1) (pre ++ ToProtoField.encodeProtoField (k + 1) a) := fun kw hm =>
+  (List.mem_append.1 hm).elim (fun h1 => Nat.le_succ_of_le (hp kw h1))
+    (fun h2 => by rw [LawfulProtoField.encodeProtoField_tag (k + 1) a kw h2]; exact Nat.le_refl _)
+theorem split_step {α : Type} [ToProtoField α] {all pre tail : List (Nat × WireVal)} (k : Nat) (a : α)
+    (h : all = pre ++ (ToProtoField.encodeProtoField k a ++ tail)) :
+    all = (pre ++ ToProtoField.encodeProtoField k a) ++ tail :=
+  h.trans (List.append_assoc pre _ tail).symm
 theorem msg_tags_pos_encodeAppend {α : Type} [LawfulProtoField α] {k : Nat} (hk : 0 < k) (a : α) {rest : List (Nat × WireVal)} (hr : ∀ kw ∈ rest, 0 < kw.1) :
     ∀ kw ∈ ToProtoField.encodeProtoField k a ++ rest, 0 < kw.1 := fun kw hm =>
   (List.mem_append.1 hm).elim (fun h1 => by rw [LawfulProtoField.encodeProtoField_tag k a kw h1]; exact hk) (hr kw)
-theorem decodeProtoField_skip {α β : Type} [LawfulProtoField α] [LawfulProtoField β] {k j : Nat} (hne : j ≠ k) (b : β) (rest : List (Nat × WireVal)) :
-    FromProtoField.decodeProtoField (α := α) k (ToProtoField.encodeProtoField j b ++ rest) = FromProtoField.decodeProtoField (α := α) k rest :=
-  LawfulProtoField.decodeProtoField_skip_prefix k _ rest fun kw hm => by rw [LawfulProtoField.encodeProtoField_tag j b kw hm]; exact hne
 theorem decodeProtoField_hit {α : Type} [LawfulProtoField α] (k : Nat) (a : α) (rest : List (Nat × WireVal)) (hgt : AllTagsGt k rest) :
     FromProtoField.decodeProtoField k (ToProtoField.encodeProtoField k a ++ rest) = .ok a :=
   LawfulProtoField.decodeProtoField_hit_raw k a rest fun kw hm => Nat.ne_of_gt (hgt kw hm)
+theorem decodeProtoField_mid {α : Type} [LawfulProtoField α] {k : Nat}
+    {all pre rest : List (Nat × WireVal)} (a : α)
+    (hsplit : all = pre ++ (ToProtoField.encodeProtoField (k + 1) a ++ rest))
+    (hle : AllTagsLe k pre) (hgt : AllTagsGt (k + 1) rest) :
+    FromProtoField.decodeProtoField (k + 1) all = .ok a := by
+  rw [hsplit, LawfulProtoField.decodeProtoField_skip_prefix (k + 1) pre _ fun kw hm => Nat.ne_of_lt (Nat.lt_succ_of_le (hle kw hm))]
+  exact decodeProtoField_hit (k + 1) a rest hgt
 end Proto
 
 @[reducible] def ToProto.ofFields {α : Type} (enc : α → List (Nat × WireVal)) : ToProto α :=

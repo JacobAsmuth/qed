@@ -1,6 +1,7 @@
 import Lean
 import Qed.Lang
 import Qed.Diag
+import Qed.Verify.Core
 import Qed.Server.Registry
 import Qed.Server.Core
 import Qed.Server.Db.Core
@@ -11,12 +12,60 @@ open Qed.Lang
 
 /-! ## Dual Lean + Parameterized SQL Query Lowering for `server` `use db : <Database>` -/
 
+def sqlCmpOps : Array (String × Lean.Name) := #[
+  ("==", `Qed.Server.Db.SqlBinOp.eq), ("!=", `Qed.Server.Db.SqlBinOp.ne), ("<", `Qed.Server.Db.SqlBinOp.lt),
+  ("<=", `Qed.Server.Db.SqlBinOp.le), (">", `Qed.Server.Db.SqlBinOp.gt), (">=", `Qed.Server.Db.SqlBinOp.ge)]
+
+open Lean Elab Command in
+@[noinline] def mkSqlIdentTerm (ref : Syntax) (raw : String) : CommandElabM Term := do
+  if !isSafeSqlIdent raw then
+    throwErrorAt ref s!"invalid SQL identifier `{raw}` (must start with an ASCII letter or `_` and contain only ASCII letters, digits, and `_`, max 63 chars)"
+  `(Qed.Server.Db.SqlIdent.mk $(Syntax.mkStrLit raw) rfl)
+
+open Lean in
+@[noinline, nospecialize]
+def mkTypedSqlParamTerm {M : Type → Type} [Monad M] [MonadQuotation M] (rowTyId fId : Ident) (valT : Term) : M Term :=
+  `(Qed.Server.Db.SqlExpr.param (Qed.Server.Db.toSqlLike (fun (_r : $rowTyId) => _r.$fId) $valT))
+
+open Lean Elab Command in
+@[noinline] def mkEncColSpecTerm (tableName colName : String) (ek : DbEncKeyInfo) : CommandElabM Term := do
+  let prevTs ← ek.prevKeys.toArray.mapM fun (k, fb?) => `(($(Syntax.mkStrLit k), $(quote fb?)))
+  `({ keyEnv := $(Syntax.mkStrLit ek.keyEnv), fallback? := $(quote ek.fallback?), aad := ($(Syntax.mkStrLit s!"{tableName}.{colName}") : String).toUTF8, isBytes := $(quote ek.isBytes), prevKeys := [$[$prevTs:term],*] : Qed.Server.Db.EncColSpec })
+
+syntax (name := qedDbProveTac) "qedDbProve" "[" ident,* "]" str str str : tactic
+
+open Lean Meta Elab Tactic in
+@[noinline, tactic qedDbProveTac]
+def elabQedDbProve : Tactic := fun stx => do
+  let unfoldNames ← (stx.getArg 2).getSepArgs.mapM resolveGlobalConstNoOverload
+  let simpNames := Qed.Verify.Core.dbBaseSimpNames.push ``eq_self
+  let simprocs := #[``Qed.Server.qedReduceStrLen]
+  -- Pass 1: Keep user pure `let` bindings opaque (`zetaDelta := false`), only expanding `_insRow`,
+  -- so `whnf` never unfolds string/helper internals on symbolic inputs.
+  let okOpaque ← Qed.Verify.Core.tryRestoreM false id do
+    let g0 ← getMainGoal
+    let g1 ← g0.withContext do
+      let mut fvs : Array FVarId := #[]
+      for ld in (← getLCtx) do
+        if ld.isLet && ld.userName.eraseMacroScopes == `_insRow then fvs := fvs.push ld.fvarId
+      if fvs.isEmpty then pure g0 else g0.replaceTargetDefEq (← Meta.zetaDeltaFVars (← instantiateMVars (← g0.getType)) fvs)
+    replaceMainGoal [g1]
+    Qed.Verify.Core.solveWithUnfolds unfoldNames simpNames simprocs
+      (simpCfg := { zetaDelta := false }) (harvestFacts := true) (scanLCtxValues := false) (clearErrorsOnFail := true)
+  if okOpaque then return
+  if !(← Qed.Verify.Core.solveWithUnfolds unfoldNames simpNames simprocs (harvestFacts := true)) then
+    Qed.Diag.throwUnsolvedGoals
+      m!"Database {(⟨stx.getArg 4⟩ : TSyntax `str).getString} failed in `{(⟨stx.getArg 5⟩ : TSyntax `str).getString}`:"
+      m!"\n\nHint: {(⟨stx.getArg 6⟩ : TSyntax `str).getString}"
+      (ref? := some stx) (stripPrefixes := ["_row", "_old", "_new", "r"]) (bulletPrefix := "  • must prove: ")
+      (goals? := some [(← getUnsolvedGoals).headD (← getMainGoal)])
+
 private partial def stxCollectRowCols (rowVar : String) (colNames : Array String) (stx : Lean.Syntax) : Array String :=
   match extractDottedChain? stx with
   | some [rv, col] => if rv == rowVar && colNames.contains col then #[col] else #[]
   | _ => stx.getArgs.foldl (init := #[]) fun acc ch => (stxCollectRowCols rowVar colNames ch).foldl pushUnique acc
 
-private def sqlBinOps : Array (Lean.Name × Lean.Name) := #[
+def sqlBinOps : Array (Lean.Name × Lean.Name) := #[
   (``qedAdd, `Qed.Server.Db.SqlBinOp.add), (``qedSub, `Qed.Server.Db.SqlBinOp.sub),
   (``qedMul, `Qed.Server.Db.SqlBinOp.mul), (``qedAnd, `Qed.Server.Db.SqlBinOp.and), (``qedOr, `Qed.Server.Db.SqlBinOp.or)]
 
@@ -24,15 +73,15 @@ section QueryHelpers
 open Lean Elab Command
 variable {M : Type → Type} [Monad M] [MonadQuotation M] [MonadError M]
 
-private def mkDbProveTac (unfolds : Array Ident) (kind op hint : String) : M Term :=
+@[noinline, nospecialize] private def mkDbProveTac (unfolds : Array Ident) (kind op hint : String) : M Term :=
   `(by qedDbProve [$[$unfolds],*] $(Syntax.mkStrLit kind) $(Syntax.mkStrLit op) $(Syntax.mkStrLit hint))
 
-private def findDbTable (ref : Syntax) (dbInfo : DatabaseInfo) (tblName : String) : M DbTableInfo := do
+@[noinline, nospecialize] private def findDbTable (ref : Syntax) (dbInfo : DatabaseInfo) (tblName : String) : M DbTableInfo := do
   let some tbl := dbInfo.tables.find? (·.tableName == tblName)
     | throwErrorAt ref s!"database `{dbInfo.shortName}` has no table `{tblName}`{Qed.Diag.didYouMean tblName (dbInfo.tables.map (·.tableName)).toList}"
   return tbl
 
-private def findDbCol (ref : Syntax) (tbl : DbTableInfo) (colName : String)
+@[noinline, nospecialize] private def findDbCol (ref : Syntax) (tbl : DbTableInfo) (colName : String)
     (fmtErr : String → String → String := fun c t => s!"table `{t}` has no column `{c}`") : M DbColumnInfo := do
   let some colInfo := tbl.columns.find? (·.name == colName)
     | throwErrorAt ref s!"{fmtErr colName tbl.tableName}{Qed.Diag.didYouMean colName (tbl.columns.map (·.name)).toList}"
@@ -43,25 +92,27 @@ private def parseStrLitArg? (stx : Syntax) : Option String :=
 
 private def mkPolHint (label fallback pfx : String) : String := if label.isEmpty then fallback else s!"{pfx} `{label}`."
 
-private def mkTblSqlParts (stx : Syntax) (tbl : DbTableInfo) : CommandElabM (Term × Term) := do
+@[noinline] private def mkTblSqlParts (stx : Syntax) (tbl : DbTableInfo) : CommandElabM (Term × Term) := do
   let colSqlIds ← tbl.columns.mapM fun c => mkSqlIdentTerm stx c.name
   return (← mkSqlIdentTerm stx tbl.tableName, ← `([$[$colSqlIds:term],*]))
 
-private def mkTblEncPairs (tbl : DbTableInfo) (mkKey : DbColumnInfo → Nat → Term) : CommandElabM (Array Term) := do
+@[noinline] def mkColsEncPairs (tableName : String) (cols : Array (String × Option DbEncKeyInfo))
+    (mkKey : String → Nat → Term) : CommandElabM (Array Term) := do
   let mut out : Array Term := #[]
-  for (c, i) in tbl.columns.zipIdx do
-    if let some ek := c.encKey? then
-      let sp ← mkEncColSpecTerm tbl.tableName c.name ek
-      out := out.push (← `(($(mkKey c i), $sp)))
+  for ((colName, encKey?), i) in cols.zipIdx do
+    if let some ek := encKey? then
+      let sp ← mkEncColSpecTerm tableName colName ek
+      out := out.push (← `(($(mkKey colName i), $sp)))
   return out
 
-private def mkTblEncRead (tbl : DbTableInfo) (colOffset : Nat := 0) : CommandElabM (Array Term) :=
-  mkTblEncPairs tbl fun _ i => Syntax.mkNumLit (toString (colOffset + i))
+@[noinline] private def mkTblEncRead (tbl : DbTableInfo) (colOffset : Nat := 0) : CommandElabM (Array Term) :=
+  mkColsEncPairs tbl.tableName (tbl.columns.map fun c => (c.name, c.encKey?)) fun _ i => Syntax.mkNumLit (toString (colOffset + i))
 
-private def mkTblEncWriteTerm (tbl : DbTableInfo) : CommandElabM Term := do
-  let es ← mkTblEncPairs tbl fun c _ => Syntax.mkStrLit c.name; `([$[$es:term],*])
+@[noinline] private def mkTblEncWriteTerm (tbl : DbTableInfo) : CommandElabM Term := do
+  let es ← mkColsEncPairs tbl.tableName (tbl.columns.map fun c => (c.name, c.encKey?)) fun c _ => Syntax.mkStrLit c
+  `([$[$es:term],*])
 
-private def parseOrderByArg (tbl : DbTableInfo) (ordStx? : Option Syntax) : CommandElabM Term := do
+@[noinline] private def parseOrderByArg (tbl : DbTableInfo) (ordStx? : Option Syntax) : CommandElabM Term := do
   let some stx := ordStx? | return ← `(none)
   let some raw := parseStrLitArg? stx | throwErrorAt stx "`orderBy` must be a string column name (e.g. `orderBy = \"id\"` or `orderBy = \"-version\"`)"
   let (colName, isDesc) := if raw.startsWith "-" then (String.ofList (raw.toList.drop 1), true) else (raw, false)
@@ -70,7 +121,7 @@ private def parseOrderByArg (tbl : DbTableInfo) (ordStx? : Option Syntax) : Comm
   let dirT ← if isDesc then `(Qed.Server.Db.SqlOrderDir.desc) else `(Qed.Server.Db.SqlOrderDir.asc)
   `(some ($(← mkSqlIdentTerm stx colName), $dirT))
 
-private def parseAggColArg (tbl : DbTableInfo) (colStx : Syntax) : CommandElabM DbColumnInfo := do
+@[noinline] private def parseAggColArg (tbl : DbTableInfo) (colStx : Syntax) : CommandElabM DbColumnInfo := do
   let u := unwrapParens1 colStx; let errMsg := "aggregate column selector must be a column name string (e.g. `\"stock\"`) or `r => r.col`"
   let colName ←
     if let some s := parseStrLitArg? colStx then pure s
@@ -123,15 +174,19 @@ private def extractDirectScopedCol? (scopes : Array (String × DbTableInfo × St
   | some [rv, col] =>
       scopes.reverse.findSome? fun (v, tbl, _) =>
         if v == rv && tbl.columns.any (·.name == col) then some (tbl, col) else none
+  | some [col] =>
+      scopes.reverse.findSome? fun (v, tbl, _) =>
+        if v.isEmpty && tbl.columns.any (·.name == col) then some (tbl, col) else none
   | _ => none
 
 @[noinline, nospecialize]
-private partial def lowerRowSqlExpr (lowerValWithLocals : Array String → Syntax → M Term) (dbInfo : DatabaseInfo)
+partial def lowerRowSqlExpr (lowerValWithLocals : Array String → Syntax → M Term) (dbInfo : DatabaseInfo)
     (scopes : Array (String × DbTableInfo × String)) (stx : Syntax) : M Term := do
   let lowerVal := lowerValWithLocals #[]
   let u := unwrapParens1 stx; let k := u.getKind
   let mentionsScope (s : Syntax) : Bool :=
-    scopes.any (fun (v, _, _) => stxMentionsVar v s) || stxAny (·.getKind == ``qedAnyIn) s
+    scopes.any (fun (v, tbl, _) => if v.isEmpty then tbl.columns.any (fun c => stxMentionsVar c.name s) else stxMentionsVar v s) ||
+    stxAny (·.getKind == ``qedAnyIn) s
   if k == ``qedAnyIn then
     let aliasId : Ident := ⟨u.getArg 1⟩; let aliasStr := aliasId.getId.eraseMacroScopes.toString
     unless isSafeSqlIdent aliasStr do throwErrorAt aliasId s!"invalid SQL alias `{aliasStr}` in `any {aliasStr} in ...`"
@@ -163,6 +218,16 @@ private partial def lowerRowSqlExpr (lowerValWithLocals : Array String → Synta
       if let some (_, stbl, sqlQual) := scopes.reverse.find? (·.1 == rv) then
         let colInfo ← findDbCol u stbl col; checkNotEnc stbl colInfo col
         return ← mkColSql sqlQual col
+      else if col == "length" then
+        if let some (_, stbl, sqlQual) := scopes.reverse.find? (·.1.isEmpty) then
+          if let some colInfo := stbl.columns.find? (·.name == rv) then
+            checkNotEnc stbl colInfo rv
+            return ← `(Qed.Server.Db.SqlExpr.strLen $(← mkColSql sqlQual rv))
+  | some [col] =>
+      if let some (_, stbl, sqlQual) := scopes.reverse.find? (·.1.isEmpty) then
+        if let some colInfo := stbl.columns.find? (·.name == col) then
+          checkNotEnc stbl colInfo col
+          return ← mkColSql sqlQual col
   | some [rv, col, "length"] =>
       if let some (_, stbl, sqlQual) := scopes.reverse.find? (·.1 == rv) then
         if let some colInfo := stbl.columns.find? (·.name == col) then
@@ -260,6 +325,7 @@ private partial def lowerRowSqlExpr (lowerValWithLocals : Array String → Synta
     throwErrorAt u s!"unsupported call `{stxSnippet u}` in SQL `where`/`set` clause"
   else throwErrorAt u s!"unsupported expression `{stxSnippet u}` in SQL `where`/`set` clause (use row columns, comparisons, `and`/`or`/`not`, `any m in tbl:`, `in`, arithmetic, `.length`, `.startsWith`, `.contains`, `xs.contains(r.col)`, or bound variables)"
 
+@[noinline, nospecialize]
 private def parseWhereArg (lowerValWithLocals : Array String → Syntax → M Term)
     (dbInfo : DatabaseInfo) (tbl : DbTableInfo) (rowTyId : Ident) (whereStx? : Option Syntax)
     (needCross : Bool := false) : M (Term × Term × Option (String × Syntax) × Bool) := do
@@ -287,6 +353,7 @@ private def parseWhereArg (lowerValWithLocals : Array String → Syntax → M Te
     | none => `(fun ($rId:ident : $rowTyId) => ($(← lowerValWithLocals #[rName] body) : Bool))
   return (predT, sqlW, some (rName, body), isCross)
 
+@[noinline, nospecialize]
 private def parseQueryWindow (tbl : DbTableInfo) (lowerVal : Syntax → M Term) (findNamed : String → Option Syntax) : M (Term × Term × Term) := do
   let optNat (s? : Option Syntax) : M Term := match s? with | none => `(none) | some s => do `(some ($(← lowerVal s) : Nat))
   return (← liftM (parseOrderByArg tbl (findNamed "orderBy")), ← optNat (findNamed "limit"), ← optNat (findNamed "offset"))
@@ -358,13 +425,7 @@ def lowerDbCall (lowerVal : Syntax → M Term) (lowerValWithLocals : Array Strin
             if seenCols.contains cn then throwErrorAt cs s!"duplicate column `{cn}` in `columns = [...]`"
             seenCols := seenCols.push cn; projCols := projCols.push (cs, ci)
           let projColIdTs ← liftM <| projCols.mapM fun (cs, ci) => mkSqlIdentTerm cs ci.name
-          let projEncTs : Array Term ← liftM (show CommandElabM (Array Term) from do
-            let mut out : Array Term := #[]
-            for ((_, ci), idx) in projCols.zipIdx do
-              if let some ek := ci.encKey? then
-                let sp ← mkEncColSpecTerm tbl.tableName ci.name ek
-                out := out.push (← `(($(Syntax.mkNumLit (toString idx)), $sp)))
-            pure out)
+          let projEncTs ← liftM <| mkColsEncPairs tbl.tableName (projCols.map fun (_, ci) => (ci.name, ci.encKey?)) fun _ idx => Syntax.mkNumLit (toString idx)
           let valsVar := mkIdent `_pvals
           let pBindIds : Array Ident := projCols.zipIdx.map fun (_, i) => mkIdent (Name.mkSimple s!"_pc{i}")
           let pDecStmts ← projCols.zipIdx.mapM fun ((cs, ci), idx) => do

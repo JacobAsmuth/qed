@@ -76,6 +76,14 @@ theorem keyedRows_eq_of_keys_eq {keys : σ → Array String} {rowsHtml : σ → 
   List.ext_getElem? fun i => if hi : i < (disambiguateKeys (keys s₁)).size then hr.2.2.2 s₁ s₂ i i hi (hk ▸ hi) (by simp [hk])
     else by rw [List.getElem?_eq_none (by rw [hr.1 s₁]; omega), List.getElem?_eq_none (by rw [hr.1 s₂, hk]; omega)]
 
+theorem down_ind {n : Nat} {P : ∀ i, i ≤ n → Prop} (base : P n (Nat.le_refl n)) (step : ∀ i (hlt : i < n), P (i + 1) hlt → P i (Nat.le_of_lt hlt)) :
+    ∀ i (hle : i ≤ n), P i hle := fun i hle => by
+  induction h : n - i generalizing i with
+  | zero => cases Nat.le_antisymm hle (Nat.sub_eq_zero_iff_le.1 h); exact base
+  | succ k ih =>
+      have hlt : i < n := Nat.lt_of_sub_pos (h.symm ▸ Nat.succ_pos k)
+      exact step i hlt (ih (i + 1) hlt ((Nat.sub_add_eq n i 1).trans (by rw [h]; exact Nat.add_sub_cancel k 1)))
+
 abbrev PatchViewPost (f : Nat) (childNs : String) (parent : Dom.Node) (pns ptag : String) (pst : SpecElemState msg) (pmg : List String)
     (v : View σ msg) (s₂ : σ) (pre suf : List Dom.Node) (Sold : Nat → Prop) (a : DomArena msg) (res : VState σ msg × DomArena msg) : Prop :=
   let (vst', a') := res
@@ -85,6 +93,9 @@ abbrev PatchViewPost (f : Nat) (childNs : String) (parent : Dom.Node) (pns ptag 
   (∀ r ∈ pre ++ vst'.rootNode :: suf, r.toNat < a'.nextId) ∧
   VStateValid f childNs v s₂ a' (fun k => Sold k ∨ (a.nextId ≤ k ∧ k < a'.nextId)) vst' ∧
   DomTreeAssocEquiv (readDomTree f a' vst'.rootNode) (specDom childNs (View.render v s₂))
+
+abbrev ElemPar.patchViewPost (ep : ElemPar msg) (v : View σ msg) :=
+  PatchViewPost ep.f ep.childNs ep.parent ep.pns ep.ptag ep.pst ep.pmg v
 
 end
 end Qed

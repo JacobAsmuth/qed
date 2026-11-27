@@ -68,51 +68,57 @@ end
 
 mutual
   theorem View.DomClean_render : ∀ {v : View σ msg}, View.DomClean v → ∀ s, (View.render v s).DomClean = true
-    | .text _, _, _ | .dyn _, _, _ => rfl | .static _, h, _ => h | .dynNode _, h, s | .memo _, h, s => h s
-    | .ifElse c _ _, ⟨hy, hn⟩, s => by cases hc : c s <;> simp [View.render, hc, View.DomClean_render hy s, View.DomClean_render hn s]
-    | .element _ _ _, ⟨ha, hks⟩, s => by simp [View.render, Html.DomClean, ha.1 s, ha.2.1 s, View.DomCleanEach_renderEach hks s]
-    | .keyedList _ _ _ _ _ _ _ none, ⟨ha, hrows⟩, s => by simp [View.render, Html.DomClean, ha.1 s, ha.2.1 s, hrows.2.1 s]
+    | .text _, _, _ | .dyn _, _, _ => by rw [View.render, Html.DomClean_text]
+    | .static _, h, _ => h | .dynNode _, h, s | .memo _, h, s => h s
+    | .ifElse c _ _, ⟨hy, hn⟩, s => by cases hc : c s <;> simp only [View.render, hc, Bool.false_eq_true, ↓reduceIte, View.DomClean_render hy s, View.DomClean_render hn s]
+    | .element _ _ _, ⟨ha, hks⟩, s => by simp only [View.render, Html.DomClean_element, ha.1 s, ha.2.1 s, View.DomCleanEach_renderEach hks s, Bool.not_false, Bool.and_self]
+    | .keyedList _ _ _ _ _ _ _ none, ⟨ha, hrows⟩, s => by simp only [View.render, Html.DomClean_element, ha.1 s, ha.2.1 s, hrows.2.1 s, Bool.not_false, Bool.and_self]
     | .keyedList _ _ _ _ _ _ _ (some _), h, _ => False.elim h
   theorem View.DomCleanEach_renderEach : ∀ {ks : List (View σ msg)}, View.DomCleanEach ks → ∀ s, Html.DomCleanList (View.renderEach ks s) = true
-    | [], _, _ => rfl | _ :: _, ⟨hk, hks⟩, s => by simp [View.renderEach, Html.DomCleanList, View.DomClean_render hk s, View.DomCleanEach_renderEach hks s]
+    | [], _, _ => rfl | _ :: _, ⟨hk, hks⟩, s => by simp only [View.renderEach, Html.DomCleanList, List.all_cons, View.DomClean_render hk s, View.DomCleanEach_renderEach hks s, Bool.and_self]
 end
 
 private theorem map_prefixSignal_of_clean (pfx : String) :
     ∀ (attrs : List (Attr msg)), ownsChildren attrs = false → attrs.all Attr.DomClean = true → attrs.map (Attr.prefixSignal pfx) = attrs
   | [], _, _ => rfl | a :: rest, hown, hcl => by
       simp only [ownsChildren, List.any_cons, Bool.or_eq_false_iff, List.all_cons, Bool.and_eq_true] at hown hcl
-      cases a <;> first | (simp [Attr.DomClean] at hown hcl; done) | simp only [List.map_cons, Attr.prefixSignal, map_prefixSignal_of_clean pfx rest hown.2 hcl.2]
+      cases a with
+      | signalBind _ => cases hown.1
+      | signalAttr _ _ _ | signalOn _ _ _ => cases hcl.1
+      | _ => simp only [List.map_cons, Attr.prefixSignal, map_prefixSignal_of_clean pfx rest hown.2 hcl.2]
 
-mutual
-  theorem Html.prefixSignals_of_DomClean (pfx : String) : ∀ {h : Html msg}, h.DomClean = true → h.prefixSignals pfx = h
-    | .text _, _ => rfl
-    | .element tag attrs cs, hc => by
-        simp only [Html.DomClean, Bool.and_eq_true, Bool.not_eq_true'] at hc
-        exact (congrArg (Html.element tag · _) (map_prefixSignal_of_clean pfx attrs hc.1.1 hc.1.2)).trans (congrArg (Html.element tag attrs) (Html.prefixSignalsList_of_DomClean pfx hc.2))
-  theorem Html.prefixSignalsList_of_DomClean (pfx : String) : ∀ {hs : List (Html msg)}, Html.DomCleanList hs = true → Html.prefixSignalsList pfx hs = hs
-    | [], _ => rfl
-    | _ :: _, hc => by simp only [Html.DomCleanList, Bool.and_eq_true] at hc; exact (congrArg (· :: _) (Html.prefixSignals_of_DomClean pfx hc.1)).trans (congrArg (_ :: ·) (Html.prefixSignalsList_of_DomClean pfx hc.2))
-end
-
-theorem Html.map_prefixSignals_of_DomCleanList (pfx : String) : ∀ {hs : List (Html msg)}, Html.DomCleanList hs = true → hs.map (Html.prefixSignals pfx) = hs
-  | [], _ => rfl
-  | _ :: _, hc => by simp only [Html.DomCleanList, Bool.and_eq_true] at hc; simp only [List.map_cons, Html.prefixSignals_of_DomClean pfx hc.1, Html.map_prefixSignals_of_DomCleanList pfx hc.2]
+private theorem prefixSignalsList_eq_map (pfx : String) : ∀ (hs : List (Html msg)), Html.prefixSignalsList pfx hs = hs.map (Html.prefixSignals pfx)
+  | [] => rfl | c :: cs => congrArg (Html.prefixSignals pfx c :: ·) (prefixSignalsList_eq_map pfx cs)
+theorem Html.prefixSignals_of_DomClean (pfx : String) : ∀ {h : Html msg}, h.DomClean = true → h.prefixSignals pfx = h
+  | .text _, _ => rfl
+  | .element tag attrs cs, hc => by
+      simp only [Html.DomClean_element, Html.DomCleanList, Bool.and_eq_true, Bool.not_eq_true'] at hc
+      exact (congrArg (Html.element tag · _) (map_prefixSignal_of_clean pfx attrs hc.1.1 hc.1.2)).trans
+        (congrArg (Html.element tag attrs) ((prefixSignalsList_eq_map pfx cs).trans
+          ((List.map_congr_left fun c hm =>
+              have : sizeOf c < sizeOf (Html.element tag attrs cs) := by have := List.sizeOf_lt_of_mem hm; simp only [Html.element.sizeOf_spec]; omega
+              Html.prefixSignals_of_DomClean pfx (List.all_eq_true.1 hc.2 c hm)).trans (List.map_id cs))))
+termination_by h => sizeOf h
+theorem Html.map_prefixSignals_of_DomCleanList (pfx : String) {hs : List (Html msg)} (hc : Html.DomCleanList hs = true) : hs.map (Html.prefixSignals pfx) = hs :=
+  (List.map_congr_left fun c hm => Html.prefixSignals_of_DomClean pfx (List.all_eq_true.1 hc c hm)).trans (List.map_id hs)
+theorem Html.prefixSignalsList_of_DomClean (pfx : String) {hs : List (Html msg)} (hc : Html.DomCleanList hs = true) : Html.prefixSignalsList pfx hs = hs :=
+  (prefixSignalsList_eq_map pfx hs).trans (Html.map_prefixSignals_of_DomCleanList pfx hc)
 
 theorem Html.DomClean_withKey (k : String) : ∀ (h : Html msg), (withKey k h).DomClean = h.DomClean
-  | .text _ => rfl | .element .. => by simp [withKey, Html.DomClean, ownsChildren, Attr.DomClean]
+  | .text _ => rfl | .element .. => by simp only [withKey, Html.DomClean_element, ownsChildren, List.any_cons, Bool.false_or, List.all_cons, Attr.DomClean, Bool.true_and]
 
 theorem Html.textOf?_withKey (k : String) : ∀ (h : Html msg), (withKey k h).textOf? = h.textOf?
   | .text _ | .element .. => rfl
 
 private theorem managedAttrName_of_key? {a : Attr msg} {k : String} (h : a.key? = some k) : managedAttrName a = some k := by
-  cases a <;> simp_all [Attr.key?, managedAttrName]
+  cases a with | attr _ _ | flag _ _ => exact h | _ => cases h
 
 private theorem mem_managed_dedupAttrs_iff {k : String} :
     ∀ {xs : List (Attr msg)}, k ∈ (dedupAttrs xs).filterMap managedAttrName ↔ ∃ a ∈ xs, managedAttrName a = some k
-  | [] => by simp [dedupAttrs]
+  | [] => ⟨(fun h => nomatch h), (fun ⟨_, h, _⟩ => nomatch h)⟩
   | x :: xs => by
       have hcons : k ∈ (x :: dedupAttrs xs).filterMap managedAttrName ↔ ∃ a ∈ x :: xs, managedAttrName a = some k := by
-        simp only [List.mem_filterMap, List.mem_cons, exists_eq_or_imp]; exact or_congr_right (by simpa [List.mem_filterMap] using mem_managed_dedupAttrs_iff (k := k) (xs := xs))
+        simp only [List.mem_filterMap, List.mem_cons, exists_eq_or_imp]; exact or_congr_right (by simpa only [List.mem_filterMap] using mem_managed_dedupAttrs_iff (k := k) (xs := xs))
       unfold dedupAttrs; split
       · exact hcons
       · rename_i kx hx; split
@@ -132,21 +138,36 @@ private theorem applyDynAttrListM_fold (a : DomArena msg) (node : Dom.Node) (s :
   | .stat _ :: rest, st, h => applyDynAttrListM_fold a node s ns tag mg cs rest st h
   | .dynVal _ _ :: rest, _, h => by dsimp only [applyDynAttrListM, bind, StateT.bind, List.foldl_cons, stepDynAttr]; rw [applyAttrM_element]; exact applyDynAttrListM_fold a node s ns tag mg cs rest _ h
 
-private theorem filterMap_cls_eq_of_noBind (s₁ s₂ : σ) :
-    ∀ (ys : List (VAttr σ msg)), noBind ys = true →
-      (ys.map (VAttr.eval s₁)).filterMap (fun | .cls c => some c | _ => none) = (ys.map (VAttr.eval s₂)).filterMap (fun | .cls c => some c | _ => none)
+private theorem filterMap_eq_of_noBind (f : Attr msg → Option String) (hattr : ∀ k v, f (.attr k v) = none) (s₁ s₂ : σ) :
+    ∀ (ys : List (VAttr σ msg)), noBind ys = true → (ys.map (VAttr.eval s₁)).filterMap f = (ys.map (VAttr.eval s₂)).filterMap f
   | [], _ => rfl | .bind _ :: _, h | .dynOn _ _ :: _, h => by cases h
-  | .dynVal _ _ :: rest, h => filterMap_cls_eq_of_noBind s₁ s₂ rest h
-  | .stat a :: rest, h => by cases a <;> simp only [List.map_cons, VAttr.eval, List.filterMap_cons, filterMap_cls_eq_of_noBind s₁ s₂ rest h]
+  | .dynVal _ _ :: rest, h => by simp only [List.map_cons, VAttr.eval, List.filterMap_cons, hattr, filterMap_eq_of_noBind f hattr s₁ s₂ rest h]
+  | .stat _ :: rest, h => by simp only [List.map_cons, VAttr.eval, List.filterMap_cons, filterMap_eq_of_noBind f hattr s₁ s₂ rest h]
 
-private theorem normalKey_slotUpdate_iff {a b : Attr msg} {k : String}
-    (ha : a.key? = some k) (hb : b.key? = some k) (haN : a.NormalKey = true) (hbN : b.NormalKey = true)
-    (sl : AttrSlot) : (a.slotUpdate? sl).isSome = true → (b.slotUpdate? sl).isSome = true := by
-  cases a <;> cases ha <;> cases b <;> cases hb <;> first
-    | (cases sl <;> simp only [Attr.slotUpdate?] <;> first | exact id | (split <;> exact id))
-    | (have h1 : (k == "checked") = false := beq_eq_false_iff_ne.2 fun h => by subst h; first | exact Bool.noConfusion haN | exact Bool.noConfusion hbN
-       have h2 : (k == "value") = false := beq_eq_false_iff_ne.2 fun h => by subst h; first | exact Bool.noConfusion haN | exact Bool.noConfusion hbN
-       cases sl <;> simp only [Attr.slotUpdate?, h1, h2, bne, Bool.not_false, Bool.true_and, Bool.false_eq_true, ↓reduceIte] <;> first | exact id | (split <;> exact id))
+private theorem isSome_ite_some {α : Type} (b : Bool) (x : α) : (if b then some x else none).isSome = b := by cases b <;> rfl
+
+private theorem normalKey_slotUpdate_eq {a : Attr msg} {k : String} (hk : a.key? = some k) (hn : a.NormalKey = true) (sl : AttrSlot) :
+    (a.slotUpdate? sl).isSome = match sl with | .val => k == "value" | .chk => k == "checked" | .attr k' => (k != "value") && (k != "checked") && (k == k') | _ => false := by
+  cases a with
+  | attr _ _ =>
+      cases Option.some.inj hk; have hc : (k == "checked") = false := beq_eq_false_iff_ne.2 fun h => by subst h; cases hn
+      cases sl with
+      | val => exact isSome_ite_some ..
+      | chk => simp only [Attr.slotUpdate?, hc]; rfl
+      | attr k' => simp only [Attr.slotUpdate?, bne, hc, Bool.not_false, Bool.and_true]; exact isSome_ite_some ..
+      | _ => rfl
+  | flag _ _ =>
+      cases Option.some.inj hk; have hv : (k == "value") = false := beq_eq_false_iff_ne.2 fun h => by subst h; cases hn
+      cases sl with
+      | chk => exact isSome_ite_some ..
+      | val => simp only [Attr.slotUpdate?, hv]; rfl
+      | attr k' => simp only [Attr.slotUpdate?, bne, hv, Bool.not_false, Bool.true_and]; exact isSome_ite_some ..
+      | _ => rfl
+  | _ => cases hk
+
+private theorem normalKey_slotUpdate_iff {a b : Attr msg} {k : String} (ha : a.key? = some k) (hb : b.key? = some k) (haN : a.NormalKey = true) (hbN : b.NormalKey = true) (sl : AttrSlot) :
+    (a.slotUpdate? sl).isSome = true → (b.slotUpdate? sl).isSome = true := by
+  rw [normalKey_slotUpdate_eq ha haN, normalKey_slotUpdate_eq hb hbN]; exact id
 
 private theorem dedupAttrs_foldl_equiv :
     ∀ (xs : List (Attr msg)) (cur : SpecElemState msg), xs.all Attr.NormalKey = true →
@@ -200,7 +221,10 @@ private theorem stepDynAttr_nonCls_read (sl : AttrSlot) (s₁ s₂ : σ) :
       simp only [nonCls, List.map_cons, VAttr.eval, List.filter_cons, ↓reduceIte, List.foldl_cons, stepDynAttr]
       cases hu : (@Attr.attr msg k (g s₂)).slotUpdate? sl with
       | none =>
-          have hu1 : (@Attr.attr msg k (g s₁)).slotUpdate? sl = none := by cases sl <;> simp only [Attr.slotUpdate?] at hu ⊢ <;> split at hu <;> simp_all
+          have hu1 : (@Attr.attr msg k (g s₁)).slotUpdate? sl = none := by
+            cases sl with
+            | attr _ | val => dsimp only [Attr.slotUpdate?] at hu ⊢; split at hu <;> (first | exact absurd hu (Option.some_ne_none _) | (rename_i h; exact ite_eq_right h))
+            | _ => rfl
           exact (foldl_stepDynAttr_congr sl s₂ rest (by rw [read_stepSpecAttr, hu]; rfl)).trans
             (stepDynAttr_nonCls_read sl s₁ s₂ rest _ _ hnb hns.2 hown (by rw [read_stepSpecAttr, hu1, read_stepSpecAttr, hu]; exact heq))
       | some _ =>
@@ -238,7 +262,7 @@ theorem applyDynAttrsM_spec (a : DomArena msg) (node : Dom.Node) (ns tag : Strin
       let cl := ((attrs.map (VAttr.eval s₁)).filterMap (fun | .cls c => some c | _ => none)).filter (· != "")
       if cl.isEmpty then [] else [Attr.cls (String.intercalate " " cl)]
     have hnorm (s : σ) : normalizeAttrs (attrs.map (VAttr.eval s)) = clsPart ++ dedupAttrs (nonCls s attrs) := by
-      unfold normalizeAttrs; dsimp only [clsPart, nonCls]; erw [filterMap_cls_eq_of_noBind s s₁ attrs hnb]; rfl
+      unfold normalizeAttrs; dsimp only [clsPart, nonCls]; rw [filterMap_eq_of_noBind _ (fun _ _ => rfl) s s₁ attrs hnb]; rfl
     have hdd (s : σ) : ElemStateEquiv ((dedupAttrs (nonCls s attrs)).foldl stepSpecAttr (clsPart.foldl stepSpecAttr {})) ((nonCls s attrs).foldl stepSpecAttr (clsPart.foldl stepSpecAttr {})) :=
       dedupAttrs_foldl_equiv _ _ (List.all_eq_true.2 fun a ha => List.all_eq_true.1 (hclean.2.2.1 s) a (List.mem_filter.1 ha).1)
     have hmgOf {a : Attr msg} {nm : String} (ha : a ∈ nonCls s₁ attrs) (hm : managedAttrName a = some nm) : mg.contains nm = true :=

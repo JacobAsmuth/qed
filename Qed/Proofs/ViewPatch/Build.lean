@@ -57,35 +57,36 @@ private abbrev BuildMatches (ns : String) (v : View σ msg) (s : σ) (a : DomAre
   View.DomClean v → 0 < a.nextId → a.nextId + htmlNodeCount (View.render v s) < UInt32.size → htmlDepth (View.render v s) ≤ f →
   let ((root, vst), a') := (buildViewM (m := ArenaM msg) ns v s).run a; vst.rootNode = root ∧ VStateMatches v s a' root vst
 
-private theorem buildViewKidsM_matches (childNs : String) (parent : Dom.Node) (s : σ) (f : Nat) (pns ptag : String) (pst : SpecElemState msg) (pmg : List String) :
-    ∀ (ks : List (View σ msg)), (∀ k ∈ ks, ∀ a, BuildMatches childNs k s a f) →
-      ∀ (a : DomArena msg) (acc : List Dom.Node), View.DomCleanEach ks → parent.toNat < a.nextId → 0 < a.nextId →
-        a.nextId + htmlListNodeCount (View.renderEach ks s) < UInt32.size → htmlListDepth (View.renderEach ks s) ≤ f →
-        (∀ c ∈ acc, c.toNat < a.nextId) → a.get parent = .element pns ptag pst pmg acc →
-        let (ksts, aOut) := (buildViewKidsM (m := ArenaM msg) childNs parent ks s).run a
-        ∃ csNew, aOut.get parent = .element pns ptag pst pmg (acc ++ csNew) ∧
-          (∀ m : Dom.Node, m ≠ parent → m.toNat < a.nextId → aOut.get m = a.get m) ∧ VStateKidsMatches ks s aOut csNew ksts
-  | [], _, _, _, _, _, _, _, _, _, hpar => ⟨[], by simpa using hpar, fun _ _ _ => rfl, trivial⟩
+private theorem buildViewKidsM_matches (ep : ElemPar msg) (s : σ) :
+    ∀ (ks : List (View σ msg)), (∀ k ∈ ks, ∀ a, BuildMatches ep.childNs k s a ep.f) →
+      ∀ (a : DomArena msg) (acc : List Dom.Node), View.DomCleanEach ks → ep.parent.toNat < a.nextId → 0 < a.nextId →
+        a.nextId + htmlListNodeCount (View.renderEach ks s) < UInt32.size → htmlListDepth (View.renderEach ks s) ≤ ep.f →
+        (∀ c ∈ acc, c.toNat < a.nextId) → a.get ep.parent = ep.entry acc →
+        let (ksts, aOut) := (buildViewKidsM (m := ArenaM msg) ep.childNs ep.parent ks s).run a
+        ∃ csNew, aOut.get ep.parent = ep.entry (acc ++ csNew) ∧
+          (∀ m : Dom.Node, m ≠ ep.parent → m.toNat < a.nextId → aOut.get m = a.get m) ∧ VStateKidsMatches ks s aOut csNew ksts
+  | [], _, _, _, _, _, _, _, _, _, hpar => ⟨[], by simpa only [List.append_nil] using hpar, fun _ _ _ => rfl, trivial⟩
   | k :: rest, hV, a, acc, ⟨hkCl, hrestCl⟩, hparLt, hpos, hbound, hdep, haccLt, hpar => by
       simp only [View.renderEach, htmlListNodeCount, htmlListDepth] at hbound hdep
       have hkM := hV k (.head _) a hkCl hpos (by omega) (Nat.le_trans (Nat.le_max_left ..) hdep)
-      have hkD := buildViewM_dom_spec childNs k s a f hkCl hpos (by omega) (Nat.le_trans (Nat.le_max_left ..) hdep)
+      have hkD := buildViewM_dom_spec ep.childNs k s a ep.f hkCl hpos (by omega) (Nat.le_trans (Nat.le_max_left ..) hdep)
       dsimp only [StateT.run, buildViewKidsM, bind, StateT.bind, pure, StateT.pure] at hkM hkD ⊢
-      rcases hbK : buildViewM (m := ArenaM msg) childNs k s a with ⟨⟨kn, kst⟩, aMid⟩
+      rcases hbK : buildViewM (m := ArenaM msg) ep.childNs k s a with ⟨⟨kn, kst⟩, aMid⟩
       rw [hbK] at hkM hkD; rcases hkD with ⟨hknGe, hknLt, haMidExt, hkClean⟩
-      let aAfter := aMid.set parent (.element pns ptag pst pmg (acc ++ [kn]))
-      dsimp only; rw [show MonadDom.appendChild (m := ArenaM msg) parent kn aMid = ((), aAfter) by
+      let aAfter := aMid.set ep.parent (ep.entry (acc ++ [kn]))
+      have hparMid : aMid.get ep.parent = ep.entry acc := (haMidExt.frame ep.parent hparLt id).trans hpar
+      dsimp only; rw [show MonadDom.appendChild (m := ArenaM msg) ep.parent kn aMid = ((), aAfter) by
             cases hkG : aMid.get kn with
             | fragment fcs => exact False.elim (CleanDomSubtree_not_fragment hkClean fcs hkG)
-            | _ => simp only [MonadDom.appendChild, hkG, DomArena.modifyChildren, DomArena.modify, (haMidExt.frame parent hparLt id).trans hpar, List.erase_of_not_mem (fun hm => by have := haccLt kn hm; omega), aAfter]]
+            | _ => simp only [MonadDom.appendChild, hkG, DomArena.modifyChildren, DomArena.modify, hparMid, ElemPar.entry, List.erase_of_not_mem (fun hm => Nat.not_lt.2 hknGe (haccLt kn hm)), aAfter]]
       dsimp only
-      have hih := buildViewKidsM_matches childNs parent s f pns ptag pst pmg rest (fun x hx => hV x (.tail _ hx)) aAfter (acc ++ [kn]) hrestCl
+      have hih := buildViewKidsM_matches ep s rest (fun x hx => hV x (.tail _ hx)) aAfter (acc ++ [kn]) hrestCl
         (Nat.lt_of_lt_of_le hparLt haMidExt.next_ge) (Nat.lt_of_lt_of_le hpos haMidExt.next_ge) (by have := haMidExt.next_le; dsimp only [aAfter, DomArena.set]; omega)
         (Nat.le_trans (Nat.le_max_right ..) hdep) (fun c hc => (List.mem_append.1 hc).elim (fun h1 => Nat.lt_of_lt_of_le (haccLt c h1) haMidExt.next_ge) (fun h2 => (List.mem_singleton.1 h2) ▸ hknLt)) (DomArena.get_set_self ..)
-      dsimp only [StateT.run] at hih; rcases hbR : buildViewKidsM (m := ArenaM msg) childNs parent rest s aAfter with ⟨_, _⟩
+      dsimp only [StateT.run] at hih; rcases hbR : buildViewKidsM (m := ArenaM msg) ep.childNs ep.parent rest s aAfter with ⟨_, _⟩
       rw [hbR] at hih; rcases hih with ⟨csRest, hparOut, hfrRest, hvkRest⟩; rw [List.append_assoc, List.singleton_append] at hparOut
       exact ⟨kn :: csRest, hparOut, fun m hmn hm => (hfrRest m hmn (Nat.lt_of_lt_of_le hm haMidExt.next_ge)).trans ((DomArena.get_set_ne _ _ hmn).trans (haMidExt.frame m hm id)),
-        hkM.1.symm, VStateMatches_frame (fun m hm => (hfrRest m (node_ne_of_toNat_ne (by omega)) hm.2).trans (DomArena.get_set_ne _ _ (node_ne_of_toNat_ne (by omega)))) hkClean hkM.2, hvkRest⟩
+        hkM.1.symm, VStateMatches_frame (fun m hm => (hfrRest m (node_ne_of_toNat_ne (Nat.ne_of_gt (Nat.lt_of_lt_of_le hparLt hm.1))) hm.2).trans (DomArena.get_set_ne _ _ (node_ne_of_toNat_ne (Nat.ne_of_gt (Nat.lt_of_lt_of_le hparLt hm.1))))) hkClean hkM.2, hvkRest⟩
 
 private theorem buildViewM_matches (ns : String) (v : View σ msg) (s : σ) (a : DomArena msg) (fuel : Nat) : BuildMatches ns v s a fuel := by
   intro hcl hpos hbound hdep
@@ -95,21 +96,21 @@ private theorem buildViewM_matches (ns : String) (v : View σ msg) (s : σ) (a :
       cases hc : c s <;> (
         simp only [buildViewM, View.render, StateT.run, bind, StateT.bind, pure, StateT.pure, hc, Bool.false_eq_true, ↓reduceIte] at hbound hdep ⊢
         have ih := by first | exact ihn ns a fuel hcl.2 hpos hbound hdep | exact ihy ns a fuel hcl.1 hpos hbound hdep
-        dsimp only [StateT.run] at ih; rcases hb : buildViewM (m := ArenaM msg) ns _ s a with ⟨⟨_, _⟩, _⟩; rw [hb] at ih; exact ⟨ih.1, hc.symm, by simp [hc, ih.2]⟩)
+        dsimp only [StateT.run] at ih; rcases hb : buildViewM (m := ArenaM msg) ns _ s a with ⟨⟨_, _⟩, _⟩; rw [hb] at ih; exact ⟨ih.1, hc.symm, by simp only [hc, Bool.false_eq_true, ↓reduceIte, ih.2]⟩)
   | element tag attrs kids ihk =>
       cases fuel with | zero => simp only [View.render, htmlDepth] at hdep; omega | succ f =>
       simp only [View.render, htmlNodeCount, htmlDepth] at hbound hdep
       let realNs := if ns == "" && tag == "svg" then Dom.svgNs else ns; let node := UInt32.ofNat a.nextId; let a1 : DomArena msg := { a with nextId := a.nextId + 1 }
       let st := evalSpecAttrs (attrs.map (VAttr.eval s)); let mg := (normalizeAttrs (attrs.map (VAttr.eval s))).filterMap managedAttrName
       have hnodeNat : node.toNat = a.nextId := uint32_toNat_ofNat_lt a.nextId (by omega)
-      have hkids := buildViewKidsM_matches (Dom.childNsOf ns tag) node s f realNs tag st mg kids (fun k hk a' => ihk k hk _ a' f)
+      have hkids := buildViewKidsM_matches ⟨f, Dom.childNsOf ns tag, node, realNs, tag, st, mg⟩ s kids (fun k hk a' => ihk k hk _ a' f)
         (a1.set node (.element realNs tag st mg [])) [] hcl.2 (by dsimp only [a1, DomArena.set]; omega) (by dsimp only [a1, DomArena.set]; omega)
-        (by dsimp only [a1, DomArena.set]; omega) (by omega) (fun _ h => nomatch h) (DomArena.get_set_self ..)
+        (by dsimp only [a1, DomArena.set]; omega) (by dsimp only; omega) (fun _ h => nomatch h) (DomArena.get_set_self ..)
       dsimp only [buildViewM, MonadDom.createElement, DomArena.alloc, StateT.run, bind, StateT.bind, pure, StateT.pure] at hkids ⊢
       rw [show ({ a with nextId := a.nextId + 1, store := fun m => if (m == node) = true then ArenaEntry.element realNs tag {} [] [] else a.store m } : DomArena msg) = a1.set node (.element realNs tag {} [] []) from rfl,
           applyAttrsM_fresh_element a1 node realNs tag [] (attrs.map (VAttr.eval s))]
       dsimp only; rcases hbk : buildViewKidsM (m := ArenaM msg) (Dom.childNsOf ns tag) node kids s (a1.set node (.element realNs tag st mg [])) with ⟨_, _⟩
-      rw [hbk] at hkids; rcases hkids with ⟨csNew, hparOut, _, hvk⟩; exact ⟨rfl, rfl, realNs, tag, st, mg, csNew, by simpa using hparOut, hvk⟩
+      rw [hbk] at hkids; rcases hkids with ⟨csNew, hparOut, _, hvk⟩; exact ⟨rfl, rfl, realNs, tag, st, mg, csNew, by simpa only [List.nil_append] using hparOut, hvk⟩
   | keyedList tag attrs keys marks rowSig rowEv rowsHtml tmpl? =>
       cases tmpl? with | some _ => exact False.elim hcl | none =>
       dsimp only [buildViewM, MonadDom.createElement, StateT.run, bind, StateT.bind, pure, StateT.pure]

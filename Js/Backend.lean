@@ -147,19 +147,6 @@ def JsDecl.render (min : Bool) (d : JsDecl) : String :=
 
 /-! ## Total IR Analysis & Reachability Passes -/
 
-mutual
-def callees : FnBody → Array Name → Array Name
-  | .vdecl _ _ e b, acc => callees b (match e with | .fap c _ => acc.push c | .pap c _ => acc.push c | _ => acc)
-  | .jdecl _ _ v b, acc => callees b (callees v acc)
-  | .case _ _ _ alts, acc => calleesAlts alts.toList acc
-  | .set _ _ _ b, acc | .setTag _ _ b, acc | .uset _ _ _ b, acc | .sset _ _ _ _ _ b, acc
-  | .inc _ _ _ _ b, acc | .dec _ _ _ _ b, acc | .del _ b, acc => callees b acc
-  | .ret _, acc | .jmp _ _, acc | .unreachable, acc => acc
-
-def calleesAlts : List Alt → Array Name → Array Name
-  | [], acc => acc | .ctor _ b :: rest, acc | .default b :: rest, acc => calleesAlts rest (callees b acc)
-end
-
 def reachAux (env : Environment) : Nat → List Name → Array Name → Std.HashSet Name → Except String (Array Name)
   | _, [], seen, _ => .ok seen
   | 0, n :: _, _, _ => .error s!"JS reachability gate: exceeded fuel limit while inspecting `{n}`"

@@ -323,16 +323,16 @@ private def owningKernelConst? (env : Environment) : Name → Option Name
   | n => if env.contains n then some n else match n with | .str p _ | .num p _ => owningKernelConst? env p | .anonymous => none
 
 mutual
-private def collectIrCallees : Lean.IR.FnBody → Array Name → Array Name
-  | .vdecl _ _ e b, acc => collectIrCallees b (match e with | .fap c _ | .pap c _ => acc.push c | _ => acc)
-  | .jdecl _ _ v b, acc => collectIrCallees b (collectIrCallees v acc)
-  | .case _ _ _ alts, acc => collectIrCalleesAlts alts.toList acc
+def callees : Lean.IR.FnBody → Array Name → Array Name
+  | .vdecl _ _ e b, acc => callees b (match e with | .fap c _ | .pap c _ => acc.push c | _ => acc)
+  | .jdecl _ _ v b, acc => callees b (callees v acc)
+  | .case _ _ _ alts, acc => calleesAlts alts.toList acc
   | .set _ _ _ b, acc | .setTag _ _ b, acc | .uset _ _ _ b, acc | .sset _ _ _ _ _ b, acc
-  | .inc _ _ _ _ b, acc | .dec _ _ _ _ b, acc | .del _ b, acc => collectIrCallees b acc
+  | .inc _ _ _ _ b, acc | .dec _ _ _ _ b, acc | .del _ b, acc => callees b acc
   | .ret _, acc | .jmp _ _, acc | .unreachable, acc => acc
 
-private def collectIrCalleesAlts : List Lean.IR.Alt → Array Name → Array Name
-  | [], acc => acc | .ctor _ b :: rest, acc | .default b :: rest, acc => collectIrCalleesAlts rest (collectIrCallees b acc)
+def calleesAlts : List Lean.IR.Alt → Array Name → Array Name
+  | [], acc => acc | .ctor _ b :: rest, acc | .default b :: rest, acc => calleesAlts rest (callees b acc)
 end
 
 private def irCallSite (irName modName : Name) (transitive : Bool) : String :=
@@ -400,7 +400,7 @@ private def verifyUserDecl (env : Environment) (modName n : Name) (ci? : Option 
     let checkTcPartials := isNonFw && !ci?.any (hasMetaReturnType env ·.type)
     for irName in #[n, Name.str n "_redArg"] do
       if let some (.fdecl (body := b) ..) := Lean.IR.findEnvDecl env irName then
-        for c in collectIrCallees b #[] do checkIrCallee env isNonFw checkTcPartials n modName false c
+        for c in callees b #[] do checkIrCallee env isNonFw checkTcPartials n modName false c
   if Lean.isExtern env n && !isAllowedExternMod modName then
     throw s!"kernel gate: unverified `@[extern]` `{n}` in `{modName}` is forbidden outside `Qed.Dom` and `Qed.Server.Prim`"
 
@@ -630,7 +630,7 @@ private def checkTransitiveIr (env : Environment) (modIrMap : Std.HashMap Name L
                 if !isToolchainModule cTargetMod && !isFrameworkModule cTargetMod then
                   match Lean.IR.findEnvDecl env c with | some (.fdecl (body := cb) ..) => some cb | _ => none
                 else none
-              if let some cb := cb? then irStack := collectIrCallees cb irStack
+              if let some cb := cb? then irStack := callees cb irStack
               checkTransitiveIr env modIrMap irName modName fuel irStack cleanIrNodes cp cr
 
 private def verifyModuleIndices (env : Environment) (idxs : Array Nat) (initCap : Nat) : Except String Nat := do
@@ -664,10 +664,10 @@ private def verifyModuleIndices (env : Environment) (idxs : Array Nat) (initCap 
         let skipFwMeta := !isNonFw && match ownerCi? with | some ci => isCompileTimeMetaDecl env owner ci | none => hasRegBuiltin irName
         if !skipFwMeta then
           let checkTcPartials := isNonFw && !ownerCi?.any (hasMetaReturnType env ·.type)
-          let callees := collectIrCallees b #[]
-          for c in callees do checkIrCallee env isNonFw checkTcPartials irName modName false c
+          let irCallees := callees b #[]
+          for c in irCallees do checkIrCallee env isNonFw checkTcPartials irName modName false c
           if checkTcPartials && !cleanIrNodes.contains irName then
-            let (cin, cp, cr) ← checkTransitiveIr env modIrMap irName modName 200000 callees (cleanIrNodes.insert irName) cleanPartials cleanRefs
+            let (cin, cp, cr) ← checkTransitiveIr env modIrMap irName modName 200000 irCallees (cleanIrNodes.insert irName) cleanPartials cleanRefs
             cleanIrNodes := cin; cleanPartials := cp; cleanRefs := cr
   return checkedCount
 

@@ -1,4 +1,4 @@
-import Qed.Proofs.ViewPatch.Attrs
+import Qed.Proofs.ViewPatch.VState
 
 namespace Qed
 
@@ -158,32 +158,39 @@ mutual
         simp [View.renderSigList, View.renderEach, renderSig_of_collectDyn_empty k h.1 he.1 s pre n en, renderSigList_of_collectDynList_empty ks h.2 he.2 s pre]
 end
 
-private theorem Html.DomCleanList_map (f : α → Html msg) : ∀ (xs : List α), (∀ a ∈ xs, (f a).DomClean = true) → Html.DomCleanList (xs.map f) = true
-  | [], _ => rfl | x :: rest, h => by simp [Html.DomCleanList, h x (.head _), Html.DomCleanList_map f rest (fun a ha => h a (.tail _ ha))]
-
 theorem View.DomClean_forEach (tag : String) (items : σ → Array α) (key : α → String) (child : View α msg) (attrs : List (VAttr σ msg)) (sigPrefix : String)
     (ha : VAttrListClean attrs) (hdyn : (View.collectDyn child).isEmpty = true) (hdynOn : (View.collectDynOn child).isEmpty = true)
     (hcl : ∀ a, (child.render a).DomClean = true) (htxt : ∀ a, (child.render a).textOf? = none)
     (hnd : ∀ s, (((items s).map key).toList).Nodup) (hkey : ∀ a b, key a = key b → child.render a = child.render b) :
     View.DomClean (V.forEach tag items key child attrs sigPrefix) := by
   dsimp only [V.forEach]
-  have hnotDirect : V.isDirectTmpl child = false := by cases child with | element _ _ _ => simp [V.isDirectTmpl, hdyn, hdynOn] | _ => rfl
+  have hnotDirect : V.isDirectTmpl child = false := by cases child with | element _ _ _ => simp only [V.isDirectTmpl, hdyn, hdynOn, Bool.not_true, Bool.or_self, Bool.false_and] | _ => rfl
   split
-  · intro s; simp only [Html.DomClean, ha.1 s, ha.2.1 s, Bool.not_false, Bool.true_and, Array.toList_map]
-    exact Html.DomCleanList_map _ _ fun a _ => by simp [Html.DomClean_withKey, hcl a]
+  · intro s; simp only [Html.DomClean_element, ha.1 s, ha.2.1 s, Bool.not_false, Bool.true_and, Array.toList_map, Html.DomCleanList, List.all_map, List.all_eq_true, Function.comp_apply, Html.DomClean_withKey]
+    exact fun a _ => hcl a
   · simp only [hnotDirect, Bool.false_eq_true, ↓reduceIte]
     have hde := List.isEmpty_iff.1 hdyn; have hdo := List.isEmpty_iff.1 hdynOn
-    have hu (s : σ) : disambiguateKeys ((items s).map key) = (items s).map key := disambiguateKeys_of_nodup (by simpa using hnd s)
-    refine ⟨ha, fun s => by simp [hu s], fun s => Html.DomCleanList_map _ _ fun p _ => by simp [Html.DomClean_withKey, renderSig_of_collectDyn_empty child hde hdo p.1, hcl p.1],
+    have hu (s : σ) : disambiguateKeys ((items s).map key) = (items s).map key := disambiguateKeys_of_nodup (by simpa only [Array.toList_map] using hnd s)
+    refine ⟨ha, fun s => by simp only [List.length_map, List.length_zipIdx, Array.length_toList, hu s, Array.size_map],
+      fun s => by dsimp only [Html.DomCleanList]; rw [List.all_map, List.all_eq_true]; exact fun p _ => by simp only [Function.comp_apply, Html.DomClean_withKey, renderSig_of_collectDyn_empty child hde hdo p.1, hcl p.1],
       fun s r hr => by rcases List.mem_map.1 hr with ⟨p, _, rfl⟩; rw [Html.textOf?_withKey, renderSig_of_collectDyn_empty child hde hdo]; exact htxt p.1,
       fun s₁ s₂ i j hi hj hkeq => by
-        have hi' : i < (items s₁).size := (by simpa [hu s₁] using hi)
-        have hj' : j < (items s₂).size := (by simpa [hu s₂] using hj)
-        have hka : key (items s₁)[i] = key (items s₂)[j] := (by simpa [hu s₁, hu s₂] using hkeq)
+        have hi' : i < (items s₁).size := (by simpa only [hu s₁, Array.size_map] using hi)
+        have hj' : j < (items s₂).size := (by simpa only [hu s₂, Array.size_map] using hj)
+        have hka : key (items s₁)[i] = key (items s₂)[j] := (by simpa only [hu s₁, hu s₂, Array.getElem_map] using hkeq)
         simp only [List.getElem?_map, List.getElem?_zipIdx, Array.getElem?_toList, Array.getElem?_eq_getElem hi', Array.getElem?_eq_getElem hj', Option.map_some, Nat.zero_add, renderSig_of_collectDyn_empty child hde hdo]
         simp [hu s₁, hu s₂, Array.getD, hi', hj', hka, hkey _ _ hka]⟩
 
 /-! ## 6. Compiled Row-Template & Prefix/Suffix/Swap Fast-Path Soundness -/
+
+private theorem matchLen_sound_of {f : Nat → Nat} {P : Nat → Prop} {bound : Nat}
+    (hstep : ∀ t, t < f t → P t ∧ f t = f (t + 1) ∧ t < bound) {i k : Nat} (hik : i ≤ k) (hklt : k < f i) : P k := by
+  have hiLe : i ≤ bound := Nat.le_of_lt (hstep i (Nat.lt_of_le_of_lt hik hklt)).2.2
+  induction i, hiLe using down_ind with
+  | base => exact absurd (hstep bound (Nat.lt_of_le_of_lt hik hklt)).2.2 (Nat.lt_irrefl _)
+  | step t _ ih =>
+      have ⟨hP, hEq, _⟩ := hstep t (Nat.lt_of_le_of_lt hik hklt)
+      if heq : k = t then exact heq ▸ hP else exact ih (Nat.succ_le_of_lt (Nat.lt_of_le_of_ne hik (Ne.symm heq))) (hEq ▸ hklt)
 
 theorem prefixMatchLen_bound (oldMarks newMarks : Array USize) (i : Nat) (ho : i ≤ oldMarks.size) (hn : i ≤ newMarks.size) :
     prefixMatchLen oldMarks newMarks i ≤ oldMarks.size ∧ prefixMatchLen oldMarks newMarks i ≤ newMarks.size := by
@@ -191,22 +198,27 @@ theorem prefixMatchLen_bound (oldMarks newMarks : Array USize) (i : Nat) (ho : i
   dsimp only; split <;> first | exact prefixMatchLen_bound oldMarks newMarks (i + 1) (by omega) (by omega) | exact ⟨ho, hn⟩
 termination_by oldMarks.size - i
 
+private theorem matchLen_step {f : Nat → Nat} {Q C : Prop} [Decidable C] {M : C → Bool} {t bound : Nat}
+    (heq : f t = if h : C then if M h then f (t + 1) else t else t)
+    (hmk : ∀ h : C, M h = true → Q ∧ t < bound) (ht : t < f t) : Q ∧ f t = f (t + 1) ∧ t < bound := by
+  rw [heq] at ht ⊢; split at ht
+  · rename_i h; split at ht
+    · rename_i hm; have ⟨hP, hb⟩ := hmk h hm; exact ⟨hP, by simp only [h, ↓reduceDIte, hm, ↓reduceIte], hb⟩
+    · exact absurd ht (Nat.lt_irrefl _)
+  · exact absurd ht (Nat.lt_irrefl _)
+
 theorem prefixMatchLen_sound (oldMarks newMarks : Array USize) (i k : Nat) (hik : i ≤ k) (hklt : k < prefixMatchLen oldMarks newMarks i) :
-    ∃ (ho : k < oldMarks.size) (hn : k < newMarks.size), newMarks[k]'hn ≠ 0 ∧ oldMarks[k]'ho = newMarks[k]'hn := by
-  unfold prefixMatchLen at hklt; split at hklt <;> try omega
-  rename_i h; dsimp only at hklt; split at hklt <;> try omega
-  rename_i hm; simp only [Bool.and_eq_true, bne_iff_ne, beq_iff_eq] at hm
-  if heq : k = i then subst heq; exact ⟨h.1, h.2, hm.1, hm.2⟩ else exact prefixMatchLen_sound oldMarks newMarks (i + 1) k (by omega) hklt
-termination_by oldMarks.size - i
+    ∃ (ho : k < oldMarks.size) (hn : k < newMarks.size), newMarks[k]'hn ≠ 0 ∧ oldMarks[k]'ho = newMarks[k]'hn :=
+  matchLen_sound_of (f := prefixMatchLen oldMarks newMarks) (P := fun k => ∃ (ho : k < oldMarks.size) (hn : k < newMarks.size), newMarks[k]'hn ≠ 0 ∧ oldMarks[k]'ho = newMarks[k]'hn)
+    (bound := oldMarks.size) (fun t => matchLen_step (prefixMatchLen.eq_1 oldMarks newMarks t) fun h hm => by
+      simp only [Bool.and_eq_true, bne_iff_ne, beq_iff_eq] at hm; exact ⟨⟨h.1, h.2, hm.1, hm.2⟩, h.1⟩) hik hklt
 
 theorem suffixMatchLen_sound (oldMarks newMarks : Array USize) (p q j : Nat) (hqj : q ≤ j) (hjlt : j < suffixMatchLen oldMarks newMarks p q) :
     p + j < oldMarks.size ∧ p + j < newMarks.size ∧ ∃ (ho : oldMarks.size - 1 - j < oldMarks.size) (hn : newMarks.size - 1 - j < newMarks.size),
-      newMarks[newMarks.size - 1 - j]'hn ≠ 0 ∧ oldMarks[oldMarks.size - 1 - j]'ho = newMarks[newMarks.size - 1 - j]'hn := by
-  unfold suffixMatchLen at hjlt; split at hjlt <;> try omega
-  rename_i h; dsimp only at hjlt; split at hjlt <;> try omega
-  rename_i hm; simp only [Bool.and_eq_true, bne_iff_ne, beq_iff_eq] at hm
-  if heq : j = q then subst heq; exact ⟨h.1, h.2, by omega, by omega, hm.1, hm.2⟩ else exact suffixMatchLen_sound oldMarks newMarks p (q + 1) j (by omega) hjlt
-termination_by oldMarks.size - (p + q)
+      newMarks[newMarks.size - 1 - j]'hn ≠ 0 ∧ oldMarks[oldMarks.size - 1 - j]'ho = newMarks[newMarks.size - 1 - j]'hn :=
+  matchLen_sound_of (f := suffixMatchLen oldMarks newMarks p) (P := fun j => p + j < oldMarks.size ∧ p + j < newMarks.size ∧ ∃ (ho : oldMarks.size - 1 - j < oldMarks.size) (hn : newMarks.size - 1 - j < newMarks.size), newMarks[newMarks.size - 1 - j]'hn ≠ 0 ∧ oldMarks[oldMarks.size - 1 - j]'ho = newMarks[newMarks.size - 1 - j]'hn)
+    (bound := oldMarks.size) (fun t => matchLen_step (suffixMatchLen.eq_1 oldMarks newMarks p t) fun h hm => by
+      simp only [Bool.and_eq_true, bne_iff_ne, beq_iff_eq] at hm; exact ⟨⟨h.1, h.2, by omega, by omega, hm.1, hm.2⟩, Nat.lt_of_le_of_lt (Nat.le_add_left t p) h.1⟩) hqj hjlt
 
 private theorem mem_collectChangedMarksLoop_of_mem (oldMarks newMarks : Array USize) (i : Nat) (acc : Array Nat) (x : Nat) (hx : x ∈ acc.toList) :
     x ∈ (collectChangedMarksLoop oldMarks newMarks i acc).toList := by

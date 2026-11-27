@@ -4,37 +4,54 @@ namespace Qed
 variable {msg : Type}
 private abbrev ArenaM (msg : Type) := StateM (DomArena msg)
 
+structure ElemPar (msg : Type) where
+  f : Nat
+  childNs : String
+  parent : Dom.Node
+  pns : String
+  ptag : String
+  pst : SpecElemState msg
+  pmg : List String
+
+abbrev ElemPar.entry (ep : ElemPar msg) (cs : List Dom.Node) : ArenaEntry msg :=
+  .element ep.pns ep.ptag ep.pst ep.pmg cs
+
+abbrev ElemPar.childNsOk (ep : ElemPar msg) : Prop :=
+  ep.childNs = if ep.pns == Dom.svgNs && ep.ptag != "foreignObject" then Dom.svgNs else ""
+
 /-! ## Pure Diff & W3C `insertBefore` Keyed/Positional Reconciler Equivalence -/
 
 theorem insertBeforeRef_split {child ref : Dom.Node} :
     ∀ (pre suf : List Dom.Node), ref ∉ pre → insertBeforeRef child ref (pre ++ ref :: suf) = pre ++ child :: ref :: suf
-  | [], _, _ => by simp [insertBeforeRef]
-  | x :: xs, suf, href => by simp [insertBeforeRef, beq_eq_false_iff_ne.2 (show x ≠ ref from fun h => href (by simp [h])), insertBeforeRef_split xs suf fun h => href (.tail _ h)]
+  | [], _, _ => by simp only [List.nil_append, insertBeforeRef, beq_self_eq_true, ↓reduceIte]
+  | x :: xs, suf, href => by
+      simp only [List.cons_append, insertBeforeRef, beq_eq_false_iff_ne.2 (show x ≠ ref from fun h => href (h ▸ .head _)), Bool.false_eq_true, ↓reduceIte, insertBeforeRef_split xs suf fun h => href (.tail _ h)]
 
 section
 variable {α : Type}
 theorem erase_append_right_of_not_mem [BEq α] [LawfulBEq α] :
     ∀ (pre suf : List α) {x : α}, x ∉ pre → (pre ++ suf).erase x = pre ++ suf.erase x
   | [], _, _, _ => rfl
-  | a :: pre, suf, x, hnot => by simp [beq_eq_false_iff_ne.2 (show a ≠ x from fun h => hnot (by simp [h])), erase_append_right_of_not_mem pre suf fun h => hnot (.tail _ h)]
+  | a :: pre, suf, x, hnot => by
+      simp only [List.cons_append, List.erase_cons, beq_eq_false_iff_ne.2 (show a ≠ x from fun h => hnot (h ▸ .head _)), Bool.false_eq_true, ↓reduceIte, erase_append_right_of_not_mem pre suf fun h => hnot (.tail _ h)]
 private theorem nodup_insert_middle {pre suf : List α} {c : α} (hnd : (pre ++ suf).Nodup) (hpre : c ∉ pre) (hsuf : c ∉ suf) : (pre ++ c :: suf).Nodup :=
   have ⟨hp, hs, hd⟩ := List.nodup_append.1 hnd
   List.nodup_append.2 ⟨hp, List.nodup_cons.2 ⟨hsuf, hs⟩, fun a ha b hb => (List.mem_cons.1 hb).elim (fun h e => hpre (h ▸ e ▸ ha)) (hd a ha b)⟩
 private theorem nodup_erase_suf [BEq α] [LawfulBEq α] {pre suf : List α} {x : α} (hnd : (pre ++ suf).Nodup) : (pre ++ suf.erase x).Nodup :=
   have ⟨hp, hs, hd⟩ := List.nodup_append.1 hnd; List.nodup_append.2 ⟨hp, hs.erase x, fun a ha b hb => hd a ha b (List.mem_of_mem_erase hb)⟩
 theorem listReplaceAt_append_middle : ∀ (pre : List α) (x y : α) (suf : List α), listReplaceAt (pre ++ x :: suf) pre.length y = pre ++ y :: suf
-  | [], _, _, _ => rfl | _ :: pre, x, y, suf => by simp [listReplaceAt, listReplaceAt_append_middle pre x y suf]
+  | [], _, _, _ => rfl | _ :: pre, x, y, suf => congrArg (_ :: ·) (listReplaceAt_append_middle pre x y suf)
 theorem nodup_snoc_append {pre suf : List α} {cn : α} (hnd : (pre ++ suf).Nodup) (hnot : cn ∉ pre ++ suf) : ((pre ++ [cn]) ++ suf).Nodup := by
-  rw [List.append_assoc, List.singleton_append]; exact nodup_insert_middle hnd (fun h => hnot (by simp [h])) (fun h => hnot (by simp [h]))
+  rw [List.append_assoc, List.singleton_append]; exact nodup_insert_middle hnd (fun h => hnot (List.mem_append_left _ h)) (fun h => hnot (List.mem_append_right _ h))
 theorem nodup_append_replace {pre suf : List α} {x y : α} (hnd : (pre ++ x :: suf).Nodup) (hy : y = x ∨ y ∉ pre ++ x :: suf) : (pre ++ y :: suf).Nodup :=
   hy.elim (· ▸ hnd) fun hnot => have ⟨hpre, hcons, hdisj⟩ := List.nodup_append.1 hnd
     nodup_insert_middle (List.nodup_append.2 ⟨hpre, (List.nodup_cons.1 hcons).2, fun a ha b hb => hdisj a ha b (.tail _ hb)⟩)
-      (fun h => hnot (by simp [h])) (fun h => hnot (by simp [h]))
+      (fun h => hnot (List.mem_append_left _ h)) (fun h => hnot (List.mem_append_right _ (.tail _ h)))
 theorem nodup_move_to_pre [BEq α] [LawfulBEq α] {pre suf : List α} {x y : α} (hnd : (pre ++ suf).Nodup) (hx : x ∈ suf) (hy : y = x ∨ y ∉ pre ++ suf) : ((pre ++ [y]) ++ suf.erase x).Nodup := by
   rw [List.append_assoc, List.singleton_append]; have ⟨_, hsuf, hdisj⟩ := List.nodup_append.1 hnd
   exact nodup_insert_middle (nodup_erase_suf hnd)
-    (fun hp => hy.elim (fun h => hdisj _ (h ▸ hp) _ hx rfl) fun hn => hn (by simp [hp]))
-    (fun hs => hy.elim (fun h => hsuf.not_mem_erase (h ▸ hs)) fun hn => hn (by simp [List.mem_of_mem_erase hs]))
+    (fun hp => hy.elim (fun h => hdisj _ (h ▸ hp) _ hx rfl) fun hn => hn (List.mem_append_left _ hp))
+    (fun hs => hy.elim (fun h => hsuf.not_mem_erase (h ▸ hs)) fun hn => hn (List.mem_append_right _ (List.mem_of_mem_erase hs)))
 theorem nodup_getElem_inj {xs : List α} {i₁ i₂ : Nat} (h₁ : i₁ < xs.length) (h₂ : i₂ < xs.length) (hnd : xs.Nodup) (hEq : xs[i₁] = xs[i₂]) : i₁ = i₂ := by
   rcases Nat.lt_trichotomy i₁ i₂ with hlt | rfl | hgt
   · exact absurd hEq ((List.pairwise_iff_getElem.1 hnd) i₁ i₂ h₁ h₂ hlt)
@@ -91,7 +108,7 @@ theorem snapshotChildrenM_spec (a : DomArena msg) (node : Dom.Node) (pns ptag : 
       have hca : (MonadDom.childAt (m := ArenaM msg) node (UInt32.ofNat i)).run (a.set node (.element pns ptag pst pmg cs)) = (cs[i], a.set node (.element pns ptag pst pmg cs)) := by
         simp [MonadDom.childAt, StateT.run, DomArena.get_set_self, uint32_toNat_ofNat_lt i (by omega), List.getElem?_eq_getElem hlt]
       have hih := snapshotChildrenM_spec a node pns ptag pst pmg cs hsize (i + 1) r (acc.push cs[i]) (by omega)
-      dsimp only [snapshotChildrenM, StateT.run, bind] at hca hih ⊢; rw [stateM_bind_step hca, hih]
+      dsimp only [snapshotChildrenM, StateT.run] at hca hih ⊢; rw [stateM_bind_step hca, hih]
       simp only [Array.toList_push, List.append_assoc, List.singleton_append, List.drop_eq_getElem_cons hlt]
 
 theorem list_length_le_htmlListNodeCount : ∀ (cs : List (Html msg)), cs.length ≤ htmlListNodeCount cs

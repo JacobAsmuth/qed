@@ -3,9 +3,62 @@ import Qed.Proto
 
 namespace Qed
 
+namespace Internal
+inductive TaggedCase (α : Type) where
+  | unit (jTag : String) (pTag : Nat) | payload (a : α) | failed (e : String)
+
+structure TaggedCodec (T α : Type) where mk ::
+  (typeName payloadTag payloadField : String) (payloadPTag failedPTag : Nat)
+  (split : T → TaggedCase α) (ofUnitJson : String → Option T) (ofUnitProto : Nat → Option T)
+  (mkPayload : α → T) (mkFailed : String → T)
+  (sound : ∀ t, match split t with
+    | .unit j p => ofUnitJson j = some t ∧ ofUnitProto p = some t ∧ j ≠ payloadTag ∧ j ≠ "failed" ∧ p ≠ payloadPTag ∧ p ≠ failedPTag
+    | .payload a => mkPayload a = t | .failed e => mkFailed e = t)
+  (tagsDistinct : payloadTag ≠ "failed" ∧ payloadField ≠ "t" ∧ payloadPTag ≠ failedPTag)
+
+namespace TaggedCodec
+variable {T α : Type} (c : TaggedCodec T α)
+@[instance_reducible] def toJsonInst [ToJson α] : ToJson T := ⟨fun t => match c.split t with
+  | .unit j _ => .obj [("t", .str j)] | .payload a => .obj [("t", .str c.payloadTag), (c.payloadField, toJson a)] | .failed e => .obj [("t", .str "failed"), ("e", .str e)]⟩
+@[instance_reducible] def fromJsonInst [FromJson α] : FromJson T := ⟨fun j => match j.strAt? "t" with
+  | some s => if s == c.payloadTag then ((j.field c.payloadField).bind fromJson).map c.mkPayload
+              else if s == "failed" then .ok (c.mkFailed (j.strAtD "e")) else (c.ofUnitJson s).elim (.error s!"expected a {c.typeName}") .ok
+  | none => .error s!"expected a {c.typeName}"⟩
+theorem nonNullInst [ToJson α] : @NonNullJson T c.toJsonInst := @NonNullJson.mk T c.toJsonInst fun t => by
+  change (match c.split t with | .unit j _ => Json.obj [("t", .str j)] | .payload a => .obj [("t", .str c.payloadTag), (c.payloadField, toJson a)] | .failed e => .obj [("t", .str "failed"), ("e", .str e)]) ≠ Json.null
+  cases c.split t <;> nofun
+@[instance_reducible] def lawfulJsonInst [LawfulJson α] : LawfulJson T where
+  toToJson := c.toJsonInst; toFromJson := c.fromJsonInst; depthBound := 1 + LawfulJson.depthBound α
+  depth_toJson t := by
+    change Json.depth (match c.split t with | .unit .. => _ | .payload .. => _ | .failed .. => _) ≤ _
+    cases c.split t with | unit _ _ | failed _ => exact Nat.le_add_right 1 _ | payload a => exact Nat.add_le_add_left (by simpa [Json.maxObj, Json.depth] using LawfulJson.depth_toJson a) 1
+  fromJson_toJson t := by
+    have hs := c.sound t; change c.fromJsonInst.fromJson (c.toJsonInst.toJson t) = .ok t
+    unfold toJsonInst fromJsonInst; dsimp only; cases h : c.split t <;> (rw [h] at hs; dsimp only at hs)
+    · simp [Json.strAt?, Json.get?, Json.field, Except.toOption, Json.str?, hs.2.2.1, hs.2.2.2.1, hs.1]
+    · simp only [Json.strAt?, Json.get?, Json.field, Except.toOption, Json.str?, List.foldl, beq_self_eq_true, ↓reduceIte, beq_eq_false_iff_ne.2 c.tagsDistinct.2.1, Bool.false_eq_true, Option.bind_some, Option.elim]
+      change (fromJson (toJson _) : Except String α).map c.mkPayload = _; rw [LawfulJson.fromJson_toJson]; exact congrArg Except.ok hs
+    · simp [Json.strAt?, Json.strAtD, Json.get?, Json.field, Except.toOption, Json.str?, c.tagsDistinct.1.symm, hs]
+def encodeFields [ToProto α] (t : T) : List (Nat × Proto.WireVal) := match c.split t with
+  | .unit _ p => [(1, .varint p)] | .payload a => [(1, .varint c.payloadPTag), (2, ToProto.toProtoVal a)] | .failed e => [(1, .varint c.failedPTag), (2, ToProto.toProtoVal e)]
+def decodeFields [FromProto α] (fs : List (Nat × Proto.WireVal)) : Except String T := match Proto.lookupField 1 fs with
+  | some (.varint n) => if n == c.payloadPTag then (Proto.decodeFieldVal 2 fs s!"{c.typeName}: missing field 2").map c.mkPayload
+                        else if n == c.failedPTag then (Proto.decodeFieldVal 2 fs s!"{c.typeName}.failed: missing field 2").map c.mkFailed
+                        else (c.ofUnitProto n).elim (.error s!"protobuf: invalid {c.typeName} tag") .ok
+  | _ => .error s!"protobuf: invalid {c.typeName} tag"
+@[instance_reducible] def toProtoInst [ToProto α] : ToProto T := .ofFields c.encodeFields
+@[instance_reducible] def fromProtoInst [FromProto α] : FromProto T := .ofFields c.decodeFields
+@[instance_reducible] def lawfulProtoInst [LawfulProto α] : LawfulProto T := .ofFields c.encodeFields c.decodeFields
+  (by intro t kw h; unfold encodeFields at h; cases h' : c.split t <;> rw [h'] at h <;> (simp only [List.mem_cons, List.not_mem_nil, or_false] at h; try rcases h with rfl | rfl; all_goals ((try subst h); exact Nat.zero_lt_succ _)))
+  (by intro t; have hs := c.sound t; dsimp only [encodeFields, decodeFields]; cases h : c.split t <;> (rw [h] at hs; dsimp only at hs)
+      · simp [Proto.lookupField, beq_eq_false_iff_ne.2 hs.2.2.2.2.1, beq_eq_false_iff_ne.2 hs.2.2.2.2.2, hs.2.1]
+      · simp [Proto.decodeFieldVal, Proto.lookupField, Except.map, hs]
+      · simp [Proto.decodeFieldVal, Proto.lookupField, beq_eq_false_iff_ne.2 c.tagsDistinct.2.2.symm, Except.map, hs])
+end TaggedCodec
+end Internal
+
 inductive SocketStatus where
-  | disconnected | connecting | connected
-  | reconnecting (attempt : Nat) | failed (err : String)
+  | disconnected | connecting | connected | reconnecting (attempt : Nat) | failed (err : String)
 deriving Inhabited, DecidableEq, Repr
 
 namespace SocketStatus
@@ -13,35 +66,21 @@ namespace SocketStatus
 instance : ToString SocketStatus := ⟨fun
   | .disconnected => "disconnected" | .connecting => "connecting" | .connected => "connected"
   | .reconnecting n => s!"reconnecting ({n})" | .failed e => s!"failed: {e}"⟩
-instance : ToJson SocketStatus := ⟨fun
-  | .disconnected => .obj [("t", .str "disconnected")] | .connecting => .obj [("t", .str "connecting")]
-  | .connected => .obj [("t", .str "connected")] | .reconnecting n => .obj [("t", .str "reconnecting"), ("a", toJson n)]
-  | .failed e => .obj [("t", .str "failed"), ("e", .str e)]⟩
-instance : FromJson SocketStatus := ⟨fun j => match j.strAt? "t" with
-  | some "disconnected" => .ok .disconnected | some "connecting" => .ok .connecting | some "connected" => .ok .connected
-  | some "reconnecting" => ((j.field "a").bind fromJson).map .reconnecting | some "failed" => .ok (.failed (j.strAtD "e"))
-  | _ => .error "expected a SocketStatus"⟩
-instance : LawfulJson SocketStatus where
-  depthBound := 1 + LawfulJson.depthBound Nat
-  depth_toJson
-    | .disconnected | .connecting | .connected | .failed _ => Nat.le_add_right 1 _
-    | .reconnecting n => Nat.add_le_add_left (by simp [Json.maxObj, Json.depth]) 1
-  fromJson_toJson
-    | .disconnected | .connecting | .connected | .failed _ => rfl
-    | .reconnecting n => by change (FromJson.fromJson (toJson n) : Except String Nat).map SocketStatus.reconnecting = _; rw [LawfulJson.fromJson_toJson n]; rfl
-instance : NonNullJson SocketStatus := ⟨fun | .disconnected | .connecting | .connected | .reconnecting _ | .failed _ => nofun⟩
-private def encodeFields : SocketStatus → List (Nat × Proto.WireVal)
-  | .disconnected => [(1, .varint 0)] | .connecting => [(1, .varint 1)] | .connected => [(1, .varint 2)]
-  | .reconnecting n => [(1, .varint 3), (2, ToProto.toProtoVal n)] | .failed e => [(1, .varint 4), (2, ToProto.toProtoVal e)]
-private def decodeFields (fs : List (Nat × Proto.WireVal)) : Except String SocketStatus :=
-  match Proto.lookupField 1 fs with
-  | some (.varint 0) => .ok .disconnected | some (.varint 1) => .ok .connecting | some (.varint 2) => .ok .connected
-  | some (.varint 3) => (Proto.decodeFieldVal 2 fs "SocketStatus.reconnecting: missing field 2").map .reconnecting
-  | some (.varint 4) => (Proto.decodeFieldVal 2 fs "SocketStatus.failed: missing field 2").map .failed
-  | _ => .error "protobuf: invalid SocketStatus tag"
-qed_proto_fields% [] (SocketStatus, encodeFields, decodeFields,
-  by intro s kw h; cases s <;> (simp only [encodeFields, List.mem_cons, List.not_mem_nil, or_false] at h; rcases h with rfl | rfl <;> simp),
-  by intro s; cases s <;> simp [encodeFields, decodeFields, Proto.decodeFieldVal, Proto.lookupField, Except.map])
+private def codec : Internal.TaggedCodec SocketStatus Nat where
+  typeName := "SocketStatus"; payloadTag := "reconnecting"; payloadField := "a"; payloadPTag := 3; failedPTag := 4
+  split | .disconnected => .unit "disconnected" 0 | .connecting => .unit "connecting" 1 | .connected => .unit "connected" 2 | .reconnecting n => .payload n | .failed e => .failed e
+  ofUnitJson | "disconnected" => some .disconnected | "connecting" => some .connecting | "connected" => some .connected | _ => none
+  ofUnitProto | 0 => some .disconnected | 1 => some .connecting | 2 => some .connected | _ => none
+  mkPayload := .reconnecting; mkFailed := .failed
+  sound | .disconnected | .connecting | .connected => by decide | .reconnecting _ | .failed _ => rfl
+  tagsDistinct := by decide
+instance : ToJson SocketStatus := codec.toJsonInst
+instance : FromJson SocketStatus := codec.fromJsonInst
+instance : LawfulJson SocketStatus := codec.lawfulJsonInst
+instance : NonNullJson SocketStatus := codec.nonNullInst
+instance : ToProto SocketStatus := codec.toProtoInst
+instance : FromProto SocketStatus := codec.fromProtoInst
+instance : LawfulProto SocketStatus := codec.lawfulProtoInst
 end SocketStatus
 
 inductive Reconnect where

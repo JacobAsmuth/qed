@@ -24,16 +24,15 @@ def routeAltP : Parser := node `Qed.routeAlt (withPosition
 end RouterParsers
 
 section RouterElab
-open Lean
-@[noinline, macro routeEnumCmd] def expandRouteEnumCmd : Macro := fun stx => do
-  let t : Ident := ⟨stx.getArg 1⟩
+open Lean Qed.Lang
+
+private structure RouteAltInfo where mk ::
+  (ctor : Ident) (params : Array (Ident × Term)) (segments : Array (Sum String Ident)) (marked : Bool)
+
+@[noinline] private def mkRouteEnumCmdPure (t : Ident) (alts : Array (Ident × Term)) : PureQuotM Syntax := do
   let (toSegId, fromSegId, rtId) := (mkIdent (t.getId ++ `toSeg), mkIdent (t.getId ++ `fromSeg), mkIdent (t.getId ++ `round_trip))
-  let rows ← (stx.getArg 3).getArgs.mapM fun alt => do
-    let c : Ident := ⟨alt.getArg 0⟩; let ctorId := mkIdent (t.getId ++ c.getId)
-    let slug : TSyntax `term := if (alt.getArg 1).getNumArgs == 2 then ⟨(alt.getArg 1).getArg 1⟩ else quote (toString c.getId)
-    pure (c, (ctorId : TSyntax `term), slug, ← `(some $ctorId))
-  let (ctors, ctorPats, slugs) := (rows.map (·.1), rows.map (·.2.1), rows.map (·.2.2.1))
-  let parsePats := slugs.push (← `(_)); let parseRhss := (rows.map (·.2.2.2)).push (← `(none))
+  let (ctors, slugs) := (alts.map (·.1), alts.map (·.2)); let ctorPats : Array Term := ctors.map fun c => mkIdent (t.getId ++ c.getId)
+  let parsePats := slugs.push (← `(_)); let parseRhss := (← ctorPats.mapM fun cp => `(some $cp)).push (← `(none))
   `(inductive $t:ident where $[| $ctors:ident]*
     deriving Repr, DecidableEq, Inhabited
     def $toSegId:ident (x : $t) : String := match x with $[| $ctorPats:term => $slugs:term]*
@@ -41,53 +40,49 @@ open Lean
     theorem $rtId:ident : ∀ a, $fromSegId:ident ($toSegId:ident a) = some a := by intro a; cases a <;> rfl
     instance : RouteParam $t:ident := ⟨$toSegId, $fromSegId, $rtId⟩)
 
-private abbrev RouteRow := TSyntax `ident × Array (TSyntax `ident) × Array (TSyntax `term) × TSyntax `term × TSyntax `term × TSyntax `term × TSyntax `term
-@[noinline, macro routerCmd] def expandRouterCmd : Macro := fun stx => do
-  let t : Ident := ⟨stx.getArg 1⟩
-  let err (s : Syntax) (msg : String) := Macro.throwErrorAt s s!"router `{t.getId}`: {msg}"
+@[noinline, macro routeEnumCmd] def expandRouteEnumCmd : Macro := fun stx =>
+  runPureQuot (mkRouteEnumCmdPure ⟨stx.getArg 1⟩ ((stx.getArg 3).getArgs.map fun alt =>
+    let c : Ident := ⟨alt.getArg 0⟩; (c, if (alt.getArg 1).getNumArgs == 2 then (⟨(alt.getArg 1).getArg 1⟩ : Term) else quote (toString c.getId))))
+
+@[noinline] private def parseRouteAlt (tName : Name) (strTy : Term) (alt : Syntax) : MacroM RouteAltInfo := do
+  let err (s : Syntax) (msg : String) := Macro.throwErrorAt s s!"router `{tName}`: {msg}"
+  let (marked, c) := ((alt.getArg 0).getNumArgs == 1, (⟨alt.getArg 1⟩ : Ident))
+  let rawBs := if (alt.getArg 2).getNumArgs == 3 then ((alt.getArg 2).getArg 1).getSepArgs else #[]
+  let seg : Option (TSyntax `str) := if (alt.getArg 3).getNumArgs == 2 then some ⟨(alt.getArg 3).getArg 1⟩ else none
+  let explicitBs ← rawBs.mapM fun b => do
+    let ty ← if (b.getArg 1).getNumArgs == 2 then do pure (← lowerQedType ((b.getArg 1).getArg 1) false).1 else pure strTy
+    pure ((⟨b.getArg 0⟩ : Ident), ty)
+  let rawSegs := seg.elim #[toString c.getId] fun s => ((s.getString.splitOn "/").filter (· ≠ "")).toArray
+  let pathDesc := seg.elim s!"`/{c.getId}`" fun s => s!"`{s.getString}`"
+  if !rawSegs.any (·.startsWith ":") then return .mk c explicitBs (rawSegs.map Sum.inl ++ explicitBs.map (Sum.inr ·.1)) marked
+  let mut params := #[]; let mut segs := #[]; let mut seen := #[]
+  for rs in rawSegs do
+    if !rs.startsWith ":" then segs := segs.push (.inl rs)
+    else
+      let pname := String.ofList (rs.toList.drop 1)
+      if pname.isEmpty then err alt s!"route `{c.getId}` has an empty `:` parameter in path {pathDesc}"
+      if seen.contains pname then err alt s!"route `{c.getId}` has duplicate `:{pname}` parameter in path {pathDesc}"
+      let bt := (explicitBs.find? (toString ·.1.getId == pname)).getD (mkIdent (Name.mkSimple pname), strTy)
+      params := params.push bt; segs := segs.push (.inr bt.1); seen := seen.push pname
+  for (b, _) in explicitBs do
+    unless seen.contains (toString b.getId) do err b s!"parameter `{b.getId}` on route `{c.getId}` is not referenced as `:{b.getId}` in path {pathDesc}"
+  return .mk c params segs marked
+
+@[noinline] private def mkRouterRowPure (tName : Name) (a : RouteAltInfo) : PureQuotM (Term × Term × Term × Term) := do
+  let bs := a.params.map (·.1); let ctorId := mkIdent (tName ++ a.ctor.getId)
+  let printSeg ← a.segments.mapM fun | .inl s => pure (quote s : Term) | .inr b => `(RouteParam.toSeg $(⟨b.raw⟩))
+  let parseSeg : Array Term := a.segments.map fun | .inl s => quote s | .inr b => ⟨b.raw⟩
+  let parseBody ← a.params.foldrM (init := ← `(some ($ctorId $bs*))) fun (b, bt) body =>
+    let bT : Term := ⟨b.raw⟩; `(match (RouteParam.fromSeg $bT : Option $bt) with | some $bT => $body | none => none)
+  return (← `($ctorId $bs*), ← `([$printSeg,*]), ← `([$parseSeg,*]), parseBody)
+
+@[noinline] private def mkRouterCmdPure (t : Ident) (alts : Array RouteAltInfo) (markedCtor : Option Ident) : PureQuotM Syntax := do
   let (printId, parseId, rtId) := (mkIdent (t.getId ++ `print), mkIdent (t.getId ++ `parse), mkIdent (t.getId ++ `round_trip))
   let (toPathId, toUrlId, fromPathId) := (mkIdent (t.getId ++ `toPath), mkIdent (t.getId ++ `toUrl), mkIdent (t.getId ++ `fromPath))
-  let (rows, _, markedCtor) ← (stx.getArg 3).getArgs.foldlM
-    (init := ((#[], #[], none) : Array RouteRow × Array (TSyntax `ident × Array (Option String)) × Option (TSyntax `ident)))
-    fun (rows, patShapes, markedCtor) alt => do
-      let (marked, c) := ((alt.getArg 0).getNumArgs == 1, (⟨alt.getArg 1⟩ : Ident))
-      let rawBs := if (alt.getArg 2).getNumArgs == 3 then ((alt.getArg 2).getArg 1).getSepArgs else #[]
-      let seg : Option (TSyntax `str) := if (alt.getArg 3).getNumArgs == 2 then some ⟨(alt.getArg 3).getArg 1⟩ else none
-      let explicitBs : Array (Ident × Term) ← rawBs.mapM fun b => do
-        return (⟨b.getArg 0⟩, ← if (b.getArg 1).getNumArgs == 2 then do pure (← Qed.Lang.lowerQedType ((b.getArg 1).getArg 1) false).1 else `(String))
-      let rawSegs := seg.elim #[toString c.getId] fun s => ((s.getString.splitOn "/").filter (· ≠ "")).toArray
-      let pathDesc := seg.elim s!"`/{c.getId}`" fun s => s!"`{s.getString}`"
-      let (bs, bts, segments) ← if rawSegs.any (·.startsWith ":") then do
-        let (bs, bts, segs, seen) ← rawSegs.foldlM (init := (#[], #[], (#[] : Array (Sum String Ident)), #[])) fun (bs, bts, segs, seen) rs => do
-          if !rs.startsWith ":" then return (bs, bts, segs.push (.inl rs), seen)
-          let pname := String.ofList (rs.toList.drop 1)
-          if pname.isEmpty then err alt s!"route `{c.getId}` has an empty `:` parameter in path {pathDesc}"
-          if seen.contains pname then err alt s!"route `{c.getId}` has duplicate `:{pname}` parameter in path {pathDesc}"
-          let (b, bt) ← (explicitBs.find? (toString ·.1.getId == pname)).elim (do pure (mkIdent (Name.mkSimple pname), ← `(String))) pure
-          return (bs.push b, bts.push bt, segs.push (.inr b), seen.push pname)
-        for (b, _) in explicitBs do
-          unless seen.contains (toString b.getId) do err b s!"parameter `{b.getId}` on route `{c.getId}` is not referenced as `:{b.getId}` in path {pathDesc}"
-        pure (bs, bts, segs)
-      else pure (explicitBs.map (·.1), explicitBs.map (·.2), rawSegs.map Sum.inl ++ (explicitBs.map (·.1)).map Sum.inr)
-      let patShape := segments.map fun | .inl s => some s | .inr _ => none
-      for (prevC, prevPat) in patShapes do
-        if prevPat.size == patShape.size && (prevPat.zip patShape).all (fun | (some a, some b) => a == b | _ => true) then
-          err c s!"route `{c.getId}` overlaps with earlier route `{prevC.getId}` (both match {patShape.size}-segment paths)"
-      let ctorId := mkIdent (t.getId ++ c.getId)
-      let printSeg ← segments.mapM fun | .inl s => pure (quote s : TSyntax `term) | .inr b => `(RouteParam.toSeg $(⟨b.raw⟩))
-      let parseSeg : Array (TSyntax `term) := segments.map fun | .inl s => quote s | .inr b => ⟨b.raw⟩
-      let parseBody ← (bs.zip bts).foldrM (init := ← `(some ($ctorId $bs*))) fun (b, bt) body =>
-        let bT : TSyntax `term := ⟨b.raw⟩; `(match (RouteParam.fromSeg $bT : Option $bt) with | some $bT => $body | none => none)
-      let markedCtor' ← if marked then
-        if let some prevC := markedCtor then err c s!"duplicate fallback route `*` on `{c.getId}` (already marked on `{prevC.getId}`)"
-        if bs.size != 0 then err c s!"fallback route `{c.getId}` (marked `*`) must take no arguments because it handles arbitrary unmatched URLs"
-        pure (some c)
-      else pure markedCtor
-      let row : RouteRow := (c, bs, bts, ← `($ctorId $bs*), ← `([$printSeg,*]), ← `([$parseSeg,*]), parseBody)
-      pure (rows.push row, patShapes.push (c, patShape), markedCtor')
-  let (ctorNames, ctorBs, ctorBts) := (rows.map (·.1), rows.map (·.2.1), rows.map (·.2.2.1))
-  let (printPats, printRhss) := (rows.map (·.2.2.2.1), rows.map (·.2.2.2.2.1))
-  let parsePatsAll := (rows.map (·.2.2.2.2.2.1)).push (← `(_)); let parseRhssAll := (rows.map (·.2.2.2.2.2.2)).push (← `(none))
+  let (ctorNames, ctorBs, ctorBts) := (alts.map (·.ctor), alts.map (·.params.map (·.1)), alts.map (·.params.map (·.2)))
+  let rows ← alts.mapM (mkRouterRowPure t.getId)
+  let (printPats, printRhss) := (rows.map (·.1), rows.map (·.2.1))
+  let (parsePatsAll, parseRhssAll) := ((rows.map (·.2.2.1)).push (← `(_)), (rows.map (·.2.2.2)).push (← `(none)))
   let inhCmd : TSyntax `command ← markedCtor.elim `(deriving instance Inhabited for $t) fun mc => `(instance : Inhabited $t := ⟨$(mkIdent (t.getId ++ mc.getId))⟩)
   `(inductive $t:ident where $[| $ctorNames:ident $[($ctorBs:ident : $ctorBts:term)]*]*
     deriving Repr, DecidableEq
@@ -103,6 +98,23 @@ private abbrev RouteRow := TSyntax `ident × Array (TSyntax `ident) × Array (TS
     @[inline, simp] def $toUrlId:ident (r : $t) : Url := Router.toUrl r
     @[inline, simp] def $fromPathId:ident (p : String) : Option $t := Router.fromURL p
     instance : ToString $t:ident := ⟨$toPathId⟩)
+
+@[noinline, macro routerCmd] def expandRouterCmd : Macro := fun stx => do
+  let t : Ident := ⟨stx.getArg 1⟩; let strTy ← runPureQuot `(String)
+  let err (s : Syntax) (msg : String) := Macro.throwErrorAt s s!"router `{t.getId}`: {msg}"
+  let mut alts := #[]; let mut patShapes : Array (Ident × Array (Option String)) := #[]; let mut markedCtor : Option Ident := none
+  for alt in (stx.getArg 3).getArgs do
+    let info ← parseRouteAlt t.getId strTy alt
+    let patShape := info.segments.map fun | .inl s => some s | .inr _ => none
+    for (prevC, prevPat) in patShapes do
+      if prevPat.size == patShape.size && (prevPat.zip patShape).all (fun | (some a, some b) => a == b | _ => true) then
+        err info.ctor s!"route `{info.ctor.getId}` overlaps with earlier route `{prevC.getId}` (both match {patShape.size}-segment paths)"
+    if info.marked then
+      if let some prevC := markedCtor then err info.ctor s!"duplicate fallback route `*` on `{info.ctor.getId}` (already marked on `{prevC.getId}`)"
+      if !info.params.isEmpty then err info.ctor s!"fallback route `{info.ctor.getId}` (marked `*`) must take no arguments because it handles arbitrary unmatched URLs"
+      markedCtor := some info.ctor
+    alts := alts.push info; patShapes := patShapes.push (info.ctor, patShape)
+  runPureQuot (mkRouterCmdPure t alts markedCtor)
 end RouterElab
 
 private def decodeRouteSegs [Router R] (segs : List String) : Except String R := (Router.parse segs).elim (.error "invalid route") .ok

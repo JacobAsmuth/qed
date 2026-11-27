@@ -299,14 +299,11 @@ theorem View.validIn_render_ite_intro {σ msg : Type} (ctx : HtmlCtx) (c : Prop)
     (ht : c → Html.validIn ctx (View.render a s) = true) (hf : ¬ c → Html.validIn ctx (View.render b s) = true) :
     Html.validIn ctx (View.render (if c then a else b) s) = true := (View.render_ite c a b s).symm ▸ Html.validIn_ite_intro ctx c _ _ ht hf
 
-local macro "valid_pres_intro " thm:ident " [" bs:ident* "] " argTy:term ", " targetTy:term ", " pred:ident ", " op:term " via " eqLem:ident : command =>
-  `(theorem $thm {$bs:ident* : Type} (ctx : HtmlCtx) (a : $argTy) (x : $targetTy) (hx : $pred ctx x = true) : $pred ctx ($op a x) = true := ($eqLem ctx a x).trans hx)
-
-valid_pres_intro Html.validIn_withKey_intro [msg] String, Html msg, Html.validIn, withKey via Html.validIn_withKey
-valid_pres_intro Html.validIn_map_intro [α β] (α → β), Html α, Html.validIn, (fun f h => h.map f) via Html.validIn_map
-valid_pres_intro Html.validListIn_mapChildren_intro [α β] (α → β), List (Html α), Html.validListIn, Html.mapChildren via Html.validListIn_mapChildren
-valid_pres_intro Html.validIn_prefixSignals_intro [msg] String, Html msg, Html.validIn, (fun p h => h.prefixSignals p) via Html.validIn_prefixSignals
-valid_pres_intro Html.validListIn_prefixSignalsList_intro [msg] String, List (Html msg), Html.validListIn, Html.prefixSignalsList via Html.validListIn_prefixSignalsList
+theorem Html.validIn_withKey_intro {msg : Type} (ctx : HtmlCtx) (k : String) (h : Html msg) (hh : Html.validIn ctx h = true) : Html.validIn ctx (withKey k h) = true := (Html.validIn_withKey ctx k h).trans hh
+theorem Html.validIn_map_intro {α β : Type} (ctx : HtmlCtx) (f : α → β) (h : Html α) (hh : Html.validIn ctx h = true) : Html.validIn ctx (h.map f) = true := (Html.validIn_map ctx f h).trans hh
+theorem Html.validListIn_mapChildren_intro {α β : Type} (ctx : HtmlCtx) (f : α → β) (hs : List (Html α)) (hh : Html.validListIn ctx hs = true) : Html.validListIn ctx (Html.mapChildren f hs) = true := (Html.validListIn_mapChildren ctx f hs).trans hh
+theorem Html.validIn_prefixSignals_intro {msg : Type} (ctx : HtmlCtx) (p : String) (h : Html msg) (hh : Html.validIn ctx h = true) : Html.validIn ctx (h.prefixSignals p) = true := (Html.validIn_prefixSignals ctx p h).trans hh
+theorem Html.validListIn_prefixSignalsList_intro {msg : Type} (ctx : HtmlCtx) (p : String) (hs : List (Html msg)) (hh : Html.validListIn ctx hs = true) : Html.validListIn ctx (Html.prefixSignalsList p hs) = true := (Html.validListIn_prefixSignalsList ctx p hs).trans hh
 
 def View.ofHtml (f : σ → Html msg) : View σ msg := .dynNode f
 def dynValGets (attrs : List (VAttr σ msg)) : List (σ → String) := attrs.filterMap fun | .dynVal _ get => some get | _ => none

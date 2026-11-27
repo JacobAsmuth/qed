@@ -119,8 +119,7 @@ def App.ssrStep (app : App Model Msg) (path title script resultsJson : String) :
 
 /-! ## Zero-Hop Native In-Memory SSR & Full-Stack Equivalence Proofs -/
 
-@[specialize]
-def ssrDrainQueueM {Model Msg : Type} {m : Type → Type} [Monad m] (app : App Model Msg)
+@[specialize] def ssrDrainQueueM {Model Msg : Type} {m : Type → Type} [Monad m] (app : App Model Msg)
     (dispatchBytes : String → String → ByteArray → m (Except String ByteArray))
     (dispatchText  : String → String → String → m (Except String String)) : Nat → Model → List (Cmd Msg) → m Model
   | 0, mdl, _ | _ + 1, mdl, [] => pure mdl
@@ -133,20 +132,14 @@ def ssrDrainQueueM {Model Msg : Type} {m : Type → Type} [Monad m] (app : App M
           ssrDrainQueueM app dispatchBytes dispatchText fuel mdl' (rest ++ Cmd.flatten c')
       | _ => ssrDrainQueueM app dispatchBytes dispatchText fuel mdl rest
 
-@[specialize]
-def App.ssrBootM {Model Msg : Type} {m : Type → Type} [Monad m] (app : App Model Msg) (path : String)
+@[specialize] def App.ssrBootM {Model Msg : Type} {m : Type → Type} [Monad m] (app : App Model Msg) (path : String)
     (dispatchBytes : String → String → ByteArray → m (Except String ByteArray))
     (dispatchText  : String → String → String → m (Except String String)) (fuel : Nat := 32) (sessionUser : Option String := none) : m Model :=
   let (m1, queue) := app.ssrInitQueue path sessionUser
   ssrDrainQueueM app dispatchBytes dispatchText fuel m1 queue
 
-structure PrebuiltDocShell where
-  css              : String
-  headWithCssBytes : ByteArray
-  headNoCssBytes   : ByteArray
-  afterAppBytes    : ByteArray
-  afterStateBytes  : ByteArray
-  noStateTailBytes : ByteArray
+structure PrebuiltDocShell where mk ::
+  (css : String) (headWithCssBytes headNoCssBytes afterAppBytes afterStateBytes noStateTailBytes : ByteArray)
 
 def mkPrebuiltDocShell (title : String) (script : String := "/qed_host.mjs") (css : String := "") (stylesheets : List String := []) : PrebuiltDocShell :=
   let baseHead := docHeadPrefix title (renderStylesheetLinks stylesheets); let scriptTag := docScriptTag script
@@ -166,8 +159,7 @@ def PrebuiltDocShell.renderBytes (sh : PrebuiltDocShell) (appHtml state : String
     let cap := headB.size + appB.size + sh.afterAppBytes.size + state.utf8ByteSize + sh.afterStateBytes.size + 16
     appendSlice (escapeRawTextBytesInto (appendSlice (appendSlice (appendSlice (ByteArray.emptyWithCapacity cap) headB) appB) sh.afterAppBytes) state) sh.afterStateBytes
 
-@[specialize]
-def App.ssrRenderNativeWithStatus {Model Msg : Type} {m : Type → Type} [Monad m]
+@[specialize] def App.ssrRenderNativeWithStatus {Model Msg : Type} {m : Type → Type} [Monad m]
     (app : App Model Msg) (sh : PrebuiltDocShell) (defaultTitle script path : String)
     (dispatchBytes : String → String → ByteArray → m (Except String ByteArray))
     (dispatchText  : String → String → String → m (Except String String) := fun _ _ _ => pure (.error "no external JSON handler registered for SSR"))
@@ -180,8 +172,7 @@ def App.ssrRenderNativeWithStatus {Model Msg : Type} {m : Type → Type} [Monad 
     else (renderDocument defaultTitle appHtml script (state := state) (css := sh.css) (stylesheets := app.stylesheets) (headMeta := hm)).toUTF8
   return (status, hm, htmlBytes)
 
-@[specialize]
-def App.ssrRenderNativeBytes {Model Msg : Type} {m : Type → Type} [Monad m]
+@[specialize] def App.ssrRenderNativeBytes {Model Msg : Type} {m : Type → Type} [Monad m]
     (app : App Model Msg) (path title : String)
     (dispatchBytes : String → String → ByteArray → m (Except String ByteArray))
     (dispatchText  : String → String → String → m (Except String String) := fun _ _ _ => pure (.error "no external JSON handler registered for SSR"))

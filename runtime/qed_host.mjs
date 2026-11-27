@@ -30,8 +30,7 @@ function ensureEvent(event) {
   attached.add(event);
   const onA = 'data-qed-on-' + event, rowA = 'data-qed-row-on-' + event, onvA = 'data-qed-onv-' + event;
   root.addEventListener(event, (e) => {
-    const et = active && e.target;
-    if (!et?.closest) return;
+    const et = active && e.target; if (!et?.closest) return;
     if (event === 'click' && e.button === 0 && !e.metaKey && !e.ctrlKey && !e.shiftKey && !e.altKey) {
       const a = et.closest('a[href], [data-qed-link]'), href = a && !a.target && !a.hasAttribute('download') && !a.hasAttribute('data-qed-external') ? (a.getAttribute('href') || '') : null;
       if (href !== null && !href.startsWith('/_qed/') && (a.hasAttribute('data-qed-link') || (href.startsWith('/') && !href.startsWith('//')))) { e.preventDefault(); history.pushState({}, '', href); active.urlChanged(href); return; }
@@ -42,8 +41,7 @@ function ensureEvent(event) {
     if (rt && event === 'submit') e.preventDefault();
     if (list) {
       const evIdx = rt.getAttribute(rowA), listId = intAttr(list, 'data-qed-list');
-      let row = rt, rowIdx = 0;
-      while (row && row.parentNode !== list) row = row.parentNode;
+      let row = rt, rowIdx = 0; while (row && row.parentNode !== list) row = row.parentNode;
       if (evIdx !== null && row && listId !== null) { for (let p = row.previousSibling; p; p = p.previousSibling) rowIdx++; active.fire(rt, listId, evIdx + ':' + rowIdx); }
     }
     const vt = et.closest(`[${onvA}]`);
@@ -82,8 +80,7 @@ function mountApp(app, isTimeTravel = false) {
   g.fetchStream = (url, body, cid, did) => {
     const k = 's:' + did;
     fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body, signal: trackAbort(k) }).then(async (resp) => {
-      if (disposed) return;
-      if (!resp.ok || !resp.body) return streamDone(did);
+      if (disposed) return; if (!resp.ok || !resp.body) return streamDone(did);
       const reader = resp.body.getReader(), dec = new TextDecoder();
       for (;;) { const { done, value } = await reader.read(); if (done || disposed) break; const t = dec.decode(value, { stream: true }); if (t) app.qed_stream_chunk(cid, t, W); }
       if (!disposed) { const tail = dec.decode(); if (tail) app.qed_stream_chunk(cid, tail, W); streamDone(did); }
@@ -153,8 +150,7 @@ function mountApp(app, isTimeTravel = false) {
   g.send = (name, payload) => !disposed && portRecv(name, String(payload));
   g.wsOpen = (cid, url, isBin) => {
     if (disposed) return;
-    let ws;
-    try { ws = new WebSocket(resolveWsUrl(url)); } catch (err) { return app.qed_ws_close(cid, String(err), BigInt(Date.now()), W); }
+    let ws; try { ws = new WebSocket(resolveWsUrl(url)); } catch (err) { return app.qed_ws_close(cid, String(err), BigInt(Date.now()), W); }
     if (isBin) ws.binaryType = 'arraybuffer';
     wsConns.set(cid, ws);
     const live = () => !disposed && wsConns.get(cid) === ws;
@@ -193,37 +189,18 @@ let oneTapStarted = false;
 function initGoogleOneTap() {
   if (oneTapStarted || typeof document === 'undefined' || !document.querySelector('a[href^="/_qed/auth/login"]')) return;
   oneTapStarted = true;
-  fetch('/_qed/auth/onetap', { credentials: 'same-origin' })
-    .then((r) => (r.ok ? r.json() : null))
-    .then((cfg) => {
-      if (!cfg?.enabled || !cfg.clientId || !cfg.nonce) return;
-      const start = () => {
-        const gsi = globalThis.google?.accounts?.id;
-        if (!gsi) return;
-        gsi.initialize({
-          client_id: cfg.clientId,
-          nonce: cfg.nonce,
-          use_fedcm_for_prompt: true,
-          auto_select: false,
-          callback: (resp) => {
-            if (!resp?.credential) return;
-            fetch('/_qed/auth/onetap', {
-              method: 'POST',
-              credentials: 'same-origin',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ credential: resp.credential }),
-            }).then((res) => { if (res.ok) location.reload(); }).catch(() => {});
-          },
-        });
-        gsi.prompt();
-      };
-      if (globalThis.google?.accounts?.id) return start();
-      const s = document.createElement('script');
-      s.src = 'https://accounts.google.com/gsi/client';
-      s.async = true; s.defer = true; s.onload = start;
-      document.head.appendChild(s);
-    })
-    .catch(() => {});
+  fetch('/_qed/auth/onetap', { credentials: 'same-origin' }).then((r) => (r.ok ? r.json() : null)).then((cfg) => {
+    if (!cfg?.enabled || !cfg.clientId || !cfg.nonce) return;
+    const start = () => {
+      const gsi = globalThis.google?.accounts?.id; if (!gsi) return;
+      gsi.initialize({ client_id: cfg.clientId, nonce: cfg.nonce, use_fedcm_for_prompt: true, auto_select: false,
+        callback: (resp) => resp?.credential && fetch('/_qed/auth/onetap', { method: 'POST', credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ credential: resp.credential }) }).then((res) => { if (res.ok) location.reload(); }).catch(() => {}) });
+      gsi.prompt();
+    };
+    if (globalThis.google?.accounts?.id) return start();
+    document.head.appendChild(Object.assign(document.createElement('script'), { src: 'https://accounts.google.com/gsi/client', async: true, defer: true, onload: start }));
+  }).catch(() => {});
 }
 
 export function boot() { mountApp(initialApp); initGoogleOneTap(); }

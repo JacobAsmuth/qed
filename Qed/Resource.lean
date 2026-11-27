@@ -59,13 +59,9 @@ instance : QedCoalesce (Cached α) α := ⟨Cached.get?⟩
 def isOk (c : Cached α) : Bool := c.state.isOk
 def isLoading (c : Cached α) : Bool := c.state.isLoading
 def updateCurrent (c : Cached α) (currentKey : String) (f : α → α) : Cached α :=
-  match c.state with
-  | .ok a => c.put currentKey (.ok (f a)) currentKey
-  | _ => c
-def setKey (c : Cached α) (currentKey : String) (val : α) : Cached α :=
-  c.put currentKey (.ok val) currentKey
-def invalidateKey (c : Cached α) (currentKey : String) : Cached α :=
-  { state := .idle, seen := c.seen.filter (·.1 != currentKey), rev := c.rev }
+  match c.state with | .ok a => c.put currentKey (.ok (f a)) currentKey | _ => c
+def setKey (c : Cached α) (currentKey : String) (val : α) : Cached α := c.put currentKey (.ok val) currentKey
+def invalidateKey (c : Cached α) (currentKey : String) : Cached α := { state := .idle, seen := c.seen.filter (·.1 != currentKey), rev := c.rev }
 def markRefetch (c : Cached α) : Cached α := { c with rev := c.rev + 1 }
 def invalidateAll (c : Cached α) : Cached α := { state := .idle, seen := [], rev := c.rev + 1 }
 def view (c : Cached α) (ready : α → Html msg) (loading : Html msg := .text "Loading…")
@@ -111,18 +107,10 @@ def Query.liftWithProps {PModel PMsg CModel CMsg Props : Type}
     (getState : PModel → CModel) (setState : CModel → PModel → PModel) (wrapMsg : CMsg → PMsg)
     (childQuery : Props → Query CModel CMsg) : Query PModel PMsg :=
   { key := KeyedLifecycle.composeKey getKey getProps getState (fun p => (childQuery p).key),
-    load := fun _ pm =>
-      match getProps pm with
-      | none => (pm, .none)
-      | some p =>
-          let q := childQuery p
-          let ck := q.key (getState pm)
-          let (cs', c) := q.load ck (getState pm)
-          (setState cs' pm, Cmd.map wrapMsg c),
-    idle := fun pm =>
-      match getProps pm with
-      | none => pm
-      | some p => setState ((childQuery p).idle (getState pm)) pm }
+    load := fun _ pm => (getProps pm).elim (pm, .none) fun p =>
+      let q := childQuery p; let (cs', c) := q.load (q.key (getState pm)) (getState pm)
+      (setState cs' pm, Cmd.map wrapMsg c),
+    idle := fun pm => (getProps pm).elim pm fun p => setState ((childQuery p).idle (getState pm)) pm }
 
 namespace Internal
 def App.withQueries {Model Msg : Type} (qs : List (Query Model Msg)) (app : App Model Msg) : App Model Msg :=
@@ -133,35 +121,22 @@ defAppProjSimps App.withQueries (qs : List (Query Model Msg)) (app : App Model M
    template := app.template, dehydrate := app.dehydrate, rehydrate := app.rehydrate]
 end Internal
 
-instance [ToJson α] : ToJson (Resource α) := ⟨fun
-  | .idle => .obj [("t", .str "idle")] | .loading => .obj [("t", .str "loading")]
-  | .ok a => .obj [("t", .str "ok"), ("v", toJson a)] | .failed e => .obj [("t", .str "failed"), ("e", .str e)]⟩
-instance [FromJson α] : FromJson (Resource α) := ⟨fun j => match j.strAt? "t" with
-  | some "idle" => .ok .idle | some "loading" => .ok .loading
-  | some "ok" => ((j.field "v").bind fromJson).map .ok | some "failed" => .ok (.failed (j.strAtD "e"))
-  | _ => .error "expected a Resource (tagged object)"⟩
-instance [LawfulJson α] : LawfulJson (Resource α) where
-  depthBound := 1 + LawfulJson.depthBound α
-  depth_toJson
-    | .idle | .loading | .failed _ => Nat.le_add_right 1 _
-    | .ok a => Nat.add_le_add_left (by simpa [Json.maxObj, Json.depth] using LawfulJson.depth_toJson a) 1
-  fromJson_toJson
-    | .idle | .loading | .failed _ => rfl
-    | .ok a => by change (fromJson (toJson a) : Except String α).map Resource.ok = _; rw [LawfulJson.fromJson_toJson a]; rfl
-instance [ToJson α] : NonNullJson (Resource α) := ⟨fun | .idle | .loading | .ok _ | .failed _ => nofun⟩
+private def Resource.taggedCodec (α : Type) : Internal.TaggedCodec (Resource α) α where
+  typeName := "Resource (tagged object)"; payloadTag := "ok"; payloadField := "v"; payloadPTag := 2; failedPTag := 3
+  split | .idle => .unit "idle" 0 | .loading => .unit "loading" 1 | .ok a => .payload a | .failed e => .failed e
+  ofUnitJson | "idle" => some .idle | "loading" => some .loading | _ => none
+  ofUnitProto | 0 => some .idle | 1 => some .loading | _ => none
+  mkPayload := .ok; mkFailed := .failed
+  sound | .idle | .loading => ⟨rfl, rfl, by decide, by decide, by decide, by decide⟩ | .ok _ | .failed _ => rfl
+  tagsDistinct := by decide
+instance [ToJson α] : ToJson (Resource α) := (Resource.taggedCodec α).toJsonInst
+instance [FromJson α] : FromJson (Resource α) := (Resource.taggedCodec α).fromJsonInst
+instance [LawfulJson α] : LawfulJson (Resource α) := (Resource.taggedCodec α).lawfulJsonInst
+instance [ToJson α] : NonNullJson (Resource α) := (Resource.taggedCodec α).nonNullInst
 qed_equiv_codec% json [α] (Cached α, fun c => (c.state, c.seen, c.rev), fun p : Resource α × List (String × α) × Nat => ⟨p.1, p.2.1, p.2.2⟩, fun ⟨_, _, _⟩ => rfl)
-private def encodeResourceFields [ToProto α] : Resource α → List (Nat × Proto.WireVal)
-  | .idle => [(1, .varint 0)] | .loading => [(1, .varint 1)]
-  | .ok a => [(1, .varint 2), (2, ToProto.toProtoVal a)] | .failed e => [(1, .varint 3), (2, ToProto.toProtoVal e)]
-private def decodeResourceFields [FromProto α] (fs : List (Nat × Proto.WireVal)) : Except String (Resource α) :=
-  match Proto.lookupField 1 fs with
-  | some (.varint 0) => .ok .idle | some (.varint 1) => .ok .loading
-  | some (.varint 2) => (Proto.decodeFieldVal 2 fs "Resource.ok: missing field 2").map .ok
-  | some (.varint 3) => (Proto.decodeFieldVal 2 fs "Resource.failed: missing field 2").map .failed
-  | _ => .error "protobuf: invalid Resource tag"
-qed_proto_fields% [α] (Resource α, encodeResourceFields, decodeResourceFields,
-  by intro r kw h; cases r <;> (simp only [encodeResourceFields, List.mem_cons, List.not_mem_nil, or_false] at h; rcases h with rfl | rfl <;> simp),
-  by intro r; cases r <;> simp [encodeResourceFields, decodeResourceFields, Proto.decodeFieldVal, Proto.lookupField, Except.map])
+instance [ToProto α] : ToProto (Resource α) := (Resource.taggedCodec α).toProtoInst
+instance [FromProto α] : FromProto (Resource α) := (Resource.taggedCodec α).fromProtoInst
+instance [LawfulProto α] : LawfulProto (Resource α) := (Resource.taggedCodec α).lawfulProtoInst
 
 def Resource.stripEnsured {α : Type} {p : α → Prop} (r : Resource (Ensured α p)) : Resource α := r.map (·.val)
 theorem Resource.all_stripEnsured_of_imp {α : Type} {P Q : α → Prop} {r : Resource (Ensured α P)}

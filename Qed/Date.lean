@@ -25,18 +25,8 @@ def trim (s : String) : String := String.ofList (dropWhileWs (dropWhileWs s.toLi
 def toLower (s : String) : String := String.ofList (s.toList.map Char.toLower)
 def toUpper (s : String) : String := String.ofList (s.toList.map Char.toUpper)
 
-private def listStartsWith : List Char → List Char → Bool
-  | _, [] => true
-  | [], _ :: _ => false
-  | a :: as, b :: bs => a == b && listStartsWith as bs
-
 def startsWith (s pfx : String) : Bool := listStartsWith s.toList pfx.toList
 def endsWith (s sfx : String) : Bool := listStartsWith s.toList.reverse sfx.toList.reverse
-
-private def listContains (needle : List Char) : List Char → Bool
-  | [] => needle.isEmpty
-  | xs@(_ :: tl) => listStartsWith xs needle || listContains needle tl
-
 def contains (haystack needle : String) : Bool :=
   if needle.isEmpty then true else listContains needle.toList haystack.toList
 
@@ -154,55 +144,43 @@ instance : ToString Date := ⟨Date.toString⟩
 def before (a b : Date) : Bool := a.year < b.year || (a.year == b.year && (a.month < b.month || (a.month == b.month && a.day < b.day)))
 
 section RoundTripProof
-private theorem toDigitsCore_noDash : ∀ fuel n ds, '-' ∉ ds → '-' ∉ Nat.toDigitsCore 10 fuel n ds
-  | 0, _, ds, h => h
-  | fuel + 1, n, ds, h => by
-      rw [Nat.toDigitsCore]
-      have hd : Nat.digitChar (n % 10) ≠ '-' := (Str.digitChar_ok ⟨n % 10, Nat.mod_lt _ (by omega)⟩).2.2
-      have hcons : '-' ∉ Nat.digitChar (n % 10) :: ds := by simp [hd.symm, h]
-      by_cases hq : n / 10 = 0
-      · simpa [hq] using hcons
-      · simpa [hq] using toDigitsCore_noDash fuel (n / 10) _ hcons
-
 private theorem parseNatAux_repZero : ∀ k xs, Str.parseNatAux 0 (List.replicate k '0' ++ xs) = Str.parseNatAux 0 xs
   | 0, _ => rfl
-  | k + 1, xs => by
-      simp only [List.replicate_succ, List.cons_append, Str.parseNatAux]
-      exact parseNatAux_repZero k xs
+  | k + 1, xs => by simp only [List.replicate_succ, List.cons_append, Str.parseNatAux]; exact parseNatAux_repZero k xs
 
 private theorem padNat_noDash (w n : Nat) : '-' ∉ (padNat w n).toList := by
-  unfold padNat padZero Nat.repr Nat.toDigits
-  have hdig := toDigitsCore_noDash (n + 1) n [] (by simp)
+  unfold padNat padZero; have hdig : '-' ∉ (Nat.repr n).toList := Str.nat_toString_not_mem (by decide) n
   split
-  · rw [String.toList_append, String.toList_ofList, String.toList_ofList, List.mem_append]
-    rintro (h | h)
-    · have := List.eq_of_mem_replicate h; cases this
-    · exact hdig h
-  · rw [String.toList_ofList]; exact hdig
+  · rw [String.toList_append, String.toList_ofList, List.mem_append]
+    exact fun h => h.elim (fun hr => by cases List.eq_of_mem_replicate hr) hdig
+  · exact hdig
 
 private theorem parseNat?_padNat (w n : Nat) : Str.parseNat? (padNat w n) = some n := by
-  unfold padNat padZero Nat.repr Nat.toDigits
-  have hne := Str.toDigitsCore_ne_nil n n []
-  have hcore := Str.parseNatAux_toDigitsCore n n [] (Nat.le_refl n)
-  split
-  · unfold Str.parseNat?; rw [String.toList_append, String.toList_ofList, String.toList_ofList]
-    cases hEq : List.replicate (w - (String.ofList (Nat.toDigitsCore 10 (n + 1) n [])).length) '0' ++ Nat.toDigitsCore 10 (n + 1) n [] with
+  have hrep (k : Nat) : Str.parseNat? (String.ofList (List.replicate k '0') ++ Nat.repr n) = some n := by
+    unfold Str.parseNat? Nat.repr Nat.toDigits; rw [String.toList_append, String.toList_ofList, String.toList_ofList]
+    have hne := Str.toDigitsCore_ne_nil n n []
+    cases hEq : List.replicate k '0' ++ Nat.toDigitsCore 10 (n + 1) n [] with
     | nil => exact absurd (List.append_eq_nil_iff.1 hEq).2 hne
-    | cons c cs => dsimp only; rw [← hEq, parseNatAux_repZero, hcore]; rfl
-  · unfold Str.parseNat?; rw [String.toList_ofList]
-    cases hEq : Nat.toDigitsCore 10 (n + 1) n [] with
-    | nil => exact absurd hEq hne
-    | cons c cs => dsimp only; rw [← hEq, hcore]; rfl
+    | cons _ _ => dsimp only; rw [← hEq, parseNatAux_repZero, Str.parseNatAux_toDigitsCore n n [] (Nat.le_refl n)]; rfl
+  unfold padNat padZero; split
+  · exact hrep _
+  · exact Str.parseNat?_repr n
+
+private theorem splitChar_sep (s : String) (a : String) (ha : '-' ∉ a.toList) :
+    Str.splitChar (a ++ "-" ++ s) '-' = a :: Str.splitChar s '-' := by
+  unfold Str.splitChar
+  rw [show (a ++ "-" ++ s).toList = a.toList ++ '-' :: s.toList by simp [String.toList_append, List.append_assoc],
+      Str.splitCharAux_append_not_mem '-' a.toList s.toList [] [] ha, Str.splitCharAux_acc,
+      List.reverse_nil, List.nil_append, String.ofList_toList]
+  rfl
+
+private theorem splitChar_single (a : String) (ha : '-' ∉ a.toList) : Str.splitChar a '-' = [a] := by
+  unfold Str.splitChar; rw [Str.splitCharAux_not_mem '-' a.toList [] [] ha, List.reverse_nil, List.nil_append, String.ofList_toList]; rfl
 
 private theorem splitChar_ymd (a b c : String) (ha : '-' ∉ a.toList) (hb : '-' ∉ b.toList) (hc : '-' ∉ c.toList) :
     Str.splitChar (a ++ "-" ++ b ++ "-" ++ c) '-' = [a, b, c] := by
-  unfold Str.splitChar
-  have hlist : (a ++ "-" ++ b ++ "-" ++ c).toList = a.toList ++ '-' :: (b.toList ++ '-' :: c.toList) := by
-    simp [String.toList_append, List.append_assoc]
-  rw [hlist, Str.splitCharAux_append_not_mem '-' a.toList _ [] [] ha,
-      Str.splitCharAux_append_not_mem '-' b.toList _ [] _ hb,
-      Str.splitCharAux_not_mem '-' c.toList [] _ hc]
-  simp [String.ofList_toList]
+  rw [show a ++ "-" ++ b ++ "-" ++ c = a ++ "-" ++ (b ++ "-" ++ c) by simp only [String.append_assoc],
+      splitChar_sep _ a ha, splitChar_sep _ b hb, splitChar_single c hc]
 
 theorem parse?_toString (d : Date) : Date.parse? (Date.toString d) = some d := by
   cases d with | mk yr mo dy hok =>
@@ -219,17 +197,10 @@ theorem parse?_toString (d : Date) : Date.parse? (Date.toString d) = some d := b
   | negSucc k =>
       have hneg : Int.negSucc k < 0 := Int.negSucc_lt_zero k
       simp only [hneg, ↓reduceIte]
-      have hyr := padNat_noDash 4 (Int.negSucc k).natAbs
-      have hsplit : Str.splitChar ("-" ++ padNat 4 (Int.negSucc k).natAbs ++ "-" ++ padNat 2 mo ++ "-" ++ padNat 2 dy) '-' =
-          ["", padNat 4 (Int.negSucc k).natAbs, padNat 2 mo, padNat 2 dy] := by
-        unfold Str.splitChar
-        have hlist : ("-" ++ padNat 4 (Int.negSucc k).natAbs ++ "-" ++ padNat 2 mo ++ "-" ++ padNat 2 dy).toList =
-            '-' :: ((padNat 4 (Int.negSucc k).natAbs).toList ++ '-' :: ((padNat 2 mo).toList ++ '-' :: (padNat 2 dy).toList)) := by
-          simp [String.toList_append, List.append_assoc]
-        rw [hlist]; simp only [Str.splitCharAux, beq_self_eq_true, ↓reduceIte]
-        rw [Str.splitCharAux_append_not_mem '-' _ _ [] _ hyr, Str.splitCharAux_append_not_mem '-' _ _ [] _ hmo, Str.splitCharAux_not_mem '-' _ [] _ hdy]
-        simp [String.ofList_toList]
-      rw [hsplit]
+      have hpre : "-" ++ padNat 4 (Int.negSucc k).natAbs ++ "-" ++ padNat 2 mo ++ "-" ++ padNat 2 dy =
+          "" ++ "-" ++ (padNat 4 (Int.negSucc k).natAbs ++ "-" ++ padNat 2 mo ++ "-" ++ padNat 2 dy) := by
+        simp only [String.empty_append, String.append_assoc]
+      rw [hpre, splitChar_sep _ "" (by simp), splitChar_ymd _ _ _ (padNat_noDash 4 _) hmo hdy]
       have hna : (Int.negSucc k).natAbs = k + 1 := rfl
       have hnegEq : -(Int.ofNat (k + 1)) = Int.negSucc k := rfl
       simp only [hna, parseNat?_padNat, Bind.bind, Option.bind, Nat.add_one_ne_zero, beq_iff_eq, ↓reduceIte, hnegEq, Date.mk?]

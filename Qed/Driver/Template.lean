@@ -173,7 +173,7 @@ private def patchTmplListM [MonadDom msg m] (node : Dom.Node) (attrs : List (VAt
     (oldDups : Bool) (oldLive : Array Dom.Node) (oldVals : Array (Array String)) (oldMarks : Array USize) : m (VState σ msg) := do
   if !tmpl.evNames.isEmpty then MonadDom.setRowEvSlot evSlot (tmpl.rowEvAt s)
   applyDynAttrsM node attrs s
-  let newMarks := marks s; let nOld := oldMarks.size; let nNew := newMarks.size; let rowVals := tmpl.rowVals s
+  let (newMarks, nOld, rowVals) := (marks s, oldMarks.size, tmpl.rowVals s); let nNew := newMarks.size
   let mk ks dups lv vs : VState σ msg := .tlist node tmplId evSlot ks dups lv vs newMarks
   let patchDirty (dst src : Nat) (rn : Dom.Node) : m (Array String) := do
     let ov := oldVals.getD src #[]; let m := newMarks.getD dst 0
@@ -191,8 +191,8 @@ private def patchTmplListM [MonadDom msg m] (node : Dom.Node) (attrs : List (VAt
       if changed.isEmpty then return mk oldKeys false oldLive oldVals
       if changed.all fun idx => tmpl.rowKey s idx == oldKeys.getD idx "" then return mk oldKeys false oldLive (← patchIdxs changed)
       if h2 : changed.size = 2 then
-        let a := changed[0]'(h2 ▸ Nat.zero_lt_two); let b := changed[1]'(h2 ▸ Nat.one_lt_two)
-        let ka := tmpl.rowKey s a; let kb := tmpl.rowKey s b
+        let (a, b) := (changed[0]'(h2 ▸ Nat.zero_lt_two), changed[1]'(h2 ▸ Nat.one_lt_two))
+        let (ka, kb) := (tmpl.rowKey s a, tmpl.rowKey s b)
         if ka == oldKeys.getD b "" && kb == oldKeys.getD a "" then
           let (nodeA, nodeB) := (oldLive.getD a 0, oldLive.getD b 0)
           MonadDom.insertBeforeRef node (some nodeA) nodeB
@@ -202,8 +202,7 @@ private def patchTmplListM [MonadDom msg m] (node : Dom.Node) (attrs : List (VAt
     else
       let p := prefixMatchLen oldMarks newMarks 0
       if p == nOld && nNew > nOld then
-        let addCount := nNew - nOld
-        let tailVals := Array.ofFn (n := addCount) fun i => rowVals (nOld + i.1)
+        let addCount := nNew - nOld; let tailVals := Array.ofFn (n := addCount) fun i => rowVals (nOld + i.1)
         let (uKeys, hasDups) := disambiguateWithFlag (oldKeys ++ Array.ofFn (n := addCount) fun i => tmpl.rowKey s (nOld + i.1))
         return mk uKeys hasDups (oldLive ++ (← MonadDom.mountTmplRows node tmplId tailVals)) (oldVals ++ tailVals)
       if nNew < nOld then

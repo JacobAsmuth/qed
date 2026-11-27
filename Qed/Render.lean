@@ -263,16 +263,8 @@ private theorem isKeyChar_no_angle {c : Char} (h : isKeyChar c = true) : NoAngle
   unfold isKeyChar at h; simp only [Bool.or_eq_true, beq_iff_eq] at h
   refine ⟨?_, ?_⟩ <;> intro heq <;> subst heq <;> simp [Char.isAlphanum, Char.isAlpha, Char.isDigit] at h
 
-private theorem toDigitsCore_no_angle : ∀ (k m : Nat) (acc : List Char), (∀ c ∈ acc, NoAngle c) → ∀ c ∈ Nat.toDigitsCore 10 k m acc, NoAngle c
-  | 0, _, _, hacc, c, hc => by rw [Nat.toDigitsCore.eq_1] at hc; exact hacc c hc
-  | k + 1, m, acc, hacc, c, hc => by
-      have hcons : ∀ x ∈ Nat.digitChar (m % 10) :: acc, NoAngle x := fun x hx =>
-        (List.mem_cons.1 hx).elim (· ▸ (by decide : ∀ d : Fin 10, NoAngle (Nat.digitChar d.val)) ⟨m % 10, Nat.mod_lt _ (by decide)⟩) (hacc x)
-      rw [Nat.toDigitsCore.eq_2] at hc; split at hc; exact hcons c hc; exact toDigitsCore_no_angle k (m / 10) _ hcons c hc
-
-private theorem nat_repr_no_angle (n : Nat) : ∀ c ∈ (toString n).toList, NoAngle c := fun c hc => by
-  change c ∈ (Nat.repr n).toList at hc; unfold Nat.repr Nat.toDigits at hc; rw [String.toList_ofList] at hc
-  exact toDigitsCore_no_angle (n + 1) n [] (fun _ h => nomatch h) c hc
+private theorem nat_repr_no_angle (n : Nat) : ∀ c ∈ (toString n).toList, NoAngle c := fun _ hc =>
+  ⟨fun h => Str.nat_toString_not_mem (by decide) n (h ▸ hc), fun h => Str.nat_toString_not_mem (by decide) n (h ▸ hc)⟩
 
 private theorem escapeHtml_no_angle (s : String) : ∀ c ∈ (escapeHtml s).toList, NoAngle c := fun c hc => by
   have hnm := escapeHtml_no_markup_or_quote s c hc; simp only [isMarkupOrQuote, Bool.or_eq_false_iff, beq_eq_false_iff_ne, ne_eq] at hnm; exact ⟨hnm.1.1.1, hnm.1.1.2⟩

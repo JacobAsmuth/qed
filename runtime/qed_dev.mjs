@@ -10,40 +10,38 @@
   let drawerOpen = false, stateFilter = '', history = [], activeSnapIdx = -1, timeTravelActive = false, prevInFlightHttp = 0, pendingPredictIdx = -1;
   const MAX_HISTORY = 200;
 
-  // ---- Shadow-DOM UI (isolated from app styles & view invariants) ----
   const host = Object.assign(document.createElement('div'), { id: '__qed-dev-ui' }), shadow = host.attachShadow({ mode: 'open' });
   shadow.innerHTML = `<style>
-    :host { all: initial; --bg: rgba(15,23,42,.94); --bd: rgba(148,163,184,.28); --bds: rgba(148,163,184,.14); --fg: #e2e8f0; --hi: #f8fafc; --mut: #94a3b8; --dim: #64748b; --acc: #7dd3fc; --abg: rgba(56,189,248,.16); --ok: #86efac; --warn: #fcd34d; --err: #fca5a5; --sans: ui-sans-serif,system-ui,-apple-system,sans-serif; --mono: ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
-    * { box-sizing: border-box; }
-    .drawer.open, .backdrop.open, .dt-pane.active, .dt-tt-banner.show { display: flex; }
-    .dt-brand, .dt-toolbar, .dt-row-title, .dt-row-meta, .hdr-actions, .title { display: flex; align-items: center; }
-    .dt-hdr, .hdr, .dt-row-top, .dt-tt-banner { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-    .dt-list, .dt-row, .dt-pane { display: flex; flex-direction: column; } .dt-pane { display: none; flex: 1; min-height: 0; }
-    .toast, .pill { position: fixed; right: 14px; z-index: 2147483645; background: var(--bg); border: 1px solid var(--bd); border-radius: 999px; display: inline-flex; align-items: center; }
-    .toast { bottom: 52px; padding: 6px 12px; gap: 8px; color: var(--hi); font: 500 12px/1.35 var(--sans); box-shadow: 0 8px 24px rgba(0,0,0,.28); opacity: 0; transform: translateY(6px); pointer-events: none; transition: .15s ease; } .toast.show { opacity: 1; transform: none; }
-    .dot { width: 7px; height: 7px; border-radius: 50%; flex: none; } .dot.ok { background: #22c55e; } .dot.error { background: #ef4444; } .dot.building { background: #f59e0b; animation: pulse 900ms ease-in-out infinite; } @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
-    .pill { bottom: 14px; padding: 7px 11px; gap: 7px; color: var(--fg); font: 600 11.5px/1 var(--sans); cursor: pointer; user-select: none; box-shadow: 0 6px 20px rgba(0,0,0,.32); transition: .14s ease; } .pill:hover { background: rgba(30,41,59,.98); border-color: rgba(148,163,184,.55); transform: translateY(-1px); }
-    .pill-badge, .dt-chip, .dt-pred { font-size: 10px; font-weight: 600; } .pill-badge { padding: 2px 6px; border-radius: 999px; background: var(--abg); color: var(--acc); } .pill-badge.tt { background: rgba(245,158,11,.22); color: var(--warn); }
-    .drawer, .card { color: var(--fg); border-radius: 12px; overflow: hidden; box-shadow: 0 22px 56px rgba(0,0,0,.55); }
-    .drawer { position: fixed; right: 14px; bottom: 52px; z-index: 2147483646; width: min(460px, calc(100vw - 28px)); height: min(520px, calc(100vh - 80px)); background: rgba(15,23,42,.97); border: 1px solid var(--bd); display: none; flex-direction: column; font-family: var(--sans); backdrop-filter: blur(8px); }
-    .dt-hdr { padding: 10px 12px; background: rgba(30,41,59,.72); border-bottom: 1px solid var(--bds); } .dt-brand { gap: 8px; font-size: 12.5px; font-weight: 600; color: var(--hi); }
-    .dt-chip { padding: 2px 6px; border-radius: 4px; background: rgba(34,197,94,.16); color: var(--ok); letter-spacing: .02em; } .dt-chip.poll { background: rgba(148,163,184,.18); color: #cbd5e1; }
-    .dt-tabs { display: flex; gap: 4px; padding: 6px 10px; border-bottom: 1px solid var(--bds); background: rgba(15,23,42,.6); }
-    .dt-tab, .dt-btn, .close { all: unset; cursor: pointer; border-radius: 6px; display: inline-flex; align-items: center; }
-    .dt-tab { font-size: 12px; font-weight: 500; color: var(--mut); padding: 5px 10px; gap: 6px; } .dt-tab:hover { color: var(--fg); background: rgba(148,163,184,.1); } .dt-tab.active { color: var(--hi); background: var(--abg); } .dt-count { font-size: 10px; padding: 1px 5px; border-radius: 999px; background: rgba(148,163,184,.2); color: #cbd5e1; }
-    .dt-btn, .close { color: #cbd5e1; border: 1px solid var(--bd); gap: 4px; } .dt-btn { font-size: 11px; font-weight: 500; padding: 4px 8px; } .close { font-size: 12px; padding: 4px 10px; } .dt-btn:hover, .close:hover { background: rgba(148,163,184,.16); color: #fff; }
-    .dt-btn.primary { border-color: rgba(56,189,248,.5); color: var(--acc); background: rgba(56,189,248,.12); } .dt-btn.primary:hover { background: rgba(56,189,248,.24); color: #fff; } .dt-btn.warn { border-color: rgba(245,158,11,.55); color: var(--warn); background: rgba(245,158,11,.16); }
-    .dt-toolbar { gap: 6px; padding: 8px 10px; border-bottom: 1px solid var(--bds); } .dt-search { flex: 1; background: rgba(30,41,59,.9); color: #f1f5f9; border: 1px solid var(--bd); border-radius: 6px; padding: 5px 8px; font-size: 12px; outline: none; } .dt-search:focus { border-color: #38bdf8; }
-    .dt-json, .body { margin: 0; overflow: auto; font-family: var(--mono); white-space: pre-wrap; word-break: break-word; } .dt-json { padding: 10px 12px; flex: 1; font-size: 12px; line-height: 1.5; color: var(--fg); } .dt-json mark { background: rgba(250,204,21,.35); color: #fef08a; border-radius: 2px; padding: 0 1px; }
-    .dt-tt-banner { display: none; padding: 7px 10px; background: rgba(245,158,11,.16); border-bottom: 1px solid rgba(245,158,11,.35); font-size: 11.5px; color: #fde68a; }
-    .dt-list { flex: 1; overflow: auto; padding: 6px 8px; gap: 5px; } .dt-empty { padding: 24px 12px; text-align: center; color: var(--dim); font-size: 12px; }
-    .dt-row { padding: 7px 9px; border-radius: 8px; background: rgba(30,41,59,.6); border: 1px solid var(--bds); gap: 4px; } .dt-row.current { border-color: rgba(56,189,248,.55); background: rgba(14,116,144,.18); }
-    .dt-row-top, .dt-row-title, .dt-row-meta { gap: 6px; } .dt-row-title { font-size: 12px; font-weight: 600; color: #f1f5f9; min-width: 0; } .dt-idx, .dt-time { font-family: var(--mono); font-size: 10.5px; } .dt-idx { color: var(--mut); } .dt-time { color: var(--dim); } .dt-diff { font: 11px/1.4 var(--mono); color: var(--mut); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .dt-pred { padding: 1px 5px; border-radius: 4px; } .dt-pred.pending { background: rgba(245,158,11,.2); color: var(--warn); } .dt-pred.hit { background: rgba(34,197,94,.18); color: var(--ok); } .dt-pred.rollback { background: rgba(239,68,68,.22); color: var(--err); }
-    .dt-ftr, .ftr { display: flex; justify-content: space-between; border-top: 1px solid var(--bds); } .dt-ftr { padding: 6px 10px; font-size: 10.5px; color: var(--dim); }
-    .backdrop { position: fixed; inset: 0; z-index: 2147483647; background: rgba(15,23,42,.78); backdrop-filter: blur(4px); display: none; align-items: flex-start; justify-content: center; padding: 48px 20px; overflow: auto; font-family: var(--sans); }
-    .card { width: min(860px, 100%); background: #0f172a; border: 1px solid rgba(239,68,68,.45); } .hdr { padding: 14px 18px; background: rgba(239,68,68,.14); border-bottom: 1px solid rgba(239,68,68,.28); } .hdr-actions, .title { gap: 8px; } .title { font-size: 14px; font-weight: 600; color: var(--err); }
-    .body { padding: 18px; max-height: 70vh; font-size: 13px; line-height: 1.55; color: #f1f5f9; } .file-link { color: var(--acc); text-decoration: underline dotted; cursor: pointer; border-radius: 3px; padding: 0 2px; } .file-link:hover { background: var(--abg); color: #bae6fd; } .ftr { padding: 10px 18px; font-size: 12px; color: var(--mut); gap: 12px; flex-wrap: wrap; }
+    :host{all:initial;--bg:rgba(15,23,42,.94);--bd:rgba(148,163,184,.28);--bds:rgba(148,163,184,.14);--fg:#e2e8f0;--hi:#f8fafc;--mut:#94a3b8;--dim:#64748b;--acc:#7dd3fc;--abg:rgba(56,189,248,.16);--ok:#86efac;--warn:#fcd34d;--err:#fca5a5;--sans:ui-sans-serif,system-ui,-apple-system,sans-serif;--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+    *{box-sizing:border-box} .drawer.open,.backdrop.open,.dt-pane.active,.dt-tt-banner.show{display:flex}
+    .dt-brand,.dt-toolbar,.dt-row-title,.dt-row-meta,.hdr-actions,.title{display:flex;align-items:center}
+    .dt-hdr,.hdr,.dt-row-top,.dt-tt-banner{display:flex;align-items:center;justify-content:space-between;gap:8px}
+    .dt-list,.dt-row,.dt-pane{display:flex;flex-direction:column} .dt-pane{display:none;flex:1;min-height:0}
+    .toast,.pill{position:fixed;right:14px;z-index:2147483645;background:var(--bg);border:1px solid var(--bd);border-radius:999px;display:inline-flex;align-items:center}
+    .toast{bottom:52px;padding:6px 12px;gap:8px;color:var(--hi);font:500 12px/1.35 var(--sans);box-shadow:0 8px 24px rgba(0,0,0,.28);opacity:0;transform:translateY(6px);pointer-events:none;transition:.15s ease} .toast.show{opacity:1;transform:none}
+    .dot{width:7px;height:7px;border-radius:50%;flex:none} .dot.ok{background:#22c55e} .dot.error{background:#ef4444} .dot.building{background:#f59e0b;animation:pulse 900ms ease-in-out infinite} @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+    .pill{bottom:14px;padding:7px 11px;gap:7px;color:var(--fg);font:600 11.5px/1 var(--sans);cursor:pointer;user-select:none;box-shadow:0 6px 20px rgba(0,0,0,.32);transition:.14s ease} .pill:hover{background:rgba(30,41,59,.98);border-color:rgba(148,163,184,.55);transform:translateY(-1px)}
+    .pill-badge,.dt-chip,.dt-pred{font-size:10px;font-weight:600} .pill-badge{padding:2px 6px;border-radius:999px;background:var(--abg);color:var(--acc)} .pill-badge.tt{background:rgba(245,158,11,.22);color:var(--warn)}
+    .drawer,.card{color:var(--fg);border-radius:12px;overflow:hidden;box-shadow:0 22px 56px rgba(0,0,0,.55)}
+    .drawer{position:fixed;right:14px;bottom:52px;z-index:2147483646;width:min(460px,calc(100vw - 28px));height:min(520px,calc(100vh - 80px));background:rgba(15,23,42,.97);border:1px solid var(--bd);display:none;flex-direction:column;font-family:var(--sans);backdrop-filter:blur(8px)}
+    .dt-hdr{padding:10px 12px;background:rgba(30,41,59,.72);border-bottom:1px solid var(--bds)} .dt-brand{gap:8px;font-size:12.5px;font-weight:600;color:var(--hi)}
+    .dt-chip{padding:2px 6px;border-radius:4px;background:rgba(34,197,94,.16);color:var(--ok);letter-spacing:.02em} .dt-chip.poll{background:rgba(148,163,184,.18);color:#cbd5e1}
+    .dt-tabs{display:flex;gap:4px;padding:6px 10px;border-bottom:1px solid var(--bds);background:rgba(15,23,42,.6)}
+    .dt-tab,.dt-btn,.close{all:unset;cursor:pointer;border-radius:6px;display:inline-flex;align-items:center}
+    .dt-tab{font-size:12px;font-weight:500;color:var(--mut);padding:5px 10px;gap:6px} .dt-tab:hover{color:var(--fg);background:rgba(148,163,184,.1)} .dt-tab.active{color:var(--hi);background:var(--abg)} .dt-count{font-size:10px;padding:1px 5px;border-radius:999px;background:rgba(148,163,184,.2);color:#cbd5e1}
+    .dt-btn,.close{color:#cbd5e1;border:1px solid var(--bd);gap:4px} .dt-btn{font-size:11px;font-weight:500;padding:4px 8px} .close{font-size:12px;padding:4px 10px} .dt-btn:hover,.close:hover{background:rgba(148,163,184,.16);color:#fff}
+    .dt-btn.primary{border-color:rgba(56,189,248,.5);color:var(--acc);background:rgba(56,189,248,.12)} .dt-btn.primary:hover{background:rgba(56,189,248,.24);color:#fff} .dt-btn.warn{border-color:rgba(245,158,11,.55);color:var(--warn);background:rgba(245,158,11,.16)}
+    .dt-toolbar{gap:6px;padding:8px 10px;border-bottom:1px solid var(--bds)} .dt-search{flex:1;background:rgba(30,41,59,.9);color:#f1f5f9;border:1px solid var(--bd);border-radius:6px;padding:5px 8px;font-size:12px;outline:none} .dt-search:focus{border-color:#38bdf8}
+    .dt-json,.body{margin:0;overflow:auto;font-family:var(--mono);white-space:pre-wrap;word-break:break-word} .dt-json{padding:10px 12px;flex:1;font-size:12px;line-height:1.5;color:var(--fg)} .dt-json mark{background:rgba(250,204,21,.35);color:#fef08a;border-radius:2px;padding:0 1px}
+    .dt-tt-banner{display:none;padding:7px 10px;background:rgba(245,158,11,.16);border-bottom:1px solid rgba(245,158,11,.35);font-size:11.5px;color:#fde68a}
+    .dt-list{flex:1;overflow:auto;padding:6px 8px;gap:5px} .dt-empty{padding:24px 12px;text-align:center;color:var(--dim);font-size:12px}
+    .dt-row{padding:7px 9px;border-radius:8px;background:rgba(30,41,59,.6);border:1px solid var(--bds);gap:4px} .dt-row.current{border-color:rgba(56,189,248,.55);background:rgba(14,116,144,.18)}
+    .dt-row-top,.dt-row-title,.dt-row-meta{gap:6px} .dt-row-title{font-size:12px;font-weight:600;color:#f1f5f9;min-width:0} .dt-idx,.dt-time{font-family:var(--mono);font-size:10.5px} .dt-idx{color:var(--mut)} .dt-time{color:var(--dim)} .dt-diff{font:11px/1.4 var(--mono);color:var(--mut);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .dt-pred{padding:1px 5px;border-radius:4px} .dt-pred.pending{background:rgba(245,158,11,.2);color:var(--warn)} .dt-pred.hit{background:rgba(34,197,94,.18);color:var(--ok)} .dt-pred.rollback{background:rgba(239,68,68,.22);color:var(--err)}
+    .dt-ftr,.ftr{display:flex;justify-content:space-between;border-top:1px solid var(--bds)} .dt-ftr{padding:6px 10px;font-size:10.5px;color:var(--dim)}
+    .backdrop{position:fixed;inset:0;z-index:2147483647;background:rgba(15,23,42,.78);backdrop-filter:blur(4px);display:none;align-items:flex-start;justify-content:center;padding:48px 20px;overflow:auto;font-family:var(--sans)}
+    .card{width:min(860px,100%);background:#0f172a;border:1px solid rgba(239,68,68,.45)} .hdr{padding:14px 18px;background:rgba(239,68,68,.14);border-bottom:1px solid rgba(239,68,68,.28)} .hdr-actions,.title{gap:8px} .title{font-size:14px;font-weight:600;color:var(--err)}
+    .body{padding:18px;max-height:70vh;font-size:13px;line-height:1.55;color:#f1f5f9} .file-link{color:var(--acc);text-decoration:underline dotted;cursor:pointer;border-radius:3px;padding:0 2px} .file-link:hover{background:var(--abg);color:#bae6fd} .ftr{padding:10px 18px;font-size:12px;color:var(--mut);gap:12px;flex-wrap:wrap}
   </style>
   <div class="toast" id="toast"><span class="dot" id="dot"></span><span id="msg"></span></div>
   <button class="pill" id="pill" title="Toggle Qed DevTools (Alt+Shift+Q)"><span class="dot ok" id="pill-dot"></span><span>Qed</span><span class="pill-badge" id="pill-badge">0</span></button>
@@ -58,7 +56,7 @@
   <div class="backdrop" id="backdrop" role="dialog" aria-modal="true" aria-label="Qed build error"><div class="card">
     <div class="hdr"><div class="title"><span class="dot error"></span><span>Build / Proof Error</span></div><div class="hdr-actions"><button class="close" id="copy-err">Copy Error</button><button class="close" id="close">Dismiss (Esc)</button></div></div>
     <pre class="body" id="errbody"></pre>
-    <div class="ftr"><span>Fix the error and save — Qed will hot-reload automatically.</span><span>Click any file:line to open in editor or copy location.</span></div>
+    <div class="ftr"><span>Fix the error and save: Qed will hot-reload automatically.</span><span>Click any file:line to open in editor or copy location.</span></div>
   </div></div>`;
 
   const mountUi = () => { if (document.body && !host.isConnected) document.body.appendChild(host); };
@@ -80,7 +78,6 @@
   };
   const hideOverlay = () => $('backdrop').classList.remove('open'), dismissOverlay = () => { overlayDismissedFor = lastError; hideOverlay(); };
 
-  // ---- JSON Formatting, State Diff & Time-Travel DevTools ----
   const tryJson = (s) => s ? tryCall(() => JSON.parse(s), null) : null;
   const fmtShort = (v) => v === null ? 'null' : v === undefined ? '∅' : typeof v === 'string' ? JSON.stringify(v.length > 22 ? v.slice(0, 20) + '…' : v)
     : Array.isArray(v) ? `[${v.length}]` : typeof v === 'object' ? `{${Object.keys(v).length}}` : String(v);
@@ -103,7 +100,7 @@
   };
   const PRED_TEXT = { pending: 'predict', hit: 'predict hit', rollback: 'rollback' };
   const curSnap = () => (activeSnapIdx >= 0 && activeSnapIdx < history.length) ? history[activeSnapIdx] : (history[history.length - 1] ?? null);
-  const prettyState = () => { const raw = curSnap()?.state ?? (window.qed?.dehydrate?.() || ''); if (!raw) return '(empty — no dehydrated state)'; const p = tryJson(raw); return p !== null ? JSON.stringify(p, null, 2) : raw; };
+  const prettyState = () => { const raw = curSnap()?.state ?? (window.qed?.dehydrate?.() || ''); if (!raw) return '(empty: no dehydrated state)'; const p = tryJson(raw); return p !== null ? JSON.stringify(p, null, 2) : raw; };
   const renderStatePane = () => {
     const el = $('state-json'), text = prettyState(), q = stateFilter.trim().toLowerCase();
     if (!q) return (el.textContent = text);
@@ -135,7 +132,6 @@
   const setTab = (name) => { for (const t of ['state', 'actions']) { $('tab-' + t).classList.toggle('active', t === name); $('pane-' + t).classList.toggle('active', t === name); } renderDevTools(); };
   const resetToLatest = () => { activeSnapIdx = history.length - 1; timeTravelActive = false; renderDevTools(); };
 
-  // ---- Dev-Only State-Preserving Hot Swap (`__qedHotReload` & `__qedDevRestore`) ----
   const captureFocus = () => {
     const el = document.activeElement, root = document.getElementById('app');
     if (!el || !root?.contains(el)) return null;
@@ -153,11 +149,11 @@
     const next = oldLink.cloneNode(false); next.setAttribute('href', `${href.split('?')[0]}?t=${encodeURIComponent(buildId)}`);
     return [new Promise((resolve) => {
       let settled = false; const done = () => { if (!settled) { settled = true; oldLink.remove(); resolve(); } };
-      next.addEventListener('load', done, { once: true }); next.addEventListener('error', done, { once: true }); oldLink.after(next); setTimeout(done, 1200);
+      for (const ev of ['load', 'error']) next.addEventListener(ev, done, { once: true }); oldLink.after(next); setTimeout(done, 1200);
     })];
   }));
   window.__qedDevRestore = (stateJson, localsJson) => !!window.__qedHost?.remount(undefined, stateJson, localsJson, true);
-  window.__qedHotReload = async function (buildId, opts = {}) {
+  window.__qedHotReload = async (buildId, opts = {}) => {
     if ((opts.kind || 'hmr') === 'css') { await hotSwapStyles(buildId); return { mode: 'css', preserved: true }; }
     if (!window.__qedHost) throw new Error('qed host unavailable');
     const { scrollX, scrollY } = window, focus = captureFocus(), cur = window.__qedHost.active();
@@ -169,7 +165,7 @@
     window.scrollTo(scrollX, scrollY); restoreFocus(focus);
     return { mode: 'hmr', preserved };
   };
-  window.__qedDevHook = function (kind, d) {
+  window.__qedDevHook = (kind, d) => {
     if (!d || (kind === 'mount' && d.isTimeTravel) || (kind !== 'mount' && kind !== 'action')) return;
     const prev = history[history.length - 1] ?? null, state = d.state || '', diff = prev ? summarizeDiff(prev.state, state) : 'initial state';
     let label = prev ? 'hmr mount' : 'init', predict = null;
@@ -189,7 +185,6 @@
   };
   if (window.qed?.dehydrate && !history.length) tryCall(() => window.__qedDevHook('mount', { state: window.qed.dehydrate(), locals: window.qed.snapshot?.() }));
 
-  // ---- UI Event Listeners ----
   const clicks = {
     pill: () => toggleDrawer(), 'dt-close': () => toggleDrawer(false), 'tab-state': () => setTab('state'), 'tab-actions': () => setTab('actions'),
     'copy-state': () => copyFromBtn(prettyState(), $('copy-state'), 'Copy JSON'), 'tt-resume': () => history.length && jumpToSnapshot(history.length - 1),
@@ -206,7 +201,6 @@
     else if (e.key === 'Escape' && $('backdrop').classList.contains('open')) dismissOverlay();
   });
 
-  // ---- HMR Apply, Status Handling & SSE / Poll Transport ----
   const updateTransport = () => setChip('dt-transport', sseConnected ? 'SSE' : 'Poll', sseConnected ? 'dt-chip' : 'dt-chip poll');
   async function applyUpdate(st) {
     const kind = st.kind || 'hmr', ms = typeof st.durationMs === 'number' && st.durationMs > 0 ? ` · ${st.durationMs}ms` : '';

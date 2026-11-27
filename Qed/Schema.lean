@@ -17,18 +17,18 @@ private def schemaExampleFieldP : Parser := node `Qed.schemaExampleField (checkC
 private def schemaExampleP      : Parser := node `Qed.schemaExample (withPosition (atomic (symbol "example" >> ident >> ":") >> sepBy1 schemaExampleFieldP ","))
 private def schemaRejectsP      : Parser := node `Qed.schemaRejects (withPosition (atomic (identEq `rejects >> ident >> ":") >> sepBy1 schemaExampleFieldP ","))
 private def schemaInvP          : Parser := node `Qed.schemaInv (withPosition (atomic (symbol "invariant" >> ident >> ":") >> sepBy1 pExpr ","))
-private def schemaItemP         : Parser := schemaExampleP <|> schemaRejectsP <|> schemaInvP <|> schemaFieldP
+def schemaItemP                 : Parser := schemaExampleP <|> schemaRejectsP <|> schemaInvP <|> schemaFieldP
 @[command_parser] def schemaCmd : Parser := opaqueP (node `Qed.schemaCmd (withPosition
   ("schema " >> ident >> schemaCtxOpt >> ":" >> checkColGt "expected indented `schema` fields" >> many1Indent schemaItemP)))
 private def recordFieldP : Parser := node `Qed.recordField (withPosition (
   ident >> ":" >> pType >> optional (checkLineEq >> "=" >> pExpr) >> optional (checkColGt >> " where " >> sepBy1 pExpr ",")))
-private def recordItemP : Parser := schemaExampleP <|> schemaRejectsP <|> schemaInvP <|> recordFieldP
+def recordItemP : Parser := schemaExampleP <|> schemaRejectsP <|> schemaInvP <|> recordFieldP
 @[command_parser] def recordCmd : Parser := opaqueP (node `Qed.recordCmd (
   optional Command.docComment >> withPosition (
     atomic (optional (symbol "private") >> identEq `record) >> ident >> schemaCtxOpt >> ":" >>
     checkColGt "expected indented `record` fields" >> many1Indent recordItemP)))
 private def enumParamP   : Parser := node `Qed.enumParam (ident >> ":" >> pType)
-private def enumVariantP : Parser := node `Qed.enumVariant (withPosition (
+def enumVariantP : Parser := node `Qed.enumVariant (withPosition (
   ident >> optional (checkNoWsBefore "" >> "(" >> sepBy1 enumParamP "," >> ")") >> optional (checkLineEq >> "=" >> strLit)))
 @[command_parser] def enumCmd : Parser := opaqueP (node `Qed.enumCmd (
   optional Command.docComment >> withPosition (

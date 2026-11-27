@@ -96,8 +96,7 @@ structure JwtClaims where
   flatClaims    : List (String × String) := []
 deriving Inhabited, DecidableEq, Repr
 
-def JwtClaims.claim (c : JwtClaims) (key : String) : Option String :=
-  (c.flatClaims.lookup key).orElse fun _ => if key == "verified" then c.flatClaims.lookup "email_verified" else none
+def JwtClaims.claim (c : JwtClaims) (key : String) : Option String := Qed.lookupClaim c.flatClaims key
 
 def parseJwtClaims (j : Json) : Except String JwtClaims := do
   let some iss := j.strAt? "iss" | .error "jwt: missing `iss` claim"

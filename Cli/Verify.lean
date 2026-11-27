@@ -644,8 +644,8 @@ def buildGraphClean : IO Bool := do
     return false
   let mut ok := true
   let pureExact := #["Qed.Html", "Qed.Render", "Qed.View.Core", "Qed.Ssr", "Qed.Resource", "Qed.Socket", "Qed.Driver", "Qed.Speculative",
-    "Qed.Runtime.AppCore", "Qed.Runtime.LocalCore", "Qed.Runtime.Cmd", "Qed.Server.Core", "Qed.Server.Eval", "Qed.Server.Http", "Qed.Server.Net",
-    "Qed.Server.Prim", "Qed.Server.Native", "Qed.Server.Ensured", "Qed.Server.Db.Core", "Qed.Server.Db.HttpSql", "Qed.Server.Db.PgWire"]
+    "Qed.Schema.Codec", "Qed.Runtime.AppCore", "Qed.Runtime.LocalCore", "Qed.Runtime.Cmd", "Qed.Server.Core", "Qed.Server.Eval", "Qed.Server.Http", "Qed.Server.Net",
+    "Qed.Server.Prim", "Qed.Server.Native", "Qed.Server.Db.Core", "Qed.Server.Db.Runtime", "Qed.Server.Db.HttpSql", "Qed.Server.Db.PgWire"]
   for (mod, _) in adj.toList do
     if (pureExact.contains mod || #["Qed.Driver.", "Qed.Socket.", "Qed.Speculative.", "Qed.Proofs."].any (mod.startsWith ·)) && reaches mod "Lean" then
       IO.eprintln (red s!"  build-graph regression: pure module `{mod}` transitively imports `Lean`"); ok := false
@@ -656,7 +656,7 @@ def buildGraphClean : IO Bool := do
       ("Qed.Server.FnElab", "Qed.Server.External"), ("Qed.Invariant.State", "Qed.Runtime.App"),
       ("Qed.Invariant.View", "Qed.Runtime.App"), ("Qed.Invariant.ForEach", "Qed.Runtime.App"),
       ("Qed.Invariant.View", "Qed.Invariant.State"), ("Qed.Schema", "Qed.Runtime.Verify"),
-      ("Qed.Component.Rewrite", "Qed.Runtime.Verify")] do
+      ("Qed.Mapping", "Qed.Runtime.Verify"), ("Qed.Component.Rewrite", "Qed.Runtime.Verify")] do
     if adj.contains src && reaches src dst then
       IO.eprintln (red s!"  build-graph regression: `{src}` reaches forbidden dependency `{dst}`"); ok := false
   let lockPath := qh / "rust" / "qed_server" / "Cargo.lock"
@@ -740,7 +740,7 @@ def cmdTest : IO UInt32 := do
   if !(← verify) then IO.eprintln (red "✗ verification failed"); return 1
   step "building native test runner"
   let targets := #["qedtest", "qed/QedServer:static", "qed/Qed:static", "qed/libqed_server"] ++
-    (if ← isInRepo then #["+QedTests.CheckHelper:c.o", "+QedTests.ServerChecks:c.o", "+QedTests.AuthChecks:c.o",
+    (if ← isInRepo then #["+QedTests.CheckHelper:c.o", "+QedTests.AuthChecks:c.o",
       "+QedTests.DbChecks:c.o", "+QedTests.WebEssentialsFixture:c.o", "+Examples.CloudBooks:c.o", "+Examples.LiveRoom:c.o"] else #[])
   if (← shLakeBuild (#["build"] ++ targets)) != 0 then IO.eprintln (red "✗ failed to build native test runner"); return 1
   step "running tests"

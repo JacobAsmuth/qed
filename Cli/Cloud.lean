@@ -92,28 +92,18 @@ private def resolveCloudAuth (flagApi? flagTok? : Option String) : ExceptT Strin
 
 private def cloudHttpJson {α : Type} [FromJson α] (apiBase method path : String)
     (token? : Option String) (body? : Option Json := none) : ExceptT String IO α := do
-  let isLocal := isStrictLoopbackUrl apiBase
-  let url := apiBase ++ path
-  let mut hdrs : Array (String × String) := #[("Accept", "application/json")]
-  if let some tok := token? then hdrs := hdrs.push ("Authorization", s!"Bearer {tok}")
-  let bodyBytes : ByteArray := match body? with
-    | some j => j.render.toUTF8
-    | none   => ByteArray.empty
-  if body?.isSome then hdrs := hdrs.push ("Content-Type", "application/json")
-  let (status, respBody, _) ← match ← liftIO (execHttpCall method url hdrs bodyBytes (ssrfGuard := !isLocal)) with
-    | .ok r    => pure r
-    | .error e => throw s!"cannot reach Qed Cloud at `{apiBase}`: {e}"
-  let txt := (String.fromUTF8? respBody).getD ""
-  if status < 200 || status >= 300 then
-    let detail := match Json.parse txt.cliTrim with
-      | .ok j => (j.strAt? "error").orElse (fun _ => j.strAt? "message") |>.getD txt.cliTrim
-      | .error _ => txt.cliTrim
-    throw s!"Qed Cloud API error (HTTP {status}): {if detail.isEmpty then "request failed" else detail}"
-  match Json.parse txt.cliTrim with
-  | .error e => throw s!"invalid JSON response from Qed Cloud `{path}`: {e}"
-  | .ok j    => match (fromJson j : Except String α) with
-      | .ok v    => return v
-      | .error e => throw s!"unexpected Qed Cloud response for `{path}`: {e}"
+  let (_, j) ← liftE <| execHttpJson method (apiBase ++ path) token?
+    (body?.elim ByteArray.empty (·.render.toUTF8)) (body?.map fun _ => "application/json")
+    #[("Accept", "application/json")] (ssrfGuard := !isStrictLoopbackUrl apiBase)
+    (fmtTransportErr := fun e => s!"cannot reach Qed Cloud at `{apiBase}`: {e}")
+    (fmtStatusErr := fun status txt =>
+      let t := txt.cliTrim
+      let detail := match Json.parse t with
+        | .ok j => (j.strAt? "error").orElse (fun _ => j.strAt? "message") |>.getD t
+        | .error _ => t
+      s!"Qed Cloud API error (HTTP {status}): {if detail.isEmpty then "request failed" else detail}")
+    (fmtJsonErr := fun _ e => s!"invalid JSON response from Qed Cloud `{path}`: {e}")
+  liftP <| (fromJson j : Except String α).mapError (s!"unexpected Qed Cloud response for `{path}`: {·}")
 
 private def sanitizeSlugFromDir (dirName : String) : String :=
   let raw := String.ofList <| dirName.toLower.toList.map fun c =>

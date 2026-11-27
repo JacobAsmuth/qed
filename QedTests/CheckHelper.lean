@@ -2,15 +2,7 @@ import Qed
 
 abbrev strHas := Qed.Str.containsBytes
 abbrev strHasAll := Qed.Str.containsAllBytes
-
-private def bytesStartsWith : List UInt8 → List UInt8 → Bool
-  | _, [] => true | [], _ :: _ => false | a :: as, b :: bs => a == b && bytesStartsWith as bs
-private def bytesHas (needle : List UInt8) : List UInt8 → Bool
-  | [] => needle.isEmpty | xs@(_ :: tl) => bytesStartsWith xs needle || bytesHas needle tl
-/-- Kernel-fast check that `haystack` contains none of `needles` (converts `haystack` once). Wave 1B can alias to `Qed.Str.containsNoneBytes`. -/
-def strHasNone (haystack : String) (needles : List String) : Bool :=
-  let hbs := haystack.toByteArray.data.toList
-  needles.all fun n => if n.utf8ByteSize == 0 then false else !bytesHas n.toByteArray.data.toList hbs
+abbrev strHasNone := Qed.Str.containsNoneBytes
 
 open Lean in
 elab "rollback_env " cmd:command : command => withoutModifyingEnv (Elab.Command.elabCommand cmd)
@@ -33,16 +25,15 @@ macro "bad_a11y " rule:ident " : " v:qedExpr : command => do
       state $x:ident : $nat:ident = 0
       view: $v
       invariant $ok:ident: $r)
--- Wave 1B: change `its:cssBlockItem+` -> `it:cssBlockItem` in both macros below once `Qed/Style/Syntax.lean:342-346` (`checkContrastEval`) merges from `impl-style-html`.
-macro "bad_style " msg:str nm:ident " : " its:cssBlockItem+ : command =>
+macro "bad_style " msg:str nm:ident " : " it:cssBlockItem : command =>
   `(expect_err $msg in
     style $nm:ident:
-      $[$its:cssBlockItem]*
+      $it:cssBlockItem
   )
-macro "bad_style_strict " msg:str nm:ident " : " its:cssBlockItem+ : command =>
+macro "bad_style_strict " msg:str nm:ident " : " it:cssBlockItem : command =>
   `(expect_err $msg in
     style $nm:ident strict_tokens:
-      $[$its:cssBlockItem]*
+      $it:cssBlockItem
   )
 syntax withPosition("bad_style_contrast " str ident " : " (colGt cssBlockItem)+) : command
 macro_rules

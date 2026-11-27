@@ -1,4 +1,5 @@
 import Qed.Component.AwaitLift
+import Qed.Invariant.State
 import Qed.Invariant.ForEach
 import Qed.Invariant.Reachability
 

@@ -525,7 +525,7 @@ private def diagnoseHtmlStepFailure (ctx : HtmlCtx) (tag : String) : Option Stri
     | .option | .textarea | .rawStyle => some s!"`<{tag}>` cannot be nested inside a text-only element (`<option>`, `<textarea>`, or `<style>`)"
     | .normal =>
         if isContextOnlyTag tag then some s!"`<{tag}>` must be placed inside its required parent container (e.g. `<li>` in `<ul>`/`<ol>`, `<tr>` in `<tbody>`, `<td>`/`<th>` in `<tr>`, `<option>` in `<select>`)"
-        else if ctx.inP && closesPTag tag then some s!"`<{tag}>` cannot be nested inside `<p>` or a heading (`<h1>`–`<h6>`)"
+        else if ctx.inP && closesPTag tag then some s!"`<{tag}>` cannot be nested inside `<p>` or a heading (`<h1>-<h6>`)"
         else if ctx.interactive && (isInteractiveTag tag || tag == "label" || tag == "form") then some s!"`<{tag}>` cannot be nested inside an interactive element (`<a>`, `<button>`, `<details>`, `<summary>`, `<textarea>`, or `<select>`)"
         else if ctx.inForm && tag == "form" then some "`<form>` cannot be nested inside another `<form>`"
         else none

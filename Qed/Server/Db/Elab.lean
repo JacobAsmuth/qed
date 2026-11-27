@@ -23,14 +23,13 @@ open Lean Parser Qed.Lang
 
 private def dbEnvName : Parser := identEq `dev <|> identEq `preview <|> identEq `staging <|> identEq `prod
 private def dbExpr : Parser := categoryParser `qedExpr 0
-def dbSecretOrEnv : Parser := node `Qed.Server.Db.envRef ((identEq `secret <|> identEq `env) >> "(" >> strLit >> ")" >> optional (" ?? " >> strLit))
-private def dbKv (k : Name) : Parser := identEq k >> "=" >> dbSecretOrEnv
+private def dbKv (k : Name) : Parser := identEq k >> "=" >> qedEnvRef
 private def dbIndented (msg : String) (cat : Name) : Parser := ":" >> checkColGt msg >> many1Indent (categoryParser cat 0)
 
-@[dbEndpointSpec_parser] def dbEpUrl       : Parser := leading_parser atomic (identEq `url) >> dbSecretOrEnv
-@[dbEndpointSpec_parser] def dbEpPostgres  : Parser := leading_parser atomic (identEq `postgres) >> dbSecretOrEnv
+@[dbEndpointSpec_parser] def dbEpUrl       : Parser := leading_parser atomic (identEq `url) >> qedEnvRef
+@[dbEndpointSpec_parser] def dbEpPostgres  : Parser := leading_parser atomic (identEq `postgres) >> qedEnvRef
 @[dbEndpointSpec_parser] def dbEpSqliteLit : Parser := leading_parser atomic (identEq `sqlite) >> strLit
-@[dbEndpointSpec_parser] def dbEpSqliteEnv : Parser := leading_parser atomic (identEq `sqlite) >> dbSecretOrEnv
+@[dbEndpointSpec_parser] def dbEpSqliteEnv : Parser := leading_parser atomic (identEq `sqlite) >> qedEnvRef
 @[dbEndpointSpec_parser] def dbEpD1        : Parser := leading_parser atomic (identEq `d1) >> dbKv `account >> "," >> dbKv `db >> "," >> dbKv `token
 @[dbEndpointSpec_parser] def dbEpTurso     : Parser := leading_parser atomic (identEq `turso) >> dbKv `url >> "," >> dbKv `token
 @[dbEndpointSpec_parser] def dbEpHttp      : Parser := leading_parser atomic (identEq `http) >> dbKv `url >> optional ("," >> dbKv `token)
@@ -46,8 +45,8 @@ def dbPolicyOp : Parser := node `Qed.Server.Db.policyOp (identEq `read <|> ident
 def dbTransEdge : Parser := node `Qed.Server.Db.transEdge (sepBy1 (categoryParser `qedExpr 55) "->")
 def dbEncColTy : Parser := node `Qed.Server.Db.encColTy
   (atomic (identEq `encrypted >> checkNoWsBefore "" >> "(") >>
-    categoryParser `qedType 91 >> "," >> identEq `key >> "=" >> dbSecretOrEnv >>
-    optional ("," >> identEq `prevKeys >> "=" >> "[" >> sepBy dbSecretOrEnv "," >> "]") >>
+    categoryParser `qedType 91 >> "," >> identEq `key >> "=" >> qedEnvRef >>
+    optional ("," >> identEq `prevKeys >> "=" >> "[" >> sepBy qedEnvRef "," >> "]") >>
     ")" >> optional "?")
 
 def dbAssignItem : Parser := node `Qed.Server.Db.assignItem (ident >> "=" >> dbExpr)

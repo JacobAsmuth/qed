@@ -3,7 +3,7 @@ import Qed.Diag
 import Qed.Lang
 import Qed.Cloud.Env
 import Qed.Auth.Core
-import Qed.Server.Ensured
+import Qed.Field
 import Qed.Socket.Basic
 
 namespace Qed

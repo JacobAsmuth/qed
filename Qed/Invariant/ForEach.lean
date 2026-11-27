@@ -1,5 +1,5 @@
 import Qed.Component.Core
-import Qed.Invariant.State
+import Qed.Verify.Core
 import Qed.Invariant.View
 
 namespace Qed

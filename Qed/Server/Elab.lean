@@ -1,6 +1,7 @@
 import Qed.Server.FnElab
 import Qed.Server.Invariant
 import Qed.Server.Eval
+import Qed.Invariant.State
 import Qed.Runtime.Cmd
 import Qed.Resource.Basic
 import Qed.Ssr
@@ -435,39 +436,8 @@ private def elabSrvExtraContracts (fnIdent targetId : Ident) (thmBaseLeaf : Name
   for (bl, idx) in contracts.blinds.zipIdx do
     let thmId := c.subId (thmBaseLeaf.appendAfter s!"_blindTo_{idx + 1}") fnIdent
     let guardBinders ← liftM <| mkGuardBinders bl.guards
-    let mut paramBlinds : Array (Name × Bool × Array Ident) := #[]
-    for rawT in bl.targets do
-      let rawId : Ident := ⟨rawT.getArg 0⟩; let optB := rawT.getArg 1
-      let (pId, flds) ← if optB.getNumArgs == 3 then pure (rawId, (optB.getArg 1).getSepArgs.map (⟨·⟩))
-        else match rawId.getId.eraseMacroScopes with
-          | .str .anonymous _ => pure (rawId, #[])
-          | .str (.str .anonymous p) f => pure (mkIdentFrom rawId (Name.mkSimple p), #[mkIdentFrom rawId (Name.mkSimple f)])
-          | _ => throwErrorAt rawId s!"`blindTo` expects `<param>`, `<param>.<field>`, or `<param>.\{f1, f2}`"
-      let pn := pId.getId.eraseMacroScopes
-      unless paramNames.contains pn do
-        throwErrorAt pId s!"unknown parameter `{pn}` in `blindTo` of `{fnStr}`"
-      if let some pos := paramBlinds.findIdx? (·.1 == pn) then
-        let (_, w, fs) := paramBlinds[pos]!; let w' := w || flds.isEmpty
-        let fs' := if w' then #[] else flds.foldl (fun a f => if a.any (·.getId.eraseMacroScopes == f.getId.eraseMacroScopes) then a else a.push f) fs
-        paramBlinds := paramBlinds.set! pos (pn, w', fs')
-      else paramBlinds := paramBlinds.push (pn, flds.isEmpty, flds)
-    let mut freshVars : Array (Ident × Option Term) := #[]
-    let mut lhsArgs : Array Term := #[]
-    let mut rhsArgs : Array Term := #[]
-    for (bId, bTy) in binderIds.zip binderTys do
-      let bn := bId.getId.eraseMacroScopes
-      rhsArgs := rhsArgs.push ⟨bId.raw⟩
-      match paramBlinds.find? (·.1 == bn) with
-      | none => lhsArgs := lhsArgs.push ⟨bId.raw⟩
-      | some (_, true, _) =>
-          let fv := mkIdent (Name.mkSimple s!"_qed_blind_{bn}")
-          freshVars := freshVars.push (fv, some bTy); lhsArgs := lhsArgs.push ⟨fv.raw⟩
-      | some (_, false, flds) =>
-          let mut updIds : Array Ident := #[]; let mut updVals : Array Term := #[]
-          for f in flds do
-            let fv := mkIdent (Name.mkSimple s!"_qed_blind_{bn}_{f.getId.eraseMacroScopes}")
-            freshVars := freshVars.push (fv, none); updIds := updIds.push f; updVals := updVals.push ⟨fv.raw⟩
-          lhsArgs := lhsArgs.push (← `({ $bId with $[$updIds:ident := $updVals:term],* }))
+    let parsedTgts ← liftM <| bl.targets.mapM (Qed.Verify.Core.parseBlindTarget · (includeGot := false))
+    let (freshVars, lhsArgs, rhsArgs) ← liftM <| Qed.Verify.Core.buildBlindToArgs parsedTgts paramNames binderIds binderTys (some fnStr)
     let (lhsCall, rhsCall) ← if isMonadic && !hasState then
         let l ← mkAppTerms targetId lhsArgs; let r ← mkAppTerms targetId rhsArgs
         pure (← `(($l : Qed.Server.ThreadProg _σ _)), ← `(($r : Qed.Server.ThreadProg _σ _)))
@@ -476,8 +446,7 @@ private def elabSrvExtraContracts (fnIdent targetId : Ident) (thmBaseLeaf : Name
         pure (← `($targetId $s0Id $lhsArgs*), ← `($targetId $s0Id $rhsArgs*))
       else
         pure (← mkAppTerms targetId lhsArgs, ← mkAppTerms targetId rhsArgs)
-    let eqProp ← freshVars.foldrM (init := ← `($lhsCall = $rhsCall)) fun (fv, ty?) acc => match ty? with
-      | some ty => `(∀ ($fv:ident : $ty), $acc) | none => `(∀ $fv:ident, $acc)
+    let eqProp ← liftM <| Qed.Verify.Core.mkBlindToEqProp freshVars lhsCall rhsCall
     let proofTac : TSyntax ``Lean.Parser.Tactic.tacticSeq ← match bl.tac? with
       | some ts => pure ts
       | none => `(Lean.Parser.Tactic.tacticSeq| qedProveBlindTo $targetId $thmId $(Syntax.mkStrLit fnStr))

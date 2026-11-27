@@ -51,7 +51,7 @@ structure OidcRuntime where
   cfg   : ResolvedOidcConfig
   cache : Prim.StateBox OidcCacheState
 
-def nowSec : IO Nat := return (← Prim.nowMs).toNat / 1000
+abbrev nowSec : IO Nat := Prim.nowSec
 
 private def ResolvedOidcConfig.ssrfGuard (cfg : ResolvedOidcConfig) : Bool :=
   !(cfg.devMode && ["http://127.0.0.1", "http://localhost"].any fun p => cfg.issuer == p || cfg.issuer.startsWith (p ++ ":"))
@@ -59,7 +59,7 @@ private def ResolvedOidcConfig.ssrfGuard (cfg : ResolvedOidcConfig) : Bool :=
 def loadNonEmptyEnv (envName : String) : IO (Option String) := do
   return (← Prim.getEnv envName).bind fun v => let t := trimWs v; if t.isEmpty then none else some t
 
-private def resolveEnvWithDefault (envName : String) (default? : Option String) : IO (Option String) := do
+def resolveEnvWithDefault (envName : String) (default? : Option String) : IO (Option String) := do
   return (← loadNonEmptyEnv envName).orElse fun _ => default?
 
 /-- Resolves an `OidcAuthSpec` from OS environment variables at server boot. -/
@@ -96,15 +96,33 @@ def verifyJwtWithKeys (cfg : OidcValidationCfg) (keys : Array JwkKey) (token : S
 
 /-! ### OIDC Discovery & JWKS Caching -/
 
-def execJsonHttp (httpExec : HttpExecFn) (method url : String) (headers : Array (String × String) := #[("Accept", "application/json")])
-    (body : ByteArray := ByteArray.empty) (ssrfGuard : Bool := true) (label : String := s!"oidc endpoint `{url}`") : IO (Except String Json) := do
+def execJsonHttpStatus (httpExec : HttpExecFn) (method url : String)
+    (headers : Array (String × String) := #[("Accept", "application/json")])
+    (body : ByteArray := ByteArray.empty) (ssrfGuard : Bool := true)
+    (okStatus : Nat → Bool := fun st => 200 ≤ st && st < 300)
+    (allowEmptyBody : Bool := false) (requireUtf8 : Bool := true)
+    (fmtTransportErr : String → String := fun e => s!"HTTP error calling `{url}`: {e}")
+    (fmtStatusErr : Nat → String → String := fun st raw => s!"`{url}` returned HTTP {st}{if raw.isEmpty then "" else s!": {raw}"}")
+    (fmtJsonErr : Nat → String → String := fun _ e => s!"invalid JSON from `{url}`: {e}")
+    (nonUtf8Err : String := s!"`{url}` returned non-UTF-8 body") : IO (Except String (Nat × Json)) := do
   match ← httpExec method url headers body ssrfGuard with
-  | .error e => return .error s!"HTTP error calling {label}: {e}"
+  | .error e => return .error (fmtTransportErr e)
   | .ok (status, respBody, _) =>
-      let some raw := String.fromUTF8? respBody | return .error s!"{label} returned non-UTF-8 body"
-      if status < 200 || status >= 300 then
-        return .error s!"{label} returned HTTP {status}{if raw.isEmpty then "" else s!": {String.ofList (raw.toList.take 400)}"}"
-      return (Json.parse raw).mapError (s!"invalid JSON from {label}: {·}")
+      let raw ← match String.fromUTF8? respBody with
+        | some s => pure s
+        | none => if requireUtf8 then return .error nonUtf8Err else pure ""
+      if !okStatus status then return .error (fmtStatusErr status raw)
+      let trimmed := trimWs raw
+      if allowEmptyBody && trimmed.isEmpty then return .ok (status, .obj [])
+      return (Json.parse trimmed).map (status, ·) |>.mapError (fmtJsonErr status)
+
+def execJsonHttp (httpExec : HttpExecFn) (method url : String) (headers : Array (String × String) := #[("Accept", "application/json")])
+    (body : ByteArray := ByteArray.empty) (ssrfGuard : Bool := true) (label : String := s!"oidc endpoint `{url}`") : IO (Except String Json) :=
+  (·.map Prod.snd) <$> execJsonHttpStatus httpExec method url headers body ssrfGuard
+    (fmtTransportErr := fun e => s!"HTTP error calling {label}: {e}")
+    (fmtStatusErr := fun st raw => s!"{label} returned HTTP {st}{if raw.isEmpty then "" else s!": {String.ofList (raw.toList.take 400)}"}")
+    (fmtJsonErr := fun _ e => s!"invalid JSON from {label}: {e}")
+    (nonUtf8Err := s!"{label} returned non-UTF-8 body")
 
 def fetchDiscovery (httpExec : HttpExecFn) (rt : OidcRuntime) (force : Bool := false) : IO (Except String OidcDiscovery) :=
   ExceptT.run do

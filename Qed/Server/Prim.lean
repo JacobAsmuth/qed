@@ -24,6 +24,7 @@ instance : Nonempty StaticDir := StaticDirPointed.property
 -- Environment, clock, CSPRNG, crypto (`ring`) & DEFLATE gzip
 @[extern "qed_server_get_env"]            opaque getEnv           (name : @& String) : IO (Option String)
 @[extern "qed_server_now_ms"]             opaque nowMs            : IO UInt64
+def nowSec : IO Nat := return (← nowMs).toNat / 1000
 @[extern "qed_server_random_hex"]         opaque randomHex        (numBytes : UInt32) : IO String
 @[extern "qed_server_random_bytes"]       opaque randomBytes      (numBytes : UInt32) : IO ByteArray
 @[extern "qed_server_const_eq"]           opaque constEq          (a b : @& ByteArray) : IO Bool

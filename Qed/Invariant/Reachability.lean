@@ -1,4 +1,4 @@
-import Qed.Invariant.State
+import Qed.Verify.Core
 import Qed.Runtime.Cmd
 
 namespace Qed

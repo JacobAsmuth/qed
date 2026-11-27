@@ -57,8 +57,7 @@ namespace RequestCtx
 def header (ctx : RequestCtx) (name : String) : Option String :=
   let target := name.toLower; (ctx.headers.find? fun (k, _) => k.toLower == target).map Prod.snd
 def cookie (ctx : RequestCtx) (name : String) : Option String := ctx.cookies.lookup name
-def claim (ctx : RequestCtx) (name : String) : Option String :=
-  (ctx.claims.lookup name).orElse fun _ => if name == "verified" then ctx.claims.lookup "email_verified" else none
+def claim (ctx : RequestCtx) (name : String) : Option String := Qed.lookupClaim ctx.claims name
 def hasClaim (ctx : RequestCtx) (name expected : String) : Bool := ctx.claim name == some expected
 def isAuthenticated (ctx : RequestCtx) : Bool := ctx.userId.isSome
 def isSession (ctx : RequestCtx) : Bool := ctx.userId.isSome && ctx.authMethod == .session

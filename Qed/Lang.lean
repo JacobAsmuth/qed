@@ -90,7 +90,8 @@ def qedBinder : Parser := ident <|> symbol "_"
 @[qedLetPat_parser] def qedLetPatWild  : Parser := leading_parser symbol "_"
 @[qedLetPat_parser] def qedLetPatTuple : Parser := leading_parser "(" >> sepBy1 (categoryParser `qedLetPat 0) "," >> ")"
 def qedLetBinder : Parser := ident <|> symbol "_" <|> qedLetPatTuple
-def qedEnvRef : Parser := node `Qed.Lang.envRef ((identEq `secret <|> identEq `env) >> "(" >> strLit >> ")" >> optional (" ?? " >> strLit))
+@[run_parser_attribute_hooks]
+def qedEnvRef : Parser := group ((identEq `secret <|> identEq `env) >> "(" >> strLit >> ")" >> optional (" ?? " >> strLit))
 
 @[qedTypeMod_parser] def qedTypeModArr : Parser := leading_parser atomic ("[" >> "]")
 @[qedTypeMod_parser] def qedTypeModOpt : Parser := leading_parser symbol "?"

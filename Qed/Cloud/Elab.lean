@@ -1,5 +1,5 @@
 import Qed.Cloud.Gcp
-import Qed.Server.Lower
+import Qed.Server.Registry
 
 namespace Qed.Cloud
 

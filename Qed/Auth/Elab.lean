@@ -17,11 +17,8 @@ open Lean Parser Qed.Lang
 private def kwP (kw : Name) (p : Parser) : Parser :=
   withPosition (atomic (identEq kw) >> p)
 
-private def authEnvRefParser : Parser :=
-  node `Qed.Auth.envRef ((identEq `secret <|> identEq `env) >> "(" >> strLit >> ")" >> optional (" ?? " >> strLit))
-
 @[authClause_parser] def authEnvClause : Parser := leading_parser
-  withPosition (atomic (identEq `issuer <|> identEq `audience <|> identEq `clientId <|> identEq `clientSecret) >> authEnvRefParser)
+  withPosition (atomic (identEq `issuer <|> identEq `audience <|> identEq `clientId <|> identEq `clientSecret) >> qedEnvRef)
 
 @[authClause_parser] def authManagedClause : Parser := leading_parser kwP `managed ("[" >> sepBy1 ident "," >> "]")
 @[authClause_parser] def authProvidersClause : Parser := leading_parser kwP `providers ("[" >> sepBy ident "," >> "]")

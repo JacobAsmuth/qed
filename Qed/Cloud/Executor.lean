@@ -51,21 +51,23 @@ def resolveToken (cfg : GcpExecConfig) (audience? : Option String := none) : IO 
   | none,     .serviceAccountJson js => (·.map some) <$> fetchGcpBearerToken none js gcpCloudPlatformScope (isIdToken := false) (ssrfGuard := cfg.ssrfGuard)
   | aud?,     .metadata              => (·.map some) <$> fetchGcpMetadataToken none aud?
 
+private def gcpContentType? (req : GcpHttpRequest) (bodyBytes : ByteArray) : Option String :=
+  if bodyBytes.isEmpty && req.method == "GET" then none else some req.contentType
+
 private def sendGcpRaw (cfg : GcpExecConfig) (req : GcpHttpRequest) (bodyBytes : ByteArray) (tok? : Option String) : IO (Except String (Nat × String)) := do
-  let authHdr := tok?.elim #[] fun t => #[("Authorization", s!"Bearer {t}")]
-  let ctHdr := if bodyBytes.isEmpty && req.method == "GET" then #[] else #[("Content-Type", req.contentType)]
-  match ← execHttpCall req.method req.url (authHdr ++ ctHdr ++ req.headers.toArray) bodyBytes cfg.ssrfGuard with
+  let hdrs := mkBearerHeaders tok? (gcpContentType? req bodyBytes) req.headers.toArray
+  match ← execHttpCall req.method req.url hdrs bodyBytes cfg.ssrfGuard with
   | .error e => return .error s!"GCP HTTP {req.method} {req.url}: {e}"
   | .ok (st, body, _) => return .ok (st, (String.fromUTF8? body).getD "")
 
 private def sendGcpJson (cfg : GcpExecConfig) (req : GcpHttpRequest) (tok? : Option String)
-    (allowStatuses : List Nat := [200, 201, 204]) : IO (Except String (Nat × Json)) := do
-  match ← sendGcpRaw cfg req req.body.toUTF8 tok? with
-  | .error e => return .error e
-  | .ok (st, txt) =>
-      if !allowStatuses.contains st then return .error s!"GCP {req.method} {req.url} failed (HTTP {st}): {txt}"
-      if txt.trimAscii.toString.isEmpty then return .ok (st, .obj [])
-      return (Json.parse txt).map (st, ·) |>.mapError (s!"GCP {req.method} {req.url} invalid JSON (HTTP {st}): {·}")
+    (allowStatuses : List Nat := [200, 201, 204]) : IO (Except String (Nat × Json)) :=
+  let bodyBytes := req.body.toUTF8
+  execHttpJson req.method req.url tok? bodyBytes (gcpContentType? req bodyBytes) req.headers.toArray cfg.ssrfGuard
+    (okStatus := allowStatuses.contains) (allowEmptyBody := true)
+    (fmtTransportErr := fun e => s!"GCP HTTP {req.method} {req.url}: {e}")
+    (fmtStatusErr := fun st txt => s!"GCP {req.method} {req.url} failed (HTTP {st}): {txt}")
+    (fmtJsonErr := fun st e => s!"GCP {req.method} {req.url} invalid JSON (HTTP {st}): {e}")
 
 private def pollOp (cfg : GcpExecConfig) (tok? : Option String) (label : String)
     (parseNext : Json → Except String (Option String)) (mkReq : String → GcpHttpRequest) (resp : Json) : Nat → ExceptT String IO Unit

@@ -71,23 +71,10 @@ private def canSynthJson (fromCls : Name) (tyTerm : Term) : CommandElabM Bool :=
 private def mkCompStructJsonCmds (sName : Name) (decls : Array FieldDecl) : CommandElabM (Array CmdStx) :=
   Qed.mkStructJsonCmds (mkIdent sName) (decls.map fun d => { ident := d.id, wireKey := d.id.getId.toString, valTy := d.ty }) { emitNamedDefs := false }
 
-@[noinline]
-private def mkOutJsonCmds (tId : Name) (outCtorSpecs : Array (Name × Array (Ident × Term))) : CommandElabM (Array CmdStx) := do
-  let outId := mkIdent (tId ++ `Out)
-  let encAlts ← outCtorSpecs.mapM fun (cName, ps) => do
-    let (cId, pTerms) := (mkIdent (tId ++ `Out ++ cName), (ps.map (⟨·.1.raw⟩) : Array Term))
-    let pairs := #[← `(("t", Json.str $(Syntax.mkStrLit cName.toString)))] ++ (← ps.zipIdx.mapM fun ((pId, _), i) => `(($(Syntax.mkStrLit (toString i)), toJson $pId:ident)))
-    `(Lean.Parser.Term.matchAltExpr| | $cId $pTerms* => Json.obj [$[$pairs],*])
-  let decBody ← outCtorSpecs.reverse.foldlM (init := ← `(Except.error "unknown Out tag")) fun acc (cName, ps) => do
-    let (cId, pIds) := (mkIdent (tId ++ `Out ++ cName), ps.map (·.1)); let pTerms : Array Term := pIds.map (⟨·.raw⟩)
-    let decSteps ← ps.zipIdx.mapM fun ((_, pTy), i) => `((FromJsonField.fromField j $(Syntax.mkStrLit (toString i)) : Except String $pTy))
-    let okBr ← `(do
-      $[let $pIds:ident ← $decSteps:term]*
-      return ($cId $pTerms*))
-    `(if tag == $(Syntax.mkStrLit cName.toString) then $okBr else $acc)
-  pure #[
-    ← `(command| instance $(mkIdent (tId ++ `Out ++ `instToJson)):ident : ToJson $outId := ⟨fun o => match o with $[$encAlts:matchAlt]*⟩),
-    ← `(command| instance $(mkIdent (tId ++ `Out ++ `instFromJson)):ident : FromJson $outId := ⟨fun j => do let tag ← (FromJsonField.fromField j "t" : Except String String); $decBody:term⟩) ]
+private def mkOutJsonCmds (tId : Name) (outCtorSpecs : Array (Name × Array (Ident × Term))) : CommandElabM (Array CmdStx) :=
+  Qed.mkTaggedUnionJsonCmds (mkIdent (tId ++ `Out))
+    (outCtorSpecs.map fun (cName, ps) => { ctorName := cName, wireTag := cName.toString, fields := ps.zipIdx.map fun ((pId, pTy), i) => (pId, toString i, pTy) })
+    { emitNamedDefs := false, unknownTagStatic? := some "unknown Out tag" }
 
 @[noinline]
 private def mkCompLocalDefCmds (spec : ComponentSpec) (idLit : StrLit) : CommandElabM (Array CmdStx) := do

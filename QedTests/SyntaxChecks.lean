@@ -206,7 +206,7 @@ component GoodLazy:
   state m : Nat = 7
   view: <div><a href={goodSafeUrl}>Docs</a><a href={url("/about")}>About</a>{Qed.lazy((k: Nat) => <span>{k}</span>, m / 2)}</div>
 def sneakyBlock {msg : Type} : Html msg := <div>bad</div>
-bad_comp_view "Invalid HTML / XSS check failed for this view:\n  • `<div>` cannot be nested inside `<p>` or a heading (`<h1>`–`<h6>`)" BadOpaqueNesting u : Unit = () | <p>{sneakyBlock}</p>
+bad_comp_view "Invalid HTML / XSS check failed for this view:\n  • `<div>` cannot be nested inside `<p>` or a heading (`<h1>-<h6>`)" BadOpaqueNesting u : Unit = () | <p>{sneakyBlock}</p>
 bad_comp_view "Qed.lazy function must not capture state directly" BadLazyCapturesModel m : Nat = 1 | <div>{Qed.lazy((k: Nat) => <span>{k + m}</span>, m / 2)}</div>
 expect_err "SSR hydration mismatch: `ephemeral` field affects the rendered view:\n  • view mismatch after rehydration:  \"hi\" = b" in
 component BadEphemeralReadByView:

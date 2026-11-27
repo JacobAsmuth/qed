@@ -3,6 +3,16 @@ import Qed.Lang
 import Qed.Diag
 import Qed.Collection
 
+namespace Qed
+
+class InvTarget (α : Type) (Model : outParam Type) where proj : α → Model
+instance {Model : Type} : InvTarget Model Model := ⟨id⟩
+instance {Model β : Type} : InvTarget (Model × β) Model := ⟨Prod.fst⟩
+@[simp] theorem InvTarget.proj_id {Model : Type} (m : Model) : InvTarget.proj m = m := rfl
+@[simp] theorem InvTarget.proj_fst {Model β : Type} (p : Model × β) : InvTarget.proj p = p.1 := rfl
+
+end Qed
+
 namespace Qed.Verify.Core
 
 open Lean Meta Elab Tactic
@@ -440,5 +450,116 @@ structure CloseFallbackConfig where
   if ← tryRestoreM false id (do runPass true; return (← getGoals).isEmpty) then return true
   if !clearErrorsOnFail then try runPass false catch _ => pure ()
   return false
+
+private def boundaryLemmaGroups : Array (Name × Array Name) := #[
+  (``Array.size, #[``Array.size_push, ``Array.size_modify, ``Array.size_set, ``Array.size_pop, ``Array.size_map, ``Array.size_append, ``Array.size_eraseIdx, ``Array.size_reverse, ``Array.size_extract, ``Array.size_swap, ``Array.size_mergeSort]),
+  (``Array.sumBy, #[``Array.sumBy_empty, ``Array.sumBy_push, ``Array.sumBy_append, ``Array.sumBy_map, ``Array.sumBy_reverse, ``Array.sumBy_mergeSort]),
+  (``Array.sumByInt, #[``Array.sumByInt_empty, ``Array.sumByInt_push, ``Array.sumByInt_append, ``Array.sumByInt_map, ``Array.sumByInt_reverse, ``Array.sumByInt_mergeSort]),
+  (``Array.countWhere, #[``Array.countWhere_empty, ``Array.countWhere_push, ``Array.countWhere_append, ``Array.countWhere_reverse, ``Array.countWhere_mergeSort]),
+  (``Array.uniqueBy, #[``Array.uniqueBy_empty, ``Array.uniqueBy_push_iff]),
+  (``Array.isSortedBy, #[``Array.isSortedBy_empty, ``Array.isSortedBy_singleton, ``Array.isSortedBy_push_iff]),
+  (``List.length, #[``List.length_cons, ``List.length_append, ``List.length_map]),
+  (``Qed.Lang.QedSeqLit.ofList, #[``Qed.Lang.QedSeqLit.ofList_array, ``Qed.Lang.QedSeqLit.ofList_list]),
+  (``Qed.Lang.QedMem.mem, #[``Qed.Lang.QedMem.mem_array, ``Qed.Lang.QedMem.mem_list, ``Qed.Lang.QedMem.mem_string, ``Array.contains_iff_mem, ``List.contains_iff_mem]),
+  (``Qed.Lang.QedMemProp.memProp, #[``Qed.Lang.QedMemProp.memProp_array, ``Qed.Lang.QedMemProp.memProp_list, ``Qed.Lang.QedMemProp.memProp_string]),
+  (``Qed.Lang.QedAndProp, #[``Qed.Lang.not_qedAndProp]), (``Qed.Lang.QedOrProp, #[``Qed.Lang.not_qedOrProp])]
+
+def relevantBoundaryLemmas (cs : Std.HashSet Name) : Array Name :=
+  boundaryLemmaGroups.foldl (init := #[``Qed.Lang.QedVal.val_id]) fun acc (k, ns) => if cs.contains k then acc ++ ns else acc
+
+def collectTriggered (env : Environment) (cs : Std.HashSet Name) (init : Array Name) (groups : Array (Array Name × Array Name)) : Array Name :=
+  groups.foldl (init := init) fun acc (triggers, lemmas) => if triggers.any cs.contains then acc ++ lemmas.filter env.contains else acc
+
+def relevantAppLemmas (env : Environment) (cs : Std.HashSet Name) : Array Name :=
+  collectTriggered env cs #[``InvTarget.proj_id, ``InvTarget.proj_fst] #[
+    (appWrapperBases ++ #[`Qed.App.init, `Qed.App.update], appProjSimpNames env #["init", "update"] ++
+      #[`Qed.Query.boot, `Qed.Query.wrap, `Qed.Resource.query, `Qed.Resource.rpcQuery, `Qed.Subscription.boot, `Qed.Subscription.wrap, `Qed.Subscription.boot_state_eq]),
+    (#[`Qed.Cached.activate, `Qed.Cached.all, `Qed.Cached.markRefetch, `Qed.Cached.invalidateAll],
+     #[`Qed.Cached.activate, `Qed.Cached.all_empty, `Qed.Cached.all_markRefetch, `Qed.Cached.all_invalidateAll])]
+
+@[noinline]
+def runUnfoldPresent (extra : Array Term) (skip : Array Name := #[]) : TacticM Unit := do
+  let g :: _ ← getGoals | return
+  let cs ← collectGoalConsts g true
+  let fixedL := (← namesToSimpLemmas (relevantAppLemmas (← getEnv) cs ++ relevantBoundaryLemmas cs)) ++ (← termsToSimpLemmas extra)
+  Qed.qedUnfoldHelperLoop 12 (fun env n => if skip.contains n || !Qed.qedIsHelper env n then return false else return (← getProjectionFnInfo? n).isNone)
+    fixedL (includeLCtx := true) (useSimpAll := true)
+
+private def runFastClose : TacticM Unit := do
+  if ← tryCloseTrivial (← getMainGoal) (reducibleOnly := true) then replaceMainGoal []
+  else throwError "qedFastClose: not trivially closed"
+
+elab "qedUnfoldPresent" "[" extra:term,* "]" : tactic => runUnfoldPresent extra.getElems
+elab "qedFastClose" : tactic => runFastClose
+
+macro "qedAutoClose" : tactic => `(tactic|
+  (first
+    | qedFastClose | contradiction | omega | decide | assumption | rfl | (qedNonlinearClose; done)
+    | (try (repeat' (apply And.intro)); all_goals (first | qedFastClose | contradiction | omega | decide | (qedNonlinearClose; done) | grind); done)))
+
+structure ParsedBlindTarget where
+  paramId : Ident
+  fields  : Array Ident
+
+def parseBlindTarget (stx : Syntax) (includeGot : Bool := true) : Command.CommandElabM ParsedBlindTarget := do
+  let rawId : Ident := ⟨stx.getArg 0⟩
+  let optBraces := stx.getArg 1
+  if optBraces.getNumArgs == 3 then
+    return { paramId := rawId, fields := (optBraces.getArg 1).getSepArgs.map (⟨·⟩) }
+  match rawId.getId.eraseMacroScopes with
+  | .str .anonymous _ => return { paramId := rawId, fields := #[] }
+  | .str (.str .anonymous p) f =>
+      return { paramId := mkIdentFrom rawId (Name.mkSimple p), fields := #[mkIdentFrom rawId (Name.mkSimple f)] }
+  | _ =>
+      let tail := if includeGot then s!", got `{rawId.getId}`" else ""
+      throwErrorAt rawId s!"`blindTo` expects `<param>`, `<param>.<field>`, or `<param>.\{f1, f2}`{tail}"
+
+def fmtBlindTarget (t : ParsedBlindTarget) : String :=
+  if t.fields.isEmpty then t.paramId.getId.toString
+  else if t.fields.size == 1 then s!"{t.paramId.getId}.{t.fields[0]!.getId}"
+  else s!"{t.paramId.getId}.\{" ++ String.intercalate ", " (t.fields.toList.map (·.getId.toString)) ++ "}"
+
+@[noinline]
+def buildBlindToArgs (targets : Array ParsedBlindTarget) (validParamNames : Array Name)
+    (binderIds : Array Ident) (binderTys : Array Term) (fnErrCtx? : Option String := none) :
+    Command.CommandElabM (Array (Ident × Option Term) × Array Term × Array Term) := do
+  let mut paramBlinds : Array (Name × Bool × Array Ident) := #[]
+  for t in targets do
+    let pn := t.paramId.getId.eraseMacroScopes
+    unless validParamNames.contains pn do
+      match fnErrCtx? with
+      | some fnStr => throwErrorAt t.paramId s!"unknown parameter `{pn}` in `blindTo` of `{fnStr}`"
+      | none => throwErrorAt t.paramId s!"unknown parameter `{pn}` in `blindTo`{Qed.Diag.didYouMean pn.toString (validParamNames.toList.map toString)}"
+    if let some pos := paramBlinds.findIdx? (·.1 == pn) then
+      let (_, whole, flds) := paramBlinds[pos]!
+      let whole' := whole || t.fields.isEmpty
+      let flds' := if whole' then #[] else t.fields.foldl (fun acc f => if acc.any (·.getId.eraseMacroScopes == f.getId.eraseMacroScopes) then acc else acc.push f) flds
+      paramBlinds := paramBlinds.set! pos (pn, whole', flds')
+    else
+      paramBlinds := paramBlinds.push (pn, t.fields.isEmpty, t.fields)
+  let mut freshVars : Array (Ident × Option Term) := #[]
+  let mut lhsArgs : Array Term := #[]
+  let mut rhsArgs : Array Term := #[]
+  for (bId, bTy) in binderIds.zip binderTys do
+    let bn := bId.getId.eraseMacroScopes
+    rhsArgs := rhsArgs.push ⟨bId.raw⟩
+    match paramBlinds.find? (·.1 == bn) with
+    | none => lhsArgs := lhsArgs.push ⟨bId.raw⟩
+    | some (_, true, _) =>
+        let fv := mkIdent (Name.mkSimple s!"_qed_blind_{bn}")
+        freshVars := freshVars.push (fv, some bTy); lhsArgs := lhsArgs.push ⟨fv.raw⟩
+    | some (_, false, flds) =>
+        let mut updIds : Array Ident := #[]; let mut updVals : Array Term := #[]
+        for f in flds do
+          let fv := mkIdent (Name.mkSimple s!"_qed_blind_{bn}_{f.getId.eraseMacroScopes}")
+          freshVars := freshVars.push (fv, none); updIds := updIds.push f; updVals := updVals.push ⟨fv.raw⟩
+        lhsArgs := lhsArgs.push (← `({ $bId with $[$updIds:ident := $updVals:term],* }))
+  return (freshVars, lhsArgs, rhsArgs)
+
+@[noinline]
+def mkBlindToEqProp (freshVars : Array (Ident × Option Term)) (lhsCall rhsCall : Term) : Command.CommandElabM Term := do
+  freshVars.foldrM (init := ← `($lhsCall = $rhsCall)) fun (fv, ty?) acc => match ty? with
+    | some ty => `(∀ ($fv:ident : $ty), $acc)
+    | none    => `(∀ $fv:ident, $acc)
 
 end Qed.Verify.Core

@@ -10,7 +10,7 @@ import Qed.Auth.Oidc
 namespace Qed.Server.Native
 open Qed.Server.Net
 open Qed.Server.Http
-open Qed.Auth.Oidc (nowSec loadNonEmptyEnv)
+open Qed.Auth.Oidc (nowSec loadNonEmptyEnv resolveEnvWithDefault)
 
 /-! ## Unified CSRF & CSWSH Origin / Fetch-Metadata Verification -/
 
@@ -119,6 +119,26 @@ def execHttpCall (method url : String) (headers : Array (String × String)) (bod
     IO (Except String (Nat × ByteArray × Array (String × String))) :=
   ExceptT.run do let u ← liftP (parseHttpUrl url); liftE (execHttpAttempt method u (← liftP (formatOutboundRequest method u headers body)) ssrfGuard 2)
 
+/-- Build standard outbound HTTP headers with optional Bearer authorization and Content-Type. -/
+def mkBearerHeaders (token? : Option String := none) (contentType? : Option String := none)
+    (extraHeaders : Array (String × String) := #[]) : Array (String × String) :=
+  (token?.elim #[] fun t => #[("Authorization", s!"Bearer {t}")]) ++
+  (contentType?.elim #[] fun ct => #[("Content-Type", ct)]) ++ extraHeaders
+
+/-- Execute an outbound JSON HTTP request with optional Bearer token, Content-Type, status check, and `Json.parse`. -/
+def execHttpJson (method url : String) (token? : Option String := none)
+    (body : ByteArray := ByteArray.empty) (contentType? : Option String := none)
+    (extraHeaders : Array (String × String) := #[]) (ssrfGuard : Bool := true)
+    (okStatus : Nat → Bool := fun st => 200 ≤ st && st < 300)
+    (allowEmptyBody : Bool := false) (requireUtf8 : Bool := false)
+    (fmtTransportErr : String → String := fun e => s!"HTTP {method} {url}: {e}")
+    (fmtStatusErr : Nat → String → String := fun st txt => s!"{method} {url} failed (HTTP {st}): {txt}")
+    (fmtJsonErr : Nat → String → String := fun st e => s!"{method} {url} invalid JSON (HTTP {st}): {e}") :
+    IO (Except String (Nat × Json)) :=
+  Qed.Auth.Oidc.execJsonHttpStatus execHttpCall method url
+    (mkBearerHeaders token? contentType? extraHeaders) body ssrfGuard okStatus allowEmptyBody requireUtf8
+    fmtTransportErr fmtStatusErr fmtJsonErr
+
 /-! ## GCP RS256 OAuth2 Token Exchange -/
 
 structure GcpTokenCacheEntry where
@@ -162,7 +182,7 @@ def fetchGcpBearerToken (cache? : Option (Prim.StateBox (Array GcpTokenCacheEntr
     let j ← liftP ((Json.parse saJson).mapError (s!"invalid GCP service account JSON: {·}"))
     let some clientEmail := j.strAt? "client_email" | throw "GCP service account JSON missing `client_email`"
     let some privateKey := j.strAt? "private_key" | throw "GCP service account JSON missing `private_key`"
-    let tokenUri := ((← loadNonEmptyEnv "QED_GCP_TOKEN_URL").orElse fun _ => j.strAt? "token_uri").getD "https://oauth2.googleapis.com/token"
+    let tokenUri := (← resolveEnvWithDefault "QED_GCP_TOKEN_URL" (j.strAt? "token_uri")).getD "https://oauth2.googleapis.com/token"
     if ssrfGuard then
       if !tokenUri.startsWith "https://" || tokenUri.contains '#' then throw s!"GCP token_uri `{tokenUri}` must be a canonical https:// Google OAuth2 token endpoint"
       if !isAllowedGcpTokenEndpoint (← liftP (parseHttpUrl tokenUri)) then throw s!"GCP token_uri `{tokenUri}` is not an allowed Google OAuth2 token endpoint"
@@ -296,7 +316,7 @@ private def stripSqliteScheme (u : String) : String :=
   match [("sqlite://", 9), ("sqlite:", 7), ("file:", 5)].find? fun (p, _) => u.startsWith p with
   | some (_, n) => String.ofList (u.toList.drop n) | none => u
 private def requireEnv (envVar label : String) (default? : Option String := none) : IO (Except String String) := do
-  return ((← loadNonEmptyEnv envVar).orElse fun _ => default?).elim (.error s!"missing {label} `{envVar}`") .ok
+  return (← resolveEnvWithDefault envVar default?).elim (.error s!"missing {label} `{envVar}`") .ok
 private def resolveDbEndpoint (ep : Db.DbEndpoint) : IO (Except String ResolvedDbTransport) := ExceptT.run do
   let reqEnv (v l : String) (d : Option String := none) := liftE (requireEnv v l d)
   match ep with
@@ -488,7 +508,7 @@ private def finishPgTx (conn : Db.PgWire.PgConn) (cmd : String) : IO (Except Api
 
 private def runAead (op : ByteArray → ByteArray → ByteArray → IO (Except String ByteArray))
     (keyEnv : String) (fallback? : Option String) (aad data : ByteArray) : IO (Except ApiError ByteArray) := do
-  match (← loadNonEmptyEnv keyEnv).orElse fun _ => fallback?.bind fun s => if s.isEmpty then none else some s with
+  match ← resolveEnvWithDefault keyEnv (fallback?.bind fun s => if s.isEmpty then none else some s) with
   | some k => mapApi (op k.toUTF8 aad data)
   | none => return .error (ApiError.internal s!"missing required encryption key `{keyEnv}`")
 

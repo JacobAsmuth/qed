@@ -64,6 +64,19 @@ theorem optionBind_isSome_iff {α β : Type} (o : Option α) (f : α → Option 
 section CodecDerive
 open Lean Elab Command Term
 
+@[run_parser_attribute_hooks]
+def schemaCtxParamP : Lean.Parser.Parser :=
+  Lean.Parser.group (Lean.Parser.ident >> ":" >> Lean.Parser.withPosition (Lean.Parser.categoryParser `qedType 0))
+
+def parseCtxBinders (ctxStx : Syntax) : CommandElabM (Array Ident × Array Term) := do
+  let rawCtx := if ctxStx.getNumArgs == 3 then (ctxStx.getArg 1).getSepArgs else #[]
+  let cbns : Array Ident := rawCtx.map (⟨·.getArg 0⟩)
+  let cbts ← rawCtx.mapM fun cp => liftMacroM (return (← Qed.Lang.lowerQedType (cp.getArg 2) false).1)
+  return (cbns, cbts)
+
+def fmtWhereLabel (rawWheres : Array Syntax) (fallback : String := "constraint") : String :=
+  String.intercalate ", " (rawWheres.toList.map fun w => let s := Qed.Lang.stxSnippet w; if s.isEmpty then fallback else s)
+
 structure StructFieldSpec where mk :: (ident : Ident) (wireKey : String) (valTy : Term) (codecTerm? : Option Term := none) deriving Inhabited
 structure StructJsonOpts where mk ::
   (ctxBinders : Array (Ident × Term) := #[]) (emitNamedDefs : Bool := true) (emitStringCodec : Bool := false)
@@ -210,6 +223,98 @@ private def numLit (n : Nat) : TSyntax `num := Syntax.mkNumLit (toString n)
     ← `(command| private theorem $thmId ($xId:ident : $t) : $fromId ($toId $xId) = Except.ok $xId := by
           $[$pHaveTacs:tactic]*; unfold $fromId $toId; exact $roundtripPf),
     ← `(command| instance $(mkIdent (tId ++ `instLawfulProto)):ident : Qed.LawfulProto $t := .ofFields $toId $fromId (fun $xId => $tagsPosPf) $thmId) ]
+
+structure TaggedVariantSpec where mk ::
+  (ctorName : Name) (wireTag : String) (fields : Array (Ident × String × Term))
+deriving Inhabited
+
+structure TaggedJsonOpts where mk ::
+  (tagKey : String := "t")
+  (emitNamedDefs : Bool := true)
+  (emitStringCodec : Bool := false)
+  (emitNonNull emitLawful : Bool := false)
+  (unknownTagStatic? : Option String := none)
+
+private def mkLeMaxProof (idx total : Nat) : MacroM Term := do
+  let mut pf ← `(term| Nat.le_max_left _ _)
+  for _ in [0:idx] do
+    pf ← `(term| Nat.le_trans $pf (Nat.le_max_right _ _))
+  if total == 0 then `(term| Nat.le_refl _) else pure pf
+
+@[noinline] private def mkTaggedUnionLawfulJsonCmds (t toId fromId : Ident) (tagKeyLit : StrLit)
+    (variants : Array TaggedVariantSpec) : CommandElabM (Array (TSyntax `command)) := do
+  let tId := t.getId
+  let allParamTys := variants.flatMap fun v => v.fields.map (·.2.2)
+  let maxDepthExpr ← allParamTys.foldrM (init := ← `(term| (0 : Nat))) fun ty acc => `(term| Nat.max (Qed.LawfulJson.depthBound $ty) $acc)
+  let mut flatIdx := 0; let mut depthAlts : Array (TSyntax ``Lean.Parser.Term.matchAltExpr) := #[]
+  for v in variants do
+    let ctorId := mkIdent (tId ++ v.ctorName); let pTerms : Array Term := v.fields.map fun (p, _, _) => ⟨p.raw⟩
+    let mut paramPfs : Array Term := #[]
+    for (pId, _, _) in v.fields do
+      let leMax ← liftMacroM <| mkLeMaxProof flatIdx allParamTys.size
+      paramPfs := paramPfs.push (← `(term| Nat.le_trans (Qed.LawfulJson.depth_toJson $pId:ident) $leMax))
+      flatIdx := flatIdx + 1
+    let bodyPf ← paramPfs.foldrM (init := ← `(term| Nat.zero_le _)) fun hp acc => `(term| Nat.max_le.2 ⟨$hp, $acc⟩)
+    let fullPf ← `(term| Nat.add_le_add_left (Nat.max_le.2 ⟨Nat.zero_le _, $bodyPf⟩) 1)
+    depthAlts := depthAlts.push (← `(Lean.Parser.Term.matchAltExpr| | $ctorId $pTerms* => $fullPf))
+  let mut rtCases : Array (TSyntax ``Lean.Parser.Tactic.inductionAlt) := #[]
+  for (v, vi) in variants.zipIdx do
+    let vName := v.ctorName; let vLit := Syntax.mkStrLit v.wireTag; let pIds := v.fields.map (·.1)
+    let ctorVal ← Qed.Lang.mkAppTerms (mkIdent (tId ++ vName)) (pIds.map (⟨·.raw⟩))
+    let mut hIdents : Array Ident := #[]; let mut hTacs : Array (TSyntax `tactic) := #[]
+    let hTagId := mkIdent `_htag; hIdents := hIdents.push hTagId
+    hTacs := hTacs.push (← `(tactic| have $hTagId:ident := Qed.LawfulJson.fromField_of_field ($toId $ctorVal) $tagKeyLit $vLit rfl))
+    for ((pId, wKey, _), pi) in v.fields.zipIdx do
+      let hfId := mkIdent (Name.mkSimple s!"_hf{pi}"); hIdents := hIdents.push hfId
+      hTacs := hTacs.push (← `(tactic| have $hfId:ident := Qed.LawfulJson.fromField_of_field ($toId $ctorVal) $(Syntax.mkStrLit wKey) $pId:ident rfl))
+    for prevIdx in [0:vi] do
+      let prevLit := Syntax.mkStrLit variants[prevIdx]!.wireTag
+      let hneId := mkIdent (Name.mkSimple s!"_hne{prevIdx}"); hIdents := hIdents.push hneId
+      hTacs := hTacs.push (← `(tactic| have $hneId:ident : ($vLit == $prevLit) = false := rfl))
+    rtCases := rtCases.push (← `(Lean.Parser.Tactic.inductionAlt| | $(mkIdent vName):ident $[$pIds:ident]* =>
+      $[$hTacs:tactic]*; unfold $fromId; simp only [$[$hIdents:term],*, beq_self_eq_true, Bool.false_eq_true, ↓reduceIte, bind, Except.bind, pure, Except.pure]))
+  let thmId := mkIdent (tId ++ `_fromJson_toJson)
+  return #[
+    ← `(command| private theorem $thmId (x : $t) : $fromId ($toId x) = Except.ok x := by cases x with $[$rtCases:inductionAlt]*),
+    ← `(command| instance $(mkIdent (tId ++ `instLawfulJson)):ident : Qed.LawfulJson $t where
+          depthBound := 1 + $maxDepthExpr; depth_toJson $[$depthAlts:matchAlt]*; fromJson_toJson := $thmId)]
+
+@[noinline] def mkTaggedUnionJsonCmds (t : Ident) (variants : Array TaggedVariantSpec) (opts : TaggedJsonOpts := {}) :
+    CommandElabM (Array (TSyntax `command)) := do
+  let (tId, jId, tagId) := (t.getId, mkIdent `j, mkIdent `_tag)
+  let tagKeyLit := Syntax.mkStrLit opts.tagKey
+  let toAlts ← variants.mapM fun v => do
+    let ctorId := mkIdent (tId ++ v.ctorName); let pTerms : Array Term := v.fields.map fun (p, _, _) => ⟨p.raw⟩
+    let pairs := #[← `(($tagKeyLit, Qed.ToJson.toJson $(Syntax.mkStrLit v.wireTag)))] ++
+      (← v.fields.mapM fun (pId, wKey, _) => `(($(Syntax.mkStrLit wKey), Qed.ToJson.toJson $pId:ident)))
+    `(Lean.Parser.Term.matchAltExpr| | $ctorId $pTerms* => Qed.Json.obj [$[$pairs:term],*])
+  let unknownErr ← match opts.unknownTagStatic? with
+    | some msg => `(Except.error $(Syntax.mkStrLit msg))
+    | none => `(Except.error ($(Syntax.mkStrLit s!"unknown {tId} variant '") ++ $tagId ++ "'"))
+  let fromChain ← variants.foldrM (init := unknownErr) fun v acc => do
+    let ctorId := mkIdent (tId ++ v.ctorName); let pIds := v.fields.map (·.1)
+    let decs ← v.fields.mapM fun (_, wKey, pTy) => `(Qed.FromJsonField.fromField (α := $pTy) $jId $(Syntax.mkStrLit wKey))
+    let ctorApp ← Qed.Lang.mkAppTerms ctorId (pIds.map (⟨·.raw⟩))
+    let okBr ← if pIds.isEmpty then `(Except.ok $ctorApp) else `(do
+      $[let $pIds:ident ← $decs:term]*
+      return $ctorApp)
+    `(if $tagId == $(Syntax.mkStrLit v.wireTag) then $okBr else $acc)
+  if !opts.emitNamedDefs then return #[
+    ← `(command| instance $(mkIdent (tId ++ `instToJson)):ident : Qed.ToJson $t := ⟨fun _x => match _x with $[$toAlts:matchAlt]*⟩),
+    ← `(command| instance $(mkIdent (tId ++ `instFromJson)):ident : Qed.FromJson $t := ⟨fun $jId:ident => do let $tagId:ident ← Qed.FromJsonField.fromField (α := String) $jId $tagKeyLit; $fromChain:term⟩) ]
+  let (toId, fromId) := (mkIdent (tId ++ `toJson), mkIdent (tId ++ `fromJson))
+  let mut cmds : Array (TSyntax `command) := #[
+    ← `(command| def $toId : $t → Qed.Json $[$toAlts:matchAlt]*),
+    ← `(command| def $fromId ($jId:ident : Qed.Json) : Except String $t := do let $tagId:ident ← Qed.FromJsonField.fromField (α := String) $jId $tagKeyLit; $fromChain:term) ]
+  if opts.emitStringCodec then cmds := cmds ++ #[
+    ← `(command| def $(mkIdent (tId ++ `encode)) (x : $t) : String := Qed.Json.render ($toId x)),
+    ← `(command| def $(mkIdent (tId ++ `decode)) (s : String) (maxDepth : Nat := 64) : Except String $t := (Qed.Json.parse s maxDepth).bind $fromId) ]
+  cmds := cmds ++ #[
+    ← `(command| instance $(mkIdent (tId ++ `instToJson)):ident : Qed.ToJson $t := ⟨$toId⟩),
+    ← `(command| instance $(mkIdent (tId ++ `instFromJson)):ident : Qed.FromJson $t := ⟨$fromId⟩) ]
+  if opts.emitNonNull then cmds := cmds.push (← `(command| instance $(mkIdent (tId ++ `instNonNullJson)):ident : Qed.NonNullJson $t := ⟨fun x => by cases x <;> nofun⟩))
+  if !opts.emitLawful then return cmds
+  return cmds ++ (← mkTaggedUnionLawfulJsonCmds t toId fromId tagKeyLit variants)
 
 end CodecDerive
 end Qed

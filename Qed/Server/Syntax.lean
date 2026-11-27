@@ -1,6 +1,5 @@
 import Lean
 import Qed.Lang
-import Qed.Invariant.State
 
 namespace Qed.Server
 

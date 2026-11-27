@@ -29,11 +29,9 @@ structure DevAuthKeypair where
   xB64     : String
   yB64     : String
 
-private def nowSec : IO Nat := return (← Prim.nowMs).toNat / 1000
-
 def signDevIdToken (kp : DevAuthKeypair) (issuer sub aud nonce email role orgId : String)
     (emailVerified : Bool) (ttlSec : Nat := 3600) : IO (Except String String) := do
-  let now ← nowSec
+  let now ← Prim.nowSec
   let hdr := Qed.Json.obj [("alg", .str "ES256"), ("typ", .str "JWT"), ("kid", .str kp.kid)]
   let claims : List (String × Qed.Json) := [("iss", .str issuer), ("sub", .str sub), ("aud", .str aud),
     ("exp", .num ⟨Int.ofNat (now + ttlSec), 0⟩), ("iat", .num ⟨Int.ofNat now, 0⟩), ("email", .str email),
@@ -96,7 +94,7 @@ def runDevAuthServer (port : UInt16) : IO UInt32 := do
         if !((redirectUri.startsWith "http://127.0.0.1:" || redirectUri.startsWith "http://localhost:") && !redirectUri.contains "\r" && !redirectUri.contains "\n") then
           return formatHttpResponse 400 "text/plain; charset=utf-8" "dev-auth: redirect_uri must target localhost or 127.0.0.1".toUTF8 isHead req.keepAlive false
         let (sub, email, role, orgId, verified) := if isPost then parsePersona ps "" true else parsePersona ps
-        let (code, now) := (← Prim.randomHex 20, ← nowSec)
+        let (code, now) := (← Prim.randomHex 20, ← Prim.nowSec)
         let entry : DevAuthCode := {
           code, clientId, redirectUri, nonce, codeChallenge, email, emailVerified := verified, role, orgId
           sub := if sub.isEmpty then "usr_dev" else sub, expiresAtSec := now + 300 }
@@ -112,7 +110,7 @@ def runDevAuthServer (port : UInt16) : IO UInt32 := do
         let (sub, email, role, orgId, verified) := parsePersona form
         return ← mintTokenResp sub ((form.lookup "audience").getD ((form.lookup "client_id").getD "qed-app")) "" email role orgId verified
       if grant != "authorization_code" then return jsonErr "unsupported_grant_type"
-      let (code, now) := ((form.lookup "code").getD "", ← nowSec)
+      let (code, now) := ((form.lookup "code").getD "", ← Prim.nowSec)
       let some entry ← Prim.atomicModify codesBox fun arr => match arr.find? (·.code == code) with | some c => (arr.filter (·.code != code), some c) | none => (arr, none)
         | return jsonErr "invalid_grant" (some "unknown or already used code")
       if now >= entry.expiresAtSec || entry.clientId != (form.lookup "client_id").getD "" || entry.redirectUri != (form.lookup "redirect_uri").getD "" then

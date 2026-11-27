@@ -90,6 +90,9 @@ def parseQueryParams (q : String) : List (String × String) :=
 def encodeFormBody (pairs : List (String × String)) : String :=
   "&".intercalate (pairs.map fun (k, v) => encodeSeg k ++ "=" ++ encodeSeg v)
 
+def lookupClaim (claims : List (String × String)) (name : String) : Option String :=
+  (claims.lookup name).orElse fun _ => if name == "verified" then claims.lookup "email_verified" else none
+
 def joinSlash : List String → String
   | [] => "" | [s] => s | s :: ss => s ++ "/" ++ joinSlash ss
 theorem joinSlash_all (p : Char → Bool) (hslash : p '/' = true) :

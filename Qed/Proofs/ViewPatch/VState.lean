@@ -57,45 +57,31 @@ theorem VStateValid_root_mem (h : VStateValid f ns v s a S vst) : S vst.rootNode
 theorem VStateValid_equiv (h : VStateValid f ns v s a S vst) : DomTreeAssocEquiv (readDomTree f a vst.rootNode) (specDom ns (View.render v s)) := CleanDomSubtree_equiv h.1
 theorem VStateValid_mono {S' : Nat → Prop} (hsub : ∀ k, S k → S' k) (h : VStateValid f ns v s a S vst) : VStateValid f ns v s a S' vst := ⟨CleanDomSubtree_mono hsub h.1, h.2⟩
 theorem VStateValid_frame {a' : DomArena msg} (hfr : ∀ m : Dom.Node, S m.toNat → a'.get m = a.get m) (h : VStateValid f ns v s a S vst) : VStateValid f ns v s a' S vst := ⟨CleanDomSubtree_frame hfr h.1, VStateMatches_frame hfr h.1 h.2⟩
+theorem VStateValid.frame_set_ne {p : Dom.Node} {e : ArenaEntry msg} (hp : ¬S p.toNat) (h : VStateValid f ns v s a S vst) : VStateValid f ns v s (a.set p e) S vst := VStateValid_frame (fun _ hm => a.get_set_ne e fun heq => hp (heq ▸ hm)) h
+theorem VStateValid.of_sameDom {aOut aDom : DomArena msg} {root : Dom.Node} (hsd : aOut.SameDom aDom) (hcl : CleanDomSubtree f ns (View.render v s) aDom S root) (hroot : vst.rootNode = root) (hmt : VStateMatches v s aOut root vst) : VStateValid f ns v s aOut S vst :=
+  ⟨hroot.symm ▸ CleanDomSubtree_frame (fun m _ => hsd.get_eq m) hcl, hroot.symm ▸ hmt⟩
 end
 
-theorem View.ind {P : View σ msg → Prop}
-    (text : ∀ str, P (.text str)) (dyn : ∀ get, P (.dyn get)) (static : ∀ h, P (.static h))
+theorem View.ind {P : View σ msg → Prop} (text : ∀ str, P (.text str)) (dyn : ∀ get, P (.dyn get)) (static : ∀ h, P (.static h))
     (dynNode : ∀ get, P (.dynNode get)) (memo : ∀ sm, P (.memo sm)) (ifElse : ∀ c y n, P y → P n → P (.ifElse c y n))
-    (element : ∀ tag attrs kids, (∀ k ∈ kids, P k) → P (.element tag attrs kids))
-    (keyedList : ∀ tag attrs keys marks rowSig rowEv rowsHtml tmpl?, P (.keyedList tag attrs keys marks rowSig rowEv rowsHtml tmpl?)) : ∀ v, P v
+    (element : ∀ tag attrs kids, (∀ k ∈ kids, P k) → P (.element tag attrs kids)) (keyedList : ∀ tag attrs keys marks rowSig rowEv rowsHtml tmpl?, P (.keyedList tag attrs keys marks rowSig rowEv rowsHtml tmpl?)) : ∀ v, P v
   | .text s => text s | .dyn g => dyn g | .static h => static h | .dynNode g => dynNode g | .memo sm => memo sm | .keyedList .. => keyedList ..
   | .ifElse c y n => ifElse c y n (View.ind text dyn static dynNode memo ifElse element keyedList y) (View.ind text dyn static dynNode memo ifElse element keyedList n)
-  | .element tag attrs kids => element tag attrs kids fun k hk =>
-      have : sizeOf k < sizeOf (View.element tag attrs kids) := by have := List.sizeOf_lt_of_mem hk; simp only [View.element.sizeOf_spec]; omega
+  | .element tag attrs kids => element tag attrs kids fun k hk => have : sizeOf k < sizeOf (View.element tag attrs kids) := by have := List.sizeOf_lt_of_mem hk; simp only [View.element.sizeOf_spec]; omega
       View.ind text dyn static dynNode memo ifElse element keyedList k
 termination_by v => sizeOf v
-
 theorem keyedRows_eq_of_keys_eq {keys : σ → Array String} {rowsHtml : σ → List (Html msg)} (hr : KeyedRowsClean keys rowsHtml)
     {s₁ s₂ : σ} (hk : disambiguateKeys (keys s₂) = disambiguateKeys (keys s₁)) : rowsHtml s₁ = rowsHtml s₂ :=
   List.ext_getElem? fun i => if hi : i < (disambiguateKeys (keys s₁)).size then hr.2.2.2 s₁ s₂ i i hi (hk ▸ hi) (by simp [hk])
     else by rw [List.getElem?_eq_none (by rw [hr.1 s₁]; omega), List.getElem?_eq_none (by rw [hr.1 s₂, hk]; omega)]
-
-theorem down_ind {n : Nat} {P : ∀ i, i ≤ n → Prop} (base : P n (Nat.le_refl n)) (step : ∀ i (hlt : i < n), P (i + 1) hlt → P i (Nat.le_of_lt hlt)) :
-    ∀ i (hle : i ≤ n), P i hle := fun i hle => by
+theorem down_ind {n : Nat} {P : ∀ i, i ≤ n → Prop} (base : P n (Nat.le_refl n)) (step : ∀ i (hlt : i < n), P (i + 1) hlt → P i (Nat.le_of_lt hlt)) : ∀ i (hle : i ≤ n), P i hle := fun i hle => by
   induction h : n - i generalizing i with
   | zero => cases Nat.le_antisymm hle (Nat.sub_eq_zero_iff_le.1 h); exact base
-  | succ k ih =>
-      have hlt : i < n := Nat.lt_of_sub_pos (h.symm ▸ Nat.succ_pos k)
-      exact step i hlt (ih (i + 1) hlt ((Nat.sub_add_eq n i 1).trans (by rw [h]; exact Nat.add_sub_cancel k 1)))
-
-abbrev PatchViewPost (f : Nat) (childNs : String) (parent : Dom.Node) (pns ptag : String) (pst : SpecElemState msg) (pmg : List String)
-    (v : View σ msg) (s₂ : σ) (pre suf : List Dom.Node) (Sold : Nat → Prop) (a : DomArena msg) (res : VState σ msg × DomArena msg) : Prop :=
+  | succ k ih => have hlt : i < n := Nat.lt_of_sub_pos (h.symm ▸ Nat.succ_pos k); exact step i hlt (ih (i + 1) hlt ((Nat.sub_add_eq n i 1).trans (by rw [h]; exact Nat.add_sub_cancel k 1)))
+abbrev PatchViewPost (ep : ElemPar msg) (v : View σ msg) (s₂ : σ) (pre suf : List Dom.Node) (Sold : Nat → Prop) (a : DomArena msg) (res : VState σ msg × DomArena msg) : Prop :=
   let (vst', a') := res
-  a.nextId ≤ a'.nextId ∧ a'.nextId ≤ a.nextId + htmlNodeCount (View.render v s₂) ∧
-  (∀ m : Dom.Node, m ≠ parent → ¬Sold m.toNat → m.toNat < a.nextId → a'.get m = a.get m) ∧
-  a'.get parent = .element pns ptag pst pmg (pre ++ vst'.rootNode :: suf) ∧ (pre ++ vst'.rootNode :: suf).Nodup ∧
-  (∀ r ∈ pre ++ vst'.rootNode :: suf, r.toNat < a'.nextId) ∧
-  VStateValid f childNs v s₂ a' (fun k => Sold k ∨ (a.nextId ≤ k ∧ k < a'.nextId)) vst' ∧
-  DomTreeAssocEquiv (readDomTree f a' vst'.rootNode) (specDom childNs (View.render v s₂))
-
-abbrev ElemPar.patchViewPost (ep : ElemPar msg) (v : View σ msg) :=
-  PatchViewPost ep.f ep.childNs ep.parent ep.pns ep.ptag ep.pst ep.pmg v
+  ArenaExt a a' (fun k => k = ep.parent.toNat ∨ Sold k) (htmlNodeCount (View.render v s₂)) ∧ a'.get ep.parent = ep.entry (pre ++ vst'.rootNode :: suf) ∧ (pre ++ vst'.rootNode :: suf).Nodup ∧
+  (∀ r ∈ pre ++ vst'.rootNode :: suf, r.toNat < a'.nextId) ∧ VStateValid ep.f ep.childNs v s₂ a' (fun k => Sold k ∨ (a.nextId ≤ k ∧ k < a'.nextId)) vst' ∧ DomTreeAssocEquiv (readDomTree ep.f a' vst'.rootNode) (specDom ep.childNs (View.render v s₂))
 
 end
 end Qed

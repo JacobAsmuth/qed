@@ -17,17 +17,15 @@ theorem App.ssr_hydrate_patch_equiv {Model Msg : Type} (app : App Model Msg) (m 
     DomTreeAssocEquiv (readDomTree (f + 1) aPatch vst'.rootNode) (specDom "" (app.view mNext)) := by
   have hview : View.render app.template m' = app.view m := app.dehydrate_view m m' hre
   have hb := HydratableDom_bounds (f + 1) "" (app.view m) a lo hi root hdom
-  have hhyd := hydrateViewM_spec "" f app.template m' root a lo hi hclean hbound hdep (hview.symm ▸ hdom)
-  dsimp only [StateT.run] at hhyd ⊢; rcases hH : hydrateViewM (m := StateM (DomArena Msg)) app.template m' root a with ⟨vst, aHyd⟩
-  rw [hH] at hhyd; rcases hhyd with ⟨hroot, haHydGe, haHydBound, haHydFr, hVstHyd, hEquivHyd⟩
-  have hrootLt : vst.rootNode.toNat < aHyd.nextId := by rcases VStateValid_root_mem hVstHyd with h1 | h2 <;> omega
-  have hpatch := patchViewM_spec (f + 1) "" parent "" ptag pst pmg app.template m' (app.update m' msg).1
-    [] [] (fun k => (lo ≤ k ∧ k < hi) ∨ (a.nextId ≤ k ∧ k < aHyd.nextId)) aHyd vst rfl hclean (by simp only [List.length_nil]; decide)
+  have ⟨hroot, haHydGe, haHydBound, haHydFr, hVstHyd, hEquivHyd⟩ := hydrateViewM_spec "" f app.template m' root a lo hi hclean hbound hdep (hview.symm ▸ hdom)
+  dsimp only [StateT.run] at hroot haHydGe haHydBound haHydFr hVstHyd hEquivHyd ⊢
+  have hrootLt : (hydrateViewM (m := ArenaM Msg) app.template m' root a).1.rootNode.toNat < (hydrateViewM (m := ArenaM Msg) app.template m' root a).2.nextId := by
+    rcases VStateValid_root_mem hVstHyd with h1 | h2 <;> omega
+  have ⟨_, _, _, _, hVstPatch, hEquivPatch⟩ := patchViewM_spec (f + 1) "" parent "" ptag pst pmg app.template m' (app.update m' msg).1
+    [] [] (HydSet lo hi a.nextId (hydrateViewM (m := ArenaM Msg) app.template m' root a).2.nextId) _ _ rfl hclean (by simp only [List.length_nil]; decide)
     (by dsimp only [App.view] at hbound hboundNext; omega) hdepNext (by omega) (by omega) (by rw [haHydFr parent (.inl hparLo) (by omega), hpar, hroot]; rfl) (by simp)
     (fun h => h.elim (fun _ => by omega) (fun _ => by omega)) (fun _ hk => hk.elim (fun _ => by omega) (·.2)) (fun _ hr => by simp only [List.nil_append, List.mem_singleton] at hr; exact hr ▸ hrootLt) hVstHyd
-  dsimp only [StateT.run] at hpatch ⊢; rw [show (UInt32.ofNat ([] : List Dom.Node).length) = 0 from rfl] at hpatch
-  rcases hP : patchViewM (m := StateM (DomArena Msg)) parent 0 app.template (app.update m' msg).1 vst aHyd with ⟨_, _⟩
-  rw [hP] at hpatch; dsimp only [App.view] at hpatch hview ⊢
-  exact ⟨by rw [← hview, hroot]; exact hEquivHyd, hpatch.2.2.2.2.2.2.1, hpatch.2.2.2.2.2.2.2⟩
+  dsimp only [App.view] at hVstPatch hEquivPatch hview ⊢
+  exact ⟨by rw [← hview, hroot]; exact hEquivHyd, hVstPatch, hEquivPatch⟩
 
 end Qed

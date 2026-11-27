@@ -82,160 +82,102 @@ private theorem map_prefixSignal_of_clean (pfx : String) :
     ∀ (attrs : List (Attr msg)), ownsChildren attrs = false → attrs.all Attr.DomClean = true → attrs.map (Attr.prefixSignal pfx) = attrs
   | [], _, _ => rfl | a :: rest, hown, hcl => by
       simp only [ownsChildren, List.any_cons, Bool.or_eq_false_iff, List.all_cons, Bool.and_eq_true] at hown hcl
-      cases a with
-      | signalBind _ => cases hown.1
-      | signalAttr _ _ _ | signalOn _ _ _ => cases hcl.1
-      | _ => simp only [List.map_cons, Attr.prefixSignal, map_prefixSignal_of_clean pfx rest hown.2 hcl.2]
-
+      cases a with | signalBind _ => cases hown.1 | signalAttr _ _ _ | signalOn _ _ _ => cases hcl.1 | _ => simp only [List.map_cons, Attr.prefixSignal, map_prefixSignal_of_clean pfx rest hown.2 hcl.2]
 private theorem prefixSignalsList_eq_map (pfx : String) : ∀ (hs : List (Html msg)), Html.prefixSignalsList pfx hs = hs.map (Html.prefixSignals pfx)
   | [] => rfl | c :: cs => congrArg (Html.prefixSignals pfx c :: ·) (prefixSignalsList_eq_map pfx cs)
 theorem Html.prefixSignals_of_DomClean (pfx : String) : ∀ {h : Html msg}, h.DomClean = true → h.prefixSignals pfx = h
   | .text _, _ => rfl
   | .element tag attrs cs, hc => by
       simp only [Html.DomClean_element, Html.DomCleanList, Bool.and_eq_true, Bool.not_eq_true'] at hc
-      exact (congrArg (Html.element tag · _) (map_prefixSignal_of_clean pfx attrs hc.1.1 hc.1.2)).trans
-        (congrArg (Html.element tag attrs) ((prefixSignalsList_eq_map pfx cs).trans
-          ((List.map_congr_left fun c hm =>
-              have : sizeOf c < sizeOf (Html.element tag attrs cs) := by have := List.sizeOf_lt_of_mem hm; simp only [Html.element.sizeOf_spec]; omega
-              Html.prefixSignals_of_DomClean pfx (List.all_eq_true.1 hc.2 c hm)).trans (List.map_id cs))))
+      exact (congrArg (Html.element tag · _) (map_prefixSignal_of_clean pfx attrs hc.1.1 hc.1.2)).trans (congrArg (Html.element tag attrs) ((prefixSignalsList_eq_map pfx cs).trans
+        ((List.map_congr_left fun c hm => have : sizeOf c < sizeOf (Html.element tag attrs cs) := by have := List.sizeOf_lt_of_mem hm; simp only [Html.element.sizeOf_spec]; omega
+          Html.prefixSignals_of_DomClean pfx (List.all_eq_true.1 hc.2 c hm)).trans (List.map_id cs))))
 termination_by h => sizeOf h
 theorem Html.map_prefixSignals_of_DomCleanList (pfx : String) {hs : List (Html msg)} (hc : Html.DomCleanList hs = true) : hs.map (Html.prefixSignals pfx) = hs :=
   (List.map_congr_left fun c hm => Html.prefixSignals_of_DomClean pfx (List.all_eq_true.1 hc c hm)).trans (List.map_id hs)
-theorem Html.prefixSignalsList_of_DomClean (pfx : String) {hs : List (Html msg)} (hc : Html.DomCleanList hs = true) : Html.prefixSignalsList pfx hs = hs :=
-  (prefixSignalsList_eq_map pfx hs).trans (Html.map_prefixSignals_of_DomCleanList pfx hc)
-
 theorem Html.DomClean_withKey (k : String) : ∀ (h : Html msg), (withKey k h).DomClean = h.DomClean
   | .text _ => rfl | .element .. => by simp only [withKey, Html.DomClean_element, ownsChildren, List.any_cons, Bool.false_or, List.all_cons, Attr.DomClean, Bool.true_and]
-
 theorem Html.textOf?_withKey (k : String) : ∀ (h : Html msg), (withKey k h).textOf? = h.textOf?
   | .text _ | .element .. => rfl
 
-private theorem managedAttrName_of_key? {a : Attr msg} {k : String} (h : a.key? = some k) : managedAttrName a = some k := by
-  cases a with | attr _ _ | flag _ _ => exact h | _ => cases h
-
+private theorem managedAttrName_of_key? {a : Attr msg} {k : String} (h : a.key? = some k) : managedAttrName a = some k := by cases a with | attr _ _ | flag _ _ => exact h | _ => cases h
 private theorem mem_managed_dedupAttrs_iff {k : String} :
     ∀ {xs : List (Attr msg)}, k ∈ (dedupAttrs xs).filterMap managedAttrName ↔ ∃ a ∈ xs, managedAttrName a = some k
   | [] => ⟨(fun h => nomatch h), (fun ⟨_, h, _⟩ => nomatch h)⟩
   | x :: xs => by
       have hcons : k ∈ (x :: dedupAttrs xs).filterMap managedAttrName ↔ ∃ a ∈ x :: xs, managedAttrName a = some k := by
         simp only [List.mem_filterMap, List.mem_cons, exists_eq_or_imp]; exact or_congr_right (by simpa only [List.mem_filterMap] using mem_managed_dedupAttrs_iff (k := k) (xs := xs))
-      unfold dedupAttrs; split
-      · exact hcons
-      · rename_i kx hx; split
-        · rcases List.any_eq_true.1 ‹_› with ⟨y, hy, hyk⟩; simp only [mem_managed_dedupAttrs_iff, List.mem_cons, exists_eq_or_imp]
-          exact ⟨.inr, fun h => h.elim (fun hmk => ⟨y, hy, (managedAttrName_of_key? (beq_iff_eq.1 hyk)).trans ((managedAttrName_of_key? hx).symm.trans hmk)⟩) id⟩
+      unfold dedupAttrs; split; · exact hcons
+      · rename_i kx hx; split; · rcases List.any_eq_true.1 ‹_› with ⟨y, hy, hyk⟩; simp only [mem_managed_dedupAttrs_iff, List.mem_cons, exists_eq_or_imp]
+                                 exact ⟨.inr, fun h => h.elim (fun hmk => ⟨y, hy, (managedAttrName_of_key? (beq_iff_eq.1 hyk)).trans ((managedAttrName_of_key? hx).symm.trans hmk)⟩) id⟩
         · exact hcons
-
 private def noBind (xs : List (VAttr σ msg)) : Bool := xs.all (fun | .bind _ | .dynOn _ _ => false | _ => true)
 private abbrev nonCls (s : σ) (xs : List (VAttr σ msg)) : List (Attr msg) := (xs.map (VAttr.eval s)).filter (fun | .cls _ => false | _ => true)
 private def stepDynAttr (s : σ) (cur : SpecElemState msg) : VAttr σ msg → SpecElemState msg | .dynVal k g => stepSpecAttr cur (.attr k (g s)) | _ => cur
-
 private theorem applyDynAttrListM_fold (a : DomArena msg) (node : Dom.Node) (s : σ) (ns tag : String) (mg : List String) (cs : List Dom.Node) :
     ∀ (xs : List (VAttr σ msg)) (st : SpecElemState msg), noBind xs = true →
-      applyDynAttrListM (m := StateM (DomArena msg)) node s xs (a.set node (.element ns tag st mg cs)) =
-        ((), a.set node (.element ns tag (xs.foldl (stepDynAttr s) st) mg cs))
+      applyDynAttrListM (m := ArenaM msg) node s xs (a.set node (.element ns tag st mg cs)) = ((), a.set node (.element ns tag (xs.foldl (stepDynAttr s) st) mg cs))
   | [], _, _ => rfl | .bind _ :: _, _, h | .dynOn _ _ :: _, _, h => by cases h
   | .stat _ :: rest, st, h => applyDynAttrListM_fold a node s ns tag mg cs rest st h
   | .dynVal _ _ :: rest, _, h => by dsimp only [applyDynAttrListM, bind, StateT.bind, List.foldl_cons, stepDynAttr]; rw [applyAttrM_element]; exact applyDynAttrListM_fold a node s ns tag mg cs rest _ h
-
 private theorem filterMap_eq_of_noBind (f : Attr msg → Option String) (hattr : ∀ k v, f (.attr k v) = none) (s₁ s₂ : σ) :
     ∀ (ys : List (VAttr σ msg)), noBind ys = true → (ys.map (VAttr.eval s₁)).filterMap f = (ys.map (VAttr.eval s₂)).filterMap f
   | [], _ => rfl | .bind _ :: _, h | .dynOn _ _ :: _, h => by cases h
   | .dynVal _ _ :: rest, h => by simp only [List.map_cons, VAttr.eval, List.filterMap_cons, hattr, filterMap_eq_of_noBind f hattr s₁ s₂ rest h]
   | .stat _ :: rest, h => by simp only [List.map_cons, VAttr.eval, List.filterMap_cons, filterMap_eq_of_noBind f hattr s₁ s₂ rest h]
-
 private theorem isSome_ite_some {α : Type} (b : Bool) (x : α) : (if b then some x else none).isSome = b := by cases b <;> rfl
-
 private theorem normalKey_slotUpdate_eq {a : Attr msg} {k : String} (hk : a.key? = some k) (hn : a.NormalKey = true) (sl : AttrSlot) :
     (a.slotUpdate? sl).isSome = match sl with | .val => k == "value" | .chk => k == "checked" | .attr k' => (k != "value") && (k != "checked") && (k == k') | _ => false := by
   cases a with
-  | attr _ _ =>
-      cases Option.some.inj hk; have hc : (k == "checked") = false := beq_eq_false_iff_ne.2 fun h => by subst h; cases hn
-      cases sl with
-      | val => exact isSome_ite_some ..
-      | chk => simp only [Attr.slotUpdate?, hc]; rfl
-      | attr k' => simp only [Attr.slotUpdate?, bne, hc, Bool.not_false, Bool.and_true]; exact isSome_ite_some ..
-      | _ => rfl
-  | flag _ _ =>
-      cases Option.some.inj hk; have hv : (k == "value") = false := beq_eq_false_iff_ne.2 fun h => by subst h; cases hn
-      cases sl with
-      | chk => exact isSome_ite_some ..
-      | val => simp only [Attr.slotUpdate?, hv]; rfl
-      | attr k' => simp only [Attr.slotUpdate?, bne, hv, Bool.not_false, Bool.true_and]; exact isSome_ite_some ..
-      | _ => rfl
+  | attr _ _ => cases Option.some.inj hk; have hc : (k == "checked") = false := beq_eq_false_iff_ne.2 fun h => by subst h; cases hn
+                cases sl with | val => exact isSome_ite_some .. | chk => exact hc.symm | attr _ => simp only [Attr.slotUpdate?, bne, hc, Bool.not_false, Bool.and_true]; exact isSome_ite_some .. | _ => rfl
+  | flag _ _ => cases Option.some.inj hk; have hv : (k == "value") = false := beq_eq_false_iff_ne.2 fun h => by subst h; cases hn
+                cases sl with | chk => exact isSome_ite_some .. | val => exact hv.symm | attr _ => simp only [Attr.slotUpdate?, bne, hv, Bool.not_false, Bool.true_and]; exact isSome_ite_some .. | _ => rfl
   | _ => cases hk
-
-private theorem normalKey_slotUpdate_iff {a b : Attr msg} {k : String} (ha : a.key? = some k) (hb : b.key? = some k) (haN : a.NormalKey = true) (hbN : b.NormalKey = true) (sl : AttrSlot) :
-    (a.slotUpdate? sl).isSome = true → (b.slotUpdate? sl).isSome = true := by
-  rw [normalKey_slotUpdate_eq ha haN, normalKey_slotUpdate_eq hb hbN]; exact id
-
 private theorem dedupAttrs_foldl_equiv :
-    ∀ (xs : List (Attr msg)) (cur : SpecElemState msg), xs.all Attr.NormalKey = true →
-      ElemStateEquiv ((dedupAttrs xs).foldl stepSpecAttr cur) (xs.foldl stepSpecAttr cur)
+    ∀ (xs : List (Attr msg)) (cur : SpecElemState msg), xs.all Attr.NormalKey = true → ElemStateEquiv ((dedupAttrs xs).foldl stepSpecAttr cur) (xs.foldl stepSpecAttr cur)
   | [], cur, _ => ElemStateEquiv.refl cur
   | x :: xs, cur, hn => by
-      simp only [List.all_cons, Bool.and_eq_true] at hn; unfold dedupAttrs; split
-      · exact dedupAttrs_foldl_equiv xs (stepSpecAttr cur x) hn.2
-      · rename_i k hx; split
-        · rcases List.any_eq_true.1 ‹_› with ⟨y, hy, hyk⟩; intro sl
-          refine (dedupAttrs_foldl_equiv xs cur hn.2 sl).trans (foldl_stepSpecAttr_read sl xs cur _ ?_)
-          cases hxu : x.slotUpdate? sl with
-          | some _ => exact .inl ⟨y, hy, normalKey_slotUpdate_iff hx (beq_iff_eq.1 hyk) hn.1 (List.all_eq_true.1 hn.2 y hy) sl (by rw [hxu]; rfl)⟩
-          | none => exact .inr (by rw [read_stepSpecAttr, hxu]; rfl)
+      simp only [List.all_cons, Bool.and_eq_true] at hn; unfold dedupAttrs; split; · exact dedupAttrs_foldl_equiv xs (stepSpecAttr cur x) hn.2
+      · rename_i k hx; split; · rcases List.any_eq_true.1 ‹_› with ⟨y, hy, hyk⟩; intro sl
+                                refine (dedupAttrs_foldl_equiv xs cur hn.2 sl).trans (foldl_stepSpecAttr_read sl xs cur _ ?_)
+                                cases hxu : x.slotUpdate? sl with
+                                | some _ => exact .inl ⟨y, hy, by rw [normalKey_slotUpdate_eq (beq_iff_eq.1 hyk) (List.all_eq_true.1 hn.2 y hy), ← normalKey_slotUpdate_eq hx hn.1, hxu]; rfl⟩
+                                | none => exact .inr (by rw [read_stepSpecAttr, hxu]; rfl)
         · exact dedupAttrs_foldl_equiv xs (stepSpecAttr cur x) hn.2
-
 private theorem foldl_stepDynAttr_congr (sl : AttrSlot) (s : σ) :
-    ∀ (xs : List (VAttr σ msg)) {s₁ s₂ : SpecElemState msg}, sl.read s₁ = sl.read s₂ →
-      sl.read (xs.foldl (stepDynAttr s) s₁) = sl.read (xs.foldl (stepDynAttr s) s₂)
+    ∀ (xs : List (VAttr σ msg)) {s₁ s₂ : SpecElemState msg}, sl.read s₁ = sl.read s₂ → sl.read (xs.foldl (stepDynAttr s) s₁) = sl.read (xs.foldl (stepDynAttr s) s₂)
   | [], _, _, h => h | va :: xs, _, _, h => foldl_stepDynAttr_congr sl s xs (by cases va <;> simp only [stepDynAttr, read_stepSpecAttr, h])
-
 private theorem attr_slotUpdate_key_eq {k v : String} {a : Attr msg} {sl : AttrSlot}
-    (hu : (@Attr.attr msg k v).slotUpdate? sl ≠ none) (ha : a.slotUpdate? sl ≠ none)
-    (hok : match a with | .cls _ | .localCell .. => False | _ => True) : a.key? = some k := by
-  cases sl <;> simp only [Attr.slotUpdate?] at hu <;> try exact absurd rfl hu
-  all_goals
-    split at hu <;> try exact absurd rfl hu
-    rename_i h1; simp only [Bool.and_eq_true, beq_iff_eq] at h1
-    cases a <;> simp only [Attr.slotUpdate?] at ha <;>
-      first | exact False.elim hok | exact absurd rfl ha
-            | (split at ha <;> first | exact absurd rfl ha | (rename_i h2; simp only [Bool.and_eq_true, beq_iff_eq] at h2; exact congrArg some (by first | exact h2.2.trans h1.2.symm | exact h2.trans h1.symm)))
-
+    (hu : (@Attr.attr msg k v).slotUpdate? sl ≠ none) (ha : a.slotUpdate? sl ≠ none) (hok : match a with | .cls _ | .localCell .. => False | _ => True) : a.key? = some k := by
+  have h1 := managedAttrName_of_slotUpdate (Option.isSome_iff_ne_none.2 hu); have h2 := managedAttrName_of_slotUpdate (Option.isSome_iff_ne_none.2 ha)
+  cases a with | attr _ _ | flag _ _ => exact h2.trans h1.symm | cls _ | localCell _ _ _ _ _ => exact False.elim hok | _ => cases sl <;> simp [Attr.slotUpdate?] at hu ha
 private theorem foldl_dynAttr_eq_nonCls (sl : AttrSlot) (s : σ) :
-    ∀ (xs : List (VAttr σ msg)) (u₁ u₂ : SpecElemState msg), noBind xs = true →
-      (∀ a, .stat a ∈ xs → (match a with | .cls _ => False | _ => True) → a.slotUpdate? sl = none) →
+    ∀ (xs : List (VAttr σ msg)) (u₁ u₂ : SpecElemState msg), noBind xs = true → (∀ a, .stat a ∈ xs → (match a with | .cls _ => False | _ => True) → a.slotUpdate? sl = none) →
       sl.read u₁ = sl.read u₂ → sl.read (xs.foldl (stepDynAttr s) u₁) = sl.read ((nonCls s xs).foldl stepSpecAttr u₂)
   | [], _, _, _, _, h => h | .bind _ :: _, _, _, hn, _, _ | .dynOn _ _ :: _, _, _, hn, _, _ => by cases hn
   | .dynVal _ _ :: ws, _, _, hn, hst, h => foldl_dynAttr_eq_nonCls sl s ws _ _ hn (fun a ha => hst a (.tail _ ha)) (by dsimp only [stepDynAttr, VAttr.eval]; rw [read_stepSpecAttr, read_stepSpecAttr, h])
   | .stat a :: ws, _, _, hn, hst, h => by cases a <;> exact foldl_dynAttr_eq_nonCls sl s ws _ _ hn (fun b hb => hst b (.tail _ hb)) (by first | exact h | (dsimp only [stepDynAttr, VAttr.eval]; rw [read_stepSpecAttr, hst _ (.head _) trivial]; exact h))
-
 private theorem stepDynAttr_nonCls_read (sl : AttrSlot) (s₁ s₂ : σ) :
-    ∀ (xs : List (VAttr σ msg)) (st₁ st₂ : SpecElemState msg),
-      noBind xs = true → dynValNoLaterStat xs = true → ownsChildren (xs.map (VAttr.eval s₂)) = false → sl.read st₁ = sl.read st₂ →
+    ∀ (xs : List (VAttr σ msg)) (st₁ st₂ : SpecElemState msg), noBind xs = true → dynValNoLaterStat xs = true → ownsChildren (xs.map (VAttr.eval s₂)) = false → sl.read st₁ = sl.read st₂ →
       sl.read (xs.foldl (stepDynAttr s₂) ((nonCls s₁ xs).foldl stepSpecAttr st₁)) = sl.read ((nonCls s₂ xs).foldl stepSpecAttr st₂)
   | [], _, _, _, _, _, heq => heq | .bind _ :: _, _, _, hnb, _, _, _ | .dynOn _ _ :: _, _, _, hnb, _, _, _ => by cases hnb
   | .stat a :: rest, _, _, hnb, hns, hown, heq => by
       simp only [ownsChildren, List.map_cons, VAttr.eval, List.any_cons, Bool.or_eq_false_iff] at hown
       cases a <;> exact stepDynAttr_nonCls_read sl s₁ s₂ rest _ _ hnb hns hown.2 (by first | exact heq | (dsimp only [VAttr.eval]; rw [read_stepSpecAttr, read_stepSpecAttr, heq]))
   | .dynVal k g :: rest, st₁, st₂, hnb, hns, hown, heq => by
-      simp only [dynValNoLaterStat, Bool.and_eq_true, List.all_eq_true] at hns
-      simp only [nonCls, List.map_cons, VAttr.eval, List.filter_cons, ↓reduceIte, List.foldl_cons, stepDynAttr]
+      simp only [dynValNoLaterStat, Bool.and_eq_true, List.all_eq_true] at hns; simp only [nonCls, List.map_cons, VAttr.eval, List.filter_cons, ↓reduceIte, List.foldl_cons, stepDynAttr]
       cases hu : (@Attr.attr msg k (g s₂)).slotUpdate? sl with
       | none =>
-          have hu1 : (@Attr.attr msg k (g s₁)).slotUpdate? sl = none := by
-            cases sl with
-            | attr _ | val => dsimp only [Attr.slotUpdate?] at hu ⊢; split at hu <;> (first | exact absurd hu (Option.some_ne_none _) | (rename_i h; exact ite_eq_right h))
-            | _ => rfl
-          exact (foldl_stepDynAttr_congr sl s₂ rest (by rw [read_stepSpecAttr, hu]; rfl)).trans
-            (stepDynAttr_nonCls_read sl s₁ s₂ rest _ _ hnb hns.2 hown (by rw [read_stepSpecAttr, hu1, read_stepSpecAttr, hu]; exact heq))
+          have hu1 : (@Attr.attr msg k (g s₁)).slotUpdate? sl = none := by cases sl <;> first | rfl | (dsimp only [Attr.slotUpdate?] at hu ⊢; split at hu <;> first | exact absurd hu (Option.some_ne_none _) | (rename_i h; exact ite_eq_right h))
+          exact (foldl_stepDynAttr_congr sl s₂ rest (by rw [read_stepSpecAttr, hu]; rfl)).trans (stepDynAttr_nonCls_read sl s₁ s₂ rest _ _ hnb hns.2 hown (by rw [read_stepSpecAttr, hu1, read_stepSpecAttr, hu]; exact heq))
       | some _ =>
           refine foldl_dynAttr_eq_nonCls sl s₂ rest _ _ hnb (fun a ha hnc => ?_) (by rw [read_stepSpecAttr, read_stepSpecAttr, hu]; rfl)
           cases ha' : a.slotUpdate? sl with | none => rfl | some _ =>
           exact absurd (attr_slotUpdate_key_eq (hu ▸ Option.some_ne_none _) (ha' ▸ Option.some_ne_none _)
             (by have hl := List.any_eq_false.1 hown a (List.mem_map.2 ⟨.stat a, .tail _ ha, rfl⟩); cases a <;> first | trivial | exact hnc | exact hl rfl)) (bne_iff_ne.1 (hns.1 (.stat a) ha))
-
 private theorem stepDynAttr_foldl_clean (s₂ : σ) (mg : List String) :
-    ∀ (xs : List (VAttr σ msg)) (cur : SpecElemState msg), (xs.map (VAttr.eval s₂)).all Attr.DomClean = true →
-      (∀ k g, .dynVal k g ∈ xs → mg.contains k = true) → ElemClean cur mg → ElemClean (xs.foldl (stepDynAttr s₂) cur) mg
+    ∀ (xs : List (VAttr σ msg)) (cur : SpecElemState msg), (xs.map (VAttr.eval s₂)).all Attr.DomClean = true → (∀ k g, .dynVal k g ∈ xs → mg.contains k = true) → ElemClean cur mg → ElemClean (xs.foldl (stepDynAttr s₂) cur) mg
   | [], _, _, _, hc => hc
   | va :: rest, cur, hcl, hmk, hc => by
       simp only [List.map_cons, List.all_cons, Bool.and_eq_true] at hcl
@@ -249,8 +191,7 @@ theorem applyDynAttrsM_spec (a : DomArena msg) (node : Dom.Node) (ns tag : Strin
     let a' := (applyDynAttrsM (m := StateM (DomArena msg)) node attrs s₂ (a.set node (.element ns tag st mg cs))).2
     a'.nextId = a.nextId ∧ (∀ m, m ≠ node → a'.get m = a.get m) ∧
     ∃ st' mg', a'.get node = .element ns tag st' mg' cs ∧ ElemClean st' mg' ∧
-      ElemStateEquiv st' (evalSpecAttrs (attrs.map (VAttr.eval s₂))) ∧
-      (∀ nm ∈ (normalizeAttrs (attrs.map (VAttr.eval s₂))).filterMap managedAttrName, mg'.contains nm = true) := by
+      ElemStateEquiv st' (evalSpecAttrs (attrs.map (VAttr.eval s₂))) ∧ (∀ nm ∈ (normalizeAttrs (attrs.map (VAttr.eval s₂))).filterMap managedAttrName, mg'.contains nm = true) := by
   dsimp only [applyDynAttrsM]; split
   · rcases ElemClean_applyAttrsM a node ns tag st mg cs (attrs.map (VAttr.eval s₂)) hElClean (hclean.2.1 s₂) with ⟨st', hget, heqv', hElClean'⟩
     have ⟨hnx, hne⟩ := applyAttrsM_preserves (a.set node (.element ns tag st mg cs)) node (attrs.map (VAttr.eval s₂))
@@ -258,11 +199,8 @@ theorem applyDynAttrsM_spec (a : DomArena msg) (node : Dom.Node) (ns tag : Strin
   · rename_i hnotBind
     have hnb : noBind attrs = true := List.all_eq_true.2 fun x hx => by cases x <;> first | rfl | exact False.elim (hnotBind (List.any_eq_true.2 ⟨_, hx, rfl⟩))
     rw [congrArg Prod.snd (applyDynAttrListM_fold a node s₂ ns tag mg cs attrs st hnb)]
-    let clsPart : List (Attr msg) :=
-      let cl := ((attrs.map (VAttr.eval s₁)).filterMap (fun | .cls c => some c | _ => none)).filter (· != "")
-      if cl.isEmpty then [] else [Attr.cls (String.intercalate " " cl)]
-    have hnorm (s : σ) : normalizeAttrs (attrs.map (VAttr.eval s)) = clsPart ++ dedupAttrs (nonCls s attrs) := by
-      unfold normalizeAttrs; dsimp only [clsPart, nonCls]; rw [filterMap_eq_of_noBind _ (fun _ _ => rfl) s s₁ attrs hnb]; rfl
+    let clsPart : List (Attr msg) := let cl := ((attrs.map (VAttr.eval s₁)).filterMap (fun | .cls c => some c | _ => none)).filter (· != ""); if cl.isEmpty then [] else [Attr.cls (String.intercalate " " cl)]
+    have hnorm (s : σ) : normalizeAttrs (attrs.map (VAttr.eval s)) = clsPart ++ dedupAttrs (nonCls s attrs) := by unfold normalizeAttrs; dsimp only [clsPart, nonCls]; rw [filterMap_eq_of_noBind _ (fun _ _ => rfl) s s₁ attrs hnb]; rfl
     have hdd (s : σ) : ElemStateEquiv ((dedupAttrs (nonCls s attrs)).foldl stepSpecAttr (clsPart.foldl stepSpecAttr {})) ((nonCls s attrs).foldl stepSpecAttr (clsPart.foldl stepSpecAttr {})) :=
       dedupAttrs_foldl_equiv _ _ (List.all_eq_true.2 fun a ha => List.all_eq_true.1 (hclean.2.2.1 s) a (List.mem_filter.1 ha).1)
     have hmgOf {a : Attr msg} {nm : String} (ha : a ∈ nonCls s₁ attrs) (hm : managedAttrName a = some nm) : mg.contains nm = true :=
@@ -277,6 +215,14 @@ theorem applyDynAttrsM_spec (a : DomArena msg) (node : Dom.Node) (ns tag : Strin
         rcases List.mem_map.1 hxm with ⟨va, hva, rfl⟩; have hv := List.all_eq_true.1 hnb va hva
         exact hmgOf (List.mem_filter.2 ⟨List.mem_map.2 ⟨va, hva, rfl⟩, by cases va <;> first | exact hxnc | rfl | cases hv⟩) (by cases va <;> first | exact hmk | cases hv)⟩
 
+abbrev DynAttrsOk (attrs : List (VAttr σ msg)) (s₂ : σ) (st' : SpecElemState msg) (mg' : List String) : Prop :=
+  ElemClean st' mg' ∧ ElemStateEquiv st' (evalSpecAttrs (attrs.map (VAttr.eval s₂))) ∧ (∀ nm ∈ (normalizeAttrs (attrs.map (VAttr.eval s₂))).filterMap managedAttrName, mg'.contains nm = true)
+theorem applyDynAttrsM_elem_ext {a : DomArena msg} {node : Dom.Node} {ns tag : String} {st : SpecElemState msg} {mg : List String} {cs : List Dom.Node}
+    {attrs : List (VAttr σ msg)} {s₁ s₂ : σ} (hget : a.get node = .element ns tag st mg cs) (hclean : VAttrListClean attrs) (hDyn₁ : DynAttrsOk attrs s₁ st mg) :
+    let a' := (applyDynAttrsM (m := ArenaM msg) node attrs s₂ a).2
+    ArenaExt a a' (· = node.toNat) 0 ∧ a'.nextId = a.nextId ∧ (∀ m, m ≠ node → a'.get m = a.get m) ∧ ∃ st' mg', a'.get node = .element ns tag st' mg' cs ∧ DynAttrsOk attrs s₂ st' mg' := by
+  have h := applyDynAttrsM_spec a node ns tag st mg cs attrs s₁ s₂ hclean hDyn₁.1 hDyn₁.2.1 hDyn₁.2.2; rw [DomArena.set_get_self a hget] at h; rcases h with ⟨hn, hne, rest⟩
+  exact ⟨ArenaExt.of_next_eq hn fun m _ h => hne m (node_ne_of_toNat_ne h), hn, hne, rest⟩
 theorem array_push_step_inv {α : Type} {a : Array α} {i bound : Nat} {x : α} {f : (j : Nat) → j < bound → α}
     (hle : i < bound) (hsz : a.size = i) (hprev : ∀ j (hj : j < i), a[j]'(by omega) = f j (Nat.lt_trans hj hle)) (hcur : x = f i hle) :
     ∀ j (hj : j < i + 1), (a.push x)[j]'(by rw [Array.size_push, hsz]; omega) = f j (by omega) := fun j hj => by

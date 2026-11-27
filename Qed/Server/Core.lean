@@ -38,7 +38,7 @@ inductive AuthMethod where
   | session
   | bearer
   | oidcJwt
-deriving Inhabited, DecidableEq, Repr
+deriving Inhabited, DecidableEq
 
 structure RequestCtx where
   headers     : List (String × String) := []
@@ -51,7 +51,7 @@ structure RequestCtx where
   connId      : String := ""
   query       : String := ""
   body        : String := ""
-deriving Inhabited, DecidableEq, Repr
+deriving Inhabited, BEq
 
 namespace RequestCtx
 def header (ctx : RequestCtx) (name : String) : Option String :=
@@ -113,7 +113,7 @@ private theorem filter_no_crlf (p : Char → Bool) (hp : p '\r' = false ∧ p '\
 theorem header_no_crlf (s : String) : ∀ c ∈ (sanitizeHeader s).toList, c ≠ '\r' ∧ c ≠ '\n' ∧ c ≠ '\x00' :=
   filter_no_crlf isSafeHeaderChar (by decide) s
 
-inductive SameSite where | lax | strict | none deriving Inhabited, DecidableEq, Repr
+inductive SameSite where | lax | strict | none deriving Inhabited, DecidableEq
 def SameSite.render : SameSite → String | .lax => "Lax" | .strict => "Strict" | .none => "None"
 @[inline] def isSafeCookieAtomChar (c : Char) : Bool := let n := c.toNat; 33 ≤ n && n ≠ 127 && c ≠ ';' && c ≠ '=' && c ≠ ',' && c ≠ '"'
 @[inline] def isSafeCookieValChar  (c : Char) : Bool := let n := c.toNat; 32 ≤ n && n ≠ 127 && c ≠ ';'
@@ -129,7 +129,7 @@ structure SetCookie where
   secure   : Bool := false
   maxAge?  : Option Nat := none
   domain?  : Option String := none
-deriving Inhabited, DecidableEq, Repr
+deriving Inhabited, DecidableEq
 
 namespace SetCookie
 def mkSafe (name value : String) (maxAge? : Option Nat := none) (secure : Bool := false)
@@ -146,11 +146,19 @@ def render (c : SetCookie) : String :=
     dom ++ age ++ (if c.secure then "; Secure" else "") ++
     (if c.httpOnly then "; HttpOnly" else "") ++ "; SameSite=" ++ c.sameSite.render
 
+private theorem noCrlfEmpty : NoCrlf "" := fun _ h => nomatch h
 private theorem cat {a b : String} (ha : NoCrlf a) (hb : NoCrlf b) : NoCrlf (a ++ b) := fun c hc =>
   (List.mem_append.1 (String.toList_append ▸ hc)).elim (ha c) (hb c)
 private theorem noCrlfIte (b : Bool) {t e : String} (ht : NoCrlf t) (he : NoCrlf e) : NoCrlf (if b then t else e) := by cases b <;> assumption
-private theorem noCrlfLit (s : String) (h : s.toList.all (fun c => c != '\r' && c != '\n' && c != '\x00') = true) : NoCrlf s := by
-  intro c hc; have := (List.all_eq_true.1 h) c hc; simp only [Bool.and_eq_true, bne_iff_ne] at this; exact ⟨this.1.1, this.1.2, this.2⟩
+private theorem noCrlfLit {s : String} (h : s.toByteArray.data.toList.all (fun b => b != 13 && b != 10 && b != 0) = true := by decide +kernel) : NoCrlf s :=
+  let ofB (b : UInt8) (hb : b.toNat < 128) (hp : (b != 13 && b != 10 && b != 0) = false) :=
+    Db.noAsciiChar_of_bytes b hb s (List.all_eq_true.2 fun x hx =>
+      bne_iff_ne.2 fun heq => by subst heq; have := List.all_eq_true.1 h x hx; rw [hp] at this; cases this)
+  fun c hc => ⟨ofB 13 (by decide) rfl c hc, ofB 10 (by decide) rfl c hc, ofB 0 (by decide) rfl c hc⟩
+private theorem catL {a s : String} (ha : NoCrlf a) (h : s.toByteArray.data.toList.all (fun b => b != 13 && b != 10 && b != 0) = true := by decide +kernel) : NoCrlf (a ++ s) :=
+  cat ha (noCrlfLit h)
+private theorem lCat {s b : String} (hb : NoCrlf b) (h : s.toByteArray.data.toList.all (fun b => b != 13 && b != 10 && b != 0) = true := by decide +kernel) : NoCrlf (s ++ b) :=
+  cat (noCrlfLit h) hb
 private theorem nat_toString_no_crlf (n : Nat) : NoCrlf (toString n) := fun c hc =>
   let hb := Qed.Server.Db.nat_toString_digits n c hc
   ⟨fun h => absurd (h ▸ hb) (by decide), fun h => absurd (h ▸ hb) (by decide), fun h => absurd (h ▸ hb) (by decide)⟩
@@ -160,13 +168,12 @@ theorem render_no_crlf (c : SetCookie) : ∀ ch ∈ c.render.toList, ch ≠ '\r'
   unfold SetCookie.render; dsimp only
   have hVal (s : String) : NoCrlf (sanitizeCookieVal s) := filter_no_crlf isSafeCookieValChar (by decide) s
   have hDom : NoCrlf (match dom with | some d => let sd := sanitizeCookieVal d; if sd.isEmpty then "" else "; Domain=" ++ sd | none => "") := by
-    cases dom with | none => exact noCrlfLit "" rfl | some d => exact noCrlfIte _ (noCrlfLit "" rfl) (cat (noCrlfLit "; Domain=" rfl) (hVal d))
+    cases dom with | none => exact noCrlfEmpty | some d => exact noCrlfIte _ noCrlfEmpty (lCat (hVal d))
   have hAge : NoCrlf (match age with | some n => "; Max-Age=" ++ toString n | none => "") := by
-    cases age with | none => exact noCrlfLit "" rfl | some n => exact cat (noCrlfLit "; Max-Age=" rfl) (nat_toString_no_crlf n)
-  exact cat (cat (cat (cat (cat (cat (cat (cat (cat (cat (filter_no_crlf isSafeCookieAtomChar (by decide) name) (noCrlfLit "=" rfl)) (hVal val))
-    (noCrlfLit "; Path=" rfl)) (hVal _)) hDom) hAge) (noCrlfIte sec (noCrlfLit "; Secure" rfl) (noCrlfLit "" rfl)))
-    (noCrlfIte ho (noCrlfLit "; HttpOnly" rfl) (noCrlfLit "" rfl))) (noCrlfLit "; SameSite=" rfl))
-    (show NoCrlf ss.render by cases ss <;> exact noCrlfLit _ rfl)
+    cases age with | none => exact noCrlfEmpty | some n => exact lCat (nat_toString_no_crlf n)
+  exact filter_no_crlf isSafeCookieAtomChar (by decide) name |> catL |> (cat · (hVal val)) |> catL |> (cat · (hVal _))
+    |> (cat · hDom) |> (cat · hAge) |> (cat · (noCrlfIte sec noCrlfLit noCrlfEmpty))
+    |> (cat · (noCrlfIte ho noCrlfLit noCrlfEmpty)) |> catL |> (cat · (show NoCrlf ss.render by cases ss <;> exact noCrlfLit))
 end SetCookie
 
 /-! ## SSE Events & Custom HTTP Responses -/
@@ -176,7 +183,7 @@ structure SseEvent where
   event : Option String := none
   id    : Option String := none
   retry : Option Nat := none
-deriving Inhabited, DecidableEq, Repr
+deriving Inhabited, DecidableEq
 
 namespace SseEvent
 def msg (data : String) (event : Option String := none) (id : Option String := none) (retry : Option Nat := none) : SseEvent :=
@@ -435,7 +442,7 @@ structure OutboundResp where
   status  : UInt32
   body    : ByteArray
   headers : List (String × String) := []
-deriving Inhabited, DecidableEq
+deriving Inhabited, BEq
 
 inductive ServerEffect : Type where
   | httpCall (req : OutboundReq) | dbExec (cfg : Db.DbConfig) (q : Db.SqlQuery) | dbExecDdl (cfg : Db.DbConfig)
@@ -805,7 +812,6 @@ structure ServerJob (σ : Type) extends JobMeta where
   runWorkM? : Option ({m : Type → Type} → [Monad m] → [MonadServer m] → [MonadAtomic σ m] → m (Except ApiError Bool)) := none
 structure VerifiedJob (σ : Type) (Inv : σ → Prop) extends ServerJob σ where
   preserves : ProgPreservesInv Inv (runM (m := ThreadProg σ))
-abbrev StatelessJob := ServerJob Unit
 structure IoJob extends JobMeta where
   runOnce     : IO (Except ApiError Unit)
   runWorkOnce : IO (Except ApiError Bool) := runOnce.map fun | .ok () => .ok false | .error e => .error e
@@ -843,7 +849,7 @@ abbrev runServerJobs := @spawnServerJobs
 
 inductive SrvFailure (ε : Type) where
   | api (err : ApiError) | domain (tag : ε) (message : String)
-deriving Inhabited, DecidableEq, Repr
+deriving Inhabited, BEq
 def SrvFailure.toWire {ε α : Type} : Except (SrvFailure ε) α → Except ApiError (Except (RpcDomainError ε) α)
   | .ok a => .ok (.ok a) | .error (.domain t msg) => .ok (.error ⟨t, msg⟩) | .error (.api err) => .error err
 

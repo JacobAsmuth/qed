@@ -49,12 +49,14 @@ def execDbMaybeTx {m : Type → Type} [MonadServer m] (cfg : DbConfig) (q : SqlQ
 section DbEnc
 variable {m : Type → Type} [Monad m] [MonadServer m]
 
+@[noinline, nospecialize]
 private def dbEncryptVal (spec : EncColSpec) : SqlVal → m (Except ApiError SqlVal)
   | .null => pure (.ok .null)
   | .text s => (·.map fun ct => .text (Qed.Base64.encode ct)) <$> MonadServer.aeadEncrypt spec.keyEnv spec.fallback? spec.aad s.toUTF8
   | .bytes bs => (·.map fun ct => .text (Qed.Base64.encode ct)) <$> MonadServer.aeadEncrypt spec.keyEnv spec.fallback? spec.aad bs
   | _ => pure (.error (ApiError.internal "encrypted database column expects TEXT, BLOB, or NULL"))
 
+@[noinline, nospecialize]
 private def dbDecryptTryPrev (aad : ByteArray) (raw : ByteArray) (origErr : ApiError) :
     List (String × Option String) → m (Except ApiError ByteArray)
   | [] => pure (.error origErr)
@@ -73,6 +75,7 @@ private def finishDecryptVal (isBytes : Bool) (res : Except ApiError ByteArray) 
       | some s => .ok (.text s)
       | none => .error (ApiError.internal "decrypted database column is not valid UTF-8")
 
+@[noinline, nospecialize]
 private def dbDecryptVal (spec : EncColSpec) : SqlVal → m (Except ApiError SqlVal)
   | .null => pure (.ok .null)
   | .text b64 =>
@@ -87,10 +90,12 @@ private def dbDecryptVal (spec : EncColSpec) : SqlVal → m (Except ApiError Sql
                 else finishDecryptVal spec.isBytes <$> dbDecryptTryPrev spec.aad raw err spec.prevKeys
   | _ => pure (.error (ApiError.internal "encrypted database column stored value must be TEXT or NULL"))
 
+@[noinline, nospecialize]
 private def mapExceptList {α β : Type} (f : α → m (Except ApiError β)) : List α → m (Except ApiError (List β))
   | [] => pure (.ok [])
   | x :: xs => f x >>= fun | .error e => pure (.error e) | .ok y => (·.map (y :: ·)) <$> mapExceptList f xs
 
+@[noinline, nospecialize]
 def dbEncryptQuery (encWrite : List (String × EncColSpec)) (q : SqlQuery) : m (Except ApiError SqlQuery) :=
   let encCols (cols : List (SqlIdent × SqlVal)) := mapExceptList (fun (c, v) =>
     match encWrite.lookup c.raw with | some spec => (·.map (c, ·)) <$> dbEncryptVal spec v | none => pure (.ok (c, v))) cols
@@ -107,6 +112,7 @@ def dbEncryptQuery (encWrite : List (String × EncColSpec)) (q : SqlQuery) : m (
           | none, _ => pure (.ok (c, e))) sets
     | _ => pure (.ok q)
 
+@[noinline, nospecialize]
 private def dbDecryptRow : List (Nat × EncColSpec) → DbRow → m (Except ApiError DbRow)
   | [], row => pure (.ok row)
   | (idx, spec) :: rest, row =>
@@ -114,6 +120,7 @@ private def dbDecryptRow : List (Nat × EncColSpec) → DbRow → m (Except ApiE
         dbDecryptVal spec row[idx] >>= fun | .error e => pure (.error e) | .ok dv => dbDecryptRow rest (row.set idx dv h)
       else pure (.error (ApiError.internal s!"encrypted column index {idx} out of bounds"))
 
+@[noinline, nospecialize]
 def dbDecryptResult (encRead : List (Nat × EncColSpec)) (res : DbResult) : m (Except ApiError DbResult) :=
   if encRead.isEmpty then pure (.ok res)
   else (·.map fun rs => { res with rows := rs.toArray }) <$> mapExceptList (dbDecryptRow encRead) res.rows.toList
@@ -348,17 +355,12 @@ abbrev dbFindOneProj {Proj : Type} {P : Prop} (cfg : DbConfig) (q : SqlQuery) (d
 
 abbrev dbCount {P : Prop} (cfg : DbConfig) (q : SqlQuery) (pf : P) (txId? : Option UInt64 := none) : m (Except ApiError Nat) :=
   dbRun cfg q txId? (decodeFirstCell (α := Nat) id none 0 "COUNT") pf
-
 abbrev dbSumNat {P : Prop} (cfg : DbConfig) (q : SqlQuery) (pf : P) (txId? : Option UInt64 := none) : m (Except ApiError Nat) :=
   dbRun cfg q txId? (decodeFirstCell (α := Nat) id (some 0) 0 "SUM") pf
-
 abbrev dbSumInt {P : Prop} (cfg : DbConfig) (q : SqlQuery) (pf : P) (txId? : Option UInt64 := none) : m (Except ApiError Int) :=
   dbRun cfg q txId? (decodeFirstCell (α := Int) id (some 0) 0 "SUM") pf
-
-abbrev dbAggOpt {Val : Type} [FromSql Val] {P : Prop} (cfg : DbConfig) (q : SqlQuery) (_proj : Row → Val)
-    (pf : P) (txId? : Option UInt64 := none) : m (Except ApiError (Option Val)) :=
+abbrev dbAggOpt {Val : Type} [FromSql Val] {P : Prop} (cfg : DbConfig) (q : SqlQuery) (_proj : Row → Val) (pf : P) (txId? : Option UInt64 := none) : m (Except ApiError (Option Val)) :=
   dbRun cfg q txId? (decodeFirstCell (α := Val) some (some none) none "aggregate") pf
-
 abbrev dbDelete {P : Prop} (cfg : DbConfig) (q : SqlQuery) (pf : P) (txId? : Option UInt64 := none) : m (Except ApiError Nat) :=
   dbRun cfg q txId? (fun dbRes => .ok dbRes.affected) pf
 
@@ -425,18 +427,11 @@ theorem some_getD_eq_self_iff {α : Type} (o : Option α) (d : α) : some (o.get
 /-! ## Standalone Typed DB Client (for background workers & scripts outside `server`) -/
 
 inductive DbFilter where
-  | litTrue
-  | cmp       (op : SqlBinOp) (col : String) (val : SqlVal)
-  | isNull    (col : String)
-  | isNotNull (col : String)
-  | and       (a b : DbFilter)
-  | or        (a b : DbFilter)
-  | not       (a : DbFilter)
+  | litTrue | cmp (op : SqlBinOp) (col : String) (val : SqlVal) | isNull (col : String) | isNotNull (col : String)
+  | and (a b : DbFilter) | or (a b : DbFilter) | not (a : DbFilter)
 
 private def resolveDbCol (tblName : String) (cols : List SqlIdent) (col : String) : Except ApiError SqlIdent :=
-  match cols.find? (·.raw == col) with
-  | some cid => .ok cid
-  | none => .error (ApiError.badRequest s!"unknown column `{col}` on table `{tblName}`")
+  (cols.find? (·.raw == col)).elim (.error (ApiError.badRequest s!"unknown column `{col}` on table `{tblName}`")) .ok
 
 namespace DbFilter
 def eq {α : Type} [ToSql α] (col : String) (v : α) : DbFilter := .cmp .eq col (ToSql.toSql v)
@@ -451,16 +446,12 @@ def toSqlExpr (tblName : String) (cols : List SqlIdent) : DbFilter → Except Ap
   | .cmp op col v => (resolveDbCol tblName cols col).map fun cid => .binOp op (.col cid) (.param v)
   | .isNull col => (resolveDbCol tblName cols col).map fun cid => .isNull (.col cid)
   | .isNotNull col => (resolveDbCol tblName cols col).map fun cid => .isNotNull (.col cid)
-  | .and a b => do return .binOp .and (← toSqlExpr tblName cols a) (← toSqlExpr tblName cols b)
-  | .or a b => do return .binOp .or (← toSqlExpr tblName cols a) (← toSqlExpr tblName cols b)
-  | .not a => do return .not (← toSqlExpr tblName cols a)
+  | .and a b => (toSqlExpr tblName cols a).bind fun ea => (toSqlExpr tblName cols b).map (.binOp .and ea)
+  | .or a b => (toSqlExpr tblName cols a).bind fun ea => (toSqlExpr tblName cols b).map (.binOp .or ea)
+  | .not a => (toSqlExpr tblName cols a).map .not
 end DbFilter
 
-inductive DbSetRhs where
-  | val (v : SqlVal)
-  | add (delta : SqlVal)
-  | sub (delta : SqlVal)
-deriving Inhabited, DecidableEq
+inductive DbSetRhs where | val (v : SqlVal) | add (delta : SqlVal) | sub (delta : SqlVal) deriving Inhabited
 
 @[inline] def sqlSet {α : Type} [ToSql α] (col : String) (v : α) : String × DbSetRhs := (col, .val (ToSql.toSql v))
 @[inline] def sqlAdd {α : Type} [ToSql α] (col : String) (delta : α) : String × DbSetRhs := (col, .add (ToSql.toSql delta))

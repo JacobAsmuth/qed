@@ -82,7 +82,7 @@ def decodePgCell (oid : Nat) (raw : ByteArray) : Except String SqlVal :=
   | some s =>
       if oid == 16 then .ok (.bool (s == "t" || s == "true" || s == "1"))
       else if oid == 20 || oid == 21 || oid == 23 then (s.toInt?).elim (.error s!"postgres invalid int cell: {s}") (.ok ∘ .int)
-      else if oid == 17 then if s.startsWith "\\x" then (Proto.decodeHex (String.ofList (s.toList.drop 2))).map .bytes else .ok (.bytes raw)
+      else if oid == 17 then if s.startsWith "\\x" then (decodeSqlHex s).map .bytes else .ok (.bytes raw)
       else .ok (.text s)
 def parseDataRow (oids : Array Nat) (payload : ByteArray) : Except String DbRow :=
   let rec go (off colIdx : Nat) (acc : Array SqlVal) : Nat → Except String DbRow
@@ -100,7 +100,7 @@ def parseCommandTag (payload : ByteArray) : String :=
 
 /-! ### `postgres://` URL Parser & SCRAM-SHA-256 Auth -/
 
-inductive PgSslMode where | disable | prefer | require deriving Inhabited, DecidableEq
+inductive PgSslMode where | disable | prefer | require deriving Inhabited, BEq
 structure PgConnParams where
   user      : String := "postgres"
   password  : String := ""

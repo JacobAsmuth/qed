@@ -2,7 +2,6 @@ import Cli.Verify
 import Cli.Watch
 import Cli.DevAuth
 import Qed.Server.Native
-import Qed.Deploy
 
 open System (FilePath)
 
@@ -61,9 +60,7 @@ private def copyLocalStylesheets (outDir : FilePath) (sheets : List String) : IO
         let isFile ← try pure ((← sr.metadata).type == .file) catch _ => pure false
         if isFile && sr.toString.startsWith rootPrefix then
           let some dstParent ← ensureSafeSubdir outReal outPrefix segs.dropLast | break
-          let dst := dstParent / fileName
-          if let some dty ← symlinkType? dst then if ← orB (dty != .file) ((fun r => !r.any (·.toString.startsWith outPrefix)) <$> realPath? dst) then break
-          IO.FS.writeBinFile dst (← IO.FS.readBinFile sr); break
+          discard <| writeBytesInsideDir dstParent fileName (← IO.FS.readBinFile sr); break
 
 private def parseCssOutput (outDir : FilePath) (out : String) : IO (Bool × List String) := do
   let lines := nonEmptyLines out
@@ -333,14 +330,21 @@ private def publishDevStatus (outDir : FilePath) (sse? : Option Watch.DevSseServ
   let json ← writeDevStatusJson outDir status kind errText durationMs bumpId ((sse?.map (·.url)).getD "")
   if let some srv := sse? then srv.publish json
 
+private structure DevWatchState where
+  watcher?  : Option Watch.FileWatcher
+  leanMt    : Int
+  cssMt     : Int
+  rtMt      : Int
+  curServer : IO.Process.Child ⟨.null, .null, .inherit⟩
+  isNative  : Bool
+
 def cmdDev : IO UInt32 := do
   IO.FS.createDirAll devDir
   let (qh, mod) := (← frameworkHome, ← jsRoot)
   let sse? := (← Watch.DevSseServer.start (parsePort ((← env "QED_DEV_SSE_PORT").getD "0") 0)).toOption
   let sseUrl := (sse?.map (·.url)).getD ""
-  let mut watcher? := (← Watch.FileWatcher.open "." (qh / "runtime").toString devSkipDirs.toArray).toOption
-  let (initLeanMt, initCssMt, initRtMt) ← if watcher?.isSome then pure (0, 0, 0) else scanDevMtimes qh
-  let mut leanMt := initLeanMt; let mut cssMt := initCssMt; let mut rtMt := initRtMt
+  let initWatcher? := (← Watch.FileWatcher.open "." (qh / "runtime").toString devSkipDirs.toArray).toOption
+  let (initLeanMt, initCssMt, initRtMt) ← if initWatcher?.isSome then pure (0, 0, 0) else scanDevMtimes qh
   let t0 ← IO.monoMsNow; step "initial build"; clearLastBuildError
   let initOk ← buildJs devDir (prod := false) (fastClientDev := true) (sourceMap := true) (sseUrl := sseUrl)
   let elapsed := (← IO.monoMsNow) - t0
@@ -357,17 +361,23 @@ def cmdDev : IO UInt32 := do
     publishDevStatus devDir sse? "error" "hmr" (← getLastBuildError) elapsed true
     IO.eprintln (red "initial build failed, fix the error and save; dev will rebuild")
   let port := (← env "PORT").getD devPort; let portNum := parsePort port
-  let (initServer, initNative) ← spawnDevChild port devEnv; let mut curServer := initServer; let mut isNative := initNative
+  let (initServer, initNative) ← spawnDevChild port devEnv
+  let mut st : DevWatchState := { watcher? := initWatcher?, leanMt := initLeanMt, cssMt := initCssMt, rtMt := initRtMt, curServer := initServer, isNative := initNative }
   waitDevServerHealthy portNum
-  let watchTag := match watcher?, sse? with | some _, some _ => "OS watch + SSE push" | some _, none => "OS watch" | none, some _ => "SSE push" | none, none => "watching"
-  IO.println (green s!"\nqed dev → http://localhost:{port}{if isNative then "   (Native + SSR + HMR)" else "   (HMR)"}{devAuthNote}   ({watchTag}; Ctrl-C to stop)\n")
+  let watchTag := match st.watcher?, sse? with | some _, some _ => "OS watch + SSE push" | some _, none => "OS watch" | none, some _ => "SSE push" | none, none => "watching"
+  IO.println (green s!"\nqed dev → http://localhost:{port}{if st.isNative then "   (Native + SSR + HMR)" else "   (HMR)"}{devAuthNote}   ({watchTag}; Ctrl-C to stop)\n")
   while true do
-    let mut leanChg := false; let mut cssChg := false; let mut rtChg := false
-    match watcher? with
-    | some w => let ev ← w.wait 1000; if ev.error then w.close; watcher? := none else leanChg := ev.lean; cssChg := ev.css; rtChg := ev.runtime
-    | none =>
-        IO.sleep 120; let (cL, cC, cR) ← scanDevMtimes qh
-        if cL > leanMt then leanMt := cL; leanChg := true else if cC > cssMt then cssMt := cC; cssChg := true else if cR > rtMt then rtMt := cR; rtChg := true
+    let (leanChg, cssChg, rtChg) ← match st.watcher? with
+      | some w =>
+          let ev ← w.wait 1000
+          if ev.error then w.close; st := { st with watcher? := none }; pure (false, false, false)
+          else pure (ev.lean, ev.css, ev.runtime)
+      | none =>
+          IO.sleep 120; let (cL, cC, cR) ← scanDevMtimes qh
+          if cL > st.leanMt then st := { st with leanMt := cL }; pure (true, false, false)
+          else if cC > st.cssMt then st := { st with cssMt := cC }; pure (false, true, false)
+          else if cR > st.rtMt then st := { st with rtMt := cR }; pure (false, false, true)
+          else pure (false, false, false)
     let tStart ← IO.monoMsNow
     let finishOk (kind msg : String) (post : IO Unit := pure ()) : IO Unit := do
       let ms := (← IO.monoMsNow) - tStart; publishDevStatus devDir sse? "ok" kind "" ms true; post; IO.println (green s!"✓ {msg}{ms}ms)")
@@ -377,10 +387,10 @@ def cmdDev : IO UInt32 := do
       let (prevApp, prevCss, prevSrv) := (← fileHash? (devDir / "app.mjs"), ← fileHash? (devDir / "styles.css"), ← mtimeNs (devDir / "server"))
       if ← buildJs devDir (prod := false) (fastClientDev := true) (sourceMap := true) (sseUrl := sseUrl) then
         let nowNative ← (devDir / "server").pathExists
-        let srvChanged ← orB (isNative != nowNative) (andB nowNative ((prevSrv != ·) <$> mtimeNs (devDir / "server")))
+        let srvChanged ← orB (st.isNative != nowNative) (andB nowNative ((prevSrv != ·) <$> mtimeNs (devDir / "server")))
         if srvChanged then
-          curServer.kill; discard <| curServer.wait
-          let (restarted, nat) ← spawnDevChild port devEnv; curServer := restarted; isNative := nat; waitDevServerHealthy portNum
+          st.curServer.kill; discard <| st.curServer.wait
+          let (restarted, nat) ← spawnDevChild port devEnv; st := { st with curServer := restarted, isNative := nat }; waitDevServerHealthy portNum
         let isCss ← andB (!srvChanged) (do if prevApp == (← fileHash? (devDir / "app.mjs")) then pure (prevCss != (← fileHash? (devDir / "styles.css"))) else pure false)
         finishOk (if isCss then "css" else "hmr") s!"reloaded ({if isCss then "css" else "hmr"}, " (do if ← isInRepo then discard effectsCovered)
       else

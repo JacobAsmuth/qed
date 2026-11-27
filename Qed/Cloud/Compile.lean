@@ -86,6 +86,6 @@ def planPreviewTeardown (live : GcpObservedState) : List GcpAction :=
   else
     ((live.bindings.filter fun b => b.resource.ownerKey? == some live.key && !b.resource.isAsset).map .revokeBinding) ++
     (live.secretNames.map (.deleteSecret live.key)) ++ (live.managedDbs.map (.dropPreviewDb live.key)) ++
-    [.deleteService live.key, .deleteEgressPolicy live.key, .pruneDenyException live.key, .deleteServiceAccount live.key]
+    ([.deleteService live.key, .deleteEgressPolicy live.key, .pruneDenyException live.key, .deleteServiceAccount live.key] : List GcpAction)
 
 end Qed.Cloud

@@ -13,6 +13,7 @@ def axiomsManifest : FilePath := "scripts" / "axioms.lean"
 
 def env (k : String) : IO (Option String) := IO.getEnv k
 def nonEmptyEnv (k : String) : IO (Option String) := do return (← env k).bind fun s => let t := s.cliTrim; if t.isEmpty then none else some t
+def optOrEnv (o : Option String) (k : String) : IO (Option String) := o.elim (nonEmptyEnv k) (pure ∘ some)
 def frameworkHome : IO FilePath := return (← env "QED_HOME").getD "."
 def runtimeFile (name : String) : IO FilePath := return (← frameworkHome) / "runtime" / name
 def isInRepo : IO Bool := (FilePath.mk "Examples").pathExists
@@ -20,18 +21,72 @@ def modLeanPath (mod : String) : FilePath := FilePath.mk ((mod.replace "." "/") 
 def modOleanPath (mod : String) : FilePath := FilePath.mk ".lake" / "build" / "lib" / "lean" / ((mod.replace "." "/") ++ ".olean")
 def dirPrefix (realDir : FilePath) : String := let s := realDir.toString; if s.endsWith "/" then s else s ++ "/"
 def realPath? (p : FilePath) : IO (Option FilePath) := try some <$> IO.FS.realPath p catch _ => pure none
-def symlinkType? (p : FilePath) : IO (Option IO.FS.FileType) := try some <$> (·.type) <$> p.symlinkMetadata catch _ => pure none
+def symlinkMetadata? (p : FilePath) : IO (Option IO.FS.Metadata) := try some <$> p.symlinkMetadata catch _ => pure none
+def symlinkType? (p : FilePath) : IO (Option IO.FS.FileType) := return (← symlinkMetadata? p).map (·.type)
 def removeIfExists (p : FilePath) : IO Unit := do if ← p.pathExists then try IO.FS.removeFile p catch _ => pure ()
 def andB [Monad m] (a : Bool) (b : m Bool) : m Bool := if a then b else pure false
 def orB [Monad m] (a : Bool) (b : m Bool) : m Bool := if a then pure true else b
 
-def writeFileInsideDir (realOutDir : FilePath) (fileName content : String) : IO (Except String FilePath) := do
+def writeBytesInsideDir (realOutDir : FilePath) (fileName : String) (bytes : ByteArray) : IO (Except String FilePath) := do
   let dst := realOutDir / fileName
   if let some ty ← symlinkType? dst then
     if ty != .file then return .error s!"refusing to overwrite symlink or non-regular file `{dst}`"
     let dstReal ← try IO.FS.realPath dst catch e => return .error s!"failed to canonicalize `{dst}`: {e}"
     if !dstReal.toString.startsWith (dirPrefix realOutDir) then return .error s!"refusing to write `{dst}` resolving outside `{realOutDir}`"
-  IO.FS.writeFile dst content; return .ok dst
+  IO.FS.writeBinFile dst bytes; return .ok dst
+
+def writeFileInsideDir (realOutDir : FilePath) (fileName content : String) : IO (Except String FilePath) :=
+  writeBytesInsideDir realOutDir fileName content.toUTF8
+
+def redactArg (s : String) : String :=
+  match s.splitOn "=" with
+  | k :: _ :: _ => s!"{k}=<redacted>"
+  | _           => s
+
+inductive CliFlagSpec (σ : Type) where
+  | bool (names : List String) (update : σ → σ)
+  | val  (names : List String) (update : σ → String → Except String σ)
+  | passThroughVal (names : List String)
+
+def CliFlagSpec.valOk {σ : Type} (names : List String) (f : σ → String → σ) : CliFlagSpec σ :=
+  .val names fun s v => .ok (f s v)
+
+structure CliParseConfig (σ : Type) where
+  flags      : List (CliFlagSpec σ)
+  allowEq    : Bool := true
+  allowPos   : Bool := true
+  passDash   : Bool := false
+  unknownErr : String → String
+  missingErr : String → String := fun f => s!"missing value for `{f}`"
+
+def parseCliFlags {σ : Type} (cfg : CliParseConfig σ) (init : σ) (args : List String) :
+    Except String (σ × List String) :=
+  let findBool (a : String) := cfg.flags.findSome? fun | .bool ns u => if ns.contains a then some u else none | _ => none
+  let findVal (a : String) := cfg.flags.findSome? fun | .val ns u => if ns.contains a then some u else none | _ => none
+  let findValEq (a : String) :=
+    if !cfg.allowEq then none
+    else cfg.flags.findSome? fun
+      | .val ns u => ns.findSome? fun nm =>
+          let pfx := nm ++ "="
+          if a.startsWith pfx then some (u, (a.drop pfx.length).toString) else none
+      | _ => none
+  let isPassVal (a : String) := cfg.flags.any fun | .passThroughVal ns => ns.contains a | _ => false
+  let rec go (st : σ) (pos : List String) : List String → Except String (σ × List String)
+    | [] => .ok (st, pos.reverse)
+    | a :: rest =>
+        if let some u := findBool a then go (u st) pos rest
+        else if let some u := findVal a then
+          match rest with
+          | v :: r => u st v >>= fun st' => go st' pos r
+          | [] => .error (cfg.missingErr a)
+        else if let some (u, v) := findValEq a then u st v >>= fun st' => go st' pos rest
+        else if isPassVal a then
+          match rest with
+          | v :: r => go st (v :: a :: pos) r
+          | [] => go st (a :: pos) []
+        else if !cfg.allowPos || (!cfg.passDash && a.startsWith "-") then .error (cfg.unknownErr a)
+        else go st (a :: pos) rest
+  go init [] args
 
 def webRoot : IO String := do
   if let some r ← env "QED_WEB_ROOT" then return r
@@ -92,6 +147,10 @@ def bold  (s : String) : String := paint true "1" s
 def green (s : String) : String := paint true "32" s
 def red   (s : String) : String := paint true "31" s
 def step  (s : String) : IO Unit := IO.println (bold s!"▸ {s}")
+def runExceptCmd (act : ExceptT String IO UInt32) : IO UInt32 := do
+  match ← act.run with
+  | .ok c    => return c
+  | .error e => IO.eprintln (red s!"✗ {e}"); return 1
 private def spaces (n : Nat) : String := String.ofList (List.replicate n ' ')
 
 private def parseLeanDiagLine (line : String) : Option (String × String × Nat × Nat × String) := do

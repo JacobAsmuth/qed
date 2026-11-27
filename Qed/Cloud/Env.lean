@@ -202,7 +202,7 @@ private def findAfterScheme : List Char → Option (List Char)
   | c :: cs => if c == '/' || c == '?' || c == '#' || c == '\\' then none else findAfterScheme cs
   | [] => none
 
-private def extractUrlHost (raw : String) : String :=
+def extractUrlHost (raw : String) : String :=
   let low := (((raw.toList.dropWhile (·.toNat ≤ 32)).reverse.dropWhile (·.toNat ≤ 32)).reverse).map asciiToLower
   let auth := ((findAfterScheme low).getD low).takeWhile fun c => c != '/' && c != '?' && c != '#' && c != '\\'
   let hostChars := match (splitCharAux '@' auth []).getLast?.getD [] with

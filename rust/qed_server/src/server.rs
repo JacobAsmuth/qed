@@ -794,16 +794,12 @@ ffi_export! {
 
         let per_worker_threads = env_parse::<usize>("QED_BLOCKING_THREADS").map(|n| n.clamp(1, 256).div_ceil(num_workers as usize).max(1))
             .unwrap_or_else(|| (64usize / (num_workers as usize).max(1)).clamp(2, 4));
-        let on_ws_project = if qed_lean_obj_tag(on_ws_project_opt) == 1 {
+        let on_ws_project = (qed_lean_obj_tag(on_ws_project_opt) == 1).then(|| {
             let f = qed_lean_ctor_get(on_ws_project_opt, 0);
             qed_lean_inc(f);
-            let r = LeanRef::new_persistent(f);
-            qed_lean_dec(on_ws_project_opt);
-            Some(r)
-        } else {
-            qed_lean_dec(on_ws_project_opt);
-            None
-        };
+            LeanRef::new_persistent(f)
+        });
+        qed_lean_dec(on_ws_project_opt);
         let cbs = Arc::new(Callbacks {
             init_frag: LeanRef::new_persistent(init_frag), on_head: LeanRef::new_persistent(on_head),
             on_body: LeanRef::new_persistent(on_body), on_ws_bytes: LeanRef::new_persistent(on_ws_bytes),

@@ -5,7 +5,7 @@
 #
 # Installs the Lean toolchain (elan) if missing, fetches the qed framework into
 # ~/.qed/qed, builds the qed CLI, and puts a `qed` launcher on PATH. `qed build`
-# transpiles the app to plain JavaScript — no emscripten, no wasm toolchain.
+# transpiles the app to plain JavaScript: no emscripten, no wasm toolchain.
 set -euo pipefail
 
 REPO="https://github.com/JacobAsmuth/qed"

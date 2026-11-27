@@ -3,7 +3,6 @@ import Cli.Verify
 import Cli.Build
 import Cli.Cloud
 import Cli.Deploy
-import Cli.Test
 import Cli.Scaffold
 
 open Qed.Cli in

@@ -1,7 +1,5 @@
 import Qed.Cloud.GcpApi
 import Qed.Server.Native
-import Qed.Server.Prim
-import Qed.Auth.Oidc
 
 /-! ## Thin GCP Cloud Run & IAM Executor (`Qed.Cloud.Executor`) -/
 
@@ -29,8 +27,6 @@ structure GcpExecConfig where
 deriving Inhabited
 
 def gcpCloudPlatformScope : String := "https://www.googleapis.com/auth/cloud-platform"
-
-private def nonEmptyStr? (o : Option String) : Option String := o.bind fun s => if s.isEmpty then none else some s
 
 def effectiveDeployerSaEmail? (cfg : GcpExecConfig) : Option String :=
   (nonEmptyStr? cfg.deployerSaEmail?).orElse fun _ => match cfg.auth with
@@ -213,7 +209,7 @@ private def buildCollisionFreeUpload (ep : GcpEndpoints) (key : DeployKey) (buil
       match reqUploadAsset ep key buildHash rel bytes s!"qed_gcs_{← liftIO (Qed.Server.Prim.randomHex 16)}" isPublic with
       | .ok pair => return pair | .error _ => buildCollisionFreeUpload ep key buildHash rel bytes isPublic fuel
 
-private def realPathExcept (p : System.FilePath) (label : String) : ExceptT String IO System.FilePath :=
+def realPathExcept (p : System.FilePath) (label : String) : ExceptT String IO System.FilePath :=
   ExceptT.mk (try Except.ok <$> IO.FS.realPath p catch e => pure (.error s!"{label} `{p}`: {e}"))
 
 private def executeHealthCheckInRegion (cfg : GcpExecConfig) (region : GcpRegion)
@@ -374,10 +370,10 @@ def formatRolloutPlan (plan : GcpPlan) (actions : List GcpAction) : String :=
     s!"  regions={",".intercalate (plan.regions.map GcpRegion.toString)} compute={plan.scale.cpuMilli}m/{plan.scale.memoryMb}Mi " ++
     s!"concurrency={plan.scale.concurrency} instances={plan.scale.minInstances}..{plan.scale.maxInstances} timeout={plan.scale.timeoutSec}s"
   header ++ String.join ([
-    (.phase1_provision, "Phase 1 — Provision (assets, secrets, DBs, IAM grants, denies, additive egress)"),
-    (.phase2_deployZero, "Phase 2 — Deploy 0% & Verify (new Cloud Run revision + /_qed/health)"),
-    (.phase3_shiftTraffic, "Phase 3 — Atomic Cutover (0% → 100% traffic)"),
-    (.phase4_cleanup, "Phase 4 — Cleanup (revoke stale bindings/secrets, narrow egress)")].filterMap fun (ph, title) =>
+    (.phase1_provision, "Phase 1: Provision (assets, secrets, DBs, IAM grants, denies, additive egress)"),
+    (.phase2_deployZero, "Phase 2: Deploy 0% & Verify (new Cloud Run revision + /_qed/health)"),
+    (.phase3_shiftTraffic, "Phase 3: Atomic Cutover (0% → 100% traffic)"),
+    (.phase4_cleanup, "Phase 4: Cleanup (revoke stale bindings/secrets, narrow egress)")].filterMap fun (ph, title) =>
       match actions.filter (·.phase == ph) with
       | [] => none | xs => some (s!"\n  [{title}]\n" ++ "\n".intercalate (xs.map fun a => s!"    • {formatAction a}")))
 

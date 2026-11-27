@@ -1,5 +1,5 @@
 import Qed.Cloud.Compile
-import Qed.Json
+import Qed.Json.Basic
 import Qed.Server.Http
 
 /-! ## Pure Verified GCP REST Wire Codecs & Live Drift Verifier (`Qed.Cloud.GcpApi`) -/
@@ -36,13 +36,12 @@ private def jStrArr (j : Json) (k : String) : List String := (j.arrAt k).filterM
 private def optStrField (k s : String) : List (String × Json) := if s.isEmpty then [] else [(k, .str s)]
 private def optJsonField (k : String) (v? : Option Json) : List (String × Json) := (v?.map fun v => [(k, v)]).getD []
 private def isNullOrNone : Option Json → Bool | none | some .null => true | some _ => false
-private def nonEmpty? (s? : Option String) : Option String := s?.bind fun s => if s.isEmpty then none else some s
+def nonEmptyStr? (s? : Option String) : Option String := s?.bind fun s => if s.isEmpty then none else some s
 private def mkKindObj (kind : String) (fs : List (String × Json) := []) : Json := .obj (("kind", .str kind) :: fs)
 
 /-! ### 2. Validated GCP Project IDs, Resource Paths, Principals & Roles -/
 
-private def isLowerAlnum (c : Char) : Bool := ('a' ≤ c && c ≤ 'z') || ('0' ≤ c && c ≤ '9')
-private def isTokenChar (c : Char) : Bool := isLowerAlnum c || ('A' ≤ c && c ≤ 'Z') || c == '_' || c == '-'
+private def isTokenChar (c : Char) : Bool := isDnsAlnum c || ('A' ≤ c && c ≤ 'Z') || c == '_' || c == '-'
 private def hasCtrlOrWs (s : String) : Bool := s.toList.any fun c => c.toNat ≤ 0x20 || c.toNat == 0x7F
 private def hasUrlMeta (s : String) : Bool := s.toList.any fun c => c == '?' || c == '#' || c == '\\'
 
@@ -51,7 +50,7 @@ def isValidGcpProjectId (s : String) : Bool :=
   | c :: rest =>
       let cs := c :: rest
       5 ≤ cs.length && cs.length ≤ 30 && 'a' ≤ c && c ≤ 'z' &&
-      cs.all (fun ch => isLowerAlnum ch || ch == '-') && cs.getLastD '-' != '-'
+      cs.all (fun ch => isDnsAlnum ch || ch == '-') && cs.getLastD '-' != '-'
   | [] => false
 
 def isValidGcpProjectIdOrNumber (s : String) : Bool :=
@@ -79,7 +78,7 @@ def trimLeadingSlash (s : String) : String := if s.startsWith "/" then (s.drop 1
 abbrev isSafeRelativeAssetPath : String → Bool := Qed.Deploy.isValidAssetPath
 
 def sanitizeToken (s : String) (maxLen : Nat := 24) : String :=
-  let cs := s.toLower.toList.map fun c => if isLowerAlnum c || c == '-' then c else '-'
+  let cs := s.toLower.toList.map fun c => if isDnsAlnum c || c == '-' then c else '-'
   match ((cs.dropWhile (· == '-') |>.take maxLen).reverse.dropWhile (· == '-')).reverse with
   | [] => "0" | xs => String.ofList xs
 
@@ -260,9 +259,9 @@ def reqEnsureSecret (ep : GcpEndpoints) (key : DeployKey) (secretName : String) 
 def reqDeleteSecret (ep : GcpEndpoints) (key : DeployKey) (secretName : String) : GcpHttpRequest :=
   ep.req "DELETE" "secretmanager" s!"/v1/{secretResourcePath key secretName}"
 def reqListSecrets (ep : GcpEndpoints) (key : DeployKey) (pageToken? : Option String := none) : GcpHttpRequest :=
-  let pt := (nonEmpty? pageToken?).elim "" fun t => s!"&pageToken={Qed.encodeSeg t}"
+  let pt := (nonEmptyStr? pageToken?).elim "" fun t => s!"&pageToken={Qed.encodeSeg t}"
   ep.req "GET" "secretmanager" (projV1 key s!"secrets?filter={Qed.encodeSeg s!"name:{renderKeySlug key}-"}&pageSize=100{pt}")
-def parseNextPageToken? (j : Json) : Option String := nonEmpty? (j.strAt? "nextPageToken")
+def parseNextPageToken? (j : Json) : Option String := nonEmptyStr? (j.strAt? "nextPageToken")
 
 private def parsePrefixedNames (j : Json) (arrField pfx : String) (takeLeaf : Bool) : List String :=
   (j.arrAt arrField).filterMap fun item => (item.strAt? "name").bind fun s =>
@@ -329,7 +328,7 @@ private def saV2Pfx : String := "principal://iam.googleapis.com/projects/-/servi
 private def saV2Principal (email : String) : String := saV2Pfx ++ email
 private def denyPolicyParentForProj (projId : String) : String := Qed.encodeSeg s!"cloudresourcemanager.googleapis.com/projects/{projId}"
 private def fixedDenyPrins (edgeSa builderSa : String) (deployerSa? : Option String) : List String :=
-  [saV2Principal edgeSa, saV2Principal builderSa] ++ (nonEmpty? deployerSa?).elim [] fun d => [saV2Principal d]
+  [saV2Principal edgeSa, saV2Principal builderSa] ++ (nonEmptyStr? deployerSa?).elim [] fun d => [saV2Principal d]
 
 def reqGetDenyPolicyById (ep : GcpEndpoints) (projId denyId : String) : GcpHttpRequest :=
   ep.req "GET" "iam" s!"/v2/policies/{denyPolicyParentForProj projId}/denypolicies/{denyId}"
@@ -386,11 +385,7 @@ def reqPruneDenyException (ep : GcpEndpoints) (edgeSaEmail builderSaEmail : Stri
   if nextExcs == existingExceptions then none
   else some (mkDenyPolicyReq ep projId "deny-qed-secrets-public" (some existingEtag) nextExcs [.secretAccessor])
 
-def egressOriginHost (origin : String) : String :=
-  let low := origin.toLower
-  let afterScheme := match low.splitOn "://" with | _ :: rest :: _ => rest | _ => low
-  let auth := String.ofList (afterScheme.toList.takeWhile fun c => !("/?#\\".contains c))
-  String.ofList (((auth.splitOn "@").getLastD "").toList.takeWhile (· != ':'))
+abbrev egressOriginHost : String → String := extractUrlHost
 
 def reqPutEgressPolicy (ep : GcpEndpoints) (region : GcpRegion) (key : DeployKey) (origins : List String) : GcpHttpRequest :=
   let cleanOrigins := origins.filter Qed.Deploy.isValidEgressOrigin
@@ -434,7 +429,7 @@ def formatCpuLimit (cpuMilli : Nat) : String :=
 
 def parseAllTrafficTargets (j : Json) : List Json := j.arrAt "traffic"
 private def revisionLeaf (r : String) : String := (r.splitOn "/").getLastD r
-private def nonEmptyLeaf? (s? : Option String) : Option String := (nonEmpty? s?).map revisionLeaf
+private def nonEmptyLeaf? (s? : Option String) : Option String := (nonEmptyStr? s?).map revisionLeaf
 
 private def resolveLatestServingRevision? (j : Json) (targetPct : Nat) : Option String :=
   let findWith (p : Json → Bool) := (j.arrAt "trafficStatuses").findSome? fun t => if p t then nonEmptyLeaf? (t.strAt? "revision") else none
@@ -449,7 +444,7 @@ def parseLiveTrafficTargets (j : Json) : Except String (List Json) := do
   if total != 100 then .error s!"Cloud Run live traffic percentages sum to {total} (expected 0 or 100; refusing invalid PATCH)"
   kept.mapM fun t => do
     let pct := (t.natAt? "percent").getD 0
-    if t.strAt? "type" == some "TRAFFIC_TARGET_ALLOCATION_TYPE_LATEST" || (nonEmpty? (t.strAt? "revision")).isNone then
+    if t.strAt? "type" == some "TRAFFIC_TARGET_ALLOCATION_TYPE_LATEST" || (nonEmptyStr? (t.strAt? "revision")).isNone then
       match resolveLatestServingRevision? j pct with
       | some rev => return Json.obj <| [("type", .str "TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION"),
           ("revision", .str rev), ("percent", toJson pct)] ++ optStrField "tag" (t.strAtD "tag")
@@ -512,8 +507,6 @@ def parsePendingLro (j : Json) : Except String (Option String) :=
         if isValidLroOpName nm then .ok (some nm) else .error s!"unsafe/invalid GCP LRO operation name `{nm}`" else .ok none
     | none => if explicitFalse then .error "pending GCP LRO missing `name`" else .ok none
 
-def parsePendingLroName? (j : Json) : Option String := (parsePendingLro j).toOption.join
-
 def parsePendingSqlOp (j : Json) : Except String (Option String) :=
   if j.strAt? "kind" != some "sql#operation" then .ok none
   else match j.get? "error" with
@@ -571,7 +564,7 @@ structure CloudRunSpecSnapshot where
   latestCreatedRevision? : Option String := none
   servingTraffic         : List (String × String × Nat) := []
   taggedRoutes           : List (String × String) := []
-deriving Inhabited, DecidableEq, Repr
+deriving Inhabited, BEq, Repr
 
 def parseCloudRunServiceSpec (region : GcpRegion) (j : Json) : CloudRunSpecSnapshot :=
   let containers := jPathArr j "template.containers"
@@ -582,7 +575,7 @@ def parseCloudRunServiceSpec (region : GcpRegion) (j : Json) : CloudRunSpecSnaps
   let volKind (v : Json) := (["secret", "cloudSqlInstance", "gcs", "nfs", "emptyDir"].find? fun k => (v.get? k).isSome).getD "volume"
   let extractServing (f : String) := (j.arrAt f).filterMap fun t =>
     let pct := (t.natAt? "percent").getD 0; if pct > 0 then some (t.strAtD "type", revisionLeaf (t.strAtD "revision"), pct) else none
-  let extractTagged (f : String) := (j.arrAt f).filterMap fun t => (nonEmpty? (t.strAt? "tag")).map (·, revisionLeaf (t.strAtD "revision"))
+  let extractTagged (f : String) := (j.arrAt f).filterMap fun t => (nonEmptyStr? (t.strAt? "tag")).map (·, revisionLeaf (t.strAtD "revision"))
   let tsServing := extractServing "trafficStatuses"
   { region, existsService := true, invokerIamDisabled := (j.boolAt? "invokerIamDisabled").getD false,
     ingress := j.strAtD "ingress", serviceAccount := (j.pathStr? "template.serviceAccount").getD "",
@@ -615,14 +608,13 @@ instance : FromJson DeployKey := ⟨fun j => do
   DeployKey.mkChecked (← fromField j "prodProjectId") (← fromField j "nonProdProjectId")
     (← fromField j "tenant") (← fromField j "app") (← fromField envJ "kind") (← fromField envJ "pr")⟩
 private def dbClusterStr : DbCluster → String | .prodCluster => "prod" | .nonProdCluster => "nonProd"
-private instance : ToJson DbCluster := ⟨.str ∘ dbClusterStr⟩
-private instance : FromJson DbCluster := ⟨fromEnumJson [.prodCluster, .nonProdCluster] dbClusterStr "DbCluster"⟩
-private instance : ToJson GcpRegion := ⟨.str ∘ GcpRegion.toString⟩
-private instance : FromJson GcpRegion := ⟨fromEnumJson GcpRegion.all GcpRegion.toString "region"⟩
-private instance : ToJson GcpRole := ⟨.str ∘ GcpRole.gcpName⟩
-private instance : FromJson GcpRole := ⟨fromEnumJson GcpRole.all GcpRole.gcpName "role"⟩
-private instance : ToJson GcpPermission := ⟨.str ∘ GcpPermission.gcpV2Name⟩
-private instance : FromJson GcpPermission := ⟨fromEnumJson GcpPermission.all GcpPermission.gcpV2Name "permission"⟩
+local macro "defEnumJson " ty:term " : " all:term " , " toStr:term " , " lbl:str : command =>
+  `(private instance : ToJson $ty := ⟨.str ∘ $toStr⟩
+    private instance : FromJson $ty := ⟨fromEnumJson $all $toStr $lbl⟩)
+defEnumJson DbCluster : [.prodCluster, .nonProdCluster], dbClusterStr, "DbCluster"
+defEnumJson GcpRegion : GcpRegion.all, GcpRegion.toString, "region"
+defEnumJson GcpRole : GcpRole.all, GcpRole.gcpName, "role"
+defEnumJson GcpPermission : GcpPermission.all, GcpPermission.gcpV2Name, "permission"
 private instance : ToJson GcpPrincipal := ⟨fun
   | .allUsers => mkKindObj "allUsers" | .allAuthenticatedUsers => mkKindObj "allAuthenticatedUsers"
   | .builder => mkKindObj "builder" | .edgeRouter => mkKindObj "edgeRouter"
@@ -643,60 +635,50 @@ private instance : FromJson GcpResource := ⟨fun j => do match (← fromField (
   | "assetPrefix" => return .assetPrefix (← fromField j "key") (← fromField j "hash") ((← fromField (α := Option Bool) j "isPublic").getD true)
   | "project" => let p : String ← fromField j "projectId"; if !isValidGcpProjectId p then .error s!"invalid project resource id `{p}`" else return .project p
   | other => .error s!"unknown resource kind `{other}`"⟩
-private instance : ToJson ScaleSpec := ⟨fun s => Json.obj [
-  ("minInstances", toJson s.minInstances), ("maxInstances", toJson s.maxInstances), ("memoryMb", toJson s.memoryMb),
-  ("cpuMilli", toJson s.cpuMilli), ("concurrency", toJson s.concurrency), ("timeoutSec", toJson s.timeoutSec)]⟩
-private instance : FromJson ScaleSpec := ⟨fun j => do return {
-  minInstances := ← fromField j "minInstances", maxInstances := ← fromField j "maxInstances", memoryMb := ← fromField j "memoryMb",
-  cpuMilli := ← fromField j "cpuMilli", concurrency := ← fromField j "concurrency", timeoutSec := ← fromField j "timeoutSec" }⟩
-private instance : ToJson GcpIamBinding := ⟨fun b => Json.obj [("principal", toJson b.principal), ("role", toJson b.role), ("resource", toJson b.resource)]⟩
-private instance : FromJson GcpIamBinding := ⟨fun j => do return { principal := ← fromField j "principal", role := ← fromField j "role", resource := ← fromField j "resource" }⟩
-private instance : ToJson GcpDenyRule := ⟨fun d => Json.obj [("principals", toJson d.principals), ("permissions", toJson d.permissions), ("resource", toJson d.resource)]⟩
-private instance : FromJson GcpDenyRule := ⟨fun j => do return { principals := ← fromField j "principals", permissions := ← fromField j "permissions", resource := ← fromField j "resource" }⟩
+json_obj_codec% private ScaleSpec [minInstances, maxInstances, memoryMb, cpuMilli, concurrency, timeoutSec]
+json_obj_codec% private GcpIamBinding [principal, role, resource]
+json_obj_codec% private GcpDenyRule [principals, permissions, resource]
 
-def GcpPlan.toJson (p : GcpPlan) : Json := Json.obj [
-  ("key", ToJson.toJson p.key), ("buildHash", .str p.buildHash), ("regions", ToJson.toJson p.regions), ("scale", ToJson.toJson p.scale),
-  ("serviceAccountId", .str p.serviceAccountId), ("cloudRunName", .str p.cloudRunName), ("secretNames", ToJson.toJson p.secretNames),
-  ("managedDbs", ToJson.toJson p.managedDbs), ("assetPaths", ToJson.toJson p.assetPaths), ("egressAllow", ToJson.toJson p.egressAllow),
-  ("bindings", ToJson.toJson p.bindings), ("denies", ToJson.toJson p.denies)]
+private def reqPlan (ok : Bool) (msg : String) : Except String Unit :=
+  if ok then .ok () else .error s!"GcpPlan.fromJson: {msg}"
 
-def GcpPlan.fromJson (j : Json) : Except String GcpPlan := do
-  let key : DeployKey ← fromField j "key"; let buildHash : String ← fromField j "buildHash"
-  let regions : List GcpRegion ← fromField j "regions"; let scale : ScaleSpec ← fromField j "scale"
-  let serviceAccountId : String ← fromField j "serviceAccountId"; let cloudRunName : String ← fromField j "cloudRunName"
-  let secretNames : List String ← fromField j "secretNames"; let managedDbs : List (String × DbCluster) ← fromField j "managedDbs"
-  let assetPaths : List String ← fromField j "assetPaths"; let egressAllow : List String ← fromField j "egressAllow"
-  let bindings : List GcpIamBinding ← fromField j "bindings"; let denies : List GcpDenyRule ← fromField j "denies"
-  let req (ok : Bool) (msg : String) : Except String Unit := if ok then .ok () else .error s!"GcpPlan.fromJson: {msg}"
-  let reqAll {α} (xs : List α) (ok : α → Bool) (msg : α → String) : Except String Unit := xs.forM fun x => req (ok x) (msg x)
-  req (serviceAccountId == renderSaId key) s!"serviceAccountId `{serviceAccountId}` does not match canonical `{renderSaId key}`"
-  req (cloudRunName == renderCloudRunName key) s!"cloudRunName `{cloudRunName}` does not match canonical `{renderCloudRunName key}`"
-  scale.validate
-  req (!regions.isEmpty && regions.eraseDups.length == regions.length) "regions must be non-empty and duplicate-free"
-  reqAll assetPaths isSafeRelativeAssetPath (s!"unsafe asset path `{·}`")
-  reqAll egressAllow Qed.Deploy.isValidEgressOrigin (s!"unsafe egress origin `{·}`")
-  reqAll secretNames Qed.Server.isValidEnvVarName (s!"invalid secret env var name `{·}`")
-  reqAll managedDbs (Qed.Deploy.isValidDbShortName ·.1) (fun (db, _) => s!"invalid managed DB name `{db}`")
-  reqAll managedDbs (·.2 == clusterForEnv key.env) (fun _ => s!"database cluster does not match environment `{key.env.toDeployEnv}`")
-  let assetPubFlags := bindings.filterMap fun b => match b.resource with | .assetPrefix _ _ pub => some pub | _ => none
-  req (assetPubFlags.eraseDups.length ≤ 1) "inconsistent assetPrefix `isPublic` flags across bindings"
+@[noinline, nospecialize] private def reqPlanAll {α : Type} (xs : List α) (ok : α → Bool) (msg : α → String) : Except String Unit :=
+  xs.forM fun x => reqPlan (ok x) (msg x)
+
+@[noinline] private def validateGcpPlan (p : GcpPlan) : Except String Unit := do
+  let key := p.key
+  reqPlan (p.serviceAccountId == renderSaId key) s!"serviceAccountId `{p.serviceAccountId}` does not match canonical `{renderSaId key}`"
+  reqPlan (p.cloudRunName == renderCloudRunName key) s!"cloudRunName `{p.cloudRunName}` does not match canonical `{renderCloudRunName key}`"
+  p.scale.validate
+  reqPlan (!p.regions.isEmpty && p.regions.eraseDups.length == p.regions.length) "regions must be non-empty and duplicate-free"
+  reqPlanAll p.assetPaths isSafeRelativeAssetPath (s!"unsafe asset path `{·}`")
+  reqPlanAll p.egressAllow Qed.Deploy.isValidEgressOrigin (s!"unsafe egress origin `{·}`")
+  reqPlanAll p.secretNames Qed.Server.isValidEnvVarName (s!"invalid secret env var name `{·}`")
+  reqPlanAll p.managedDbs (Qed.Deploy.isValidDbShortName ·.1) (fun (db, _) => s!"invalid managed DB name `{db}`")
+  reqPlanAll p.managedDbs (·.2 == clusterForEnv key.env) (fun _ => s!"database cluster does not match environment `{key.env.toDeployEnv}`")
+  let assetPubFlags := p.bindings.filterMap fun b => match b.resource with | .assetPrefix _ _ pub => some pub | _ => none
+  reqPlan (assetPubFlags.eraseDups.length ≤ 1) "inconsistent assetPrefix `isPublic` flags across bindings"
   let expectedAssetPub := assetPubFlags.headD true
   let expectedAssetReader : GcpPrincipal := if expectedAssetPub then .allUsers else .edgeRouter
-  reqAll bindings (fun b => match b.principal, b.role, b.resource with
-    | .runtimeSa k', .secretManagerAccessor, .secret k s => k' == key && k == key && secretNames.contains s
-    | .runtimeSa k', .cloudSqlClient, .cloudSqlDb cl k db => k' == key && k == key && cl == clusterForEnv key.env && managedDbs.contains (db, cl)
+  reqPlanAll p.bindings (fun b => match b.principal, b.role, b.resource with
+    | .runtimeSa k', .secretManagerAccessor, .secret k s => k' == key && k == key && p.secretNames.contains s
+    | .runtimeSa k', .cloudSqlClient, .cloudSqlDb cl k db => k' == key && k == key && cl == clusterForEnv key.env && p.managedDbs.contains (db, cl)
     | .edgeRouter, .runInvoker, .cloudRun k => k == key
-    | .builder, .storageObjectAdmin, .assetPrefix k h pub => k == key && h == buildHash && pub == expectedAssetPub
-    | prin, .storageLegacyObjectReader, .assetPrefix k h pub => prin == expectedAssetReader && k == key && h == buildHash && pub == expectedAssetPub
+    | .builder, .storageObjectAdmin, .assetPrefix k h pub => k == key && h == p.buildHash && pub == expectedAssetPub
+    | prin, .storageLegacyObjectReader, .assetPrefix k h pub => prin == expectedAssetReader && k == key && h == p.buildHash && pub == expectedAssetPub
     | _, _, _ => false) (fun _ => "binding does not match any legal compiled least-privilege shape")
-  reqAll denies (fun d => d.principals == [.allUsers, .allAuthenticatedUsers] && match d.resource, d.permissions with
-    | .cloudRun k, [.runInvoke] => k == key | .secret k s, [.secretAccessor] => k == key && secretNames.contains s | _, _ => false)
+  reqPlanAll p.denies (fun d => d.principals == [.allUsers, .allAuthenticatedUsers] && match d.resource, d.permissions with
+    | .cloudRun k, [.runInvoke] => k == key | .secret k s, [.secretAccessor] => k == key && p.secretNames.contains s | _, _ => false)
     (fun _ => "deny rule does not match any legal compiled least-privilege shape")
   let hasPubDeny (res : GcpResource) (perm : GcpPermission) :=
-    denies.any fun d => d.resource == res && d.principals.contains .allUsers && d.principals.contains .allAuthenticatedUsers && d.permissions.contains perm
-  req (hasPubDeny (.cloudRun key) .runInvoke) "missing mandatory public Cloud Run deny rule"
-  reqAll secretNames (fun s => hasPubDeny (.secret key s) .secretAccessor) (s!"missing mandatory public deny rule for secret `{·}`")
-  return { key, buildHash, regions, scale, serviceAccountId, cloudRunName, secretNames, managedDbs, assetPaths, egressAllow, bindings, denies }
+    p.denies.any fun d => d.resource == res && d.principals.contains .allUsers && d.principals.contains .allAuthenticatedUsers && d.permissions.contains perm
+  reqPlan (hasPubDeny (.cloudRun key) .runInvoke) "missing mandatory public Cloud Run deny rule"
+  reqPlanAll p.secretNames (fun s => hasPubDeny (.secret key s) .secretAccessor) (s!"missing mandatory public deny rule for secret `{·}`")
+
+json_obj_codec% private GcpPlan [key, buildHash, regions, scale, serviceAccountId, cloudRunName, secretNames, managedDbs, assetPaths, egressAllow, bindings, denies] validate validateGcpPlan
+
+def GcpPlan.toJson (p : GcpPlan) : Json := ToJson.toJson p
+def GcpPlan.fromJson (j : Json) : Except String GcpPlan := FromJson.fromJson j
 
 /-! ### 6. Pure Live Security Drift Verifier (`checkDrift`, `checkDriftLive`) & Universal Theorems -/
 
@@ -726,7 +708,7 @@ structure GcpLiveSnapshot where
   serviceSpecs          : List CloudRunSpecSnapshot := []
   presentDenyPolicies   : List String := []
   presentEgressPolicies : List GcpRegion := []
-deriving Inhabited, DecidableEq, Repr
+deriving Inhabited, BEq, Repr
 
 private def diffMap {α β : Type} [BEq α] (xs ys : List α) (f : α → β) : List β :=
   (xs.filter (!ys.contains ·)).map f

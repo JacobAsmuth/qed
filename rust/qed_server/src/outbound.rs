@@ -130,9 +130,7 @@ unsafe fn check_ssrf_lean(addrs: &[SocketAddr], is_blocked_fn: *mut LeanObj) -> 
     Ok(())
 }
 fn with_active<T>(handle: u64, f: impl FnOnce(&mut OutStream) -> Result<T, String>) -> Result<T, String> {
-    let arc = ACTIVE_CONNS.get(handle).ok_or_else(|| "invalid outbound connection handle".to_owned())?;
-    let res = f(&mut lock_unpoison(&arc).stream);
-    res
+    ACTIVE_CONNS.get(handle).ok_or_else(|| "invalid outbound connection handle".to_owned()).and_then(|arc| f(&mut lock_unpoison(&arc).stream))
 }
 
 ffi_export! {
@@ -189,8 +187,7 @@ ffi_export! {
         if let Some(conn) = remove_active(handle) { if keep_alive != 0 { lock_unpoison(global_pool()).push(conn, Instant::now()); } }
         mk_io_unit()
     };
-    qed_server_free_port() =>
-        qed_lean_io_mk_ok(qed_lean_box(TcpListener::bind(("127.0.0.1", 0)).and_then(|l| l.local_addr()).map_or(0, |a| a.port()) as usize));
+    qed_server_free_port() => qed_lean_io_mk_ok(qed_lean_box(bind_loopback_nonblock(0).map_or(0, |(_, p)| p) as usize));
     qed_server_tcp_listen(port: u16) =>
         mk_io_except(bind_loopback_nonblock(port).map(|(l, p)| (LISTENERS.insert(Arc::new(l)), p)), |(id, p)| qed_lean_mk_prod(qed_lean_box_u64(id), qed_lean_box(p as usize)));
     qed_server_tcp_accept(listener_id: u64, timeout_ms: u32) => {

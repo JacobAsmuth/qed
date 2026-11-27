@@ -91,6 +91,13 @@ fn write_hex(src: &[u8], dst: &mut [u8]) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     for (&b, p) in src.iter().zip(dst.chunks_exact_mut(2)) { (p[0], p[1]) = (HEX[(b >> 4) as usize], HEX[(b & 0x0F) as usize]); }
 }
+unsafe fn with_random_bytes(num_bytes: u32, encode: impl FnOnce(&[u8]) -> *mut LeanObj) -> *mut LeanObj {
+    let n = (num_bytes as usize).min(65536);
+    let (mut sr, mut hr) = ([0u8; 64], Vec::new());
+    let raw: &mut [u8] = if n <= 64 { &mut sr[..n] } else { hr.resize(n, 0); &mut hr };
+    if n > 0 && SystemRandom::new().fill(raw).is_err() { return qed_lean_io_mk_err(c"CSPRNG failure".as_ptr()); }
+    qed_lean_io_mk_ok(encode(raw))
+}
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && std::hint::black_box(a.iter().zip(b).fold(0u8, |d, (&x, &y)| d | (x ^ y))) == 0
 }
@@ -237,24 +244,13 @@ ffi_export! {
     };
     qed_server_get_env(name_obj: *mut LeanObj) => qed_lean_io_mk_ok(mk_opt(std::env::var(str_slice(name_obj)).ok().map(|v| mk_str(&v))));
     qed_server_now_ms() => qed_lean_io_mk_ok(qed_lean_box_u64(SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)));
-    qed_server_random_hex(num_bytes: u32) => {
-        let n = (num_bytes as usize).min(65536);
-        if n == 0 { return qed_lean_io_mk_ok(mk_str("")); }
-        let (mut sr, mut sh, mut hr, mut hh) = ([0u8; 64], [0u8; 128], Vec::new(), Vec::new());
-        let (raw, hex): (&mut [u8], &mut [u8]) = if n <= 64 { (&mut sr[..n], &mut sh[..n * 2]) }
-            else { hr.resize(n, 0); hh.resize(n * 2, 0); (&mut hr, &mut hh) };
-        if SystemRandom::new().fill(raw).is_err() { return qed_lean_io_mk_err(c"CSPRNG failure".as_ptr()); }
+    qed_server_random_hex(num_bytes: u32) => with_random_bytes(num_bytes, |raw| {
+        let (mut sh, mut hh) = ([0u8; 128], Vec::new());
+        let hex: &mut [u8] = if raw.len() <= 64 { &mut sh[..raw.len() * 2] } else { hh.resize(raw.len() * 2, 0); &mut hh };
         write_hex(raw, hex);
-        qed_lean_io_mk_ok(mk_str(std::str::from_utf8_unchecked(hex)))
-    };
-    qed_server_random_bytes(num_bytes: u32) => {
-        let n = (num_bytes as usize).min(65536);
-        if n == 0 { return qed_lean_io_mk_ok(mk_ba(&[])); }
-        let (mut sr, mut hr) = ([0u8; 64], Vec::new());
-        let raw: &mut [u8] = if n <= 64 { &mut sr[..n] } else { hr.resize(n, 0); &mut hr };
-        if SystemRandom::new().fill(raw).is_err() { return qed_lean_io_mk_err(c"CSPRNG failure".as_ptr()); }
-        qed_lean_io_mk_ok(mk_ba(raw))
-    };
+        mk_str(std::str::from_utf8_unchecked(hex))
+    });
+    qed_server_random_bytes(num_bytes: u32) => with_random_bytes(num_bytes, |raw| mk_ba(raw));
     qed_server_const_eq(a_obj: *mut LeanObj, b_obj: *mut LeanObj) => mk_io_bool(ct_eq(ba_slice(a_obj), ba_slice(b_obj)));
     qed_server_hmac_sha256(key_obj: *mut LeanObj, msg_obj: *mut LeanObj) =>
         qed_lean_io_mk_ok(mk_ba(with_hmac_key(ba_slice(key_obj), |k| hmac::sign(k, ba_slice(msg_obj))).as_ref()));

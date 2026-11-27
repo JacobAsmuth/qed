@@ -25,17 +25,20 @@ private structure DeployCliOpts where
   apiBase?        : Option String := none
   distDir?        : Option String := none
 
-private def parseDeployOpts : List String → DeployCliOpts → Except String DeployCliOpts
-  | [], o => .ok o
-  | "--dry-run" :: r, o => parseDeployOpts r { o with dryRun := true } | "--check-drift" :: r, o => parseDeployOpts r { o with checkDrift := true }
-  | "--teardown" :: r, o => parseDeployOpts r { o with teardown := true } | "--skip-build" :: r, o => parseDeployOpts r { o with skipBuild := true }
-  | "--env" :: v :: r, o => parseDeployOpts r { o with envStr := v } | "--pr" :: v :: r, o => parseDeployOpts r { o with prStr := v }
-  | "--project" :: v :: r, o => parseDeployOpts r { o with project? := some v } | "--prod-project" :: v :: r, o => parseDeployOpts r { o with prodProject? := some v }
-  | "--nonprod-project" :: v :: r, o => parseDeployOpts r { o with nonProdProject? := some v } | "--tenant" :: v :: r, o => parseDeployOpts r { o with tenantStr? := some v }
-  | "--app-id" :: v :: r, o => parseDeployOpts r { o with appIdStr? := some v } | "--mod" :: v :: r, o => parseDeployOpts r { o with mod? := some v }
-  | "--deploy" :: v :: r, o => parseDeployOpts r { o with deployName? := some v } | "--image" :: v :: r, o => parseDeployOpts r { o with image? := some v }
-  | "--api-base" :: v :: r, o => parseDeployOpts r { o with apiBase? := some v } | "--dist" :: v :: r, o => parseDeployOpts r { o with distDir? := some v }
-  | flag :: _, _ => .error s!"unknown or incomplete `qed deploy` flag: `{flag}`"
+private def parseDeployOpts (args : List String) : Except String DeployCliOpts :=
+  let bad (flag : String) := s!"unknown or incomplete `qed deploy` flag: `{flag}`"
+  Prod.fst <$> parseCliFlags {
+    flags := [
+      .bool ["--dry-run"] ({ · with dryRun := true }), .bool ["--check-drift"] ({ · with checkDrift := true }),
+      .bool ["--teardown"] ({ · with teardown := true }), .bool ["--skip-build"] ({ · with skipBuild := true }),
+      .valOk ["--env"] (fun o v => { o with envStr := v }), .valOk ["--pr"] (fun o v => { o with prStr := v }),
+      .valOk ["--project"] (fun o v => { o with project? := some v }), .valOk ["--prod-project"] (fun o v => { o with prodProject? := some v }),
+      .valOk ["--nonprod-project"] (fun o v => { o with nonProdProject? := some v }), .valOk ["--tenant"] (fun o v => { o with tenantStr? := some v }),
+      .valOk ["--app-id"] (fun o v => { o with appIdStr? := some v }), .valOk ["--mod"] (fun o v => { o with mod? := some v }),
+      .valOk ["--deploy"] (fun o v => { o with deployName? := some v }), .valOk ["--image"] (fun o v => { o with image? := some v }),
+      .valOk ["--api-base"] (fun o v => { o with apiBase? := some v }), .valOk ["--dist"] (fun o v => { o with distDir? := some v }) ],
+    allowEq := false, allowPos := false, unknownErr := bad, missingErr := bad
+  } {} args
 
 private def isAllowedRemoteApiBase (u : String) : Bool :=
   u.startsWith "https://" && !u.toList.any (fun c => c.isWhitespace || c.toNat < 0x20 || c.toNat == 0x7F || "@\\?#".contains c) &&
@@ -68,7 +71,7 @@ private def canonicalizeBuildDir (outDir : FilePath) : ExceptT String IO FilePat
   let raw := outDir.toString
   if raw.isEmpty || raw.startsWith "-" then throw s!"invalid build output directory `{raw}`"
   if !(← outDir.pathExists) then throw s!"build output directory does not exist: `{raw}`"
-  let realDir ← ExceptT.mk (try Except.ok <$> IO.FS.realPath outDir catch e => pure (.error s!"failed to canonicalize build output directory `{raw}`: {e}"))
+  let realDir ← realPathExcept outDir "failed to canonicalize build output directory"
   let rs := realDir.toString
   if ← orB (rs.isEmpty || rs.startsWith "-") ((!·) <$> realDir.isDir) then throw s!"invalid canonical build output directory `{rs}`"
   return realDir
@@ -128,8 +131,7 @@ private def buildAndPushContainer (plan : GcpPlan) (region : GcpRegion) (outDir 
   return imageUri
 
 private def runDeploy (args : List String) : ExceptT String IO UInt32 := do
-  let opts ← liftP (parseDeployOpts args {})
-  let optOrEnv (o : Option String) (k : String) : IO (Option String) := o.elim (nonEmptyEnv k) (pure ∘ some)
+  let opts ← liftP (parseDeployOpts args)
   if opts.checkDrift && opts.teardown then throw "`--check-drift` and `--teardown` cannot be combined"
   if let some d := opts.distDir? then if d.isEmpty || d.startsWith "-" then throw s!"invalid `--dist` directory `{d}`"
   if opts.envStr == "preview" then match opts.prStr.toNat? with
@@ -177,7 +179,7 @@ private def runDeploy (args : List String) : ExceptT String IO UInt32 := do
   let imageUri ← match ← optOrEnv (opts.image?.filter (!·.cliTrim.isEmpty)) "QED_CLOUD_IMAGE" with
     | some img => if isLocalApi then pure img else liftP (validateContainerImageUri img (plan.key.shard.projectFor plan.key.env))
     | none     => if isLocalApi then pure s!"local/{plan.cloudRunName}:{plan.buildHash}" else buildAndPushContainer plan region outDir
-  liftIO (step s!"deploying {plan.cloudRunName} ({plan.key.env.toDeployEnv}) — {actions.length} action(s)")
+  liftIO (step s!"deploying {plan.cloudRunName} ({plan.key.env.toDeployEnv}): {actions.length} action(s)")
   let n ← liftE (executeRollout cfg plan imageUri outDir actions fun a => IO.println s!"  ▸ [P{a.phase.rank}] {formatAction a}")
   liftIO (IO.println (green s!"✓ deploy complete: {plan.cloudRunName} ({n} action(s) across 4 phases)")); return 0
 
@@ -195,8 +197,7 @@ private def isLocalGcpDeployInvocation (args : List String) : IO Bool := do
 
 def cmdDeploy (args : List String) : IO UInt32 := do
   if ← isLocalGcpDeployInvocation args then
-    let filtered := args.filter (· != "--local-gcp")
-    match ← (runDeploy filtered).run with | .ok code => return code | .error e => IO.eprintln (red s!"✗ {e}"); return 1
+    runExceptCmd (runDeploy (args.filter (· != "--local-gcp")))
   else
     cmdHostedDeploy args
 

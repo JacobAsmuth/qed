@@ -73,11 +73,6 @@ private def sliceStr (cs : Array Char) (s e : Nat) : String := Id.run do
 
 @[inline] private def at2 (cs : Array Char) (n i : Nat) (a b : Char) : Bool := i + 1 < n && cs[i]! == a && cs[i + 1]! == b
 
-private def hexDigit? (c : Char) : Option Nat :=
-  if '0' ≤ c && c ≤ '9' then some (c.toNat - 48)
-  else if 'a' ≤ c && c ≤ 'f' then some (c.toNat - 87)
-  else if 'A' ≤ c && c ≤ 'F' then some (c.toNat - 55) else none
-
 private partial def skipLine (cs : Array Char) (n i : Nat) : Nat :=
   if i < n && cs[i]! != '\n' then skipLine cs n (i + 1) else i
 
@@ -165,11 +160,11 @@ private partial def decodeLeanStrLoop (cs : Array Char) (stop : Nat) (stopAtQuot
         let i' := i + (if nxt == '\r' then 3 else 2)
         decodeLeanStrLoop cs stop stopAtQuote (skipSpaces cs stop i') i' out
       else if nxt == 'x' && i + 3 < stop then
-        match hexDigit? cs[i + 2]!, hexDigit? cs[i + 3]! with
+        match Qed.unhexNat? cs[i + 2]!, Qed.unhexNat? cs[i + 3]! with
         | some a, some b => decodeLeanStrLoop cs stop stopAtQuote (i + 4) ls (out.push (Char.ofNat (a * 16 + b)))
         | _, _           => decodeLeanStrLoop cs stop stopAtQuote (i + 2) ls (out.push nxt)
       else if nxt == 'u' && i + 5 < stop then
-        match hexDigit? cs[i + 2]!, hexDigit? cs[i + 3]!, hexDigit? cs[i + 4]!, hexDigit? cs[i + 5]! with
+        match Qed.unhexNat? cs[i + 2]!, Qed.unhexNat? cs[i + 3]!, Qed.unhexNat? cs[i + 4]!, Qed.unhexNat? cs[i + 5]! with
         | some a, some b, some d, some e => decodeLeanStrLoop cs stop stopAtQuote (i + 6) ls (out.push (Char.ofNat (((a * 16 + b) * 16 + d) * 16 + e)))
         | _, _, _, _                     => decodeLeanStrLoop cs stop stopAtQuote (i + 2) ls (out.push nxt)
       else decodeLeanStrLoop cs stop stopAtQuote (i + 2) ls (out.push (match nxt with | 'n' => '\n' | 'r' => '\r' | 't' => '\t' | _ => nxt))
@@ -318,73 +313,85 @@ private partial def extractLoop (ctx : ExtractCtx) (i ls ic qm attrD delimD quot
       hasUnbalancedDelim := (fl &&& 4096) != 0 }
   else
     let c := cs[i]!; let prevId := (fl &&& 1) != 0; let prevEnd := (fl &&& 2) != 0; let fl0 := fl &&& ~~~3
-    if c == '\n' then extractLoop ctx (i + 1) (i + 1) ic qm attrD delimD quoteD (fl0 ||| 24) qp acc
-    else if c.isWhitespace then extractLoop ctx (i + 1) ls ic qm attrD delimD quoteD fl0 qp acc
-    else if at2 cs n i '-' '-' then extractLoop ctx (skipLine cs n (i + 2)) ls ic qm attrD delimD quoteD fl0 qp acc
-    else if at2 cs n i '/' '-' && !isDocCommentOverridden cs n i ctx.known prevId prevEnd false then
-      let (ni, _, nls) := enterBlockComment cs n i 0 ls; extractLoop ctx ni nls ic qm attrD delimD quoteD fl0 qp acc
-    else if c == '"' then
+    match c with
+    | '\n' => extractLoop ctx (i + 1) (i + 1) ic qm attrD delimD quoteD (fl0 ||| 24) qp acc
+    | ' ' | '\t' | '\r' => extractLoop ctx (i + 1) ls ic qm attrD delimD quoteD fl0 qp acc
+    | '"' =>
       let (s, ni, nls) := decodeLeanStrLoop cs n true (i + 1) ls ""; let (fl', acc') := recordStr (fl0 &&& ~~~24) acc s
       extractLoop ctx ni nls ic qm attrD delimD quoteD fl' qp acc'
-    else if isRawStrStart cs n i prevId then
-      let (ni, bs, be, _, nls) := scanRawStr cs n i 0 ls; let (fl', acc') := recordStr (fl0 &&& ~~~24) acc (sliceStr cs bs be)
-      extractLoop ctx ni nls ic qm attrD delimD quoteD fl' qp acc'
-    else if let some cLen := matchCustomTokenAt cs n ctx.known i prevId prevEnd then
-      extractLoop ctx (i + cLen) (countNewlines cs i cLen ls true) ic qm attrD delimD quoteD (fl0 &&& ~~~24) qp acc
-    else if at2 cs n i '=' '>' then
-      let fl1 := fl0 &&& ~~~24
-      if delimD == 0 || quoteD == 0 then
-        let (fl2, acc') := flushHdr fl1 acc
-        extractLoop ctx (i + 2) ls ic qm attrD delimD quoteD (if delimD == 0 || ctx.ignoreDelim then fl2 &&& ~~~4 else fl2) qp acc'
-      else extractLoop ctx (i + 2) ls ic qm attrD delimD quoteD fl1 qp acc
-    else if at2 cs n i '@' '[' && (fl0 &&& 16) != 0 then
-      extractLoop ctx (i + 2) ls ic qm 1 (delimD + 1) quoteD (fl0 &&& ~~~24) qp acc
-    else if c == '(' || c == '[' || c == '{' then
-      let isQ := c == '(' && i > 0 && cs[i - 1]! == '`'
-      extractLoop ctx (i + 1) ls ic qm (if c == '[' && attrD > 0 then attrD + 1 else attrD) (delimD + 1)
-        (if isQ then quoteD + 1 else quoteD) (fl0 &&& ~~~24) (if c == '(' then qp.push isQ else qp) acc
-    else if c == ')' || c == ']' || c == '}' then
-      let (qp', qd') := if c == ')' && !qp.isEmpty then (qp.pop, if qp.back! then quoteD - 1 else quoteD) else (qp, quoteD)
-      let (ad', fl') := if c == ']' && attrD > 0 then (attrD - 1, if attrD == 1 then (fl0 &&& ~~~8) ||| 16 else fl0 &&& ~~~24) else (attrD, fl0 &&& ~~~24)
-      extractLoop ctx (i + 1) ls ic qm ad' (if delimD > 0 then delimD - 1 else 0) qd' fl' qp' acc
-    else if c == ';' then extractLoop ctx (i + 1) ls ic qm attrD delimD quoteD (fl0 ||| 24) qp acc
-    else if c == '«' || Lean.isIdFirst c then
-      let isGuil := c == '«'
-      let (tokS, tokE, ni, nls) := if isGuil then
-          let (ge, ni, _, nls) := scanGuillemetLoop cs n (i + 1) 0 ls; (i + 1, ge, ni, nls)
-        else let ni := scanIdentEnd cs n (i + 1); (i, ni, ni, ls)
-      let len := tokE - tokS; let flBase := (fl0 &&& ~~~24) ||| (if isGuil then 2 else 3)
-      let maybeP := (fl0 &&& 1024) == 0 && len >= 7 && cs[tokE - 1]! == 'r' && cs[tokE - 7]! == '_'
-      let shortSkip := !isGuil && ((len == 2 && cs[tokS + 1]! != '!' && !(c == 'i' && cs[tokS + 1]! == 'n')) || (len == 3 && c != 'd' && c != 'e'))
-      if len < 2 || shortSkip || (!isGuil && !('a' ≤ c && c ≤ 'z') && !maybeP) then
-        extractLoop ctx ni nls ic qm attrD delimD quoteD flBase qp acc
-      else
-        let tok := sliceStr cs tokS tokE; let kw := kwFlags.getD tok 0
-        let (ic', qm') := if (kw &&& 2048) != 0 then
-            (ic + 1, qm + (if (sliceStr cs nls (skipLine cs n nls)).cliTrim == builtinQedFStrLine then 1 else 0)) else (ic, qm)
-        let fl1 := flBase ||| (if (kw &&& 6) != 0 then 32 else 0) |||
-          (if (kw &&& 256) != 0 || (maybeP && tok.endsWith "_parser") then 1024 else 0) |||
-          (if (flBase &&& 64) == 0 && ((kw &&& 64) != 0 || ((kw &&& 1024) != 0 && prevQualifierAt cs i == some "Command")) then 64 else 0) |||
-          (if (flBase &&& 128) == 0 && ((kw &&& 128) != 0 || ((tok == "atom" || tok == "mkStrLit") && prevQualifierAt cs i == some "Syntax")) then 128 else 0)
-        if isGuil || (i > 0 && (cs[i - 1]! == '.' || cs[i - 1]! == '`')) then
-          extractLoop ctx ni nls ic' qm' attrD delimD quoteD fl1 qp acc
-        else
-          let fl2 := if (fl1 &&& 4) != 0 && (kw &&& 512) != 0 then fl1 ||| 16384 else fl1
-          let (tokAtStmt, tokAtDecl) := ((fl0 &&& 8) != 0, (fl0 &&& 16) != 0)
-          if quoteD > 0 && (kw &&& 8) != 0 then extractLoop ctx ni nls ic' qm' attrD delimD quoteD (fl2 ||| 64) qp acc
-          else if (delimD == 0 || (quoteD == 0 && (tokAtDecl || ctx.ignoreDelim))) && (kw &&& 8) != 0 then
-            let (fl3, acc') := flushHdr fl2 acc; extractLoop ctx ni nls ic' qm' attrD delimD quoteD (fl3 ||| 4) qp acc'
-          else if (delimD == 0 || quoteD == 0) && tokAtStmt && (kw &&& 16) != 0 then
-            let (fl3, acc') := flushHdr fl2 acc
-            extractLoop ctx ni nls ic' qm' attrD delimD quoteD ((fl3 &&& ~~~4) ||| (if (kw &&& 32) != 0 then 16 else 0)) qp acc'
-          else extractLoop ctx ni nls ic' qm' attrD delimD quoteD (if tok == "in" || (tokAtDecl && (kw &&& 32) != 0) then fl2 ||| 16 else fl2) qp acc
-    else if c == '\'' && !prevId && i + 1 < n && cs[i + 1]! != '\'' then
-      extractLoop ctx (scanCharLit cs n i) ls ic qm attrD delimD quoteD (fl0 &&& ~~~24) qp acc
-    else
-      let fl1 := if (fl0 &&& 4) != 0 && (c == '?' || c == '*' || c == '+' || (c == '<' && i + 2 < n && cs[i + 1]! == '|' && cs[i + 2]! == '>')) then fl0 ||| 16384 else fl0
-      if c == '#' && (fl0 &&& 8) != 0 && (delimD == 0 || quoteD == 0) then
-        let (fl2, acc') := flushHdr (fl1 &&& ~~~24) acc; extractLoop ctx (i + 1) ls ic qm attrD delimD quoteD (fl2 &&& ~~~4) qp acc'
-      else extractLoop ctx (i + 1) ls ic qm attrD delimD quoteD (fl1 &&& ~~~24) qp acc
+    | _ =>
+      if c.isWhitespace then extractLoop ctx (i + 1) ls ic qm attrD delimD quoteD fl0 qp acc
+      else if at2 cs n i '-' '-' then extractLoop ctx (skipLine cs n (i + 2)) ls ic qm attrD delimD quoteD fl0 qp acc
+      else if at2 cs n i '/' '-' && !isDocCommentOverridden cs n i ctx.known prevId prevEnd false then
+        let (ni, _, nls) := enterBlockComment cs n i 0 ls; extractLoop ctx ni nls ic qm attrD delimD quoteD fl0 qp acc
+      else if isRawStrStart cs n i prevId then
+        let (ni, bs, be, _, nls) := scanRawStr cs n i 0 ls; let (fl', acc') := recordStr (fl0 &&& ~~~24) acc (sliceStr cs bs be)
+        extractLoop ctx ni nls ic qm attrD delimD quoteD fl' qp acc'
+      else if let some cLen := matchCustomTokenAt cs n ctx.known i prevId prevEnd then
+        extractLoop ctx (i + cLen) (countNewlines cs i cLen ls true) ic qm attrD delimD quoteD (fl0 &&& ~~~24) qp acc
+      else match c with
+      | '=' =>
+        let fl1 := fl0 &&& ~~~24
+        if i + 1 < n && cs[i + 1]! == '>' then
+          if delimD == 0 || quoteD == 0 then
+            let (fl2, acc') := flushHdr fl1 acc
+            extractLoop ctx (i + 2) ls ic qm attrD delimD quoteD (if delimD == 0 || ctx.ignoreDelim then fl2 &&& ~~~4 else fl2) qp acc'
+          else extractLoop ctx (i + 2) ls ic qm attrD delimD quoteD fl1 qp acc
+        else extractLoop ctx (i + 1) ls ic qm attrD delimD quoteD fl1 qp acc
+      | '@' =>
+        let isAttr := i + 1 < n && cs[i + 1]! == '[' && (fl0 &&& 16) != 0
+        extractLoop ctx (i + if isAttr then 2 else 1) ls ic qm (if isAttr then 1 else attrD) (if isAttr then delimD + 1 else delimD) quoteD (fl0 &&& ~~~24) qp acc
+      | '(' | '[' | '{' =>
+        let isQ := c == '(' && i > 0 && cs[i - 1]! == '`'
+        extractLoop ctx (i + 1) ls ic qm (if c == '[' && attrD > 0 then attrD + 1 else attrD) (delimD + 1)
+          (if isQ then quoteD + 1 else quoteD) (fl0 &&& ~~~24) (if c == '(' then qp.push isQ else qp) acc
+      | ')' | ']' | '}' =>
+        let (qp', qd') := if c == ')' && !qp.isEmpty then (qp.pop, if qp.back! then quoteD - 1 else quoteD) else (qp, quoteD)
+        let (ad', fl') := if c == ']' && attrD > 0 then (attrD - 1, if attrD == 1 then (fl0 &&& ~~~8) ||| 16 else fl0 &&& ~~~24) else (attrD, fl0 &&& ~~~24)
+        extractLoop ctx (i + 1) ls ic qm ad' (if delimD > 0 then delimD - 1 else 0) qd' fl' qp' acc
+      | ';' => extractLoop ctx (i + 1) ls ic qm attrD delimD quoteD (fl0 ||| 24) qp acc
+      | '\'' =>
+        let ni := if !prevId && i + 1 < n && cs[i + 1]! != '\'' then scanCharLit cs n i else i + 1
+        extractLoop ctx ni ls ic qm attrD delimD quoteD (fl0 &&& ~~~24) qp acc
+      | '#' =>
+        if (fl0 &&& 8) != 0 && (delimD == 0 || quoteD == 0) then
+          let (fl2, acc') := flushHdr (fl0 &&& ~~~24) acc; extractLoop ctx (i + 1) ls ic qm attrD delimD quoteD (fl2 &&& ~~~4) qp acc'
+        else extractLoop ctx (i + 1) ls ic qm attrD delimD quoteD (fl0 &&& ~~~24) qp acc
+      | '?' | '*' | '+' | '<' =>
+        let mark := (fl0 &&& 4) != 0 && (c != '<' || (i + 2 < n && cs[i + 1]! == '|' && cs[i + 2]! == '>'))
+        extractLoop ctx (i + 1) ls ic qm attrD delimD quoteD ((if mark then fl0 ||| 16384 else fl0) &&& ~~~24) qp acc
+      | _ =>
+        if c == '«' || Lean.isIdFirst c then
+          let isGuil := c == '«'
+          let (tokS, tokE, ni, nls) := if isGuil then
+              let (ge, ni, _, nls) := scanGuillemetLoop cs n (i + 1) 0 ls; (i + 1, ge, ni, nls)
+            else let ni := scanIdentEnd cs n (i + 1); (i, ni, ni, ls)
+          let len := tokE - tokS; let flBase := (fl0 &&& ~~~24) ||| (if isGuil then 2 else 3)
+          let maybeP := (fl0 &&& 1024) == 0 && len >= 7 && cs[tokE - 1]! == 'r' && cs[tokE - 7]! == '_'
+          let shortSkip := !isGuil && ((len == 2 && cs[tokS + 1]! != '!' && !(c == 'i' && cs[tokS + 1]! == 'n')) || (len == 3 && c != 'd' && c != 'e'))
+          if len < 2 || shortSkip || (!isGuil && !('a' ≤ c && c ≤ 'z') && !maybeP) then
+            extractLoop ctx ni nls ic qm attrD delimD quoteD flBase qp acc
+          else
+            let tok := sliceStr cs tokS tokE; let kw := kwFlags.getD tok 0
+            let (ic', qm') := if (kw &&& 2048) != 0 then
+                (ic + 1, qm + (if (sliceStr cs nls (skipLine cs n nls)).cliTrim == builtinQedFStrLine then 1 else 0)) else (ic, qm)
+            let fl1 := flBase ||| (if (kw &&& 6) != 0 then 32 else 0) |||
+              (if (kw &&& 256) != 0 || (maybeP && tok.endsWith "_parser") then 1024 else 0) |||
+              (if (flBase &&& 64) == 0 && ((kw &&& 64) != 0 || ((kw &&& 1024) != 0 && prevQualifierAt cs i == some "Command")) then 64 else 0) |||
+              (if (flBase &&& 128) == 0 && ((kw &&& 128) != 0 || ((tok == "atom" || tok == "mkStrLit") && prevQualifierAt cs i == some "Syntax")) then 128 else 0)
+            if isGuil || (i > 0 && (cs[i - 1]! == '.' || cs[i - 1]! == '`')) then
+              extractLoop ctx ni nls ic' qm' attrD delimD quoteD fl1 qp acc
+            else
+              let fl2 := if (fl1 &&& 4) != 0 && (kw &&& 512) != 0 then fl1 ||| 16384 else fl1
+              let (tokAtStmt, tokAtDecl) := ((fl0 &&& 8) != 0, (fl0 &&& 16) != 0)
+              if quoteD > 0 && (kw &&& 8) != 0 then extractLoop ctx ni nls ic' qm' attrD delimD quoteD (fl2 ||| 64) qp acc
+              else if (delimD == 0 || (quoteD == 0 && (tokAtDecl || ctx.ignoreDelim))) && (kw &&& 8) != 0 then
+                let (fl3, acc') := flushHdr fl2 acc; extractLoop ctx ni nls ic' qm' attrD delimD quoteD (fl3 ||| 4) qp acc'
+              else if (delimD == 0 || quoteD == 0) && tokAtStmt && (kw &&& 16) != 0 then
+                let (fl3, acc') := flushHdr fl2 acc
+                extractLoop ctx ni nls ic' qm' attrD delimD quoteD ((fl3 &&& ~~~4) ||| (if (kw &&& 32) != 0 then 16 else 0)) qp acc'
+              else extractLoop ctx ni nls ic' qm' attrD delimD quoteD (if tok == "in" || (tokAtDecl && (kw &&& 32) != 0) then fl2 ||| 16 else fl2) qp acc
+        else extractLoop ctx (i + 1) ls ic qm attrD delimD quoteD (fl0 &&& ~~~24) qp acc
 
 /-! ### Pass B: Tail-Recursive Register-Pure Forbidden Token Scanner -/
 
@@ -435,74 +442,94 @@ private partial def scanForbiddenLoop (ctx : ScanCtx) (i line : Nat) (sfl ic : U
     scanForbiddenLoop ctx ni nl 0 0 gs (if enterB then ib.push (0, gs.size) else ib) hits
   else
     let c := cs[i]!; let prevId := (sfl &&& 1) != 0; let prevEnd := (sfl &&& 2) != 0
-    if c == '\n' || c.isWhitespace then scanForbiddenLoop ctx (i + 1) (if c == '\n' then line + 1 else line) 0 (ic &&& ~~~4) gs ib hits
-    else if at2 cs n i '-' '-' then scanForbiddenLoop ctx (skipLine cs n (i + 2)) line 0 (ic &&& ~~~4) gs ib hits
-    else if at2 cs n i '/' '-' && !isDocCommentOverridden cs n i ctx.toks prevId prevEnd ctx.treatDoc then
-      let (ni, nl, _) := enterBlockComment cs n i line 0; scanForbiddenLoop ctx ni nl 0 (ic &&& ~~~4) gs ib hits
-    else if isRawStrStart cs n i prevId then
-      let (ni, _, _, nl, _) := scanRawStr cs n i line 0; scanForbiddenLoop ctx ni nl 0 0 gs ib hits
-    else if let some cLen := matchCustomTokenAt cs n ctx.toks i prevId prevEnd (!ctx.allowCb && !ib.isEmpty && ib.back!.1 == 0) then
-      scanForbiddenLoop ctx (i + cLen) (countNewlines cs i cLen line false) 0 (if inc then consumeAtArg ic else 0) gs ib hits
-    else if c == '«' then
-      let ic' := if !inc then 0 else if (ic &&& 8) != 0 then finishAtField ic else consumeAtArg ic
-      let (ge, ni, nl, _) := scanGuillemetLoop cs n (i + 1) line 0
-      scanForbiddenLoop ctx ni nl 2 ic' gs ib (match forbiddenAt? cs (i + 1) ge with | some f => hits.push (line, f) | none => hits)
-    else if inc && (ic >>> 4) > 0 && (c == '$' || c == '@' || c == '↑' || c == '⇑' || c == '↥' || c == '`' || (c == '!' && (ic &&& 4) == 0)) then
-      scanForbiddenLoop ctx (i + 1) line 0 (ic &&& ~~~15) gs ib hits
-    else if inc && c == ':' && (ic &&& 4) != 0 && i + 1 < n && (Lean.isIdFirst cs[i + 1]! || cs[i + 1]! == '«') then
-      scanForbiddenLoop ctx (i + 1) line 0 (mkIc (ic >>> 4) (field := true)) gs ib hits
-    else if inc && c == '.' && ((ic &&& 4) != 0 || (ic >>> 4) > 0) then
-      scanForbiddenLoop ctx (i + 1) line 0 (mkIc (if (ic &&& 4) != 0 then ic >>> 4 else (ic >>> 4) - 1) (field := true)) gs ib hits
-    else if inc && (ic &&& 4) != 0 && (c == '!' || c == '?') then
-      scanForbiddenLoop ctx (i + 1) line 0 (if (ic >>> 4) == 0 then ic ||| 1 else ic &&& ~~~1) gs ib hits
-    else if inc && (ic &&& 8) != 0 && c.isDigit then
-      scanForbiddenLoop ctx (skipDigits cs n (i + 1) false) line 0 (finishAtField ic) gs ib hits
-    else if inc && (ic >>> 4) > 0 && c.isDigit then
-      scanForbiddenLoop ctx (skipDigits cs n (i + 1) true) line 0 (consumeAtArg ic) gs ib hits
-    else if inc && at2 cs n i '#' '[' then scanForbiddenLoop ctx (i + 2) line 0 0 (pushGroup gs ']' ic) ib hits
-    else if inc && (c == '(' || c == '[' || c == '⟨') then
-      scanForbiddenLoop ctx (i + 1) line 0 0 (pushGroup gs (if c == '(' then ')' else if c == '[' then ']' else '⟩') ic (c == '[')) ib hits
-    else if (c == '{' || c == '}') && !ib.isEmpty then
-      let (top, savedGs) := ib.back!
-      if ctx.braceMode >= 2 then scanForbiddenLoop ctx (i + 1) line 0 0 gs ib hits
-      else if c == '{' then
-        scanForbiddenLoop ctx (i + 1) line 0 0 (if inc then pushGroup gs '}' ic else gs) (if ctx.braceMode == 0 then ib.pop.push (top + 1, savedGs) else ib) hits
-      else if top == 0 then scanForbiddenLoop ctx (i + 1) line 4 0 (popToSize gs savedGs) ib.pop hits
-      else
-        let (gs', ic') := if inc && !gs.isEmpty && gs.back!.1 == '}' then (gs.pop, gs.back!.2) else (gs, 0)
-        scanForbiddenLoop ctx (i + 1) line 0 ic' gs' (ib.pop.push (top - 1, savedGs)) hits
-    else if inc && c == '{' then scanForbiddenLoop ctx (i + 1) line 0 0 (pushGroup gs '}' ic) ib hits
-    else if inc && (c == ')' || c == ']' || c == '⟩' || c == '}') then
-      let (gs', ic') := if !gs.isEmpty && gs.back!.1 == c then (gs.pop, gs.back!.2) else (gs, 0)
-      scanForbiddenLoop ctx (i + 1) line 0 ic' gs' ib hits
-    else if c == '"' then
-      if ctx.braceMode >= 2 && !ib.isEmpty then
-        let (ni, nl, _) := if ctx.braceMode == 2 then (0, 0, false) else scanStrLoop cs n false (i + 1) line
-        if ctx.braceMode >= 3 && ni <= n && ni > i + 1 && cs[ni - 1]! == '"' && (ctx.braceMode == 4 || nl == line) then
-          scanForbiddenLoop ctx ni nl 0 0 gs ib hits
-        else scanForbiddenLoop ctx (i + 1) line 0 0 (popToSize gs ib.back!.2) ib.pop hits
-      else
-        let (ni, nl, enterB) := scanStrLoop cs n (inc && (ctx.allInterp || (ic &&& 1) != 0)) (i + 1) line
-        scanForbiddenLoop ctx ni nl 0 0 gs (if enterB then ib.push (0, gs.size) else ib) hits
-    else if c == '\'' && !prevId && i + 1 < n && cs[i + 1]! != '\'' then scanForbiddenLoop ctx (scanCharLit cs n i) line 0 0 gs ib hits
-    else if c == '#' && i + 6 <= n && matchWord cs i (i + 6) "#guard" && (i + 6 >= n || !Lean.isIdRest cs[i + 6]!) then
-      scanForbiddenLoop ctx (i + 6) line 0 0 gs ib (hits.push (line, "#guard"))
-    else if Lean.isIdFirst c then
-      let ni := scanIdentEnd cs n (i + 1)
-      let hits' := match forbiddenAt? cs i ni with | some f => hits.push (line, f) | none => hits
-      let ic' : UInt32 := if !inc then 0
-        else if (ic &&& 8) != 0 then finishAtField ic
-        else if (ic >>> 4) > 0 then consumeAtArg ic
-        else if i >= 6 && cs[i - 1]! == '.' && matchWord cs i ni "trace" && matchWord cs (i - 6) (i - 1) "Macro" && (i == 6 || !Lean.isIdRest cs[i - 7]!) then 2
-        else if i > 0 && (cs[i - 1]! == '.' || cs[i - 1]! == '`') then 0
-        else if c == 'f' && ni == i + 1 && ni < n && cs[ni]! == '"' then 1
-        else if ni - i >= 2 && 'a' ≤ c && c ≤ 'z' then
-          let tok := sliceStr cs i ni; let kw := kwFlags.getD tok 0
-          if (kw &&& 4) != 0 then mkIc 2 else if (kw &&& 2) != 0 then mkIc 1
-          else mkIc (prev := (kw &&& 1) != 0) (after := tok == "trace" || tok == "trace_goal")
-        else 0
-      scanForbiddenLoop ctx ni line 3 ic' gs ib hits'
-    else scanForbiddenLoop ctx (i + 1) line 0 0 gs ib hits
+    match c with
+    | '\n' => scanForbiddenLoop ctx (i + 1) (line + 1) 0 (ic &&& ~~~4) gs ib hits
+    | ' ' | '\t' | '\r' => scanForbiddenLoop ctx (i + 1) line 0 (ic &&& ~~~4) gs ib hits
+    | _ =>
+      if c.isWhitespace then scanForbiddenLoop ctx (i + 1) line 0 (ic &&& ~~~4) gs ib hits
+      else if at2 cs n i '-' '-' then scanForbiddenLoop ctx (skipLine cs n (i + 2)) line 0 (ic &&& ~~~4) gs ib hits
+      else if at2 cs n i '/' '-' && !isDocCommentOverridden cs n i ctx.toks prevId prevEnd ctx.treatDoc then
+        let (ni, nl, _) := enterBlockComment cs n i line 0; scanForbiddenLoop ctx ni nl 0 (ic &&& ~~~4) gs ib hits
+      else if isRawStrStart cs n i prevId then
+        let (ni, _, _, nl, _) := scanRawStr cs n i line 0; scanForbiddenLoop ctx ni nl 0 0 gs ib hits
+      else if let some cLen := matchCustomTokenAt cs n ctx.toks i prevId prevEnd (!ctx.allowCb && !ib.isEmpty && ib.back!.1 == 0) then
+        scanForbiddenLoop ctx (i + cLen) (countNewlines cs i cLen line false) 0 (if inc then consumeAtArg ic else 0) gs ib hits
+      else match c with
+      | '«' =>
+        let ic' := if !inc then 0 else if (ic &&& 8) != 0 then finishAtField ic else consumeAtArg ic
+        let (ge, ni, nl, _) := scanGuillemetLoop cs n (i + 1) line 0
+        scanForbiddenLoop ctx ni nl 2 ic' gs ib (match forbiddenAt? cs (i + 1) ge with | some f => hits.push (line, f) | none => hits)
+      | '$' | '@' | '↑' | '⇑' | '↥' | '`' =>
+        scanForbiddenLoop ctx (i + 1) line 0 (if inc && (ic >>> 4) > 0 then ic &&& ~~~15 else 0) gs ib hits
+      | '!' | '?' =>
+        let ic' := if !inc then 0
+          else if c == '!' && (ic >>> 4) > 0 && (ic &&& 4) == 0 then ic &&& ~~~15
+          else if (ic &&& 4) != 0 then (if (ic >>> 4) == 0 then ic ||| 1 else ic &&& ~~~1) else 0
+        scanForbiddenLoop ctx (i + 1) line 0 ic' gs ib hits
+      | ':' =>
+        let ic' := if inc && (ic &&& 4) != 0 && i + 1 < n && (Lean.isIdFirst cs[i + 1]! || cs[i + 1]! == '«') then mkIc (ic >>> 4) (field := true) else 0
+        scanForbiddenLoop ctx (i + 1) line 0 ic' gs ib hits
+      | '.' =>
+        let ic' := if inc && ((ic &&& 4) != 0 || (ic >>> 4) > 0) then mkIc (if (ic &&& 4) != 0 then ic >>> 4 else (ic >>> 4) - 1) (field := true) else 0
+        scanForbiddenLoop ctx (i + 1) line 0 ic' gs ib hits
+      | '#' =>
+        if inc && i + 1 < n && cs[i + 1]! == '[' then scanForbiddenLoop ctx (i + 2) line 0 0 (pushGroup gs ']' ic) ib hits
+        else if i + 6 <= n && matchWord cs i (i + 6) "#guard" && (i + 6 >= n || !Lean.isIdRest cs[i + 6]!) then
+          scanForbiddenLoop ctx (i + 6) line 0 0 gs ib (hits.push (line, "#guard"))
+        else scanForbiddenLoop ctx (i + 1) line 0 0 gs ib hits
+      | '(' | '[' | '⟨' =>
+        let gs' := if inc then pushGroup gs (if c == '(' then ')' else if c == '[' then ']' else '⟩') ic (c == '[') else gs
+        scanForbiddenLoop ctx (i + 1) line 0 0 gs' ib hits
+      | '{' =>
+        if !ib.isEmpty then
+          let (top, savedGs) := ib.back!
+          if ctx.braceMode >= 2 then scanForbiddenLoop ctx (i + 1) line 0 0 gs ib hits
+          else scanForbiddenLoop ctx (i + 1) line 0 0 (if inc then pushGroup gs '}' ic else gs) (if ctx.braceMode == 0 then ib.pop.push (top + 1, savedGs) else ib) hits
+        else scanForbiddenLoop ctx (i + 1) line 0 0 (if inc then pushGroup gs '}' ic else gs) ib hits
+      | '}' =>
+        if !ib.isEmpty then
+          let (top, savedGs) := ib.back!
+          if ctx.braceMode >= 2 then scanForbiddenLoop ctx (i + 1) line 0 0 gs ib hits
+          else if top == 0 then scanForbiddenLoop ctx (i + 1) line 4 0 (popToSize gs savedGs) ib.pop hits
+          else
+            let (gs', ic') := if inc && !gs.isEmpty && gs.back!.1 == '}' then (gs.pop, gs.back!.2) else (gs, 0)
+            scanForbiddenLoop ctx (i + 1) line 0 ic' gs' (ib.pop.push (top - 1, savedGs)) hits
+        else
+          let (gs', ic') := if inc && !gs.isEmpty && gs.back!.1 == '}' then (gs.pop, gs.back!.2) else (gs, 0)
+          scanForbiddenLoop ctx (i + 1) line 0 ic' gs' ib hits
+      | ')' | ']' | '⟩' =>
+        let (gs', ic') := if inc && !gs.isEmpty && gs.back!.1 == c then (gs.pop, gs.back!.2) else (gs, 0)
+        scanForbiddenLoop ctx (i + 1) line 0 ic' gs' ib hits
+      | '"' =>
+        if ctx.braceMode >= 2 && !ib.isEmpty then
+          let (ni, nl, _) := if ctx.braceMode == 2 then (0, 0, false) else scanStrLoop cs n false (i + 1) line
+          if ctx.braceMode >= 3 && ni <= n && ni > i + 1 && cs[ni - 1]! == '"' && (ctx.braceMode == 4 || nl == line) then
+            scanForbiddenLoop ctx ni nl 0 0 gs ib hits
+          else scanForbiddenLoop ctx (i + 1) line 0 0 (popToSize gs ib.back!.2) ib.pop hits
+        else
+          let (ni, nl, enterB) := scanStrLoop cs n (inc && (ctx.allInterp || (ic &&& 1) != 0)) (i + 1) line
+          scanForbiddenLoop ctx ni nl 0 0 gs (if enterB then ib.push (0, gs.size) else ib) hits
+      | '\'' =>
+        scanForbiddenLoop ctx (if !prevId && i + 1 < n && cs[i + 1]! != '\'' then scanCharLit cs n i else i + 1) line 0 0 gs ib hits
+      | _ =>
+        if inc && (ic &&& 8) != 0 && c.isDigit then scanForbiddenLoop ctx (skipDigits cs n (i + 1) false) line 0 (finishAtField ic) gs ib hits
+        else if inc && (ic >>> 4) > 0 && c.isDigit then scanForbiddenLoop ctx (skipDigits cs n (i + 1) true) line 0 (consumeAtArg ic) gs ib hits
+        else if Lean.isIdFirst c then
+          let ni := scanIdentEnd cs n (i + 1)
+          let hits' := match forbiddenAt? cs i ni with | some f => hits.push (line, f) | none => hits
+          let ic' : UInt32 := if !inc then 0
+            else if (ic &&& 8) != 0 then finishAtField ic
+            else if (ic >>> 4) > 0 then consumeAtArg ic
+            else if i >= 6 && cs[i - 1]! == '.' && matchWord cs i ni "trace" && matchWord cs (i - 6) (i - 1) "Macro" && (i == 6 || !Lean.isIdRest cs[i - 7]!) then 2
+            else if i > 0 && (cs[i - 1]! == '.' || cs[i - 1]! == '`') then 0
+            else if c == 'f' && ni == i + 1 && ni < n && cs[ni]! == '"' then 1
+            else if ni - i >= 2 && 'a' ≤ c && c ≤ 'z' then
+              let tok := sliceStr cs i ni; let kw := kwFlags.getD tok 0
+              if (kw &&& 4) != 0 then mkIc 2 else if (kw &&& 2) != 0 then mkIc 1
+              else mkIc (prev := (kw &&& 1) != 0) (after := tok == "trace" || tok == "trace_goal")
+            else 0
+          scanForbiddenLoop ctx ni line 3 ic' gs ib hits'
+        else scanForbiddenLoop ctx (i + 1) line 0 0 gs ib hits
 
 private def mergeHits (a b : Array (Nat × String)) : Array (Nat × String) :=
   b.foldl (init := a) fun acc h => if acc.contains h then acc else acc.push h
@@ -708,5 +735,16 @@ def verify (checkExterns : Bool := true) (extraLakeTargets : Array String := #[]
 def cmdCheck : IO UInt32 := do
   if ← verify (checkExterns := true) then IO.println (green "✓ verified"); return 0
   else IO.eprintln (red "✗ verification failed"); return 1
+
+def cmdTest : IO UInt32 := do
+  if !(← verify) then IO.eprintln (red "✗ verification failed"); return 1
+  step "building native test runner"
+  let targets := #["qedtest", "qed/QedServer:static", "qed/Qed:static", "qed/libqed_server"] ++
+    (if ← isInRepo then #["+QedTests.CheckHelper:c.o", "+QedTests.ServerChecks:c.o", "+QedTests.AuthChecks:c.o",
+      "+QedTests.DbChecks:c.o", "+QedTests.WebEssentialsFixture:c.o", "+Examples.CloudBooks:c.o", "+Examples.LiveRoom:c.o"] else #[])
+  if (← shLakeBuild (#["build"] ++ targets)) != 0 then IO.eprintln (red "✗ failed to build native test runner"); return 1
+  step "running tests"
+  let some lp ← lakeEnvLeanPath | return 1
+  sh (FilePath.mk ".lake" / "build" / "bin" / "qedtest").toString #[] #[("QED_SKIP_VERIFY", some "1"), ("QED_PREBUILT", some "1"), ("LEAN_PATH", some lp)]
 
 end Qed.Cli

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# qed — the Qed toolchain entry point.
+# qed: the Qed toolchain entry point.
 #
 # Sets up the environment (Lean via elan), builds the CLI if needed,
 # then runs it. Usage: `./scripts/qed <command>`.
@@ -18,7 +18,7 @@ export QED_WEB_ROOT="${QED_WEB_ROOT:-Examples.Counter}"
 
 # Build the CLI (skip `lake` altogether when `.lake/build/bin/qed` is newer than CLI sources).
 if [ ! -x .lake/build/bin/qed ] || \
-   [ -n "$(find Cli.lean Cli lakefile.lean lean-toolchain -newer .lake/build/bin/qed 2>/dev/null | head -1)" ]; then
+   [ -n "$(find Cli.lean Cli Qed/Cloud rust/qed_server/src/watch.rs lakefile.lean lean-toolchain -newer .lake/build/bin/qed 2>/dev/null | head -1)" ]; then
   if ! lake build qed >/dev/null 2>&1; then
     echo "qed: failed to build the CLI" >&2
     lake build qed   # re-run to show the error

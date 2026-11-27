@@ -1,6 +1,7 @@
 import Qed.Base64
-import Qed.Json
-import Qed.Server.Net
+import Qed.Json.Basic
+import Qed.Cloud.Env
+import Qed.Date
 
 /-! ## Hosted Qed Cloud Wire Protocol (`Qed.Cloud.Protocol`)
     Pure, verified JSON request/response types and input validators shared between
@@ -8,7 +9,7 @@ import Qed.Server.Net
 
 namespace Qed.Cloud.Protocol
 
-open Qed Qed.Server.Net
+open Qed Qed.Cloud
 
 /-! ### 1. Bounds, Base64 & Input Validators -/
 
@@ -64,6 +65,16 @@ def isValidSecretKey (s : String) : Bool :=
       1 ≤ cs.length && cs.length ≤ 64 && (('A' ≤ c && c ≤ 'Z') || c == '_') &&
       cs.all (fun ch => ('A' ≤ ch && ch ≤ 'Z') || ('0' ≤ ch && ch ≤ '9') || ch == '_')
   | [] => false
+
+def isValidModuleName (s : String) : Bool :=
+  !s.isEmpty && s.length ≤ 128 && s.toList.all (fun c => c.isAlphanum || c == '.' || c == '_')
+
+def validateSecretTarget (appSlug envStr name : String) (fmt : String → String := id)
+    (envHint : Bool := false) : Except String Unit := do
+  if !isValidAppSlug appSlug then throw s!"invalid app slug `{fmt appSlug}`"
+  if !isValidEnvName envStr then
+    throw s!"invalid env `{fmt envStr}`{if envHint then " (expected prod, staging, or preview)" else ""}"
+  if !isValidSecretKey name then throw s!"invalid secret name `{fmt name}` (use UPPER_SNAKE_CASE)"
 
 private def forbiddenSourceTopDirs : List String :=
   ["dist", "node_modules", "target"]
@@ -128,66 +139,29 @@ structure DeviceStartResp where
   verifyUrl    : String
   expiresInSec : Nat := 600
   intervalSec  : Nat := 2
-deriving Inhabited, DecidableEq, Repr
-
-instance : ToJson DeviceStartResp where
-  toJson r := .obj [
-    ("deviceCode", .str r.deviceCode), ("userCode", .str r.userCode),
-    ("verifyUrl", .str r.verifyUrl), ("expiresInSec", toJson r.expiresInSec),
-    ("intervalSec", toJson r.intervalSec)]
-
-instance : FromJson DeviceStartResp where
-  fromJson j := do
-    return {
-      deviceCode := ← fromField j "deviceCode", userCode := ← fromField j "userCode",
-      verifyUrl := ← fromField j "verifyUrl", expiresInSec := ← fromField j "expiresInSec",
-      intervalSec := ← fromField j "intervalSec" }
+deriving Inhabited, BEq, Repr
+json_obj_codec% DeviceStartResp [deviceCode, userCode, verifyUrl, expiresInSec, intervalSec]
 
 structure DevicePollReq where
   deviceCode : String
-deriving Inhabited, DecidableEq, Repr
-
-instance : ToJson DevicePollReq where
-  toJson r := .obj [("deviceCode", .str r.deviceCode)]
-
-instance : FromJson DevicePollReq where
-  fromJson j := return { deviceCode := ← fromField j "deviceCode" }
+deriving Inhabited, BEq, Repr
+json_obj_codec% DevicePollReq [deviceCode]
 
 structure DevicePollResp where
   status : String
   token  : Option String := none
   userId : Option String := none
   email  : Option String := none
-deriving Inhabited, DecidableEq, Repr
-
-instance : ToJson DevicePollResp where
-  toJson r := .obj [
-    ("status", .str r.status), ("token", toJson r.token),
-    ("userId", toJson r.userId), ("email", toJson r.email)]
-
-instance : FromJson DevicePollResp where
-  fromJson j := do
-    return {
-      status := ← fromField j "status", token := ← fromField j "token",
-      userId := ← fromField j "userId", email := ← fromField j "email" }
+deriving Inhabited, BEq, Repr
+json_obj_codec% DevicePollResp [status, token, userId, email]
 
 structure WhoamiResp where
   userId    : String
   email     : String
   tenantId  : Nat
   appsCount : Nat
-deriving Inhabited, DecidableEq, Repr
-
-instance : ToJson WhoamiResp where
-  toJson r := .obj [
-    ("userId", .str r.userId), ("email", .str r.email),
-    ("tenantId", toJson r.tenantId), ("appsCount", toJson r.appsCount)]
-
-instance : FromJson WhoamiResp where
-  fromJson j := do
-    return {
-      userId := ← fromField j "userId", email := ← fromField j "email",
-      tenantId := ← fromField j "tenantId", appsCount := ← fromField j "appsCount" }
+deriving Inhabited, BEq, Repr
+json_obj_codec% WhoamiResp [userId, email, tenantId, appsCount]
 
 /-! ### 3. Source Bundle & Deployment Protocol -/
 
@@ -195,28 +169,28 @@ structure SourceFile where
   path     : String
   content  : String
   encoding : String := "utf8"
-deriving Inhabited, DecidableEq, Repr
+deriving Inhabited, BEq, Repr
+
+private def SourceFile.withEncoding {α : Type} (f : SourceFile) (maxBytes? : Option Nat)
+    (onUtf8 : String → α) (onBin : ByteArray → α) : Except String α := do
+  if f.encoding == "utf8" then pure (onUtf8 f.content)
+  else if f.encoding == "base64" then
+    if let some lim := maxBytes? then
+      if f.content.utf8ByteSize > Qed.Base64.encodedLength lim then
+        throw s!"source file `{f.path}` exceeds max size (> {lim} bytes)"
+    match decodeBase64? f.content with
+    | some bs => pure (onBin bs)
+    | none    => throw s!"source file `{f.path}` has invalid base64 content"
+  else throw s!"source file `{f.path}` has invalid encoding `{f.encoding}` (expected utf8 or base64)"
 
 def SourceFile.decodedBytes (f : SourceFile) : Except String ByteArray :=
-  if f.encoding == "utf8" then .ok f.content.toUTF8
-  else if f.encoding == "base64" then
-    match decodeBase64? f.content with
-    | some bs => .ok bs
-    | none    => .error s!"source file `{f.path}` has invalid base64 content"
-  else
-    .error s!"source file `{f.path}` has invalid encoding `{f.encoding}` (expected utf8 or base64)"
+  f.withEncoding none String.toUTF8 id
 
-instance : ToJson SourceFile where
-  toJson f := .obj [("path", .str f.path), ("content", .str f.content), ("encoding", .str f.encoding)]
-
-instance : FromJson SourceFile where
-  fromJson j := do
-    let enc? : Option String ← fromField j "encoding"
-    return { path := ← fromField j "path", content := ← fromField j "content", encoding := enc?.getD "utf8" }
+json_obj_codec% SourceFile [path, content, encoding := "utf8"]
 
 structure SourceBundle where
   files : Array SourceFile
-deriving Inhabited, DecidableEq, Repr
+deriving Inhabited, BEq, Repr
 
 def SourceBundle.validate (b : SourceBundle) : Except String Unit := do
   if b.files.isEmpty then throw "source bundle cannot be empty"
@@ -226,17 +200,7 @@ def SourceBundle.validate (b : SourceBundle) : Except String Unit := do
   for f in b.files do
     if !isValidSourceRelPath f.path then throw s!"invalid source file path `{f.path}`"
     if seen.contains f.path then throw s!"duplicate source file path `{f.path}`"
-    let sz ←
-      if f.encoding == "utf8" then
-        pure f.content.utf8ByteSize
-      else if f.encoding == "base64" then
-        if f.content.utf8ByteSize > Qed.Base64.encodedLength maxSourceFileBytes then
-          throw s!"source file `{f.path}` exceeds max size (> {maxSourceFileBytes} bytes)"
-        match decodeBase64? f.content with
-        | some bs => pure bs.size
-        | none    => throw s!"source file `{f.path}` has invalid base64 content"
-      else
-        throw s!"source file `{f.path}` has invalid encoding `{f.encoding}` (expected utf8 or base64)"
+    let sz ← f.withEncoding (some maxSourceFileBytes) String.utf8ByteSize ByteArray.size
     if sz > maxSourceFileBytes then throw s!"source file `{f.path}` exceeds max size ({sz} > {maxSourceFileBytes} bytes)"
     totalBytes := totalBytes + sz
     if totalBytes > maxTotalSourceBytes then throw s!"source bundle exceeds max total size ({maxTotalSourceBytes} bytes)"
@@ -244,15 +208,7 @@ def SourceBundle.validate (b : SourceBundle) : Except String Unit := do
   if !b.files.any (fun f => Qed.Str.endsWith f.path ".lean") then
     throw "source bundle must include at least one `.lean` file"
 
-instance : ToJson SourceBundle where
-  toJson b := .obj [("files", toJson b.files)]
-
-instance : FromJson SourceBundle where
-  fromJson j := do
-    let files : Array SourceFile ← fromField j "files"
-    let b : SourceBundle := { files }
-    b.validate
-    return b
+json_obj_codec% SourceBundle [files] validate SourceBundle.validate
 
 structure DeployUploadReq where
   appSlug    : String
@@ -261,31 +217,18 @@ structure DeployUploadReq where
   mod        : String := "App"
   deployName : String := ""
   bundle     : SourceBundle
-deriving Inhabited, DecidableEq, Repr
+deriving Inhabited, BEq, Repr
 
 def DeployUploadReq.validate (r : DeployUploadReq) : Except String Unit := do
   if !isValidAppSlug r.appSlug then throw s!"invalid app slug `{r.appSlug}` (use 2-48 lowercase letters, digits, or single hyphens)"
   if !isValidEnvName r.env then throw s!"invalid env `{r.env}` (expected prod, staging, or preview)"
   if r.env == "preview" && r.pr == 0 then throw "preview deploy requires a positive PR number"
   if r.env != "preview" && r.pr != 0 then throw "PR number is only valid for preview deploys"
-  if r.mod.isEmpty || r.mod.length > 128 || !r.mod.toList.all (fun c => c.isAlphanum || c == '.' || c == '_') then
-    throw s!"invalid root module `{r.mod}`"
-  if !r.deployName.isEmpty && (r.deployName.length > 128 || !r.deployName.toList.all (fun c => c.isAlphanum || c == '.' || c == '_')) then
-    throw s!"invalid deploy spec name `{r.deployName}`"
+  if !isValidModuleName r.mod then throw s!"invalid root module `{r.mod}`"
+  if !r.deployName.isEmpty && !isValidModuleName r.deployName then throw s!"invalid deploy spec name `{r.deployName}`"
   r.bundle.validate
 
-instance : ToJson DeployUploadReq where
-  toJson r := .obj [
-    ("appSlug", .str r.appSlug), ("env", .str r.env), ("pr", toJson r.pr),
-    ("mod", .str r.mod), ("deployName", .str r.deployName), ("bundle", toJson r.bundle)]
-
-instance : FromJson DeployUploadReq where
-  fromJson j := do
-    let r : DeployUploadReq := {
-      appSlug := ← fromField j "appSlug", env := ← fromField j "env", pr := ← fromField j "pr",
-      mod := ← fromField j "mod", deployName := ← fromField j "deployName", bundle := ← fromField j "bundle" }
-    r.validate
-    return r
+json_obj_codec% DeployUploadReq [appSlug, env, pr, mod, deployName, bundle] validate DeployUploadReq.validate
 
 structure DeployUploadResp where
   deploymentId : String
@@ -294,38 +237,16 @@ structure DeployUploadResp where
   appId        : Nat
   status       : String
   dashboardUrl : String
-deriving Inhabited, DecidableEq, Repr
-
-instance : ToJson DeployUploadResp where
-  toJson r := .obj [
-    ("deploymentId", .str r.deploymentId), ("appSlug", .str r.appSlug),
-    ("tenantId", toJson r.tenantId), ("appId", toJson r.appId),
-    ("status", .str r.status), ("dashboardUrl", .str r.dashboardUrl)]
-
-instance : FromJson DeployUploadResp where
-  fromJson j := do
-    return {
-      deploymentId := ← fromField j "deploymentId", appSlug := ← fromField j "appSlug",
-      tenantId := ← fromField j "tenantId", appId := ← fromField j "appId",
-      status := ← fromField j "status", dashboardUrl := ← fromField j "dashboardUrl" }
+deriving Inhabited, BEq, Repr
+json_obj_codec% DeployUploadResp [deploymentId, appSlug, tenantId, appId, status, dashboardUrl]
 
 structure DeployLogEntry where
   seq     : Nat
   ts      : Nat
   level   : String
   message : String
-deriving Inhabited, DecidableEq, Repr
-
-instance : ToJson DeployLogEntry where
-  toJson e := .obj [
-    ("seq", toJson e.seq), ("ts", toJson e.ts),
-    ("level", .str e.level), ("message", .str e.message)]
-
-instance : FromJson DeployLogEntry where
-  fromJson j := do
-    return {
-      seq := ← fromField j "seq", ts := ← fromField j "ts",
-      level := ← fromField j "level", message := ← fromField j "message" }
+deriving Inhabited, BEq, Repr
+json_obj_codec% DeployLogEntry [seq, ts, level, message]
 
 structure DeploymentView where
   id            : String
@@ -340,23 +261,8 @@ structure DeploymentView where
   createdAt     : Nat
   updatedAt     : Nat
   logs          : Array DeployLogEntry := #[]
-deriving Inhabited, DecidableEq, Repr
-
-instance : ToJson DeploymentView where
-  toJson d := .obj [
-    ("id", .str d.id), ("appSlug", .str d.appSlug), ("env", .str d.env), ("pr", toJson d.pr),
-    ("status", .str d.status), ("url", .str d.url), ("buildHash", .str d.buildHash),
-    ("verifiedDecls", toJson d.verifiedDecls), ("errorMsg", .str d.errorMsg),
-    ("createdAt", toJson d.createdAt), ("updatedAt", toJson d.updatedAt), ("logs", toJson d.logs)]
-
-instance : FromJson DeploymentView where
-  fromJson j := do
-    return {
-      id := ← fromField j "id", appSlug := ← fromField j "appSlug", env := ← fromField j "env",
-      pr := ← fromField j "pr", status := ← fromField j "status", url := ← fromField j "url",
-      buildHash := ← fromField j "buildHash", verifiedDecls := ← fromField j "verifiedDecls",
-      errorMsg := ← fromField j "errorMsg", createdAt := ← fromField j "createdAt",
-      updatedAt := ← fromField j "updatedAt", logs := ← fromField j "logs" }
+deriving Inhabited, BEq, Repr
+json_obj_codec% DeploymentView [id, appSlug, env, pr, status, url, buildHash, verifiedDecls, errorMsg, createdAt, updatedAt, logs]
 
 structure AppSummary where
   slug        : String
@@ -366,116 +272,58 @@ structure AppSummary where
   lastStatus  : String
   deployCount : Nat
   createdAt   : Nat
-deriving Inhabited, DecidableEq, Repr
-
-instance : ToJson AppSummary where
-  toJson a := .obj [
-    ("slug", .str a.slug), ("tenantId", toJson a.tenantId), ("appId", toJson a.appId),
-    ("prodUrl", .str a.prodUrl), ("lastStatus", .str a.lastStatus),
-    ("deployCount", toJson a.deployCount), ("createdAt", toJson a.createdAt)]
-
-instance : FromJson AppSummary where
-  fromJson j := do
-    return {
-      slug := ← fromField j "slug", tenantId := ← fromField j "tenantId", appId := ← fromField j "appId",
-      prodUrl := ← fromField j "prodUrl", lastStatus := ← fromField j "lastStatus",
-      deployCount := ← fromField j "deployCount", createdAt := ← fromField j "createdAt" }
+deriving Inhabited, BEq, Repr
+json_obj_codec% AppSummary [slug, tenantId, appId, prodUrl, lastStatus, deployCount, createdAt]
 
 structure AppsListResp where
   apps : Array AppSummary
-deriving Inhabited, DecidableEq, Repr
-
-instance : ToJson AppsListResp where
-  toJson r := .obj [("apps", toJson r.apps)]
-
-instance : FromJson AppsListResp where
-  fromJson j := return { apps := ← fromField j "apps" }
+deriving Inhabited, BEq, Repr
+json_obj_codec% AppsListResp [apps]
 
 structure SecretSetReq where
   appSlug : String
   env     : String := "prod"
   name    : String
   value   : String
-deriving Inhabited, DecidableEq, Repr
+deriving Inhabited, BEq, Repr
 
 def SecretSetReq.validate (r : SecretSetReq) : Except String Unit := do
-  if !isValidAppSlug r.appSlug then throw s!"invalid app slug `{r.appSlug}`"
-  if !isValidEnvName r.env then throw s!"invalid env `{r.env}`"
-  if !isValidSecretKey r.name then throw s!"invalid secret name `{r.name}` (use UPPER_SNAKE_CASE)"
+  validateSecretTarget r.appSlug r.env r.name
   if r.value.isEmpty || r.value.utf8ByteSize > 65536 then throw "secret value must be 1..65536 bytes"
 
-instance : ToJson SecretSetReq where
-  toJson r := .obj [("appSlug", .str r.appSlug), ("env", .str r.env), ("name", .str r.name), ("value", .str r.value)]
-
-instance : FromJson SecretSetReq where
-  fromJson j := do
-    let r : SecretSetReq := {
-      appSlug := ← fromField j "appSlug", env := ← fromField j "env",
-      name := ← fromField j "name", value := ← fromField j "value" }
-    r.validate
-    return r
+json_obj_codec% SecretSetReq [appSlug, env, name, value] validate SecretSetReq.validate
 
 structure SecretsListResp where
   appSlug : String
   names   : Array String
-deriving Inhabited, DecidableEq, Repr
-
-instance : ToJson SecretsListResp where
-  toJson r := .obj [("appSlug", .str r.appSlug), ("names", toJson r.names)]
-
-instance : FromJson SecretsListResp where
-  fromJson j := return { appSlug := ← fromField j "appSlug", names := ← fromField j "names" }
+deriving Inhabited, BEq, Repr
+json_obj_codec% SecretsListResp [appSlug, names]
 
 structure SecretDeleteReq where
   appSlug : String
   env     : String := "prod"
   name    : String
-deriving Inhabited, DecidableEq, Repr
+deriving Inhabited, BEq, Repr
 
-def SecretDeleteReq.validate (r : SecretDeleteReq) : Except String Unit := do
-  if !isValidAppSlug r.appSlug then throw s!"invalid app slug `{r.appSlug}`"
-  if !isValidEnvName r.env then throw s!"invalid env `{r.env}`"
-  if !isValidSecretKey r.name then throw s!"invalid secret name `{r.name}` (use UPPER_SNAKE_CASE)"
+def SecretDeleteReq.validate (r : SecretDeleteReq) : Except String Unit :=
+  validateSecretTarget r.appSlug r.env r.name
 
-instance : ToJson SecretDeleteReq where
-  toJson r := .obj [("appSlug", .str r.appSlug), ("env", .str r.env), ("name", .str r.name)]
-
-instance : FromJson SecretDeleteReq where
-  fromJson j := do
-    let env? : Option String ← fromField j "env"
-    let r : SecretDeleteReq := {
-      appSlug := ← fromField j "appSlug",
-      env := env?.getD "prod",
-      name := ← fromField j "name" }
-    r.validate
-    return r
+json_obj_codec% SecretDeleteReq [appSlug, env := "prod", name] validate SecretDeleteReq.validate
 
 structure RollbackReq where
   appSlug      : String
   deploymentId : String
-deriving Inhabited, DecidableEq, Repr
-
-instance : ToJson RollbackReq where
-  toJson r := .obj [("appSlug", .str r.appSlug), ("deploymentId", .str r.deploymentId)]
-
-instance : FromJson RollbackReq where
-  fromJson j := return { appSlug := ← fromField j "appSlug", deploymentId := ← fromField j "deploymentId" }
+deriving Inhabited, BEq, Repr
+json_obj_codec% RollbackReq [appSlug, deploymentId]
 
 structure CancelDeployReq where
   deploymentId : String
-deriving Inhabited, DecidableEq, Repr
+deriving Inhabited, BEq, Repr
 
 def CancelDeployReq.validate (r : CancelDeployReq) : Except String Unit := do
   if !isValidDeploymentId r.deploymentId then throw s!"invalid deployment id `{r.deploymentId}`"
 
-instance : ToJson CancelDeployReq where
-  toJson r := .obj [("deploymentId", .str r.deploymentId)]
-
-instance : FromJson CancelDeployReq where
-  fromJson j := do
-    let r : CancelDeployReq := { deploymentId := ← fromField j "deploymentId" }
-    r.validate
-    return r
+json_obj_codec% CancelDeployReq [deploymentId] validate CancelDeployReq.validate
 
 structure RuntimeLogView where
   id        : String
@@ -483,20 +331,8 @@ structure RuntimeLogView where
   severity  : String
   source    : String
   message   : String
-deriving Inhabited, DecidableEq, Repr
-
-instance : ToJson RuntimeLogView where
-  toJson e := .obj [
-    ("id", .str e.id), ("timestamp", .str e.timestamp),
-    ("severity", .str e.severity), ("source", .str e.source),
-    ("message", .str e.message)]
-
-instance : FromJson RuntimeLogView where
-  fromJson j := do
-    return {
-      id := ← fromField j "id", timestamp := ← fromField j "timestamp",
-      severity := ← fromField j "severity", source := ← fromField j "source",
-      message := ← fromField j "message" }
+deriving Inhabited, BEq, Repr
+json_obj_codec% RuntimeLogView [id, timestamp, severity, source, message]
 
 structure RuntimeLogsResp where
   appSlug       : String
@@ -504,55 +340,12 @@ structure RuntimeLogsResp where
   pr            : Nat := 0
   logs          : Array RuntimeLogView
   nextPageToken : Option String := none
-deriving Inhabited, DecidableEq, Repr
-
-instance : ToJson RuntimeLogsResp where
-  toJson r := .obj [
-    ("appSlug", .str r.appSlug), ("env", .str r.env), ("pr", toJson r.pr),
-    ("logs", toJson r.logs), ("nextPageToken", toJson r.nextPageToken)]
-
-instance : FromJson RuntimeLogsResp where
-  fromJson j := do
-    let pr? : Option Nat ← fromField j "pr"
-    return {
-      appSlug := ← fromField j "appSlug", env := ← fromField j "env",
-      pr := pr?.getD 0, logs := ← fromField j "logs",
-      nextPageToken := ← fromField j "nextPageToken" }
+deriving Inhabited, BEq, Repr
+json_obj_codec% RuntimeLogsResp [appSlug, env, pr := 0, logs, nextPageToken]
 
 structure TokenRevokeResp where
   revoked : Bool
-deriving Inhabited, DecidableEq, Repr
-
-instance : ToJson TokenRevokeResp where
-  toJson r := .obj [("revoked", .bool r.revoked)]
-
-instance : FromJson TokenRevokeResp where
-  fromJson j := return { revoked := ← fromField j "revoked" }
-
-example : (isValidAppSlug "my-app-1" && !isValidAppSlug "A" && !isValidAppSlug "my--app" && !isValidAppSlug "-bad") = true := by decide +kernel
-example : (isValidDeploymentId "dep_abc-1" && isValidDeploymentId "0123" && !isValidDeploymentId "" && !isValidDeploymentId "-bad" && !isValidDeploymentId "--help" && !isValidDeploymentId "_bad") = true := by decide +kernel
-example : (isValidDeployStatus "live" && isValidDeployStatus "canceled" && !isValidDeployStatus "unknown") = true := by decide +kernel
-example :
-  (["App.lean", "styles/main.css", "lean-toolchain", "lakefile.lean", "lakefile.toml", "lake-manifest.json",
-    "qed.json", "robots.txt", "sitemap.xml", "manifest.json", "public/logo.png", "public/hero.jpg",
-    "public/photo.jpeg", "public/anim.gif", "public/icon.svg", "public/img.webp", "public/favicon.ico",
-    "fonts/inter.woff", "fonts/inter.woff2", "fonts/inter.ttf", "fonts/inter.otf", "public/data.json",
-    "public/notes.txt", "public/feed.xml", "public/site.webmanifest", "public/index.html",
-    "public/app.js", "public/mod.mjs"].all isValidSourceRelPath) = true := by decide +kernel
-example :
-  (["../secret.lean", "../logo.png", ".env", ".env.prod", ".env.json", ".ENV.txt",
-    ".git/config.txt", ".lake/a.lean", ".qed/cache.json", ".config/qed/credentials.json",
-    ".docker/config.json", ".ssh/id_rsa.txt", ".htaccess.txt", "..png", ".a.png",
-    "dist/app.mjs", "node_modules/pkg/index.js", "target/out.txt", "/etc/passwd", "public/a\\b.png",
-    "public/a.png?v=1", "public/a.png#frag", "public/a:b.png", "public/a\nb.png", ".png", "public/.png", ".json"].all (!isValidSourceRelPath ·)) = true := by decide +kernel
-example : (isBinarySourceExt "public/logo.png" && !isBinarySourceExt "public/.png" && !isBinarySourceExt "public/.a.png" && !isBinarySourceExt ".png") = true := by decide +kernel
-example :
-  ([ByteArray.empty, ByteArray.mk #[0], ByteArray.mk #[0, 1], ByteArray.mk #[0, 1, 2],
-    ByteArray.mk #[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0xFF]].all fun bs =>
-      (decodeBase64? (encodeBase64 bs)).map (·.data) == some bs.data) = true := by decide +kernel
-example :
-  (["abc", "ab!d", "AA==AAAA", "AB==", "AP==", "AAB=", "///=", "//=="].all fun s => (decodeBase64? s).isNone) = true := by decide +kernel
-example : (isValidCloudApiUrl "http://127.0.0.1:8080" && isValidCloudApiUrl "https://api.qed.cloud" && isValidCloudApiUrl "https://qed-cloud-abc-uc.a.run.app" && !isValidCloudApiUrl "http://example.com" && !isValidCloudApiUrl "https://a.run.app/path") = true := by decide +kernel
-example : (isValidDeviceUserCode "ABCD-2345" && !isValidDeviceUserCode "abcd-2345" && !isValidDeviceUserCode "ABCD2345") = true := by decide +kernel
+deriving Inhabited, BEq, Repr
+json_obj_codec% TokenRevokeResp [revoked]
 
 end Qed.Cloud.Protocol

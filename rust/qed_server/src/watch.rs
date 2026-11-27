@@ -35,12 +35,21 @@ fn walk_tree(dir: &Path, is_rt: bool, skip: &HashSet<String>, visit_files: bool,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn coalesce_events(mut mask: u32, mut poll_more: impl FnMut(Duration) -> Option<u32>) -> u32 {
+fn wait_with_coalesce(timeout_ms: u32, mut mask: u32, mut poll_once: impl FnMut(Duration) -> Result<Option<u32>, ()>) -> u32 {
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
+    while mask == 0 {
+        let Some(rem) = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) else { return 0 };
+        match poll_once(rem) {
+            Err(()) => return CHANGE_ERROR,
+            Ok(None) => return 0,
+            Ok(Some(m)) => mask |= m,
+        }
+    }
     let cap = Instant::now() + Duration::from_millis(120);
     while let Some(rem) = cap.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) {
-        match poll_more(rem.min(Duration::from_millis(35))) {
-            Some(m) => mask |= m,
-            None => break,
+        match poll_once(rem.min(Duration::from_millis(35))) {
+            Ok(Some(m)) => mask |= m,
+            Ok(None) | Err(()) => break,
         }
     }
     mask
@@ -102,19 +111,11 @@ mod os_watch {
             mask
         }
         pub fn wait(&mut self, timeout_ms: u32) -> u32 {
-            let (deadline, mut mask) = (Instant::now() + Duration::from_millis(timeout_ms as u64), self.drain_events());
-            while mask == 0 {
-                let Some(rem) = rem_timeout_ms(deadline, 0) else { return 0 };
-                match crate::poll_in(self.fd, rem) {
-                    rc if rc < 0 => if crate::last_errno() == libc::EINTR { continue; } else { return CHANGE_ERROR; },
-                    0 => return 0,
-                    _ => mask |= self.drain_events(),
-                }
-            }
-            coalesce_events(mask, |d| match crate::poll_in(self.fd, d.as_millis().max(1) as i32) {
-                rc if rc < 0 => if crate::last_errno() == libc::EINTR { Some(0) } else { None },
-                0 => None,
-                _ => Some(self.drain_events()),
+            let init = self.drain_events();
+            wait_with_coalesce(timeout_ms, init, |d| match crate::poll_in(self.fd, d.as_millis().clamp(1, i32::MAX as u128) as i32) {
+                rc if rc < 0 => if crate::last_errno() == libc::EINTR { Ok(Some(0)) } else { Err(()) },
+                0 => Ok(None),
+                _ => Ok(Some(self.drain_events())),
             })
         }
     }
@@ -174,16 +175,8 @@ mod os_watch {
             Ok(Some(mask))
         }
         pub fn wait(&mut self, timeout_ms: u32) -> u32 {
-            let (deadline, mut mask, mut evs): (_, u32, [libc::kevent; 64]) = (Instant::now() + Duration::from_millis(timeout_ms as u64), 0, unsafe { std::mem::zeroed() });
-            while mask == 0 {
-                let Some(rem) = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) else { return 0 };
-                match self.poll_once(&mut evs, rem) {
-                    Err(()) => return CHANGE_ERROR,
-                    Ok(None) => return 0,
-                    Ok(Some(m)) => mask |= m,
-                }
-            }
-            coalesce_events(mask, |d| self.poll_once(&mut evs, d).ok().flatten())
+            let mut evs: [libc::kevent; 64] = unsafe { std::mem::zeroed() };
+            wait_with_coalesce(timeout_ms, 0, |d| self.poll_once(&mut evs, d))
         }
     }
 }

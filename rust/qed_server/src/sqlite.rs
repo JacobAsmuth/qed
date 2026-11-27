@@ -1,30 +1,148 @@
-use std::{cell::RefCell, collections::HashMap, convert::identity, path::Path, sync::{Arc, Condvar, Mutex, OnceLock, RwLock}, time::Duration};
-use rusqlite::{params_from_iter, types::{ToSqlOutput, ValueRef}, Connection, OpenFlags};
+use std::{cell::RefCell, collections::HashMap, convert::identity, ffi::{c_char, c_int, CStr, CString}, fmt::Display, marker::PhantomData, path::Path, ptr, sync::{Arc, Condvar, Mutex, OnceLock, RwLock}};
+use libsqlite3_sys as ffi;
 
 use crate::lean_ffi::*;
 use crate::{HandleTable, lock_unpoison, read_unpoison, wait_unpoison, write_unpoison};
 
-fn sql_err(ctx: &str, e: rusqlite::Error) -> String { format!("sqlite {ctx} failed: {e}") }
+extern "C" { fn sqlite3_close_v2(db: *mut ffi::sqlite3) -> c_int; }
+
+const STMT_CACHE_CAP: usize = 128;
+const OPEN_WRITER: c_int = ffi::SQLITE_OPEN_READWRITE | ffi::SQLITE_OPEN_CREATE | ffi::SQLITE_OPEN_URI | ffi::SQLITE_OPEN_NOMUTEX;
+const OPEN_READER: c_int = ffi::SQLITE_OPEN_READONLY | ffi::SQLITE_OPEN_URI | ffi::SQLITE_OPEN_NOMUTEX;
+const PRAGMAS_MEM: &str = "PRAGMA foreign_keys = ON; PRAGMA temp_store = MEMORY; PRAGMA cache_size = -8000;";
+const PRAGMAS_WAL: &str = "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON; PRAGMA temp_store = MEMORY; PRAGMA cache_size = -8000; PRAGMA mmap_size = 67108864; PRAGMA journal_size_limit = 67108864;";
+const PRAGMAS_RO: &str = "PRAGMA query_only = ON; PRAGMA foreign_keys = ON; PRAGMA temp_store = MEMORY; PRAGMA cache_size = -2000; PRAGMA mmap_size = 67108864;";
+
+fn sql_err(ctx: &str, e: impl Display) -> String { format!("sqlite {ctx} failed: {e}") }
 fn tx_err(id: u64) -> String { format!("invalid sqlite transaction handle {id}") }
-fn init_conn(conn: &Connection, pragmas: &str) {
-    conn.set_prepared_statement_cache_capacity(128);
-    let _ = (conn.busy_timeout(Duration::from_secs(5)), conn.execute_batch(pragmas));
+unsafe fn db_errmsg(db: *mut ffi::sqlite3, rc: c_int) -> String {
+    let p = if !db.is_null() { ffi::sqlite3_errmsg(db) } else { ptr::null() };
+    let p = if p.is_null() { ffi::sqlite3_errstr(rc) } else { p };
+    if p.is_null() { format!("sqlite error code {rc}") } else { CStr::from_ptr(p).to_string_lossy().into_owned() }
 }
 
-struct SqliteDbPool { path: String, is_memory: bool, writer: Mutex<Option<Connection>>, writer_cv: Condvar, readers: Mutex<Vec<Connection>> }
-impl SqliteDbPool {
-    fn checkout_writer(&self) -> Connection {
-        let mut g = lock_unpoison(&self.writer); while g.is_none() { g = wait_unpoison(&self.writer_cv, g); } g.take().unwrap()
-    }
-    fn return_writer(&self, conn: Connection) { *lock_unpoison(&self.writer) = Some(conn); self.writer_cv.notify_one(); }
-    fn checkout_reader(&self) -> Result<Connection, String> {
-        if let Some(conn) = lock_unpoison(&self.readers).pop() { return Ok(conn); }
-        let conn = Connection::open_with_flags(&self.path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)
-            .map_err(|e| format!("sqlite open read-only `{}` failed: {e}", self.path))?;
-        init_conn(&conn, "PRAGMA query_only = ON; PRAGMA foreign_keys = ON; PRAGMA temp_store = MEMORY; PRAGMA cache_size = -2000; PRAGMA mmap_size = 67108864;");
+#[derive(Clone, Copy)]
+enum SqlParam<'a> { Null, Integer(i64), Text(&'a [u8]), Blob(&'a [u8]) }
+enum ColRef<'a> { Null, Integer(i64), Real(f64), Text(&'a [u8]), Blob(&'a [u8]) }
+
+struct SqliteConn { db: *mut ffi::sqlite3, cache: HashMap<String, (*mut ffi::sqlite3_stmt, u64)>, tick: u64 }
+unsafe impl Send for SqliteConn {}
+impl SqliteConn {
+    fn open(path: &str, flags: c_int, pragmas: &str) -> Result<Self, String> {
+        let c_path = CString::new(path).map_err(|_| "path contains NUL byte".to_owned())?;
+        let mut db = ptr::null_mut();
+        let rc = unsafe { ffi::sqlite3_open_v2(c_path.as_ptr(), &mut db, flags | ffi::SQLITE_OPEN_EXRESCODE, ptr::null()) };
+        if rc != ffi::SQLITE_OK {
+            let msg = unsafe { db_errmsg(db, rc) };
+            if !db.is_null() { unsafe { sqlite3_close_v2(db) }; }
+            return Err(msg);
+        }
+        let conn = Self { db, cache: HashMap::new(), tick: 0 };
+        unsafe { ffi::sqlite3_busy_timeout(conn.db, 5000); }
+        let _ = conn.execute_batch(pragmas);
         Ok(conn)
     }
-    fn return_reader(&self, conn: Connection) {
+    fn execute_batch(&self, sql: &str) -> Result<(), String> {
+        let c_sql = CString::new(sql).map_err(|_| "SQL contains NUL byte".to_owned())?;
+        let mut errmsg: *mut c_char = ptr::null_mut();
+        let rc = unsafe { ffi::sqlite3_exec(self.db, c_sql.as_ptr(), None, ptr::null_mut(), &mut errmsg) };
+        let err = (!errmsg.is_null()).then(|| unsafe {
+            let s = CStr::from_ptr(errmsg).to_string_lossy().into_owned();
+            ffi::sqlite3_free(errmsg.cast()); s
+        });
+        if rc == ffi::SQLITE_OK { Ok(()) } else { Err(err.unwrap_or_else(|| unsafe { db_errmsg(self.db, rc) })) }
+    }
+    fn prepare_cached(&mut self, sql: &str) -> Result<PreparedStmt<'_>, String> {
+        let key = sql.trim();
+        if key.is_empty() { return Err("empty SQL statement".to_owned()); }
+        self.tick = self.tick.wrapping_add(1);
+        let tick = self.tick;
+        if let Some(&mut (stmt, ref mut last)) = self.cache.get_mut(key) {
+            *last = tick; return Ok(PreparedStmt { db: self.db, stmt, _conn: PhantomData });
+        }
+        let len = c_int::try_from(key.len()).map_err(|_| "SQL exceeds maximum length".to_owned())?;
+        let mut stmt = ptr::null_mut();
+        let rc = unsafe { ffi::sqlite3_prepare_v3(self.db, key.as_ptr().cast(), len, ffi::SQLITE_PREPARE_PERSISTENT, &mut stmt, ptr::null_mut()) };
+        if rc != ffi::SQLITE_OK { return Err(unsafe { db_errmsg(self.db, rc) }); }
+        if stmt.is_null() { return Err("empty SQL statement".to_owned()); }
+        if self.cache.len() >= STMT_CACHE_CAP {
+            if let Some(evict) = self.cache.iter().min_by_key(|(_, &(_, t))| t).map(|(k, _)| k.clone()) {
+                if let Some((old, _)) = self.cache.remove(&evict) { unsafe { ffi::sqlite3_finalize(old) }; }
+            }
+        }
+        self.cache.insert(key.to_owned(), (stmt, tick));
+        Ok(PreparedStmt { db: self.db, stmt, _conn: PhantomData })
+    }
+    fn clear_cache(&mut self) { for (_, (stmt, _)) in self.cache.drain() { unsafe { ffi::sqlite3_finalize(stmt) }; } }
+}
+impl Drop for SqliteConn {
+    fn drop(&mut self) { self.clear_cache(); if !self.db.is_null() { unsafe { sqlite3_close_v2(self.db) }; } }
+}
+
+struct PreparedStmt<'a> { db: *mut ffi::sqlite3, stmt: *mut ffi::sqlite3_stmt, _conn: PhantomData<&'a mut SqliteConn> }
+impl Drop for PreparedStmt<'_> {
+    fn drop(&mut self) { unsafe { ffi::sqlite3_reset(self.stmt); ffi::sqlite3_clear_bindings(self.stmt); } }
+}
+impl PreparedStmt<'_> {
+    #[inline] fn column_count(&self) -> usize { (unsafe { ffi::sqlite3_column_count(self.stmt) }).max(0) as usize }
+    fn bind_params(&mut self, params: &[SqlParam<'_>], ctx: &str) -> Result<(), String> {
+        let expected = (unsafe { ffi::sqlite3_bind_parameter_count(self.stmt) }).max(0) as usize;
+        if params.len() != expected { return Err(sql_err(ctx, format!("wrong number of parameters: expected {expected}, got {}", params.len()))); }
+        for (i, &p) in params.iter().enumerate() {
+            let idx = (i + 1) as c_int;
+            let rc = unsafe { match p {
+                SqlParam::Null => ffi::sqlite3_bind_null(self.stmt, idx),
+                SqlParam::Integer(v) => ffi::sqlite3_bind_int64(self.stmt, idx, v),
+                SqlParam::Text(bs) => {
+                    let len = c_int::try_from(bs.len()).map_err(|_| sql_err(ctx, "text parameter exceeds SQLite max length"))?;
+                    if len == 0 { ffi::sqlite3_bind_text(self.stmt, idx, c"".as_ptr(), 0, ffi::SQLITE_STATIC()) }
+                    else { ffi::sqlite3_bind_text(self.stmt, idx, bs.as_ptr().cast(), len, ffi::SQLITE_TRANSIENT()) }
+                }
+                SqlParam::Blob(bs) => {
+                    let len = c_int::try_from(bs.len()).map_err(|_| sql_err(ctx, "blob parameter exceeds SQLite max length"))?;
+                    if len == 0 { ffi::sqlite3_bind_zeroblob(self.stmt, idx, 0) }
+                    else { ffi::sqlite3_bind_blob(self.stmt, idx, bs.as_ptr().cast(), len, ffi::SQLITE_TRANSIENT()) }
+                }
+            }};
+            if rc != ffi::SQLITE_OK { return Err(sql_err(ctx, unsafe { db_errmsg(self.db, rc) })); }
+        }
+        Ok(())
+    }
+    fn step(&mut self) -> Result<bool, String> {
+        match unsafe { ffi::sqlite3_step(self.stmt) } {
+            ffi::SQLITE_ROW => Ok(true),
+            ffi::SQLITE_DONE => match unsafe { ffi::sqlite3_reset(self.stmt) } { ffi::SQLITE_OK => Ok(false), rrc => Err(unsafe { db_errmsg(self.db, rrc) }) },
+            rc => Err(unsafe { db_errmsg(self.db, rc) }),
+        }
+    }
+    fn step_execute(&mut self) -> Result<usize, String> {
+        if self.step()? { return Err("execute returned rows unexpectedly".to_owned()); }
+        Ok((unsafe { ffi::sqlite3_changes(self.db) }).max(0) as usize)
+    }
+    unsafe fn col_ref(&self, ci: usize) -> ColRef<'_> {
+        let bytes = |p: *const u8, n: c_int| if p.is_null() || n <= 0 { &[][..] } else { std::slice::from_raw_parts(p, n as usize) };
+        let i = ci as c_int;
+        match ffi::sqlite3_column_type(self.stmt, i) {
+            ffi::SQLITE_INTEGER => ColRef::Integer(ffi::sqlite3_column_int64(self.stmt, i)),
+            ffi::SQLITE_FLOAT => ColRef::Real(ffi::sqlite3_column_double(self.stmt, i)),
+            ffi::SQLITE_TEXT => { let p = ffi::sqlite3_column_text(self.stmt, i); ColRef::Text(bytes(p, ffi::sqlite3_column_bytes(self.stmt, i))) }
+            ffi::SQLITE_BLOB => { let p = ffi::sqlite3_column_blob(self.stmt, i); ColRef::Blob(bytes(p.cast(), ffi::sqlite3_column_bytes(self.stmt, i))) }
+            _ => ColRef::Null,
+        }
+    }
+}
+
+struct SqliteDbPool { path: String, is_memory: bool, writer: Mutex<Option<SqliteConn>>, writer_cv: Condvar, readers: Mutex<Vec<SqliteConn>> }
+impl SqliteDbPool {
+    fn checkout_writer(&self) -> SqliteConn {
+        let mut g = lock_unpoison(&self.writer); while g.is_none() { g = wait_unpoison(&self.writer_cv, g); } g.take().unwrap()
+    }
+    fn return_writer(&self, conn: SqliteConn) { *lock_unpoison(&self.writer) = Some(conn); self.writer_cv.notify_one(); }
+    fn checkout_reader(&self) -> Result<SqliteConn, String> {
+        if let Some(conn) = lock_unpoison(&self.readers).pop() { return Ok(conn); }
+        SqliteConn::open(&self.path, OPEN_READER, PRAGMAS_RO).map_err(|e| format!("sqlite open read-only `{}` failed: {e}", self.path))
+    }
+    fn return_reader(&self, conn: SqliteConn) {
         static CAP: OnceLock<usize> = OnceLock::new();
         let cap = *CAP.get_or_init(|| std::thread::available_parallelism().map_or(16, |n| n.get().clamp(8, 32)));
         let mut pool = lock_unpoison(&self.readers);
@@ -32,18 +150,23 @@ impl SqliteDbPool {
     }
 }
 
-struct ConnGuard<'a>(&'a SqliteDbPool, Option<Connection>, bool);
+struct ConnGuard<'a>(&'a SqliteDbPool, Option<SqliteConn>, bool);
 impl<'a> ConnGuard<'a> {
     fn writer(p: &'a SqliteDbPool) -> Self { Self(p, Some(p.checkout_writer()), true) }
     fn reader(p: &'a SqliteDbPool) -> Result<Self, String> { Ok(Self(p, Some(p.checkout_reader()?), false)) }
-    fn conn(&self) -> &Connection { self.1.as_ref().expect("connection checked out") }
+    fn conn_mut(&mut self) -> &mut SqliteConn { self.1.as_mut().expect("connection checked out") }
 }
 impl Drop for ConnGuard<'_> {
     fn drop(&mut self) { if let Some(c) = self.1.take() { if self.2 { self.0.return_writer(c); } else { self.0.return_reader(c); } } }
 }
 
-struct ActiveSqliteTx { pool: Arc<SqliteDbPool>, conn: Option<Connection> }
+struct ActiveSqliteTx { pool: Arc<SqliteDbPool>, conn: Option<SqliteConn> }
 impl ActiveSqliteTx {
+    fn begin(pool: Arc<SqliteDbPool>) -> Result<Self, String> {
+        let conn = pool.checkout_writer();
+        if let Err(e) = conn.execute_batch("BEGIN IMMEDIATE;") { pool.return_writer(conn); return Err(sql_err("BEGIN", e)); }
+        Ok(Self { pool, conn: Some(conn) })
+    }
     fn finish(&mut self, commit: bool) -> Result<(), String> {
         let conn = self.conn.take().ok_or_else(|| "sqlite transaction already finished".to_owned())?;
         let res = if commit { conn.execute_batch("COMMIT;").map_err(|e| sql_err("COMMIT", e)) } else { Ok(()) };
@@ -63,12 +186,12 @@ fn open_db_pool(path: &str) -> Result<Arc<SqliteDbPool>, String> {
     let hit = read_unpoison(pool).get(path).cloned();
     let db = if let Some(db) = hit { db } else {
         let is_mem = path.is_empty() || path == ":memory:" || path.contains("mode=memory") || path.starts_with("file::memory:");
-        if let Some(p) = (!is_mem).then(|| Path::new(path).parent()).flatten().filter(|p| !p.as_os_str().is_empty()) {
+        if let Some(p) = (!is_mem && !path.starts_with("file:")).then(|| Path::new(path).parent()).flatten().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(p).map_err(|e| format!("failed to create sqlite directory `{}`: {e}", p.display()))?;
         }
-        let conn = if is_mem { Connection::open_in_memory() } else { Connection::open(path) }.map_err(|e| format!("sqlite open `{path}` failed: {e}"))?;
-        init_conn(&conn, if is_mem { "PRAGMA foreign_keys = ON; PRAGMA temp_store = MEMORY; PRAGMA cache_size = -8000;" }
-            else { "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON; PRAGMA temp_store = MEMORY; PRAGMA cache_size = -8000; PRAGMA mmap_size = 67108864; PRAGMA journal_size_limit = 67108864;" });
+        let open_path = if is_mem && !path.starts_with("file:") { ":memory:" } else { path };
+        let conn = SqliteConn::open(open_path, OPEN_WRITER, if is_mem { PRAGMAS_MEM } else { PRAGMAS_WAL })
+            .map_err(|e| format!("sqlite open `{path}` failed: {e}"))?;
         let arc = Arc::new(SqliteDbPool { path: path.to_owned(), is_memory: is_mem, writer: Mutex::new(Some(conn)), writer_cv: Condvar::new(), readers: Mutex::new(Vec::new()) });
         write_unpoison(pool).entry(path.to_owned()).or_insert(arc).clone()
     };
@@ -80,7 +203,9 @@ fn open_db_pool(path: &str) -> Result<Arc<SqliteDbPool>, String> {
 }
 
 fn exec_ddl(db: &SqliteDbPool, ddl: &str) -> Result<(), String> {
-    let r = ConnGuard::writer(db).conn().execute_batch(ddl).map_err(|e| sql_err("ddl", e));
+    let mut g = ConnGuard::writer(db);
+    let r = g.conn_mut().execute_batch(ddl).map_err(|e| sql_err("ddl", e));
+    g.conn_mut().clear_cache();
     lock_unpoison(&db.readers).clear(); r
 }
 
@@ -99,69 +224,71 @@ fn is_readonly_select(sql: &str) -> bool {
 }
 
 // Matches `Qed.Server.Db.SqlVal` (0=null, 1=int, 2=text, 3=bool[u8@0], 4=bytes) & `DbResult` (rows, affected).
-unsafe fn decode_params<'a>(arr: *mut LeanObj, stack: &'a mut [ValueRef<'a>; 16], heap: &'a mut Vec<ValueRef<'a>>) -> Result<&'a [ValueRef<'a>], String> {
+unsafe fn decode_params<'a>(arr: *mut LeanObj, stack: &'a mut [SqlParam<'a>; 16], heap: &'a mut Vec<SqlParam<'a>>) -> Result<&'a [SqlParam<'a>], String> {
     let n = qed_lean_array_size(arr);
-    let dst = if n <= 16 { &mut stack[..n] } else { heap.resize(n, ValueRef::Null); &mut heap[..] };
+    let dst = if n <= 16 { &mut stack[..n] } else { heap.resize(n, SqlParam::Null); &mut heap[..] };
     for (i, slot) in dst.iter_mut().enumerate() {
         let el = qed_lean_array_get_core(arr, i);
         *slot = match qed_lean_obj_tag(el) {
-            0 => ValueRef::Null,
-            1 => { let mut v = 0i64; if qed_lean_int_to_i64_checked(qed_lean_ctor_get(el, 0), &mut v) == 0 { return Err("SQLite integer parameter out of i64 range".into()); } ValueRef::Integer(v) }
-            2 => ValueRef::Text(str_slice(qed_lean_ctor_get(el, 0)).as_bytes()),
-            3 => ValueRef::Integer(i64::from(qed_lean_ctor_get_u8(el, 0) != 0)),
-            4 => ValueRef::Blob(ba_slice(qed_lean_ctor_get(el, 0))),
+            0 => SqlParam::Null,
+            1 => { let mut v = 0i64; if qed_lean_int_to_i64_checked(qed_lean_ctor_get(el, 0), &mut v) == 0 { return Err("SQLite integer parameter out of i64 range".into()); } SqlParam::Integer(v) }
+            2 => SqlParam::Text(str_slice(qed_lean_ctor_get(el, 0)).as_bytes()),
+            3 => SqlParam::Integer(i64::from(qed_lean_ctor_get_u8(el, 0) != 0)),
+            4 => SqlParam::Blob(ba_slice(qed_lean_ctor_get(el, 0))),
             tag => return Err(format!("unknown SqlVal constructor tag {tag}")),
         };
     }
     Ok(dst)
 }
 
-unsafe fn exec_on_conn(conn: &Connection, sql: &str, params: &[ValueRef<'_>]) -> Result<*mut LeanObj, String> {
+unsafe fn exec_on_conn(conn: &mut SqliteConn, sql: &str, params: &[SqlParam<'_>]) -> Result<*mut LeanObj, String> {
     let mut stmt = conn.prepare_cached(sql).map_err(|e| sql_err("prepare", e))?;
-    let (bound, cols) = (params_from_iter(params.iter().copied().map(ToSqlOutput::Borrowed)), stmt.column_count());
+    let cols = stmt.column_count();
+    stmt.bind_params(params, if cols > 0 { "query" } else { "execute" })?;
     if cols > 0 {
-        let mut rows = stmt.query(bound).map_err(|e| sql_err("query", e))?;
         let (mut rows_arr, mut count) = (LeanRef(qed_lean_array_with_cap(16)), 0usize);
-        while let Some(row) = rows.next().map_err(|e| sql_err("step", e))? {
-            let mut row_arr = LeanRef(qed_lean_array_with_cap(cols));
-            for ci in 0..cols {
-                let val = match row.get_ref_unwrap(ci) {
-                    ValueRef::Null => qed_lean_box(0),
-                    ValueRef::Integer(i) => qed_lean_mk_ctor_1(1, qed_lean_int64_to_int(i)),
-                    ValueRef::Real(f) => qed_lean_mk_ctor_1(2, mk_str(&f.to_string())),
-                    ValueRef::Text(bs) => qed_lean_mk_ctor_1(2, mk_str(&String::from_utf8_lossy(bs))),
-                    ValueRef::Blob(bs) => qed_lean_mk_ctor_1(4, mk_ba(bs)),
+        while stmt.step().map_err(|e| sql_err("step", e))? {
+            let ncols = stmt.column_count();
+            let mut row_arr = LeanRef(qed_lean_array_with_cap(ncols));
+            for ci in 0..ncols {
+                let val = match stmt.col_ref(ci) {
+                    ColRef::Null => qed_lean_box(0),
+                    ColRef::Integer(i) => qed_lean_mk_ctor_1(1, qed_lean_int64_to_int(i)),
+                    ColRef::Real(f) => qed_lean_mk_ctor_1(2, mk_str(&f.to_string())),
+                    ColRef::Text(bs) => qed_lean_mk_ctor_1(2, mk_str(&String::from_utf8_lossy(bs))),
+                    ColRef::Blob(bs) => qed_lean_mk_ctor_1(4, mk_ba(bs)),
                 };
                 row_arr.0 = lean_array_push(row_arr.0, val);
             }
             rows_arr.0 = lean_array_push(rows_arr.0, row_arr.into_raw()); count += 1;
         }
         Ok(qed_lean_mk_prod(rows_arr.into_raw(), qed_lean_usize_to_nat(count)))
-    } else { Ok(qed_lean_mk_prod(qed_lean_array_with_cap(0), qed_lean_usize_to_nat(stmt.execute(bound).map_err(|e| sql_err("execute", e))?))) }
+    } else {
+        let changes = stmt.step_execute().map_err(|e| sql_err("execute", e))?;
+        Ok(qed_lean_mk_prod(qed_lean_array_with_cap(0), qed_lean_usize_to_nat(changes)))
+    }
 }
 
 ffi_export! {
     qed_server_sqlite_exec(path_obj: *mut LeanObj, sql_obj: *mut LeanObj, params_arr: *mut LeanObj) => {
-        let (path, sql, mut stack, mut heap) = (str_slice(path_obj), str_slice(sql_obj), [ValueRef::Null; 16], Vec::new());
+        let (path, sql, mut stack, mut heap) = (str_slice(path_obj), str_slice(sql_obj), [SqlParam::Null; 16], Vec::new());
         mk_io_except(decode_params(params_arr, &mut stack, &mut heap).and_then(|params| {
             let db = open_db_pool(path)?;
-            let guard = if !db.is_memory && is_readonly_select(sql) { ConnGuard::reader(&db)? } else { ConnGuard::writer(&db) };
-            exec_on_conn(guard.conn(), sql, params)
+            let mut guard = if !db.is_memory && is_readonly_select(sql) { ConnGuard::reader(&db)? } else { ConnGuard::writer(&db) };
+            exec_on_conn(guard.conn_mut(), sql, params)
         }), identity)
     };
     qed_server_sqlite_ddl(path_obj: *mut LeanObj, ddl_obj: *mut LeanObj) =>
         mk_io_except_unit(open_db_pool(str_slice(path_obj)).and_then(|db| exec_ddl(&db, str_slice(ddl_obj))));
     qed_server_sqlite_tx_begin(path_obj: *mut LeanObj) => mk_io_except(open_db_pool(str_slice(path_obj)).and_then(|db| {
-        let conn = db.checkout_writer();
-        if let Err(e) = conn.execute_batch("BEGIN IMMEDIATE;") { db.return_writer(conn); return Err(sql_err("BEGIN", e)); }
-        Ok(ACTIVE_TXS.insert(Arc::new(Mutex::new(ActiveSqliteTx { pool: db, conn: Some(conn) }))))
+        Ok(ACTIVE_TXS.insert(Arc::new(Mutex::new(ActiveSqliteTx::begin(db)?))))
     }), |id| qed_lean_box_u64(id));
     qed_server_sqlite_tx_exec(tx_id: u64, sql_obj: *mut LeanObj, params_arr: *mut LeanObj) => {
-        let (sql, mut stack, mut heap) = (str_slice(sql_obj), [ValueRef::Null; 16], Vec::new());
+        let (sql, mut stack, mut heap) = (str_slice(sql_obj), [SqlParam::Null; 16], Vec::new());
         mk_io_except(decode_params(params_arr, &mut stack, &mut heap).and_then(|params| {
             let tx_arc = ACTIVE_TXS.get(tx_id).ok_or_else(|| tx_err(tx_id))?;
-            let tx = lock_unpoison(&tx_arc);
-            exec_on_conn(tx.conn.as_ref().ok_or_else(|| "sqlite transaction already finished".to_owned())?, sql, params)
+            let mut tx = lock_unpoison(&tx_arc);
+            exec_on_conn(tx.conn.as_mut().ok_or_else(|| "sqlite transaction already finished".to_owned())?, sql, params)
         }), identity)
     };
     qed_server_sqlite_tx_commit(tx_id: u64) =>
@@ -175,6 +302,52 @@ ffi_export! {
 mod tests {
     use super::*;
     use std::{path::PathBuf, time::{SystemTime, UNIX_EPOCH}};
+
+    #[derive(Debug, PartialEq)]
+    enum OwnedVal { Null, Int(i64), Text(String), Blob(Vec<u8>) }
+
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            Self(std::env::temp_dir().join(format!("qed_sqlite_{tag}_{}_{}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos())))
+        }
+    }
+    impl Drop for TempDir { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+
+    fn run_sql(conn: &mut SqliteConn, sql: &str, params: &[SqlParam<'_>]) -> Result<(Vec<Vec<OwnedVal>>, usize), String> {
+        let mut stmt = conn.prepare_cached(sql).map_err(|e| sql_err("prepare", e))?;
+        let cols = stmt.column_count();
+        stmt.bind_params(params, if cols > 0 { "query" } else { "execute" })?;
+        if cols > 0 {
+            let mut rows = Vec::new();
+            while stmt.step().map_err(|e| sql_err("step", e))? {
+                let ncols = stmt.column_count();
+                let mut row = Vec::with_capacity(ncols);
+                for ci in 0..ncols {
+                    row.push(match unsafe { stmt.col_ref(ci) } {
+                        ColRef::Null => OwnedVal::Null,
+                        ColRef::Integer(i) => OwnedVal::Int(i),
+                        ColRef::Real(f) => OwnedVal::Text(f.to_string()),
+                        ColRef::Text(bs) => OwnedVal::Text(String::from_utf8_lossy(bs).into_owned()),
+                        ColRef::Blob(bs) => OwnedVal::Blob(bs.to_vec()),
+                    });
+                }
+                rows.push(row);
+            }
+            let n = rows.len();
+            Ok((rows, n))
+        } else {
+            Ok((Vec::new(), stmt.step_execute().map_err(|e| sql_err("execute", e))?))
+        }
+    }
+
+    fn query_i64(conn: &mut SqliteConn, sql: &str) -> i64 {
+        match &run_sql(conn, sql, &[]).unwrap().0[0][0] { OwnedVal::Int(v) => *v, other => panic!("expected int, got {other:?}") }
+    }
+
+    fn query_text(conn: &mut SqliteConn, sql: &str) -> String {
+        match &run_sql(conn, sql, &[]).unwrap().0[0][0] { OwnedVal::Text(s) => s.clone(), other => panic!("expected text, got {other:?}") }
+    }
 
     #[test]
     fn is_readonly_select_cases() {
@@ -193,34 +366,141 @@ mod tests {
 
     #[test]
     fn open_db_pool_wal_concurrent_readers_and_ddl_clear() {
-        struct TempDir(PathBuf);
-        impl Drop for TempDir { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
-        let tmp = TempDir(std::env::temp_dir().join(format!("qed_sqlite_test_{}_{}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos())));
+        let tmp = TempDir::new("wal");
         let db_path = tmp.0.join("sub").join("test.db").to_string_lossy().into_owned();
         let db = open_db_pool(&db_path).expect("open_db_pool");
         assert!(Arc::ptr_eq(&db, &open_db_pool(&db_path).expect("tls cache hit")));
         {
-            let w = ConnGuard::writer(&db);
-            assert_eq!(w.conn().query_row("PRAGMA journal_mode;", [], |r| r.get::<_, String>(0)).unwrap().to_ascii_lowercase(), "wal");
-            for p in ["PRAGMA synchronous;", "PRAGMA foreign_keys;"] { assert_eq!(w.conn().query_row(p, [], |r| r.get::<_, i64>(0)).unwrap(), 1); }
-            w.conn().execute_batch("CREATE TABLE items (id INTEGER PRIMARY KEY, val TEXT NOT NULL); INSERT INTO items VALUES (1,'a'),(2,'b'),(3,'c');").unwrap();
+            let mut w = ConnGuard::writer(&db);
+            assert_eq!(query_text(w.conn_mut(), "PRAGMA journal_mode;").to_ascii_lowercase(), "wal");
+            for p in ["PRAGMA synchronous;", "PRAGMA foreign_keys;"] { assert_eq!(query_i64(w.conn_mut(), p), 1); }
+            w.conn_mut().execute_batch("CREATE TABLE items (id INTEGER PRIMARY KEY, val TEXT NOT NULL); INSERT INTO items VALUES (1,'a'),(2,'b'),(3,'c');").unwrap();
+            assert_eq!(run_sql(w.conn_mut(), "SELECT * FROM items ORDER BY id", &[]).unwrap().0[0].len(), 2);
         }
         std::thread::scope(|s| {
             let p = db_path.as_str();
-            s.spawn(move || { ConnGuard::writer(&open_db_pool(p).unwrap()).conn().execute("INSERT INTO items VALUES (4,'d')", []).unwrap(); });
+            s.spawn(move || { assert_eq!(run_sql(ConnGuard::writer(&open_db_pool(p).unwrap()).conn_mut(), "INSERT INTO items VALUES (4,'d')", &[]).unwrap().1, 1); });
             for _ in 0..8 {
                 s.spawn(move || {
                     let pool = open_db_pool(p).unwrap();
-                    let r = ConnGuard::reader(&pool).unwrap();
-                    let cnt: i64 = r.conn().query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0)).unwrap();
-                    assert!((cnt == 3 || cnt == 4) && r.conn().execute("INSERT INTO items VALUES (99,'x')", []).is_err());
+                    let mut r = ConnGuard::reader(&pool).unwrap();
+                    let cnt = query_i64(r.conn_mut(), "SELECT COUNT(*) FROM items");
+                    assert!((cnt == 3 || cnt == 4) && run_sql(r.conn_mut(), "INSERT INTO items VALUES (99,'x')", &[]).is_err());
                 });
             }
         });
         assert!(!lock_unpoison(&db.readers).is_empty());
         exec_ddl(&db, "ALTER TABLE items ADD COLUMN extra INTEGER NOT NULL DEFAULT 7;").expect("ddl");
         assert!(lock_unpoison(&db.readers).is_empty());
-        assert_eq!(ConnGuard::reader(&db).unwrap().conn().query_row("SELECT SUM(extra) FROM items", [], |r| r.get::<_, i64>(0)).unwrap(), 28);
+        assert_eq!(run_sql(ConnGuard::writer(&db).conn_mut(), "SELECT * FROM items ORDER BY id", &[]).unwrap().0[0].len(), 3);
+        assert_eq!(query_i64(ConnGuard::reader(&db).unwrap().conn_mut(), "SELECT SUM(extra) FROM items"), 28);
         assert_eq!(lock_unpoison(&db.readers).len(), 1);
+    }
+
+    #[test]
+    fn stmt_cache_reuse_lru_eviction_and_reset_on_error() {
+        let mut conn = SqliteConn::open(":memory:", OPEN_WRITER, PRAGMAS_MEM).unwrap();
+        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL);").unwrap();
+
+        // Reuse same statement handle (and trimmed whitespace hits same slot).
+        let p1 = { conn.prepare_cached("SELECT ?1 + 1").unwrap().stmt };
+        let p2 = { conn.prepare_cached("  SELECT ?1 + 1\n ").unwrap().stmt };
+        assert_eq!((p1, conn.cache.len()), (p2, 1));
+
+        // Fill cache to capacity (128): q0..q126 plus existing "SELECT ?1 + 1".
+        for i in 0..(STMT_CACHE_CAP - 1) {
+            let sql = format!("SELECT {i}");
+            assert_eq!(query_i64(&mut conn, &sql), i as i64);
+        }
+        assert_eq!(conn.cache.len(), STMT_CACHE_CAP);
+        // Touch "SELECT ?1 + 1" so it becomes MRU; q0 ("SELECT 0") is now LRU.
+        assert_eq!(run_sql(&mut conn, "SELECT ?1 + 1", &[SqlParam::Integer(41)]).unwrap().0, vec![vec![OwnedVal::Int(42)]]);
+        assert_eq!(query_i64(&mut conn, "SELECT 9999"), 9999);
+        assert_eq!(conn.cache.len(), STMT_CACHE_CAP);
+        assert!(conn.cache.contains_key("SELECT ?1 + 1"));
+        assert!(!conn.cache.contains_key("SELECT 0"));
+        assert!(conn.cache.contains_key("SELECT 1"));
+
+        // Error during step (UNIQUE constraint) resets & clears bindings cleanly for subsequent reuse.
+        assert_eq!(run_sql(&mut conn, "INSERT INTO t VALUES (?1, ?2)", &[SqlParam::Integer(1), SqlParam::Text(b"dup")]).unwrap().1, 1);
+        let err = run_sql(&mut conn, "INSERT INTO t VALUES (?1, ?2)", &[SqlParam::Integer(2), SqlParam::Text(b"dup")]).unwrap_err();
+        assert!(err.starts_with("sqlite execute failed:"), "unexpected err: {err}");
+        assert_eq!(run_sql(&mut conn, "INSERT INTO t VALUES (?1, ?2)", &[SqlParam::Integer(2), SqlParam::Text(b"ok")]).unwrap().1, 1);
+        assert_eq!(query_i64(&mut conn, "SELECT COUNT(*) FROM t"), 2);
+    }
+
+    #[test]
+    fn value_types_empty_text_blob_real_and_changes() {
+        let mut conn = SqliteConn::open(":memory:", OPEN_WRITER, PRAGMAS_MEM).unwrap();
+        conn.execute_batch("CREATE TABLE vals (id INTEGER PRIMARY KEY, n INTEGER, r REAL, t TEXT, b BLOB);").unwrap();
+        let params_full = [SqlParam::Integer(1), SqlParam::Integer(i64::MIN), SqlParam::Text(b"hello \xF0\x9F\x94\x92"), SqlParam::Blob(&[0, 1, 255])];
+        assert_eq!(run_sql(&mut conn, "INSERT INTO vals (id, n, r, t, b) VALUES (?1, ?2, 3.5, ?3, ?4)", &params_full).unwrap().1, 1);
+        let params_empty = [SqlParam::Integer(2), SqlParam::Null, SqlParam::Text(b""), SqlParam::Blob(&[])];
+        assert_eq!(run_sql(&mut conn, "INSERT INTO vals (id, n, r, t, b) VALUES (?1, ?2, NULL, ?3, ?4)", &params_empty).unwrap().1, 1);
+
+        let (rows, cnt) = run_sql(&mut conn, "SELECT id, n, r, t, b, typeof(t), typeof(b) FROM vals ORDER BY id", &[]).unwrap();
+        assert_eq!(cnt, 2);
+        assert_eq!(rows[0], vec![
+            OwnedVal::Int(1), OwnedVal::Int(i64::MIN), OwnedVal::Text("3.5".into()),
+            OwnedVal::Text("hello \u{1f512}".into()), OwnedVal::Blob(vec![0, 1, 255]),
+            OwnedVal::Text("text".into()), OwnedVal::Text("blob".into()),
+        ]);
+        assert_eq!(rows[1], vec![
+            OwnedVal::Int(2), OwnedVal::Null, OwnedVal::Null,
+            OwnedVal::Text(String::new()), OwnedVal::Blob(Vec::new()),
+            OwnedVal::Text("text".into()), OwnedVal::Text("blob".into()),
+        ]);
+
+        // RETURNING (cols > 0 on DML) & zero-row UPDATE affected count.
+        let (ret, rcnt) = run_sql(&mut conn, "INSERT INTO vals (id, n, t, b) VALUES (?1, ?2, ?3, ?4) RETURNING id, t", &[SqlParam::Integer(3), SqlParam::Integer(7), SqlParam::Text(b"ret"), SqlParam::Blob(&[])]).unwrap();
+        assert_eq!((rcnt, ret), (1, vec![vec![OwnedVal::Int(3), OwnedVal::Text("ret".into())]]));
+        assert_eq!(run_sql(&mut conn, "UPDATE vals SET n = 9 WHERE id = 999", &[]).unwrap().1, 0);
+        assert_eq!(run_sql(&mut conn, "DELETE FROM vals WHERE id >= 2", &[]).unwrap().1, 2);
+    }
+
+    #[test]
+    fn memory_uris_transactions_and_error_paths() {
+        for mem_path in ["", ":memory:", "file::memory:", "file:qed_mem_uri?mode=memory&cache=shared", "custom_mem?mode=memory"] {
+            let pool = open_db_pool(mem_path).expect(mem_path);
+            assert!(pool.is_memory, "expected is_memory for {mem_path:?}");
+            assert_eq!(query_i64(ConnGuard::writer(&pool).conn_mut(), "SELECT 1"), 1);
+        }
+
+        let tmp = TempDir::new("tx");
+        let db_path = tmp.0.join("tx.db").to_string_lossy().into_owned();
+        let db = open_db_pool(&db_path).unwrap();
+        exec_ddl(&db, "CREATE TABLE ledger (v INTEGER NOT NULL);").unwrap();
+
+        // Commit persists.
+        let mut tx = ActiveSqliteTx::begin(db.clone()).unwrap();
+        assert_eq!(run_sql(tx.conn.as_mut().unwrap(), "INSERT INTO ledger VALUES (?1)", &[SqlParam::Integer(10)]).unwrap().1, 1);
+        tx.finish(true).unwrap();
+        assert_eq!(tx.finish(true).unwrap_err(), "sqlite transaction already finished");
+        assert_eq!(query_i64(ConnGuard::writer(&db).conn_mut(), "SELECT SUM(v) FROM ledger"), 10);
+
+        // Explicit rollback reverts.
+        let mut tx = ActiveSqliteTx::begin(db.clone()).unwrap();
+        run_sql(tx.conn.as_mut().unwrap(), "INSERT INTO ledger VALUES (?1)", &[SqlParam::Integer(99)]).unwrap();
+        tx.finish(false).unwrap();
+        assert_eq!(query_i64(ConnGuard::writer(&db).conn_mut(), "SELECT SUM(v) FROM ledger"), 10);
+
+        // Drop auto-rolls back and returns writer connection to pool.
+        {
+            let mut tx = ActiveSqliteTx::begin(db.clone()).unwrap();
+            run_sql(tx.conn.as_mut().unwrap(), "INSERT INTO ledger VALUES (?1)", &[SqlParam::Integer(777)]).unwrap();
+        }
+        assert_eq!(query_i64(ConnGuard::writer(&db).conn_mut(), "SELECT SUM(v) FROM ledger"), 10);
+
+        // Error paths.
+        let mut w = ConnGuard::writer(&db);
+        assert!(run_sql(w.conn_mut(), "SELEC BAD SYNTAX", &[]).unwrap_err().starts_with("sqlite prepare failed:"));
+        assert!(run_sql(w.conn_mut(), "   -- only a comment", &[]).unwrap_err().starts_with("sqlite prepare failed:"));
+        assert!(run_sql(w.conn_mut(), "SELECT ?1", &[]).unwrap_err().starts_with("sqlite query failed:"));
+        assert!(run_sql(w.conn_mut(), "INSERT INTO ledger VALUES (?1)", &[SqlParam::Integer(1), SqlParam::Integer(2)]).unwrap_err().starts_with("sqlite execute failed:"));
+        assert!(w.conn_mut().execute_batch("SELECT 1\0").is_err());
+        drop(w);
+        assert!(exec_ddl(&db, "NOT VALID DDL;").unwrap_err().starts_with("sqlite ddl failed:"));
+        assert!(SqliteConn::open("bad\0path", OPEN_WRITER, PRAGMAS_MEM).is_err());
+        assert!(SqliteConn::open(&tmp.0.join("missing.db").to_string_lossy(), OPEN_READER, PRAGMAS_RO).is_err());
     }
 }

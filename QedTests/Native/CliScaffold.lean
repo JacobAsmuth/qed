@@ -68,7 +68,10 @@ def run : IO Bool := do
   let cleanEnv : Array (String × Option String) := #[("QED_HOME", some root.toString), ("QED_WEB_ROOT", none), ("QED_JS_ROOT", none),
     ("QED_SKIP_VERIFY", none), ("LEAN_PATH", none), ("QED_PREBUILT", none), ("QED_OUT_DIR", none)]
   let runCli (label : String) (cwd : FilePath) (args : Array String) : IO Unit := do
-    let (code, out, err) ← runCmd cli args (cwd := some cwd) (env := cleanEnv); c.check label (code == 0) (out ++ err)
+    let t0 ← IO.monoMsNow
+    let (code, out, err) ← runCmd cli args (cwd := some cwd) (env := cleanEnv)
+    logTiming s!"cli-scaffold: {label}" t0
+    c.check label (code == 0) (out ++ err)
   withTempDir "qed-scaffold-test" fun scratch => do
     let tSide ← IO.asTask (prio := .dedicated) (runPureVlqAndWatcherChecks c scratch)
     let appDir := FilePath.mk s!"{scratch}/app"
@@ -126,7 +129,9 @@ def run : IO Bool := do
         ("partial def rejected by kernel gate", validSrc ++ "\npartial def spin (n : Nat) : Nat := spin n\n", false, "kernel gate: `partial` or `opaque` declaration `spin`"),
         ("repeatM loop rejected by kernel gate", validSrc ++ "\ndef badRepeat (n : Nat) : Id Nat := repeatM (fun i => if i < n then pure (.inl (i + 1)) else pure (.inr i)) 0\n", false, "kernel gate: unbounded `while`/`repeat`/`partial_fixpoint` loop inside `badRepeat`")] fun (label, src, wantOk, wantSub) => do
       IO.FS.writeFile appLean src
+      let t0 ← IO.monoMsNow
       let (code, out, err) ← runCmd cli #["check"] (cwd := some appDir) (env := cleanEnv); let combined := out ++ err
+      logTiming s!"cli-scaffold: qed check ({label})" t0
       c.check label ((code == 0) == wantOk && (wantSub.isEmpty || combined.contains wantSub)) combined
     if let .error e ← IO.wait tSide then throw e
   c.finish

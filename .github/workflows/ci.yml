@@ -66,4 +66,6 @@ jobs:
         run: ./scripts/qed check
 
       - name: Run full test suite
+        env:
+          QED_TEST_TIMING: "1"
         run: ./scripts/qed test

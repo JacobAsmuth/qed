@@ -239,7 +239,10 @@ private def buildWithNativeServer (mod : String) (clientAppExpr? cssAppExpr? ser
           let srvTmp := outDir / "server.tmp"
           let compileArgs := (if prod then #["-O3", "-DNDEBUG"] else #["-O0"]) ++ #[srvC.toString] ++ linkInputs ++
             #["-pthread", if System.Platform.isOSX then "-Wl,-undefined,dynamic_lookup" else "-Wl,--allow-shlib-undefined", "-o", srvTmp.toString]
-          if (← if ← onPath "leanc" then sh "leanc" compileArgs else sh "lake" (#["env", "leanc"] ++ compileArgs)) != 0 then return false
+          let linkCode ← match ← resolveLeancBin with
+            | some leanc => sh leanc compileArgs
+            | none => sh "lake" (#["env", "leanc"] ++ compileArgs)
+          if linkCode != 0 then return false
           IO.FS.rename srvTmp srvBin
         pure true
   let cliOk := (← IO.wait tClient).toOption.getD false

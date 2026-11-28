@@ -129,7 +129,7 @@ private def paint (enabled : Bool) (code s : String) : String := if enabled then
 def bold (s : String) : String := paint true "1" s
 def green (s : String) : String := paint true "32" s
 def red (s : String) : String := paint true "31" s
-def step (s : String) : IO Unit := IO.println (bold s!"▸ {s}")
+def step (s : String) : IO Unit := do IO.println (bold s!"▸ {s}"); (← IO.getStdout).flush
 def runExceptCmd (act : ExceptT String IO UInt32) : IO UInt32 := do match ← act.run with | .ok c => return c | .error e => IO.eprintln (red s!"✗ {e}"); return 1
 private def spaces (n : Nat) : String := String.ofList (List.replicate n ' ')
 
@@ -221,6 +221,16 @@ def writeIfChanged (path : FilePath) (content : String) : IO Bool := do
   IO.FS.writeFile path content; return true
 
 initialize leanPathCache : IO.Ref (Option String) ← IO.mkRef none
+initialize leancBinCache : IO.Ref (Option (Option String)) ← IO.mkRef none
+
+def resolveLeancBin : IO (Option String) := do
+  if let some cached ← leancBinCache.get then return cached
+  let o ← IO.Process.output { cmd := "lean", args := #["--print-prefix"] }
+  let bin? ← if o.exitCode == 0 && !o.stdout.cliTrim.isEmpty then
+      let p : FilePath := FilePath.mk o.stdout.cliTrim / "bin" / "leanc"
+      if ← p.pathExists then pure (some p.toString) else pure none
+    else pure none
+  leancBinCache.set (some bin?); return bin?
 
 def mtimeNs (p : FilePath) : IO (Option Int) := do
   if !(← p.pathExists) then return none

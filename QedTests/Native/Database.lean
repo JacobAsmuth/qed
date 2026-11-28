@@ -556,11 +556,12 @@ private def runPrincipalSuite (c : TestChecker) (tmpDir : String) : IO Unit := d
       ("[principal] rlsDdl renders ctx.principal in [.system(...), ...]", rls.contains "(current_setting('qed.principal', true) IN ('system:BuildJobSrv.poll', 'system:reap-and-sweep'))")]
 
 private def runRlsGateNegativeSuite (c : TestChecker) (tmpDir : String) : IO Unit := do
+  let t0 ← IO.monoMsNow
   let gateDir := s!"{tmpDir}/rls_gate"
   IO.FS.createDirAll gateDir
   let (qedjs, baseLp) := (← qedjsBinPath, ← getLeanPath)
-  let (_, leanOut, _) ← runCmd "lake" #["env", "which", "lean"]
-  let leanBin := let s := leanOut.trimAscii.toString; if s.isEmpty then "lean" else s
+  let (pCode, pOut, _) ← runCmd "lean" #["--print-prefix"]
+  let leanBin := let p := pOut.trimAscii.toString; if pCode == 0 && !p.isEmpty then s!"{p}/bin/lean" else "lean"
   let env := #[("LEAN_PATH", some s!"{gateDir}:{baseLp}")]
   let compileMod (modName src : String) : IO (UInt32 × String) := do
     let fPath := s!"{gateDir}/{modName}.lean"
@@ -666,6 +667,7 @@ private def runRlsGateNegativeSuite (c : TestChecker) (tmpDir : String) : IO Uni
     match rows.find? (·.1 == dn) with
     | some (_, st, msg) => c.check s!"[rls-gate] rejects `{tag}`" (vc == 0 && st == "REJECT" && msg.contains wantErr) s!"exit={vc}, status={st}, out={msg.take 240}"
     | none => c.check s!"[rls-gate] rejects `{tag}`" false s!"exit={vc}, missing result line: {(vout ++ verr).take 240}"
+  logTiming "database: runRlsGateNegativeSuite" t0
 
 rollback_env qedServerMain DbChecks.BuildJobSrv
 rollback_env qedServerMain DbChecks.PrincipalApi

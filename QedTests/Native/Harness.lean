@@ -11,12 +11,21 @@ instance {ε α : Type} [BEq ε] [BEq α] : BEq (Except ε α) where beq | .ok a
 instance : BEq ByteArray where beq a b := a.data == b.data
 instance : Repr ByteArray where reprPrec b _ := s!"ByteArray({b.size} bytes)"
 
-structure TestChecker where (name : String) (state : IO.Ref (Nat × Nat))
+structure TestChecker where (name : String) (state : IO.Ref (Nat × Nat)) (startMs : Nat)
 class ErrMsg (ε : Type) where errMsg : ε → String
 instance : ErrMsg String where errMsg := id
 instance : ErrMsg ApiError where errMsg := ApiError.message
 
-def mkChecker (name : String) : IO TestChecker := return { name, state := ← IO.mkRef (0, 0) }
+def fmtDurationMs (ms : Nat) : String :=
+  if ms < 1000 then s!"{ms}ms" else s!"{ms / 1000}.{(ms % 1000) / 100}s"
+
+def logTiming (tag : String) (t0 : Nat) : IO Unit := do
+  if (← IO.getEnv "QED_TEST_TIMING") == some "1" then
+    let dt := (← IO.monoMsNow) - t0
+    IO.println s!"    [timing] {tag}: {fmtDurationMs dt}"
+    (← IO.getStdout).flush
+
+def mkChecker (name : String) : IO TestChecker := return { name, state := ← IO.mkRef (0, 0), startMs := ← IO.monoMsNow }
 def hasAll (s : String) (xs : List String) : Bool := xs.all (s.contains ·)
 @[noinline, nospecialize] def forList {α : Type} (xs : List α) (f : α → IO Unit) : IO Unit := xs.forM f
 def TestChecker.check (c : TestChecker) (label : String) (ok : Bool) (detail : String := "") : IO Unit := do
@@ -31,8 +40,11 @@ def TestChecker.check (c : TestChecker) (label : String) (ok : Bool) (detail : S
 @[noinline, nospecialize] def TestChecker.checkErrContains {ε α : Type} [ErrMsg ε] (c : TestChecker) (label : String) (res : Except ε α) (sub : String) : IO Unit :=
   match res with | .error e => let m := ErrMsg.errMsg e; c.check label (m.contains sub) m | .ok _ => c.check label false s!"expected error containing `{sub}`, got ok"
 def TestChecker.finish (c : TestChecker) : IO Bool := do
-  let (p, f) ← c.state.get; if f == 0 then IO.println s!"  ✓ {c.name} ({p})"; return true
-  IO.eprintln s!"  ✗ {c.name}: {f} failed ({p} passed)"; return false
+  let dt := fmtDurationMs ((← IO.monoMsNow) - c.startMs)
+  let (p, f) ← c.state.get
+  if f == 0 then
+    IO.println s!"  ✓ {c.name} ({p}, {dt})"; (← IO.getStdout).flush; return true
+  IO.eprintln s!"  ✗ {c.name}: {f} failed ({p} passed, {dt})"; (← IO.getStderr).flush; return false
 
 @[noinline, nospecialize] def decodeJson (α : Type) [Qed.FromJson α] (s : String) : Except String α := Qed.Json.parse s >>= Qed.fromJson
 @[noinline, nospecialize] def jsonRt {α : Type} [Qed.ToJson α] [Qed.FromJson α] [BEq α] (x : α) : Bool := decodeJson α (Qed.toJson x).render == .ok x
@@ -47,9 +59,11 @@ def getLeanPath : IO String := do
   if let some lp ← IO.getEnv "LEAN_PATH" then if !lp.isEmpty then return lp
   let (code, out, _) ← runCmd "lake" #["env", "printenv", "LEAN_PATH"]; return if code == 0 then out.trimAscii.toString else ""
 private def buildDevApp (webRoot : String) : IO (Option String) := do
+  let t0 ← IO.monoMsNow
   let cwd ← IO.currentDir; let outDir := (cwd / ".qed" / "test" / webRoot).toString
   let (code, out, err) ← runCmd (← qedBinPath) #["build", "--dev"] (cwd := some cwd)
     (env := #[("QED_HOME", some cwd.toString), ("QED_WEB_ROOT", some webRoot), ("QED_OUT_DIR", some outDir), ("QED_SKIP_VERIFY", some "1"), ("QED_PREBUILT", some "1")])
+  logTiming s!"buildDevApp({webRoot})" t0
   if code != 0 then IO.eprintln s!"buildDevApp({webRoot}) failed (exit {code}):\n{out}\n{err}"; return none
   return some outDir
 def withDevApp (c : TestChecker) (webRoot : String) (k : String → IO Unit) : IO Unit := do

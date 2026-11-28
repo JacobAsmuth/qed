@@ -154,14 +154,15 @@ def TestChecker.checkRawNoLeak (c : TestChecker) (port : UInt16) (label reqPath 
 def TestChecker.checkCliCases (c : TestChecker) (run : Array String → IO (UInt32 × String)) (cases : List (String × Array String × Bool × List String × List String))
     (parallel : Bool := false) (maxConcurrency : Nat := 4) : IO Unit := do
   let verify (lbl : String) (rc : UInt32) (out : String) (wantOk : Bool) (has omits : List String) := c.check lbl ((rc == 0) == wantOk && hasAll out has && omits.all (!out.contains ·)) out
-  if parallel && maxConcurrency > 1 then
+  let effConc := if System.Platform.isOSX then 1 else maxConcurrency
+  if parallel && effConc > 1 then
     let rec go : Nat → List (String × Array String × Bool × List String × List String) → IO Unit
       | 0, _ | _, [] => pure ()
       | fuel + 1, rem => do
-          let batch := rem.take maxConcurrency
+          let batch := rem.take effConc
           let ts ← batch.mapM fun (lbl, args, wantOk, has, omits) => return (lbl, wantOk, has, omits, ← IO.asTask (prio := .dedicated) (run args))
           ts.forM fun (lbl, wantOk, has, omits, t) => do match ← IO.wait t with | .ok (rc, out) => verify lbl rc out wantOk has omits | .error e => c.check lbl false (toString e)
-          go fuel (rem.drop maxConcurrency)
+          go fuel (rem.drop effConc)
     go cases.length cases
   else cases.forM fun (lbl, args, wantOk, has, omits) => do let (rc, out) ← run args; verify lbl rc out wantOk has omits
 

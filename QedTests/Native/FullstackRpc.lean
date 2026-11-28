@@ -270,7 +270,10 @@ private def runCloudBooksSuite (c : TestChecker) : IO Unit := do
 
 def run : IO Bool := do
   let c ← mkChecker "fullstack-rpc"
-  runTasks [runCloudBooksSuite c, runWebEssentialsSuite c, runServiceAndExternalSuite c, runMovedServerChecks c]
+  if System.Platform.isOSX then
+    runTasks [(do runCloudBooksSuite c; runWebEssentialsSuite c), runServiceAndExternalSuite c, runMovedServerChecks c]
+  else
+    runTasks [runCloudBooksSuite c, runWebEssentialsSuite c, runServiceAndExternalSuite c, runMovedServerChecks c]
   c.finish
 
 end QedTests.Native.FullstackRpc

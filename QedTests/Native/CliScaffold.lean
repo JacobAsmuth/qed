@@ -107,9 +107,10 @@ def run : IO Bool := do
       (do
         let strippedRt := s!"{scratch}/stripped_rt.mjs"
         IO.FS.writeFile strippedRt ((← IO.FS.readFile (root / "runtime" / "qed_rt.mjs")).replace "export const Array_push" "export const Removed_Array_push")
+        let tExt ← IO.monoMsNow
         let (cExt, outExt, errExt) ← runCmd "lake" #["env", qedjs, "--check-externs", strippedRt, "App", "--", "Quantity.app:app"] (cwd := some appDir) (env := cleanEnv)
-        c.check "stripped qed_rt fails --check-externs" (cExt != 0 && (outExt ++ errExt).contains "Array_push") (outExt ++ errExt)),
-      (do
+        logTiming "cli-scaffold: --check-externs" tExt
+        c.check "stripped qed_rt fails --check-externs" (cExt != 0 && (outExt ++ errExt).contains "Array_push") (outExt ++ errExt)
         runCli "qed build --dev succeeds" appDir #["build", "--dev", "--no-verify"]
         let devOut := appDir / ".qed" / "dev"; let devAppJs ← IO.FS.readFile (devOut / "app.mjs")
         c.checkAll [("dev app.mjs references sourceMappingURL", devAppJs.contains "//# sourceMappingURL=app.mjs.map"),

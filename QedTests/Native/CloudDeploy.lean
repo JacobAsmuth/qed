@@ -682,6 +682,12 @@ private def testCloudProtocolAndCli (c : TestChecker) : IO Unit := do
           wantTok?.all (fun t => reqs.any fun r => r.1 == "POST" && r.2.1 == "/api/v1/tokens/revoke-current" && r.2.2.1 == some s!"Bearer {t}") &&
           noTok?.all (fun t => !reqs.any fun r => r.2.2.1 == some s!"Bearer {t}") && (!lbl.contains "mismatched" || reqs.isEmpty)) out
 
-def run : IO Bool := do let c ← mkChecker "cloud-deploy"; runTasks [testCloudDeployEndToEnd c, testCloudProtocolAndCli c]; c.finish
+def run : IO Bool := do
+  let c ← mkChecker "cloud-deploy"
+  if System.Platform.isOSX then
+    testCloudDeployEndToEnd c; testCloudProtocolAndCli c
+  else
+    runTasks [testCloudDeployEndToEnd c, testCloudProtocolAndCli c]
+  c.finish
 
 end QedTests.Native.CloudDeploy

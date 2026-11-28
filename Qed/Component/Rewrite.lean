@@ -137,23 +137,44 @@ def packSuite (refStx : Syntax) (stmts : Array Syntax) : Syntax :=
     if eNode.getNumArgs == 3 then let (eL, eC?) ← f #[] (suiteStmts (eNode.getArg 2)); pure (setStxArg eNode 2 (packSuite st eL), eC?)
     else if synthEmptyElse then let (eL, eC?) ← f #[] #[]; pure (packOptElse (some eL), eC?)
     else pure (eNode, none)
+  let mapElif (node : Syntax) :=
+    if node.getKind == `Qed.Lang.elifLetClause then mapNode node 6 (collectQedPatIds (node.getArg 2)) else mapNode node 3
+  let finishIf (bodyIdx elifsIdx elseIdx : Nat) (extra : Array Name) := do
+    let (tL, tC?) ← f extra (suiteStmts (st.getArg bodyIdx))
+    let elRes ← Lang.mapCmd (st.getArg elifsIdx).getArgs mapElif
+    let (eOpt, eC?) ← mapOptElse (st.getArg elseIdx)
+    let mkIf (t els : Array Syntax) (e : Syntax) :=
+      setStxArg (setStxArg (setStxArg st bodyIdx (packSuite st t)) elifsIdx (Syntax.node info nullKind els)) elseIdx e
+    return some (mkIf tL (elRes.map (·.1)) eOpt, if tC?.isNone && !elRes.any (·.2.2) && eC?.isNone then none else some (mkIf (tC?.getD #[]) (elRes.map (·.2.1)) (packOptElse eC?)))
   match st.getKind with
-  | ``qedStmtIf =>
-      let (tL, tC?) ← f #[] (suiteStmts (st.getArg 3))
-      let elRes ← Lang.mapCmd (st.getArg 4).getArgs (mapNode · 3)
-      let (eOpt, eC?) ← mapOptElse (st.getArg 5)
-      let mkIf (t els : Array Syntax) (e : Syntax) := setStxArg (setStxArg (setStxArg st 3 (packSuite st t)) 4 (Syntax.node info nullKind els)) 5 e
-      return some (mkIf tL (elRes.map (·.1)) eOpt, if tC?.isNone && !elRes.any (·.2.2) && eC?.isNone then none else some (mkIf (tC?.getD #[]) (elRes.map (·.2.1)) (packOptElse eC?)))
-  | ``qedStmtIfLet =>
-      let (tL, tC?) ← f (collectQedPatIds (st.getArg 2)) (suiteStmts (st.getArg 6))
-      let (eOpt, eC?) ← mapOptElse (st.getArg 7)
-      let mkIfL (t : Array Syntax) (e : Syntax) := setStxArg (setStxArg st 6 (packSuite st t)) 7 e
-      return some (mkIfL tL eOpt, if tC?.isNone && eC?.isNone then none else some (mkIfL (tC?.getD #[]) (packOptElse eC?)))
+  | ``qedStmtIf    => finishIf 3 4 5 #[]
+  | ``qedStmtIfLet => finishIf 6 7 8 (collectQedPatIds (st.getArg 2))
   | ``qedStmtMatch =>
       let cRes ← Lang.mapCmd (st.getArg 3).getArgs fun c => mapNode c 3 (collectCasePatIds (extractCasePatAlts (c.getArg 1)))
       let mkM (cs : Array Syntax) := setStxArg st 3 (Syntax.node (st.getArg 3).getHeadInfo (st.getArg 3).getKind cs)
       return some (mkM (cRes.map (·.1)), if !cRes.any (·.2.2) then none else some (mkM (cRes.map (·.2.1))))
+  | ``qedStmtLetElse =>
+      let (eL, eC?) ← f #[] (extractLetElseStmts st)
+      let mkLE (es : Array Syntax) := setStxArg st 5 (Syntax.node info `Qed.Lang.letElseBlock #[Syntax.atom info ":", packSuite st es])
+      return some (mkLE eL, eC?.map mkLE)
   | _ => return none
+
+mutual
+  partial def compStmtAlwaysReturns (st : Syntax) : Bool :=
+    match st.getKind with
+    | ``qedStmtReturn => true
+    | ``qedStmtIf =>
+        compBlockAlwaysReturns (suiteStmts (st.getArg 3)) &&
+        ((desugarElifs (st.getArg 4).getArgs (st.getArg 5)).any compBlockAlwaysReturns)
+    | ``qedStmtIfLet =>
+        compBlockAlwaysReturns (suiteStmts (st.getArg 6)) &&
+        ((desugarElifs (st.getArg 7).getArgs (st.getArg 8)).any compBlockAlwaysReturns)
+    | ``qedStmtMatch =>
+        let cs := (st.getArg 3).getArgs
+        !cs.isEmpty && cs.all fun c => compBlockAlwaysReturns (suiteStmts (c.getArg 3))
+    | _ => false
+  partial def compBlockAlwaysReturns (stmts : Array Syntax) : Bool := stmts.any compStmtAlwaysReturns
+end
 
 def forEachControlSubSuite (st : Syntax) (f : Array Syntax → CommandElabM Unit) : CommandElabM Unit :=
   discard <| mapControlSubSuites st false fun _ ss => do f ss; pure (ss, none)
@@ -225,7 +246,7 @@ def splitDottedFieldName (fId : Syntax) : Name × Array Name :=
 partial def parseCompLVal? (stx : Syntax) : Option (Syntax × Name × Array Name) :=
   match stx.getKind with
   | ``qedIdent => let (root, rest) := splitDottedFieldName (stx.getArg 0); if root.isAnonymous then none else some (stx.getArg 0, root, rest)
-  | ``qedProj  => (parseCompLVal? (stx.getArg 0)).map fun (ref, root, path) => (ref, root, path.push (stx.getArg 2).getId.eraseMacroScopes)
+  | ``qedProj  => if (stx.getArg 2).isIdent then (parseCompLVal? (stx.getArg 0)).map fun (ref, root, path) => (ref, root, path.push (stx.getArg 2).getId.eraseMacroScopes) else none
   | _ => none
 
 @[noinline] partial def buildRecordUpdateFromPure (cur : Term) (path : Array Name) (mkLeaf : Term → PureQuotM Term) (idx : Nat := 0) : PureQuotM Term := do
@@ -235,14 +256,13 @@ partial def parseCompLVal? (stx : Syntax) : Option (Syntax × Name × Array Name
     `({ $cur with $fId:ident := $inner })
   else mkLeaf cur
 
-@[noinline] def desugarAssignPath (fname : Name) (path : Array Name) (op : String) (rhs : Term) : CommandElabM Term :=
-  match op with
-  | "=" => pure rhs
-  | "+=" | "-=" => Lang.runPQ do
-      let cur ← Qed.Server.foldProjTerms rhs.raw ⟨(mkIdent fname).raw⟩ path.toList
-      if op == "+=" then `(Qed.Lang.QedVal.val $cur + Qed.Lang.QedVal.val ($rhs))
-      else `(Qed.Lang.QedVal.val $cur - Qed.Lang.QedVal.val ($rhs))
-  | _ => throwErrorAt rhs s!"unknown assignment operator '{op}'"
+@[noinline] def desugarAssignPath (fname : Name) (path : Array Name) (op : String) (rhs : Term) : CommandElabM Term := do
+  if op == "=" then return rhs
+  let qctx ← Lang.getPureQuotCtxCmd
+  let cur := qctx.runPure (Qed.Server.foldProjTerms rhs.raw ⟨(mkIdent fname).raw⟩ path.toList)
+  match applyAssignOpPure qctx rhs.raw op cur rhs with
+  | .ok t => return t
+  | .error (ref, msg) => throwErrorAt ref msg
 
 /-! ## Unified Single-Ref Rewrite Accumulator & Context -/
 
@@ -310,7 +330,7 @@ open Lean Meta Elab Term in
       let (cond, tT, eT) := (← lowerCompExpr .propGuard (st.getArg 1), ← lowerBranch (suiteStmts (st.getArg 3)), ← lowerBranch ((desugarElifs (st.getArg 4).getArgs (st.getArg 5)).getD #[]))
       Lang.runPQ `(if $(mkIdent `_qedIf):ident : $cond then $tT else $eT)
   | ``qedStmtIfLet =>
-      let (pat, scrut, tT, eT) := (← liftMacroM (lowerQedPat (st.getArg 2)), ← lowerVal (st.getArg 4), ← lowerBranch (suiteStmts (st.getArg 6)), ← lowerBranch ((extractElseSuite (st.getArg 7)).getD #[]))
+      let (pat, scrut, tT, eT) := (← liftMacroM (lowerQedPat (st.getArg 2)), ← lowerVal (st.getArg 4), ← lowerBranch (suiteStmts (st.getArg 6)), ← lowerBranch ((desugarElifs (st.getArg 7).getArgs (st.getArg 8)).getD #[]))
       Lang.runPQ `(match $(mkIdent `_qedIfLet):ident : $scrut:term with | $pat:term => $tT | _ => $eT)
   | _ =>
       let scruts ← Lang.mapCmd (st.getArg 1).getSepArgs lowerVal
@@ -585,13 +605,21 @@ private def lowerEmitCallWith (ctx : RewriteCtx) (lowerE : Syntax → CommandEla
   return mkJsxAttrValNode (← mkSiteExpr ctx assigns emit?)
 
 @[noinline] partial def rewriteIn (ctx : RewriteCtx) (inLambda : Bool) (stx : Syntax) : CommandElabM Syntax := do
-  let rwGuarded (thenIdx optEIdx elseArgIdx elseLen : Nat) (mkGuard : Bool → ViewGuard) (baseStx : Syntax) : CommandElabM Syntax := do
+  let rwIfChain (thenIdx elifsIdx optEIdx : Nat) (mkGuard : Bool → ViewGuard) (baseStx : Syntax) : CommandElabM Syntax := do
     let then' ← rewriteIn { ctx with guards := ctx.guards.push (mkGuard true) } inLambda (baseStx.getArg thenIdx)
+    let elifsNode := baseStx.getArg elifsIdx
+    let (elifs', negCtx) ← Lang.foldlCmd elifsNode.getArgs (#[], { ctx with guards := ctx.guards.push (mkGuard false) }) fun (acc, curCtx) el => do
+      if el.getKind == `Qed.Lang.exprElifLet then
+        let s' ← rewriteIn curCtx inLambda (el.getArg 4); let g := ViewGuard.ifLet (el.getArg 2) s'
+        let b' ← rewriteIn { curCtx with guards := curCtx.guards.push (g true) } inLambda (el.getArg 6)
+        return (acc.push (setStxArg (setStxArg el 4 s') 6 b'), { curCtx with guards := curCtx.guards.push (g false) })
+      else
+        let c' ← rewriteIn curCtx inLambda (el.getArg 1); let g := ViewGuard.ifCond c'
+        let b' ← rewriteIn { curCtx with guards := curCtx.guards.push (g true) } inLambda (el.getArg 3)
+        return (acc.push (setStxArg (setStxArg el 1 c') 3 b'), { curCtx with guards := curCtx.guards.push (g false) })
     let optE := baseStx.getArg optEIdx
-    let optE' ← if optE.getNumArgs == elseLen then
-        setStxArg optE elseArgIdx <$> rewriteIn { ctx with guards := ctx.guards.push (mkGuard false) } inLambda (optE.getArg elseArgIdx)
-      else pure optE
-    return setStxArg (setStxArg baseStx thenIdx then') optEIdx optE'
+    let optE' ← if optE.getNumArgs == 3 then setStxArg optE 2 <$> rewriteIn negCtx inLambda (optE.getArg 2) else pure optE
+    return setStxArg (setStxArg (setStxArg baseStx thenIdx then') elifsIdx (Syntax.node elifsNode.getHeadInfo elifsNode.getKind elifs')) optEIdx optE'
   match stx.getKind with
   | ``qedRawTerm => return stx
   | ``qedLam1 | ``qedLamN => return Syntax.node stx.getHeadInfo stx.getKind (← Lang.mapCmd stx.getArgs (rewriteIn ctx true))
@@ -603,9 +631,14 @@ private def lowerEmitCallWith (ctx : RewriteCtx) (lowerE : Syntax → CommandEla
           if let some cInfo ← liftCoreM (lookupComponent? childCompId.getId) then
             if (← liftCoreM getEnv).contains (cInfo.fullName ++ `keyOf) then bodyRewritten ← injectAutoKey bodyRewritten cInfo.fullName ⟨patStx.getArg 0⟩
       return Syntax.node stx.getHeadInfo ``qedExprFor #[stx.getArg 0, patStx, stx.getArg 2, collRewritten, stx.getArg 4, bodyRewritten]
-  | ``qedExprIf    => let c' ← rewriteIn ctx inLambda (stx.getArg 1); rwGuarded 3 4 2 3 (.ifCond c') (setStxArg stx 1 c')
-  | ``qedTernary   => let c' ← rewriteIn ctx inLambda (stx.getArg 2); rwGuarded 0 3 1 2 (.ifCond c') (setStxArg stx 2 c')
-  | ``qedExprIfLet => let s' ← rewriteIn ctx inLambda (stx.getArg 4); rwGuarded 6 7 2 3 (.ifLet (stx.getArg 2) s') (setStxArg stx 4 s')
+  | ``qedExprIf    => let c' ← rewriteIn ctx inLambda (stx.getArg 1); rwIfChain 3 4 5 (.ifCond c') (setStxArg stx 1 c')
+  | ``qedTernary   =>
+      let c' ← rewriteIn ctx inLambda (stx.getArg 2); let base := setStxArg stx 2 c'
+      let then' ← rewriteIn { ctx with guards := ctx.guards.push (.ifCond c' true) } inLambda (base.getArg 0)
+      let optE := base.getArg 3
+      let optE' ← if optE.getNumArgs == 2 then setStxArg optE 1 <$> rewriteIn { ctx with guards := ctx.guards.push (.ifCond c' false) } inLambda (optE.getArg 1) else pure optE
+      return setStxArg (setStxArg base 0 then') 3 optE'
+  | ``qedExprIfLet => let s' ← rewriteIn ctx inLambda (stx.getArg 4); rwIfChain 6 7 8 (.ifLet (stx.getArg 2) s') (setStxArg stx 4 s')
   | ``qedExprMatch =>
       let scrutsNode' ← rewriteIn ctx inLambda (stx.getArg 1); let scrutsRewritten := scrutsNode'.getSepArgs
       let casesNode := stx.getArg 3; let rawCases := casesNode.getArgs
@@ -860,7 +893,7 @@ def checkTopLevelMountable (spec : ComponentSpec) (ref : Syntax) (featureDesc : 
         return mkBind fname fullValT
       else if strict then
         let lhsStr := stxSnippet lhs
-        throwErrorAt s s!"unsupported assignment{if lhsStr.isEmpty then "" else s!" `{lhsStr} {op} ...`"} in component action; expected `field = val`, `field.sub = val`, `field += val`, `field -= val`, or `arr[i] = val`"
+        throwErrorAt s s!"unsupported assignment{if lhsStr.isEmpty then "" else s!" `{lhsStr} {op} ...`"} in component action; expected `field = val`, `field.sub = val`, compound assignment (`+=`, `-=`, `*=`, ...), or `arr[i] = val`"
       else return none
   | ``qedStmtExpr =>
       let e := s.getArg 0

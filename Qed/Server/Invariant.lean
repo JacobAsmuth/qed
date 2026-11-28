@@ -61,13 +61,13 @@ private def diteFalseSimpNames : Array Name := splitNms `Qed.Server "srvDiteFals
 private def arrayAndBoolSimpNames : Array Name := #[``id_eq, ``ne_eq, ``Array.size_modify] ++ diteFalseSimpNames ++ valUnwrapSimpNames ++ arrayCoreSimpNames ++ boolSimpNames
 private def stepCombSimpNames : Array Name := splitNms `Qed.Server "srvSeq_none srvSeq_some srvEmitSeq_none srvEmitSeq_some srvFinish_ok srvFinish_err srvFinish_none srvFinishEmit_ok srvFinishEmit_err srvFinishEmit_none srvAtomicCommit_none srvAtomicCommit_ok srvAtomicCommit_err srvAtomicCommitEmit_none srvAtomicCommitEmit_ok srvAtomicCommitEmit_err"
 private def stepLetEqSimpNames : Array Name := splitNms `Qed.Server "srvSeq_srvLetEq srvEmitSeq_srvLetEq srvFinish_srvLetEq srvFinishEmit_srvLetEq srvAtomicCommit_srvLetEq srvAtomicCommitEmit_srvLetEq srvWithNewState_srvLetEq prod_fst_srvLetEq prod_snd_srvLetEq"
-private def ensPostSimpNames : Array Name := splitNms `Qed.Server "srvEnsPost_ok srvEnsPost_err srvEnsPost_srvLetEq srvEnsPostOpt_some srvEnsPostOpt_none srvEnsPostOpt_err srvEnsPostOpt_srvLetEq srvEnsPostOpt_ok_iff srvEnsErrPost_ok srvEnsErrPost_err srvEnsErrPost_srvLetEq srvEnsFails_ok srvEnsFails_err srvEnsFails_srvLetEq srvEnsFailsCode_ok srvEnsFailsCode_err srvEnsFailsCode_srvLetEq"
+private def ensPostSimpNames : Array Name := splitNms `Qed.Server "srvEnsPost_ok srvEnsPost_err srvEnsPost_srvLetEq srvEnsPostOpt_some srvEnsPostOpt_none srvEnsPostOpt_err srvEnsPostOpt_srvLetEq srvEnsPostOpt_ok_iff srvEnsFails_ok srvEnsFails_err srvEnsFails_srvLetEq srvEnsFailsCode_ok srvEnsFailsCode_err srvEnsFailsCode_srvLetEq"
 
 private def isSrvEqDecl (decl : LocalDecl) : Bool := !decl.userName.hasMacroScopes && let u := decl.userName.toString; u.startsWith "_srvEq" || u.startsWith "_hLet"
 def collectProofFacts (extraExprs : Array Expr) : TermElabM (Array Expr) :=
   liftMetaM <| collectFacts { scanLCtx := true, scanLCtxValues := true, includeMacroPropHyps := true, includeFin := true, skipDecl := fun d _ => isSrvEqDecl d } extraExprs
 
-private def unsteppedCtrlSet : NameSet := mkNameSet (splitNms `Qed.Server "srvLetEq srvFinish srvFinishEmit srvSeq srvEmitSeq srvAtomicCommit srvAtomicCommitEmit srvEnsPost srvEnsPostOpt srvEnsErrPost srvEnsFails srvEnsFailsCode" ++ #[``ite, ``dite])
+private def unsteppedCtrlSet : NameSet := mkNameSet (splitNms `Qed.Server "srvLetEq srvFinish srvFinishEmit srvSeq srvEmitSeq srvAtomicCommit srvAtomicCommitEmit srvEnsPost srvEnsPostOpt srvEnsFails srvEnsFailsCode" ++ #[``ite, ``dite])
 private def hasUnsteppedCtrlFlow (e : Expr) : Bool := hasAnyConst e unsteppedCtrlSet.contains
 
 private def tryCloseSrvTrivial (g : MVarId) : MetaM Bool := tryCloseTrivial g hasUnsteppedCtrlFlow
@@ -586,7 +586,12 @@ private def tryCloseConstMutInv (g0 : MVarId) : TacticM (Option MVarId) := do
 
 private def effWrapperUnfoldNames : Array Name :=
   splitNms `Qed.Server "newId hashBearerToken mintBearerToken flushWsEmits" ++
-  splitNms `Qed.Server.Db "dbRunRows dbRunOneRow dbSelectProj dbFindOneProj dbCount dbSumNat dbSumInt dbAggOpt dbDelete dbInsert dbInsertOrIgnore dbUpsert dbJoinSelect dbRun withTransaction"
+  splitNms `Qed.Time "nowMs nowSec sleepMs sleepSec" ++
+  splitNms `Qed.Http "requestOidcRaw getOidc getOidcString getOidcJson postOidcJson" ++
+  splitNms `Qed.Proc "exec execOk" ++
+  splitNms `Qed.Fs "readBytes readText writeBytes writeText mkdirAll removeAll pathExists mktempDir" ++
+  splitNms `Qed.Server.Db "dbRunRows dbRunOneRow dbSelectProj dbFindOneProj dbCount dbSumNat dbSumInt dbAggOpt dbDelete dbInsert dbInsertOrIgnore dbUpsert dbJoinSelect dbRun withTransaction pgSchemasQuery pgTablesQuery pgColumnsQuery pgIndexesQuery pgKeyColumnsQuery pgTableStatsQuery" ++
+  splitNms `Qed.Server.Db.PgHandle "runReadOnly queryReadOnly listSchemas listTables listColumns listIndexes listKeyColumns listTableStats countRows countRowsInSchema selectRows selectCols selectSchema"
 
 private def effHypContraSimpNames : Array Name :=
   splitNms .anonymous "Bool.not_eq_true' Bool.not_eq_false' not_true_eq_false not_false_eq_true decide_eq_true_eq decide_eq_false_iff_not beq_iff_eq bne_iff_ne Qed.Lang.QedVal.val_id Qed.qedIterable_toList_array Qed.qedIterable_toList_list Qed.qedIterable_toList_range Qed.Lang.QedSeqLit.ofList Array.toList_empty List.mem_nil_iff List.not_mem_nil"

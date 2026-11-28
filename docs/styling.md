@@ -122,9 +122,10 @@ For state-driven values like progress widths or dynamic CSS variables, use sanit
 
 ## 5. Verification checks
 
-- **Theme completeness with `verify_theme`:** Prove every `var(--...)` referenced by any style in an app is defined by the theme:
+- **Theme completeness & contrast with `invariant`:** Prove every `var(--...)` referenced by any style in an app is defined by the theme, and verify WCAG contrast across styles:
   ```lean
-  verify_theme AppTheme for MyApp.app
+  invariant appThemeComplete: AppTheme.theme.coversAll(MyApp.app.styles)
+  invariant appContrastOk: AppTheme.theme.checkContrast(MyApp.app.styles)
   ```
 - **Token-only enforcement with `strict_tokens`:** Reject raw color and non-zero length literals inside a `style` block:
   ```lean

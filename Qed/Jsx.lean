@@ -19,19 +19,19 @@ declare_syntax_cat jsxAttr
 declare_syntax_cat jsxAttrVal
 
 @[qedExpr_parser] def qedExprJsx : Parser := opaqueP (leadingNode `Qed.Jsx.qedExprJsx maxPrec (atomic (categoryParser `jsxElement 0)))
-def jsxAssignOp   : Parser := (symbol "=" >> notFollowedBy (symbol "=") "=") <|> symbol "+=" <|> symbol "-="
+def jsxAssignOp   : Parser := Qed.Lang.qedAssignOp
 def jsxAssignItem : Parser := node `Qed.Jsx.jsxAssignItem (ident >> jsxAssignOp >> categoryParser `qedExpr 0)
 
 @[jsxAttrVal_parser] def attrValStr    : Parser := opaqueP (leadingNode `Qed.Jsx.attrValStr maxPrec strLit)
 @[jsxAttrVal_parser] def attrValAssign : Parser := opaqueP (leadingNode `Qed.Jsx.attrValAssign maxPrec (
   "{" >> atomic (ident >> jsxAssignOp) >> categoryParser `qedExpr 0 >>
   many (atomic (";" >> jsxAssignItem)) >> optional (atomic (";" >> categoryParser `qedExpr 0)) >> "}"))
-@[jsxAttrVal_parser] def attrValExpr   : Parser := opaqueP (leadingNode `Qed.Jsx.attrValExpr maxPrec ("{" >> categoryParser `qedExpr 0 >> "}"))
+@[jsxAttrVal_parser] def attrValExpr   : Parser := opaqueP (leadingNode `Qed.Jsx.attrValExpr maxPrec (withPosition ("{" >> categoryParser `qedExpr 0 >> "}")))
 
 @[jsxAttr_parser] def attrNamed  : Parser := opaqueP (leadingNode `Qed.Jsx.attrNamed maxPrec (jsxName >> optional ("=" >> categoryParser `jsxAttrVal 0)))
-@[jsxAttr_parser] def attrSplice : Parser := opaqueP (leadingNode `Qed.Jsx.attrSplice maxPrec ("{" >> categoryParser `qedExpr 0 >> "}"))
+@[jsxAttr_parser] def attrSplice : Parser := opaqueP (leadingNode `Qed.Jsx.attrSplice maxPrec (withPosition ("{" >> categoryParser `qedExpr 0 >> "}")))
 -- Ordered `<|>` (not a syntax category) so `jsxText` runs before tokenizing non-token chars like `•`.
-def jsxChild : Parser := node `Qed.Jsx.jsxChild (jsxText <|> group ("{" >> categoryParser `qedExpr 0 >> "}") <|> categoryParser `jsxElement 0)
+def jsxChild : Parser := node `Qed.Jsx.jsxChild (jsxText <|> group (withPosition ("{" >> categoryParser `qedExpr 0 >> "}")) <|> categoryParser `jsxElement 0)
 @[jsxElement_parser] def jsxFragment  : Parser := opaqueP (leadingNode `Qed.Jsx.jsxFragment maxPrec (atomic ("<" >> ">") >> many jsxChild >> "</" >> ">"))
 @[jsxElement_parser] def selfClosing  : Parser := opaqueP (leadingNode `Qed.Jsx.selfClosing maxPrec ("<" >> jsxName >> many (categoryParser `jsxAttr 0) >> "/>"))
 @[jsxElement_parser] def withChildren : Parser := opaqueP (leadingNode `Qed.Jsx.withChildren maxPrec ("<" >> jsxName >> many (categoryParser `jsxAttr 0) >> ">" >> many jsxChild >> "</" >> jsxName >> ">"))
@@ -129,18 +129,17 @@ private def isMapCall (stx : Syntax) : Bool :=
   match s.getArg 0 with | .ident _ _ n _ => (match n.eraseMacroScopes with | .str _ "map" => true | _ => false) | _ => false
 
 private partial def isListJsxExpr (stx : Syntax) : Bool :=
-  let optElse (tI eI : Nat) := isListJsxExpr (stx.getArg tI) || (extractOptElseExpr? (stx.getArg eI)).any isListJsxExpr
   match stx.getKind with
   | ``qedExprJsx => (stx.getArg 0).getKind == ``jsxFragment
   | ``Qed.Lang.qedRawTerm => isMapCall (stx.getArg 1)
   | ``Qed.Lang.qedParen => (stx.getArg 1).getSepArgs.size == 1 && isListJsxExpr (stx.getArg 1).getSepArgs[0]!
   | ``Qed.Lang.qedIdent => (stx.getArg 0).getId.eraseMacroScopes == `children
-  | ``Qed.Lang.qedTernary => optElse 0 3
+  | ``Qed.Lang.qedTernary => isListJsxExpr (stx.getArg 0) || (extractOptElseExpr? (stx.getArg 3)).any isListJsxExpr
   | ``Qed.Lang.qedExprLet => isListJsxExpr (stx.getArg 6)
-  | ``Qed.Lang.qedExprIf => optElse 3 4
-  | ``Qed.Lang.qedExprIfLet => optElse 6 7
+  | ``Qed.Lang.qedExprIf => isListJsxExpr (stx.getArg 3) || (desugarExprElifs? (stx.getArg 4).getArgs (stx.getArg 5)).any isListJsxExpr
+  | ``Qed.Lang.qedExprIfLet => isListJsxExpr (stx.getArg 6) || (desugarExprElifs? (stx.getArg 7).getArgs (stx.getArg 8)).any isListJsxExpr
   | ``Qed.Lang.qedExprMatch => (stx.getArg 3).getArgs.any fun c => isListJsxExpr (c.getArg 3)
-  | ``Qed.Lang.qedCall => (stx.getArg 0).getKind == ``Qed.Lang.qedProj && ((stx.getArg 0).getArg 2).getId.eraseMacroScopes == `map
+  | ``Qed.Lang.qedCall => (stx.getArg 0).getKind == ``Qed.Lang.qedProj && ((stx.getArg 0).getArg 2).isIdent && ((stx.getArg 0).getArg 2).getId.eraseMacroScopes == `map
   | ``Qed.Lang.qedExprFor => true
   | _ => false
 

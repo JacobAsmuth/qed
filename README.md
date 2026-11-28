@@ -5,7 +5,7 @@
 Qed embeds a Python-esque web language (JSX components, scoped CSS, schemas, routing, and an optional native server) inside [Lean 4](https://lean-lang.org). You write behavioral invariants alongside your components, forms, styles, and server handlers, and Lean's kernel checks that they hold across all state transitions and inputs at compile time.
 
 - **JavaScript in the browser:** Proofs live in Lean's `Prop` universe and are erased at compile time, emitting standard ES modules.
-- **Opt-in proofs, ASCII syntax:** Arithmetic, boolean, `Option`, and view invariants are proved automatically; drop into Lean tactics with `:= by` when you want custom domain proofs.
+- **Opt-in proofs, ASCII syntax:** Arithmetic, boolean, `Option`, and view invariants are proved automatically; drop into Lean tactics with `prove:` when you want custom domain proofs.
 - **Verified builds:** `qed check` checks the compiled environment against Lean's standard axioms and rejects `sorry`, `admit`, `native_decide`, and `unsafe` code.
 
 [See it in action](#see-it-in-action) · [How it works](#how-it-works) · [Get started](#get-started) · [Examples](Examples/README.md)
@@ -46,7 +46,7 @@ Invariant `Quantity.inRange` failed in `Quantity.update`:
 Hint: Guard the failing branch with `if ...:`, fix the update, or weaken the invariant.
 ```
 
-Qed checks that `inRange` holds on the initial state, across every action, and across SSR dehydration and rehydration. For properties like ID uniqueness across arrays, you can lift child invariants with `for_each` or supply a short Lean proof with `:= by`. See the [invariant guide](docs/invariants.md).
+Qed checks that `inRange` holds on the initial state, across every action, and across SSR dehydration and rehydration. For properties like ID uniqueness across arrays, you can lift child invariants with `for_each` or supply a short Lean proof with `prove:`. See the [invariant guide](docs/invariants.md).
 
 ---
 
@@ -258,12 +258,12 @@ qed clean      # remove build outputs
 
 - **[Example tour](Examples/README.md):** Seven progressive examples: [Counter](Examples/Counter.lean), [Todo](Examples/Todo.lean), [Signup](Examples/Signup.lean), [Chat](Examples/Chat.lean), [Bookshelf](Examples/Bookshelf.lean), [CloudBooks](Examples/CloudBooks.lean), and [LiveRoom](Examples/LiveRoom.lean).
 - **[Components & apps](docs/components.md):** Props, `slot`s, `children`, `bind:`, `route`, `query`, `subscribe`, optimistic `predict`, `<Await>`, and stateful composition.
-- **[Styling & verified CSS](docs/styling.md):** First-class `style` blocks, deterministic `extends`, typed `theme`s with WCAG contrast proofs, `keyframes`, `strict_tokens`, `verify_theme`, and build-time CSS extraction.
-- **[Invariants](docs/invariants.md):** Automatic proofs, `:= by` tactic proofs, `for_each` collection lifts, and view/styling predicates.
+- **[Styling & verified CSS](docs/styling.md):** First-class `style` blocks, deterministic `extends`, typed `theme`s with WCAG contrast proofs, `keyframes`, `strict_tokens`, theme completeness invariants, and build-time CSS extraction.
+- **[Invariants](docs/invariants.md):** Automatic proofs, `prove:` tactic proofs, `for_each` collection lifts, and view/styling predicates.
 - **[How Qed works](docs/architecture.md):** Compilation pipeline, trusted computing base, verification gates, and source map.
 - **[Rendering & DOM proofs](docs/rendering.md):** Direct signal updates, keyed reconciliation, and verified memoization.
 
-Because Qed apps live inside Lean 4 files, you can drop down to full Lean definitions and `:= by` tactic proofs whenever you need custom data structures or domain lemmas. JavaScript interop uses [typed ports](docs/components.md).
+Because Qed apps live inside Lean 4 files, you can drop down to full Lean definitions and `prove:` tactic blocks whenever you need custom data structures or domain lemmas. JavaScript interop uses [typed ports](docs/components.md).
 
 Questions and issues: [GitHub issues](https://github.com/JacobAsmuth/qed/issues).
 

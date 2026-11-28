@@ -41,36 +41,40 @@ private abbrev pPat  : Parser := categoryParser `qedPat 0
 @[noinline] private def pNode (k : Name) (p : Parser) : Parser := node k (withPosition p)
 @[noinline] private def kwNode (k kw : Name) (p : Parser) : Parser := node k (withPosition (atomic (identEq kw) >> p))
 private def compParam     : Parser := node `Qed.componentParam (ident >> ":" >> pType)
-private def compParamsOpt : Parser := optional (checkLineEq >> "(" >> sepBy compParam "," >> ")")
+private def compParamsOpt : Parser := optional (checkLineEq >> "(" >> commaSep compParam >> ")")
 def compIfLet             : Parser := node `Qed.compIfLet (atomic (symbol "let" >> pPat >> "=") >> pExpr >> optional ("," >> sepBy1 pExpr ","))
 private def compIfCond    : Parser := node `Qed.compIfCond (atomic (symbol "if") >> (compIfLet <|> sepBy1 pExpr ","))
 private def compInvName   : Parser := node `Qed.compInvName (ident >> ":")
+private def compInvProveCaseP : Parser :=
+  pNode `Qed.compInvProveCase (atomic (kw "case" >> sepBy1 ident "," >> ":") >> checkColGt "expected indented proof tactics" >> Parser.Tactic.tacticSeq)
+private def compInvProveClause : Parser :=
+  node `Qed.compInvProveClause (
+    atomic (checkColGt "expected indented `prove:` block" >> identEq `prove >> ":") >>
+    checkColGt "expected indented proof tactics or `case <action>:` proofs" >>
+    (node `Qed.compInvProveCases (many1Indent compInvProveCaseP) <|> node `Qed.compInvProveTac Parser.Tactic.tacticSeq))
 def compForEachInvClause : Parser := pNode `Qed.compForEachInvClause (
-  atomic ("invariant " >> compInvName >> pExpr >> kw "for_each" >> ident) >>
-  optional (kw "holds_in" >> identEq `view) >> optional (kw "using" >> ident) >> optional (":=" >> termParser))
+  atomic (identEq `invariant >> compInvName >> pExpr >> kw "for_each" >> ident) >>
+  optional (kw "holds_in" >> identEq `view) >> optional (kw "using" >> ident) >> qedOptProof)
 def compInvariantClause : Parser := pNode `Qed.compInvariantClause (
-  "invariant " >> compInvName >> sepBy1 pExpr "," >>
+  atomic (identEq `invariant >> compInvName) >> sepBy1 pExpr "," >>
   optional (kw "holds_in" >> identEq `view >> optional (kw "assuming" >> pExpr)) >>
   optional (kw "using" >> "[" >> sepBy termParser "," >> "]") >>
-  optional ((checkColGt <|> checkLineEq) >> pNode `Qed.compInvProveClause (
-    atomic (identEq `prove >> ":") >> checkColGt "expected indented `case <action>:` proofs" >>
-    many1Indent (pNode `Qed.compInvProveCase (atomic (kw "case") >> sepBy1 ident "," >> ":" >> checkColGt "expected indented proof tactics" >> Parser.Tactic.tacticSeq)))) >>
-  optional (":=" >> termParser))
-private def compExRecord : Parser := node `Qed.compExRecord ("{" >> sepBy (node `Qed.compExAssign (ident >> "=" >> pExpr)) "," >> "}")
+  optional compInvProveClause)
+private def compExRecord : Parser := node `Qed.compExRecord ("{" >> commaSep (node `Qed.compExAssign (ident >> "=" >> pExpr)) >> "}")
 def compExampleClause : Parser := pNode `Qed.compExampleClause (
   atomic (symbol "example" >> ident) >>
-  optional (checkNoWsBefore "" >> "(" >> sepBy1 compParam "," >> ")") >>
+  optional (checkNoWsBefore "" >> "(" >> commaSep1 compParam >> ")") >>
   optional (node `Qed.compExWithProps (atomic (symbol "with" >> identEq `props) >> (compExRecord <|> ("=" >> pExpr)))) >>
   optional (node `Qed.compExFrom (atomic (symbol "from") >> (compExRecord <|> pExpr))) >>
   optional (symbol "where" >> sepBy1 pExpr ",") >>
   ":" >> sepBy1 (
     node `Qed.compExOnReply (atomic (identEq `on >> ident >> "=>") >> (
       node `Qed.compExReplyOk (atomic (identEq `ok) >> checkNoWsBefore "" >> "(" >> pExpr >> ")") <|>
-      node `Qed.compExReplyErr (atomic (identEq `error) >> checkNoWsBefore "" >> "(" >> pExpr >> ")") <|>
-      node `Qed.compExReplyDomain (atomic (identEq `err) >> checkNoWsBefore "" >> "(" >> "." >> checkNoWsBefore "" >> ident >> optional ("," >> pExpr) >> ")"))) <|>
+      node `Qed.compExReplyDomain (atomic (identEq `error >> checkNoWsBefore "" >> "(" >> "." >> checkNoWsBefore "") >> ident >> optional ("," >> pExpr) >> ")") <|>
+      node `Qed.compExReplyErr (atomic (identEq `error) >> checkNoWsBefore "" >> "(" >> pExpr >> ")"))) <|>
     pExpr 55) "," >> "->" >> pExpr >>
   optional (node `Qed.compExEmits (atomic (identEq `emits) >> pExpr)) >>
-  optional (":=" >> kw "by" >> Parser.Tactic.tacticSeq))
+  qedOptProof)
 
 private def compHeadDirective : Parser :=
   kwNode `Qed.compHeadTitle `title pExpr <|> kwNode `Qed.compHeadDescription `description pExpr <|>
@@ -90,19 +94,19 @@ def compClause : Parser :=
   kwNode `Qed.compRouteClause `route (optional ident >> ":" >> pType >> "=" >> pExpr >> optional (":" >> many1 (checkColGt >> qedStmtCase))) <|>
   pNode `Qed.compPortOutClause (atomic (identEq `port >> ident >> ":") >> pType) <|>
   pNode `Qed.compPortInClause (atomic (identEq `port >> ident >> "(") >> ident >> ":" >> pType >> ")" >> ":" >> qedSuite) <|>
-  pNode `Qed.compRpcQueryClause (atomic (identEq `query >> ident >> optional (":" >> pType) >> "=") >> ident >> "(" >> sepBy pExpr "," >> ")" >> optional compIfCond) <|>
+  pNode `Qed.compRpcQueryClause (atomic (identEq `query >> ident >> optional (":" >> pType) >> "=") >> ident >> "(" >> commaSep pExpr >> ")" >> optional compIfCond) <|>
   pNode `Qed.compSubscribeClause (
-    atomic (identEq `subscribe >> ident >> "=") >> ident >> "(" >> sepBy pExpr "," >> ")" >> optional compIfCond >>
+    atomic (identEq `subscribe >> ident >> "=") >> ident >> "(" >> commaSep pExpr >> ")" >> optional compIfCond >>
     optional (":" >> checkColGt "expected indented `subscribe` handlers" >> many1Indent (
       pNode `Qed.compSubReconnect (atomic (kw "reconnect") >> pExpr) <|>
       kwNode `Qed.compSubOnJoin `on_join (optional (checkLineEq >> "(" >> qedBinder >> ")") >> ":" >> qedSuite) <|>
       kwNode `Qed.compSubOnMsg `on_message ("(" >> qedBinder >> ")" >> ":" >> qedSuite) <|>
       kwNode `Qed.compSubOnStatus `on_status ("(" >> qedBinder >> ")" >> ":" >> qedSuite)))) <|>
   pNode `Qed.compStyleClause (
-    "style " >> ident >> optional Qed.StyleDsl.styleExtendsClause >> optional Qed.StyleDsl.styleStrictClause >>
+    atomic (identEq `style >> ident) >> optional Qed.StyleDsl.styleExtendsClause >> optional Qed.StyleDsl.styleStrictClause >>
     optional Qed.StyleDsl.styleContrastClause >> ":" >> many1 (checkColGt >> categoryParser `cssBlockItem 0)) <|>
   kwNode `Qed.compStylesheetClause `stylesheet strLit <|>
-  pNode `Qed.compThemeClause ("theme " >> ident) <|>
+  kwNode `Qed.compThemeClause `theme ident <|>
   pNode `Qed.compHeadClause (
     atomic (identEq `head >> ":") >> checkColGt "expected indented `head` directives" >>
     many1Indent (pNode `Qed.compHeadCase (atomic (kw "case") >> qedCasePats >> ":" >> checkColGt "expected indented `head` directives" >> many1Indent compHeadDirective) <|> compHeadDirective)) <|>
@@ -112,7 +116,7 @@ def compClause : Parser :=
 
 @[command_parser] def componentCmd : Parser := opaqueP (node `Qed.componentCmd (
   optional Command.docComment >>
-  withPosition ("component " >> ident >> ":" >> many (checkColGt >> compClause) >>
+  withPosition (atomic (identEq `component >> ident >> ":") >> many (checkColGt >> compClause) >>
     checkColGt >> identEq `view >> ":" >> (checkLineEq <|> checkColGt) >> pExpr >> many (checkColGt >> compInvAny))))
 
 end CompParsers

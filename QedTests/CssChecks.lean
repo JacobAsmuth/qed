@@ -123,12 +123,13 @@ component StyledShowcase:
   invariant activeValid: roleHasOneOf("toggle", [pillActive, pill])
   invariant exclusive:   noConflictingStyles([pillActive, pill])
   view: <div {shell}><StyledCard title="Verified CSS"/><button role="toggle" {pillActive if active else pill} onClick={.toggle}>Toggle</button><div {progressBox} {inlineStyle([width(pct(progress))])} {styleVars([cssVar(AppTheme.brand, hex("0055aa"))])}>Progress: {progress}%</div></div>
-verify_theme AppTheme for StyledShowcase.app
+invariant showcaseThemeCovered: AppTheme.theme.coversAll(StyledShowcase.app.styles)
 theme OtherTheme:
   color doesNotExist = #123456
 style orphanStyle:
   color: OtherTheme.doesNotExist
-expect_err "theme `AppTheme` does not define all CSS tokens used by `[orphanStyle]`.\n  Missing tokens: [\"does-not-exist\"]" in verify_theme AppTheme for [orphanStyle]
+invariant orphanMissingTokens: AppTheme.theme.missingTokens([orphanStyle]) == ["does-not-exist"]
+expect_err "Invariant `badOrphanTheme` failed" in invariant badOrphanTheme: AppTheme.theme.coversAll([orphanStyle])
 
 /-! ## Style & Stylesheet WCAG Contrast Verification -/
 style goodContrastBtn extends baseBtn contrast >= 4.5:
@@ -150,9 +151,9 @@ component ContrastCard:
     background-color: AppTheme.surface
   view: <div {body}>Readable</div>
 check_decls [goodContrastBtn_contrast, goodThemedCard_contrast, goodFgOnlyLabel_contrast, goodRgbPill_contrast, ContrastCard.body_contrast]
-verify_contrast >= 4.5 for StyledShowcase.app with AppTheme
-verify_contrast >= 4.5 for [goodContrastBtn, goodThemedCard, goodRgbPill, primaryBtn, strictCard] with AppTheme
-verify_contrast >= 4.5 for [goodFgOnlyLabel] with AppTheme on AppTheme.surface
+invariant showcaseContrast: AppTheme.theme.checkContrast(StyledShowcase.app.styles)
+invariant styleListContrast: AppTheme.theme.checkContrast([goodContrastBtn, goodThemedCard, goodRgbPill, primaryBtn, strictCard])
+invariant fgOnlyContrast: AppTheme.theme.checkContrast([goodFgOnlyLabel], 450, some(AppTheme.surface))
 bad_style "WCAG contrast check failed (required >= 4.50:1):\n  • style `qed-lowContrastBtn-" lowContrastBtn [contrast] :
   color: #888888
   background-color: #ffffff
@@ -174,5 +175,7 @@ bad_style "`contrast >= 4.50:1` on style `fgOnlyMissingBg` requires both `color`
 style badVerifyBtn:
   color: #999999
   background-color: #ffffff
-expect_err "is 2.84:1" in verify_contrast >= 4.5 for [goodContrastBtn, badVerifyBtn]
+invariant badVerifyBtnReport:
+  (findStylesContrastViolations(450, [], none, [goodContrastBtn, badVerifyBtn])).map(v => formatContrastX100(v.ratioX100)) == ["2.84:1"]
+expect_err "Invariant `badVerifyContrast` failed" in invariant badVerifyContrast: checkStylesContrast(450, [], none, [goodContrastBtn, badVerifyBtn])
 end CssChecks

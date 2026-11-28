@@ -12,6 +12,37 @@ inductive SqlVal where
   | null | int (v : Int) | text (v : String) | bool (v : Bool) | bytes (v : ByteArray)
 deriving Inhabited, DecidableEq
 
+private def sqlValToProtoFields : SqlVal → List (Nat × Proto.WireVal)
+  | .null    => [(1, .varint 0)]
+  | .int v   => [(2, ToProto.toProtoVal v)]
+  | .text v  => [(3, ToProto.toProtoVal v)]
+  | .bool v  => [(4, ToProto.toProtoVal v)]
+  | .bytes v => [(5, ToProto.toProtoVal v)]
+
+private def sqlValFromProtoFields (fs : List (Nat × Proto.WireVal)) : Except String SqlVal :=
+  match Proto.lookupField 1 fs, Proto.lookupField 2 fs, Proto.lookupField 3 fs, Proto.lookupField 4 fs, Proto.lookupField 5 fs with
+  | some _, _, _, _, _ => .ok .null
+  | none, some w, _, _, _ => (FromProto.fromProtoVal (α := Int) w).map .int
+  | none, none, some w, _, _ => (FromProto.fromProtoVal (α := String) w).map .text
+  | none, none, none, some w, _ => (FromProto.fromProtoVal (α := Bool) w).map .bool
+  | none, none, none, none, some w => (FromProto.fromProtoVal (α := ByteArray) w).map .bytes
+  | none, none, none, none, none => .error "protobuf: missing SqlVal branch"
+
+instance : ToProto SqlVal := .ofFields sqlValToProtoFields
+instance : FromProto SqlVal := .ofFields sqlValFromProtoFields
+instance : LawfulProto SqlVal := .ofFields sqlValToProtoFields sqlValFromProtoFields
+  (by intro v _ h; cases v <;> (rw [List.mem_singleton.1 h]; exact Nat.zero_lt_succ _))
+  (by intro v; cases v <;> simp [sqlValToProtoFields, sqlValFromProtoFields, Proto.lookupField, Except.map])
+
+instance : ToJson SqlVal := ⟨fun
+  | .null => .null | .int i => toJson i | .text s => .str s | .bool b => .bool b
+  | .bytes bs => .obj [("bytes", toJson bs)]⟩
+instance : FromJson SqlVal := ⟨fun
+  | .null => .ok .null | j@(.num _) => (fromJson (α := Int) j).map .int
+  | .str s => .ok (.text s) | .bool b => .ok (.bool b)
+  | j@(.obj _) => (j.field "bytes" >>= fromJson).map .bytes
+  | _ => .error "expected SQL JSON value"⟩
+
 class ToSql (α : Type) where toSql : α → SqlVal
 class FromSql (α : Type) where fromSql : SqlVal → Except String α
 
@@ -74,10 +105,52 @@ structure SqlIdent where
   valid : isSafeSqlIdent raw = true
 deriving DecidableEq
 instance : Inhabited SqlIdent := ⟨⟨"id", rfl⟩⟩
+instance : Repr SqlIdent := ⟨fun id _ => repr id.raw⟩
+
+/-- Safely validate a runtime string into a SQL-injection-proof `SqlIdent`. -/
+def SqlIdent.ofString? (s : String) : Option SqlIdent :=
+  if h : isSafeSqlIdent s = true then some ⟨s, h⟩ else none
+
+@[simp] theorem SqlIdent.ofString?_isSome (s : String) :
+    (SqlIdent.ofString? s).isSome = isSafeSqlIdent s := by
+  unfold SqlIdent.ofString?; split <;> simp_all
+
+@[simp] theorem SqlIdent.ofString?_isSome_iff (s : String) :
+    (SqlIdent.ofString? s).isSome = true ↔ isSafeSqlIdent s = true := by
+  rw [SqlIdent.ofString?_isSome]
+
+theorem SqlIdent.ofString?_raw {s : String} {id : SqlIdent} (h : SqlIdent.ofString? s = some id) :
+    id.raw = s := by
+  unfold SqlIdent.ofString? at h; split at h
+  · cases h; rfl
+  · cases h
+
+@[simp] theorem SqlIdent.ofString?_eq_some_iff (s : String) (id : SqlIdent) :
+    SqlIdent.ofString? s = some id ↔ id.raw = s := by
+  constructor
+  · exact SqlIdent.ofString?_raw
+  · intro heq; subst heq; unfold SqlIdent.ofString?; simp [id.valid]
+
+@[simp] theorem SqlIdent.ofString?_raw_self (id : SqlIdent) :
+    SqlIdent.ofString? id.raw = some id :=
+  (SqlIdent.ofString?_eq_some_iff id.raw id).2 rfl
+
+private def parseSqlIdentWire (pfx s : String) : Except String SqlIdent :=
+  (SqlIdent.ofString? s).elim (.error s!"{pfx}invalid SQL identifier `{s}`") .ok
+private theorem parseSqlIdentWire_raw (pfx : String) (id : SqlIdent) : parseSqlIdentWire pfx id.raw = .ok id := by
+  simp [parseSqlIdentWire, SqlIdent.ofString?_raw_self]
+instance : ToJson SqlIdent := .ofEquiv SqlIdent.raw
+instance : FromJson SqlIdent := .ofRetract (parseSqlIdentWire "")
+instance : LawfulJson SqlIdent := .ofRetract SqlIdent.raw (parseSqlIdentWire "") (parseSqlIdentWire_raw "")
+instance : NonNullJson SqlIdent := ⟨nofun⟩
+instance : ToProto SqlIdent := .ofEquiv SqlIdent.raw
+instance : FromProto SqlIdent := .ofRetract (parseSqlIdentWire "protobuf: ")
+instance : LawfulProto SqlIdent := .ofRetract SqlIdent.raw (parseSqlIdentWire "protobuf: ") (parseSqlIdentWire_raw "protobuf: ")
 
 /-- Compile-time validated `SqlIdent` literal macro (`sql!"col_name"`).
     Uses `noWs` so `sql` remains unreserved as an ordinary identifier. -/
-macro "sql!" noWs s:str : term => `(Qed.Server.Db.SqlIdent.mk $s rfl)
+syntax:max "sql!" noWs str : term
+macro_rules | `(sql!$s:str) => `(Qed.Server.Db.SqlIdent.mk $s rfl)
 
 theorem isSafeSqlIdent_all_body {s : String} (h : isSafeSqlIdent s = true) :
     ∀ c ∈ s.toList, isSqlIdentBodyChar c = true := by
@@ -322,7 +395,10 @@ inductive SqlQuery where
            (orderBy : Option (SqlIdent × SqlOrderDir) := none) (limit offset : Option Nat := none)
   | selectAll (table : SqlIdent) (whereExpr : SqlExpr)
               (orderBy : Option (SqlIdent × SqlOrderDir) := none) (limit offset : Option Nat := none)
+  | selectSchema (schema table : SqlIdent) (cols : List SqlIdent) (whereExpr : SqlExpr)
+                 (orderBy : Option (SqlIdent × SqlOrderDir) := none) (limit offset : Option Nat := none)
   | count  (table : SqlIdent) (whereExpr : SqlExpr)
+  | countSchema (schema table : SqlIdent) (whereExpr : SqlExpr)
   | aggregate (op : SqlAggOp) (table col : SqlIdent) (whereExpr : SqlExpr)
   | joinSelect (leftTable rightTable : SqlIdent) (leftCols rightCols : List SqlIdent)
                (leftJoinCol rightJoinCol : SqlIdent) (leftWhere rightWhere : SqlExpr)
@@ -373,7 +449,9 @@ private theorem renderUpsertSets_no_semicolon : ∀ cs : List SqlIdent, NoSemi (
 def SqlQuery.eraseVals : SqlQuery → SqlQuery
   | .select t c w o l off => .select t c w.eraseVals o l off
   | .selectAll t w o l off => .selectAll t w.eraseVals o l off
-  | .count t w => .count t w.eraseVals | .aggregate op t c w => .aggregate op t c w.eraseVals
+  | .selectSchema sc t c w o l off => .selectSchema sc t c w.eraseVals o l off
+  | .count t w => .count t w.eraseVals | .countSchema sc t w => .countSchema sc t w.eraseVals
+  | .aggregate op t c w => .aggregate op t c w.eraseVals
   | .joinSelect lt rt lc rc lj rj lw rw o l off => .joinSelect lt rt lc rc lj rj lw.eraseVals rw.eraseVals o l off
   | .insert t cols ret => .insert t (cols.map fun (c, _) => (c, .null)) ret
   | .insertOrIgnore t cols cc ret => .insertOrIgnore t (cols.map fun (c, _) => (c, .null)) cc ret
@@ -433,9 +511,17 @@ def SqlQuery.compile (d : SqlDialect) : SqlQuery → String × Array SqlVal
       let (wSql, params) := whereExpr.compile d #[]
       ("SELECT * FROM " ++ tbl.quoteIdent ++
        " WHERE " ++ wSql ++ renderOrderBy "" orderBy? ++ renderLimitOffset d limit? offset?, params)
+  | .selectSchema sc tbl cols whereExpr orderBy? limit? offset? =>
+      let (wSql, params) := whereExpr.compile d #[]
+      let sel := if cols.isEmpty then "*" else SqlIdent.joinQuoted cols
+      ("SELECT " ++ sel ++ " FROM " ++ sc.quoteIdent ++ "." ++ tbl.quoteIdent ++
+       " WHERE " ++ wSql ++ renderOrderBy "" orderBy? ++ renderLimitOffset d limit? offset?, params)
   | .count tbl whereExpr =>
       let (wSql, params) := whereExpr.compile d #[]
       ("SELECT COUNT(*) FROM " ++ tbl.quoteIdent ++ " WHERE " ++ wSql, params)
+  | .countSchema sc tbl whereExpr =>
+      let (wSql, params) := whereExpr.compile d #[]
+      ("SELECT COUNT(*) FROM " ++ sc.quoteIdent ++ "." ++ tbl.quoteIdent ++ " WHERE " ++ wSql, params)
   | .aggregate op tbl col whereExpr =>
       let (wSql, params) := whereExpr.compile d #[]
       ("SELECT " ++ op.render ++ "(" ++ col.quoteIdent ++ ") FROM " ++ tbl.quoteIdent ++ " WHERE " ++ wSql, params)
@@ -482,7 +568,7 @@ private theorem SqlQuery.compile_eraseVals (d : SqlDialect) (q : SqlQuery) : (q.
   | select _ cols w _ _ _ =>
       dsimp only [SqlQuery.eraseVals, SqlQuery.compile, SqlExpr.compile]
       split <;> (dsimp only; rw [(w.compileQual_eraseVals d "" #[] #[] rfl).1])
-  | selectAll _ w _ _ _ | count _ w | aggregate _ _ _ w | delete _ w _ =>
+  | selectAll _ w _ _ _ | selectSchema _ _ _ w _ _ _ | count _ w | countSchema _ _ w | aggregate _ _ _ w | delete _ w _ =>
       dsimp only [SqlQuery.eraseVals, SqlQuery.compile, SqlExpr.compile]
       rw [(w.compileQual_eraseVals d "" #[] #[] rfl).1]
   | joinSelect _ _ _ _ _ _ lw rw _ _ _ =>
@@ -521,7 +607,16 @@ theorem SqlQuery.compile_no_semicolon (d : SqlDialect) (q : SqlQuery) : ∀ c �
   | selectAll tbl w ob lim off =>
       exact NoSemi.lApp tbl.quoteIdent_no_semicolon |>.appL |>.app (w.compile_no_semicolon d #[])
         |>.app (renderOrderBy_no_semicolon "" NoSemi.empty ob) |>.app (renderLimitOffset_no_semicolon d lim off)
+  | selectSchema sc tbl cols w ob lim off =>
+      have hSel : NoSemi (if cols.isEmpty then "*" else SqlIdent.joinQuoted cols) := by
+        split
+        · exact NoSemi.lit
+        · exact jq cols
+      exact NoSemi.lApp hSel |>.appL |>.app sc.quoteIdent_no_semicolon |>.appL |>.app tbl.quoteIdent_no_semicolon |>.appL
+        |>.app (w.compile_no_semicolon d #[]) |>.app (renderOrderBy_no_semicolon "" NoSemi.empty ob) |>.app (renderLimitOffset_no_semicolon d lim off)
   | count tbl w => exact NoSemi.lApp tbl.quoteIdent_no_semicolon |>.appL |>.app (w.compile_no_semicolon d #[])
+  | countSchema sc tbl w =>
+      exact NoSemi.lApp sc.quoteIdent_no_semicolon |>.appL |>.app tbl.quoteIdent_no_semicolon |>.appL |>.app (w.compile_no_semicolon d #[])
   | aggregate op tbl col w =>
       exact NoSemi.lApp op.render_no_semicolon |>.appL |>.app col.quoteIdent_no_semicolon |>.appL |>.app tbl.quoteIdent_no_semicolon |>.appL |>.app (w.compile_no_semicolon d #[])
   | joinSelect lt rt lc rc lj rj lw rw ob lim off =>
@@ -755,6 +850,22 @@ def DbConfig.endpointForEnv (cfg : DbConfig) (env : Qed.Cloud.DeployEnv) : DbEnd
   | some em => em.get env
   | none    => match env with | .dev => cfg.devFallback?.getD cfg.endpoint | _ => cfg.endpoint
 
+/-- Compile-time table metadata exposed for `database` `invariant` checks. -/
+structure TableMetaInfo where
+  name            : String
+  metaColNames    : List String
+  policies        : List String
+  hasReadPolicy   : Bool
+  hasInsertPolicy : Bool
+  hasUpdatePolicy : Bool
+  hasDeletePolicy : Bool
+  hasWritePolicy  : Bool
+deriving Inhabited, DecidableEq, Repr
+
+/-- Construct a `DbConfig` targeting a dynamic runtime PostgreSQL URL (SSRF-guarded by default). -/
+@[inline] def DbConfig.forPostgresUrl (url : String) (ssrfGuard : Bool := true) (name : String := "dynamic_pg") : DbConfig :=
+  { name, endpoint := .postgresUrl url ssrfGuard }
+
 abbrev DbRow := Array SqlVal
 structure DbResult where
   rows     : Array DbRow := #[]
@@ -846,8 +957,8 @@ def decodeD1Response (raw : String) (expectedCols : List String) : Except String
   return { rows := ← decodeJsonRows first "results" rowDec "D1 results is not an array", affected := (first.get? "meta" |>.bind (·.natAt? "changes")).getD 0 }
 
 def queryExpectedCols : SqlQuery → List String
-  | .select _ cols _ _ _ _ | .insert _ _ cols | .insertOrIgnore _ _ _ cols | .upsert _ _ _ _ _ cols | .update _ _ _ cols | .delete _ _ cols => cols.map (·.raw)
-  | .joinSelect _ _ lc rc _ _ _ _ _ _ _ => lc.map (·.raw) ++ rc.map (·.raw) | .selectAll _ _ _ _ _ | .count _ _ | .aggregate _ _ _ _ => []
+  | .select _ cols _ _ _ _ | .selectSchema _ _ cols _ _ _ _ | .insert _ _ cols | .insertOrIgnore _ _ _ cols | .upsert _ _ _ _ _ cols | .update _ _ _ cols | .delete _ _ cols => cols.map (·.raw)
+  | .joinSelect _ _ lc rc _ _ _ _ _ _ _ => lc.map (·.raw) ++ rc.map (·.raw) | .selectAll _ _ _ _ _ | .count _ _ | .countSchema _ _ _ | .aggregate _ _ _ _ => []
 end HttpSql
 
 /-- Branded transaction handle carrying a live transaction ID for a specific `database`. -/

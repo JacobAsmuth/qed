@@ -8,38 +8,37 @@ section SchemaParsers
 open Lean Parser Qed.Lang
 private abbrev pType : Parser := withPosition (categoryParser `qedType 0)
 private abbrev pExpr : Parser := categoryParser `qedExpr 0
-private def schemaCtxOpt : Parser := optional (checkLineEq >> "(" >> sepBy1 schemaCtxParamP "," >> ")")
+private def schemaCtxOpt : Parser := optional (checkLineEq >> "(" >> commaSep1 schemaCtxParamP >> ")")
 private def schemaFieldJsonOnly : Parser := node `Qed.schemaFieldJsonOnly (atomic (identEq `jsonOnly >> checkNoWsBefore "" >> "(") >> pType >> ")")
 private def schemaFieldCall     : Parser := node `Qed.schemaFieldCall (atomic (ident >> checkNoWsBefore "" >> "(") >> sepBy (categoryParser `qedCallArg 0) "," >> ")")
 private def schemaFieldSpec     : Parser := schemaFieldJsonOnly <|> schemaFieldCall <|> pType
-private def schemaFieldP        : Parser := node `Qed.schemaField (withPosition (ident >> ":" >> schemaFieldSpec >> optional (checkColGt >> " where " >> sepBy1 pExpr ",")))
+private def schemaFieldP        : Parser := node `Qed.schemaField (withPosition (
+  ident >> ":" >> schemaFieldSpec >> optional (checkLineEq >> "=" >> pExpr) >> optional (checkColGt >> " where " >> sepBy1 pExpr ",")))
 private def schemaExampleFieldP : Parser := node `Qed.schemaExampleField (checkColGt >> ident >> "=" >> pExpr)
 private def schemaExampleP      : Parser := node `Qed.schemaExample (withPosition (atomic (symbol "example" >> ident >> ":") >> sepBy1 schemaExampleFieldP ","))
 private def schemaRejectsP      : Parser := node `Qed.schemaRejects (withPosition (atomic (identEq `rejects >> ident >> ":") >> sepBy1 schemaExampleFieldP ","))
-private def schemaInvP          : Parser := node `Qed.schemaInv (withPosition (atomic (symbol "invariant" >> ident >> ":") >> sepBy1 pExpr ","))
+private def schemaInvP          : Parser := node `Qed.schemaInv (withPosition (atomic (identEq `invariant >> ident >> ":") >> sepBy1 pExpr ","))
 def schemaItemP                 : Parser := schemaExampleP <|> schemaRejectsP <|> schemaInvP <|> schemaFieldP
-@[command_parser] def schemaCmd : Parser := opaqueP (node `Qed.schemaCmd (withPosition
-  ("schema " >> ident >> schemaCtxOpt >> ":" >> checkColGt "expected indented `schema` fields" >> many1Indent schemaItemP)))
-private def recordFieldP : Parser := node `Qed.recordField (withPosition (
-  ident >> ":" >> pType >> optional (checkLineEq >> "=" >> pExpr) >> optional (checkColGt >> " where " >> sepBy1 pExpr ",")))
-def recordItemP : Parser := schemaExampleP <|> schemaRejectsP <|> schemaInvP <|> recordFieldP
-@[command_parser] def recordCmd : Parser := opaqueP (node `Qed.recordCmd (
+@[command_parser] def schemaCmd : Parser := opaqueP (node `Qed.schemaCmd (
   optional Command.docComment >> withPosition (
-    atomic (optional (symbol "private") >> identEq `record) >> ident >> schemaCtxOpt >> ":" >>
-    checkColGt "expected indented `record` fields" >> many1Indent recordItemP)))
+    atomic (optional (symbol "private") >> identEq `schema) >> ident >> schemaCtxOpt >> ":" >>
+    checkColGt "expected indented `schema` fields" >> many1Indent schemaItemP)))
 private def enumParamP   : Parser := node `Qed.enumParam (ident >> ":" >> pType)
 def enumVariantP : Parser := node `Qed.enumVariant (withPosition (
-  ident >> optional (checkNoWsBefore "" >> "(" >> sepBy1 enumParamP "," >> ")") >> optional (checkLineEq >> "=" >> strLit)))
+  ident >> optional (checkNoWsBefore "" >> "(" >> commaSep1 enumParamP >> ")") >> optional (checkLineEq >> "=" >> strLit)))
 @[command_parser] def enumCmd : Parser := opaqueP (node `Qed.enumCmd (
   optional Command.docComment >> withPosition (
     atomic (optional (symbol "private") >> identEq `enum) >> ident >> ":" >> checkColGt "expected indented `enum` variants" >> many1Indent enumVariantP)))
 @[command_parser] def constCmd : Parser := opaqueP (node `Qed.constCmd (
   optional Command.docComment >>
   atomic (optional (symbol "private") >> identEq `const >> ident) >> optional (":" >> pType) >> "=" >> pExpr))
+private def fieldExampleP : Parser := node `Qed.fieldExample (withPosition (atomic (symbol "example" >> ident >> ":") >> pExpr))
+private def fieldRejectsP : Parser := node `Qed.fieldRejects (withPosition (atomic (identEq `rejects >> ident >> ":") >> pExpr))
 @[command_parser] def fieldCmd : Parser := opaqueP (node `Qed.fieldCmd (
   optional Command.docComment >> withPosition (
-    atomic (identEq `field) >> ident >> schemaCtxOpt >>
-    ":" >> pType >> checkColGt >> symbol "where" >> ident >> "=>" >> sepBy1 pExpr ",")))
+    atomic (optional (symbol "private") >> identEq `field) >> ident >> schemaCtxOpt >>
+    ":" >> pType >> checkColGt >> symbol "where" >> ident >> "=>" >> sepBy1 pExpr "," >>
+    many (checkColGt >> (fieldExampleP <|> fieldRejectsP)))))
 macro "qedProveField " id:ident : tactic =>
   `(tactic| (try dsimp only [$id:ident]) <;> first | rfl | decide | omega | (simp_all; try rfl; try decide; try omega))
 end SchemaParsers
@@ -55,34 +54,32 @@ private def lowerSchemaFieldSpec (stx : Syntax) : MacroM Term := match stx.getKi
 private def primSchemaTypes : Array (Name × Name) :=
   #[(``String, ``Qed.Codec.text), (``Nat, ``Qed.Codec.nat), (``Int, ``Qed.Codec.int), (``Bool, ``Qed.Codec.checkbox), (``Qed.Date, ``Qed.Codec.date)]
 
-private def extractOptDoc (optDoc : Syntax) : Option (TSyntax ``Lean.Parser.Command.docComment) :=
-  if optDoc.getNumArgs == 1 then some ⟨optDoc.getArg 0⟩ else none
-
-@[noinline] private partial def resolveCodecBase (qctx : PureQuotCtx) (fieldName : Name) (rawSpec : Term) : TermElabM (Term × Option Term) := do
+@[noinline] private partial def resolveCodecBase? (qctx : PureQuotCtx) (fieldName : Name) (rawSpec : Term) : TermElabM (Option (Term × Option Term)) := do
   if let `($fn:ident $arg:term) := rawSpec then
     if fn.getId.eraseMacroScopes == `jsonOnly then
-      let (base, ty?) ← resolveCodecBase qctx fieldName arg
-      return (qctx.runPure `(Qed.Codec.jsonOnly $base), ty?)
+      let some (base, ty?) ← resolveCodecBase? qctx fieldName arg
+        | throwErrorAt rawSpec m!"schema field `{fieldName}` uses `jsonOnly(...)` on `{arg}`, which has no default `Codec` or JSON (`ToJson`/`FromJson`) instances."
+      return some (qctx.runPure `(Qed.Codec.jsonOnly $base), ty?)
   let scopedSpec := qctx.runPure `(open Qed.Codec in $rawSpec)
   let e ← elabTermAndSynthesize scopedSpec none; let ety ← whnf (← instantiateMVars (← inferType e))
-  if ety.isAppOfArity ``Qed.Codec 1 then return (scopedSpec, none)
+  if ety.isAppOfArity ``Qed.Codec 1 then return some (scopedSpec, none)
   else if ety.isSort then
     let eWhnf ← whnf (← instantiateMVars e)
-    if let some (_, codecNm) := primSchemaTypes.find? (eWhnf.isConstOf ·.1) then return (mkCIdent codecNm, some rawSpec)
-    if (← trySynthInstance (← mkAppM ``Qed.DefaultCodec #[e])) matches .some _ then return (qctx.runPure `((Qed.DefaultCodec.codec : Qed.Codec $rawSpec)), some rawSpec)
-    throwErrorAt rawSpec m!"schema field `{fieldName}` has type `{rawSpec}`, which has no default `Codec` or JSON (`ToJson`/`FromJson`) instances.\nProvide a `DefaultCodec` or JSON instances for `{rawSpec}`, or use a supported field type (`String`, `Nat`, `Int`, `Bool`, `Date`, `select([...])`, `textarea`, `jsonOnly(...)`)."
-  else throwErrorAt rawSpec m!"schema field `{fieldName}` must be a type (`String`, `Nat`, `Int`, `Bool`, `Date`, …) or a `Codec` (e.g. `select([...])`, `textarea`, `jsonOnly(String)`), but this has type{indentExpr ety}"
+    if let some (_, codecNm) := primSchemaTypes.find? (eWhnf.isConstOf ·.1) then return some (mkCIdent codecNm, some rawSpec)
+    if (← trySynthInstance (← mkAppM ``Qed.DefaultCodec #[e])) matches .some _ then return some (qctx.runPure `((Qed.DefaultCodec.codec : Qed.Codec $rawSpec)), some rawSpec)
+    return none
+  else throwErrorAt rawSpec m!"schema field `{fieldName}` must be a type (`String`, `Nat`, `Int`, `Bool`, `Date`, ...) or a `Codec` (e.g. `select([...])`, `textarea`, `jsonOnly(String)`), but this has type{indentExpr ety}"
 
 private structure ResolvedField where mk ::
   (input valTy predTerm : Term)
-  (isRefined isJson isLawful isProto isLawfulP isBEq isLawfulBEq : Bool)
+  (isRefined hasCodec isJson isLawful isProto isLawfulP isBEq isLawfulBEq : Bool)
   (tyName : Name) (hasInhab hasRepr : Bool)
 deriving Inhabited
 
 private structure SchemaInvInfo where mk :: (invId : Ident) (invAppInFs : Term) (invLabel : String)
 
 private structure SchemaCtx where mk ::
-  (kindName : String) (t : Ident) (cbns : Array Ident) (cbts : Array Term) (tApp : Term)
+  (t : Ident) (cbns : Array Ident) (cbts : Array Term) (tApp : Term)
   (fs : Array Ident) (inputs valTys preds : Array Term)
   (refined : Array Bool) (whereLabels : Array String)
   (invInfo? : Option SchemaInvInfo := none) (isPrivate : Bool := false)
@@ -133,32 +130,32 @@ private def checkRefinementDecidable (kindName : String) (ref : Ident) (α : Exp
     throwErrorAt predTerm m!"{subject} has a refinement that isn't decidable (no `DecidablePred` for it).\n\nWrite it inline with `where ...` or as an `abbrev`, or provide a `DecidablePred` instance."
   return predE
 
-private def mkResolvedField (input valTy predTerm : Term) (isRefined : Bool) (α fieldTy : Expr) (checkBaseInhab : Bool := false) : TermElabM ResolvedField := do
+private def mkResolvedField (input valTy predTerm : Term) (isRefined hasCodec : Bool) (α fieldTy : Expr) (checkBaseInhab : Bool := false) : TermElabM ResolvedField := do
   let (isJson, isLawful, isProto, isLawfulP, isBEq, isLawfulBEq, hasInhab0, hasRepr) ← probeTypeTraits fieldTy
   let hasInhab ← if checkBaseInhab && isRefined then probeInst ``Inhabited α else pure hasInhab0
-  return .mk input valTy predTerm isRefined isJson isLawful isProto isLawfulP isBEq isLawfulBEq ((← whnf α).constName?.getD .anonymous) hasInhab hasRepr
+  return .mk input valTy predTerm isRefined hasCodec isJson isLawful isProto isLawfulP isBEq isLawfulBEq ((← whnf α).constName?.getD .anonymous) hasInhab hasRepr
 
-@[noinline] private def elabDataFieldsAux (qctx : PureQuotCtx) (isSchema : Bool) (cbns : Array Ident) (cbts : Array Term)
+@[noinline] private def elabSchemaFieldsAux (qctx : PureQuotCtx) (cbns : Array Ident) (cbts : Array Term)
     (fs : Array Ident) (rawSpecs : Array Term) (whereClauses : Array (Array Term)) : TermElabM (Array ResolvedField) :=
   withCtxDecls cbns cbts do
     mapArrM ((fs.zip rawSpecs).zip whereClauses) fun ((f, rawSpec), preds) => do
-      if isSchema then
-        let (base, directTy?) ← resolveCodecBase qctx f.getId rawSpec
-        let inp : Term := if preds.isEmpty then base else qctx.runPure do `(Qed.Codec.refine $base (fun $f:ident => $(← mkConjBody preds)))
-        let savedLog ← Core.getMessageLog; let preCount := savedLog.toList.length
-        let c ← elabTermAndSynthesize inp none
-        checkDecPredErrors "schema" f inp savedLog preCount
-        match (← instantiateMVars (← inferType c)).getAppFnArgs with
-        | (``Qed.Codec, #[α]) =>
-            let isRefined := !(← isDefEq (mkApp2 (mkConst ``Qed.Codec.valid) α c) (Expr.lam `x α (mkConst ``True) .default))
-            let valTy ← match directTy? with | some dt => pure dt | none => try PrettyPrinter.delab α catch _ => pure (qctx.runPure `(Qed.Codec.Val $inp))
-            mkResolvedField inp valTy (qctx.runPure `(($inp).valid)) isRefined α α
-        | _ => throwErrorAt rawSpec m!"failed to resolve schema field `{f.getId}` to a `Codec`"
-      else
-        let α ← elabType rawSpec; let isRefined := !preds.isEmpty
-        let predTerm := qctx.runPure do if isRefined then `(fun $f:ident : $rawSpec => $(← mkConjBody preds)) else `(fun (_ : $rawSpec) => True)
-        let fieldTy ← if isRefined then mkAppM ``Qed.Field #[← checkRefinementDecidable "record" f α predTerm] else pure α
-        mkResolvedField rawSpec rawSpec predTerm isRefined α fieldTy (checkBaseInhab := true)
+      match ← resolveCodecBase? qctx f.getId rawSpec with
+      | some (base, directTy?) =>
+          let inp : Term := if preds.isEmpty then base else qctx.runPure do `(Qed.Codec.refine $base (fun $f:ident => $(← mkConjBody preds)))
+          let savedLog ← Core.getMessageLog; let preCount := savedLog.toList.length
+          let c ← elabTermAndSynthesize inp none
+          checkDecPredErrors "schema" f inp savedLog preCount
+          match (← instantiateMVars (← inferType c)).getAppFnArgs with
+          | (``Qed.Codec, #[α]) =>
+              let isRefined := !(← isDefEq (mkApp2 (mkConst ``Qed.Codec.valid) α c) (Expr.lam `x α (mkConst ``True) .default))
+              let valTy ← match directTy? with | some dt => pure dt | none => try PrettyPrinter.delab α catch _ => pure (qctx.runPure `(Qed.Codec.Val $inp))
+              mkResolvedField inp valTy (qctx.runPure `(($inp).valid)) isRefined true α α
+          | _ => throwErrorAt rawSpec m!"failed to resolve schema field `{f.getId}` to a `Codec`"
+      | none =>
+          let α ← elabType rawSpec; let isRefined := !preds.isEmpty
+          let predTerm := qctx.runPure do if isRefined then `(fun $f:ident : $rawSpec => $(← mkConjBody preds)) else `(fun (_ : $rawSpec) => True)
+          let fieldTy ← if isRefined then mkAppM ``Qed.Field #[← checkRefinementDecidable "schema" f α predTerm] else pure α
+          mkResolvedField rawSpec rawSpec predTerm isRefined false α fieldTy (checkBaseInhab := true)
 
 @[noinline] private def mkSchemaBeqCmdsPure (sc : SchemaCtx) (allLawfulBEq : Bool) : PureQuotM (Array (TSyntax `command)) := do
   let (tId, cbns, cbts, tApp, fs) := (sc.t.getId, sc.cbns, sc.cbts, sc.tApp, sc.fs)
@@ -186,9 +183,9 @@ private def mkResolvedField (input valTy predTerm : Term) (isRefined : Bool) (α
     out := out.push (← `(command| instance (priority := low) $(mkIdent (sc.t.getId ++ `instInhabited)):ident : Inhabited $(sc.t) := ⟨{ $[$inits:structInstField],* }⟩))
   return out
 
-@[noinline] private def mkSchemaCoreCmdsPure (sc : SchemaCtx) (draftId : Ident) : PureQuotM (Array (TSyntax `command)) := do
-  let (t, tId, cbns, cbts, tApp, fs) := (sc.t, sc.t.getId, sc.cbns, sc.cbts, sc.tApp, sc.fs); let pairs := fs.zip sc.inputs
-  let structTys ← Lang.mapPQ ((sc.valTys.zip sc.preds).zip sc.refined) fun ((vt, pr), r) => if r then `(Field $pr) else pure vt
+@[noinline] private def mkSchemaFormCmdsPure (sc : SchemaCtx) (draftId : Ident) : PureQuotM (Array (TSyntax `command)) := do
+  let (tId, cbns, cbts, tApp, fs) := (sc.t.getId, sc.cbns, sc.cbts, sc.tApp, sc.fs); let pairs := fs.zip sc.inputs
+  let draftFields ← Lang.mapPQ fs fun f => return ({ ident := f, wireKey := f.getId.toString, valTy := ← `(String) } : StructFieldSpec)
   let runCalls ← Lang.mapPQ (pairs.zip sc.refined) fun ((f, inp), r) => if r then `(($inp).run (d.$f:ident)) else `(($inp).parse (d.$f:ident))
   let (parseId, canId, viewId) := (mkIdent (tId ++ `parse), mkIdent (tId ++ `canSubmit), mkIdent (tId ++ `formView))
   let (parseApp, canApp, viewApp) := (← sc.appToPure ⟨parseId.raw⟩, ← sc.appToPure ⟨canId.raw⟩, ← sc.appToPure ⟨viewId.raw⟩)
@@ -204,16 +201,17 @@ private def mkResolvedField (input valTy predTerm : Term) (isRefined : Bool) (α
               $(Syntax.mkStrLit ("Please enter a valid " ++ toString f.getId)) (fun v => onEdit { d with $f:ident := v }))
   let viewBody ← Lang.foldrPQ rowGroups (← `(term| [Codec.submitBtn ($parseApp d) submit])) fun g acc => `(term| $g ++ $acc)
   let validBodyPf ← Lang.foldrPQ sc.inputs (← `(term| Codec.submitBtn_validIn inForm ($parseApp d) submit)) fun _ acc => `(term| Codec.renderFieldRowCons_validIn inForm _ _ _ _ _ _ _ $acc)
-  let (structCmd, parseBody, canSubmitCmd) ← match sc.invInfo? with
+  let (parseBody, canSubmitCmd) ← match sc.invInfo? with
     | none => pure (
-        ← `(command| structure $t $[($cbns:ident : $cbts:term)]* where $[$fs:ident : $structTys]*),
         ← `(do $[let $fs:ident ← $runCalls:term]* return { $[$fs:ident],* }),
         ← `(command| theorem $(mkIdent (tId ++ `canSubmit_iff)) $[($cbns:ident : $cbts:term)]* (d : $draftId) : $canApp d = true ↔ $rhs := by unfold $canId $parseId; exact $canSubmitPf))
     | some info => pure (
-        ← `(command| structure $t $[($cbns:ident : $cbts:term)]* where $[$fs:ident : $structTys]* (_inv : $(info.invAppInFs))),
         ← `(do $[let $fs:ident ← $runCalls:term]* if _hInv : $(info.invAppInFs) then return { $[$fs:ident],*, _inv := _hInv } else none),
         ← `(command| theorem $(mkIdent (tId ++ `canSubmit_iff)) $[($cbns:ident : $cbts:term)]* (d : $draftId) : $canApp d = true ↔ ∃ _x : $tApp, $parseApp d = some _x := Option.isSome_iff_exists))
-  return #[structCmd,
+  return #[
+    ← `(command| structure $draftId where $[$fs:ident : String := ""]* deriving Inhabited, DecidableEq, Repr),
+    ← `(command| def $(mkIdent (tId ++ `Draft ++ `empty)) : $draftId := {})] ++
+    (← mkStructJsonCmdsPure draftId draftFields { fixedDepthBound := some 1 }) ++ #[
     ← `(command| def $parseId $[($cbns:ident : $cbts:term)]* (d : $draftId) : Option $tApp := $parseBody),
     ← `(command| def $canId $[($cbns:ident : $cbts:term)]* (d : $draftId) : Bool := ($parseApp d).isSome),
     canSubmitCmd,
@@ -283,12 +281,12 @@ private def parseSchemaFieldAssigns (sc : SchemaCtx) (clauseKind : String) (stx 
   for entry in (stx.getArg 3).getSepArgs do
     let fid : Ident := ⟨entry.getArg 0⟩; let fName := fid.getId.toString
     unless validNames.contains fName do
-      throwErrorAt fid s!"{sc.kindName} `{tId}` {clauseKind} `{nm}`: unknown field `{fName}`{Qed.Diag.didYouMean fName validNames} (expected: {String.intercalate ", " validNames})"
-    if provided.contains fName then throwErrorAt fid s!"{sc.kindName} `{tId}` {clauseKind} `{nm}`: duplicate field `{fName}`"
+      throwErrorAt fid s!"Schema `{tId}` {clauseKind} `{nm}`: unknown field `{fName}`{Qed.Diag.didYouMean fName validNames} (expected: {String.intercalate ", " validNames})"
+    if provided.contains fName then throwErrorAt fid s!"Schema `{tId}` {clauseKind} `{nm}`: duplicate field `{fName}`"
     provided := provided.insert fName (entry.getArg 2)
   let vals ← Lang.mapCmd fs fun f => do
     let fName := f.getId.toString
-    let some valStx := provided[fName]? | throwErrorAt stx s!"{sc.kindName} `{tId}` {clauseKind} `{nm}`: missing required field `{fName}`"
+    let some valStx := provided[fName]? | throwErrorAt stx s!"Schema `{tId}` {clauseKind} `{nm}`: missing required field `{fName}`"
     return (valStx, ← liftMacroM (lowerSimpleQedExpr .val valStx))
   return (nameId, vals)
 
@@ -298,19 +296,22 @@ private def parseSchemaFieldAssigns (sc : SchemaCtx) (clauseKind : String) (stx 
   let fieldTerms ← Lang.mapCmd (fs.zip rawVals).zipIdx fun ((f, (valStx, valTerm)), i) =>
     mkCheckedFieldVal sc.refined[i]! cbns.isEmpty sc.preds[i]! valTerm valStx pfTac fun s =>
       let valStr := if s.isEmpty then "<value>" else s
-      m!"{sc.kindName} `{tId}` example `{exId}` failed `where` constraint on field `{f.getId}`:\n  • value `{valStr}` does not satisfy `{sc.whereLabels[i]!}`\n\nHint: Update `{f.getId}` in example `{exId}` so it satisfies `{sc.whereLabels[i]!}`, or weaken the `where` rule."
+      m!"Schema `{tId}` example `{exId}` failed `where` constraint on field `{f.getId}`:\n  • value `{valStr}` does not satisfy `{sc.whereLabels[i]!}`\n\nHint: Update `{f.getId}` in example `{exId}` so it satisfies `{sc.whereLabels[i]!}`, or weaken the `where` rule."
   let sampleId := mkIdentFrom exName (tId ++ exId)
   if let some info := sc.invInfo? then
     if cbns.isEmpty then
       let invGoal ← Lang.runPQ (mkAppTermsPure ⟨info.invId.raw⟩ (cbns.map (⟨·.raw⟩) ++ rawVals.map (·.2)))
       unless ← tryCheckPropWithTactic invGoal pfTac do
-        throwErrorAt exStx m!"{sc.kindName} `{tId}` example `{exId}` failed `invariant`:\n  • values do not satisfy `{info.invLabel}`\n\nHint: Update example `{exId}` so it satisfies `{info.invLabel}`, or weaken the `invariant`."
+        throwErrorAt exStx m!"Schema `{tId}` example `{exId}` failed `invariant`:\n  • values do not satisfy `{info.invLabel}`\n\nHint: Update example `{exId}` so it satisfies `{info.invLabel}`, or weaken the `invariant`."
   let sampleCmd ← Lang.runPQ do
     match sc.invInfo? with
     | none   => `(command| def $sampleId $[($cbns:ident : $cbts:term)]* : $tApp := { $[$fs:ident := $fieldTerms:term],* })
     | some _ => `(command| def $sampleId $[($cbns:ident : $cbts:term)]* : $tApp := { $[$fs:ident := $fieldTerms:term],*, _inv := by $pfTac:tactic })
   elabCmdWithVis sc.isPrivate sampleCmd
   if emitSatisfiable then emitSatisfiableCmdsRaw sc.isPrivate sc.t sc.cbns sc.cbts sc.tApp exStx (← Lang.runPQ (sc.appToPure ⟨sampleId.raw⟩))
+
+private def mkRejectsNegTacPure (simpTac : TSyntax `tactic) : PureQuotM (TSyntax `tactic) :=
+  `(tactic| ((try $simpTac:tactic) <;> first | qedCloseGround | decide | omega | (intro _h; simp_all; try omega; try qedCloseGround; try decide)))
 
 @[noinline] private def elabSchemaRejectsClause (sc : SchemaCtx) (simpTac : TSyntax `tactic) (rejStx : Syntax) : CommandElabM Unit := do
   let (tId, cbns, cbts) := (sc.t.getId, sc.cbns, sc.cbts)
@@ -321,17 +322,16 @@ private def parseSchemaFieldAssigns (sc : SchemaCtx) (clauseKind : String) (stx 
     if let some info := sc.invInfo? then checks := checks.push (← mkAppTermsPure ⟨info.invId.raw⟩ (cbns.map (⟨·.raw⟩) ++ rawVals.map (·.2)))
     if checks.isEmpty then return (← `(False), ← `(tactic| trivial), false)
     let negGoal ← `(¬ ($(← mkConjBody checks (ascribeProp := false))))
-    let negTac ← `(tactic| ((try $simpTac:tactic) <;> first | qedCloseGround | decide | omega | (intro _h; simp_all; try omega; try qedCloseGround; try decide)))
-    return (negGoal, negTac, true)
-  unless hasChecks do throwErrorAt rejStx s!"{sc.kindName} `{tId}` `rejects {rejId}` requires at least one `where` or `invariant` constraint"
+    return (negGoal, ← mkRejectsNegTacPure simpTac, true)
+  unless hasChecks do throwErrorAt rejStx s!"Schema `{tId}` `rejects {rejId}` requires at least one `where` or `invariant` constraint"
   if cbns.isEmpty then
     unless ← tryCheckPropWithTactic negGoal negTac do
-      throwErrorAt rejStx m!"{sc.kindName} `{tId}` `rejects {rejId}` failed: the provided values unexpectedly satisfy all `where` and `invariant` constraints.\n\nHint: Strengthen the `where`/`invariant` rules or fix the negative test case `{rejId}`."
+      throwErrorAt rejStx m!"Schema `{tId}` `rejects {rejId}` failed: the provided values unexpectedly satisfy all `where` and `invariant` constraints.\n\nHint: Strengthen the `where`/`invariant` rules or fix the negative test case `{rejId}`."
   let thmId := mkIdentFrom rejName (tId ++ (Name.mkSimple s!"rejects_{rejId}"))
   elabCmdWithVis sc.isPrivate (← Lang.runPQ `(command| theorem $thmId $[($cbns:ident : $cbts:term)]* : $negGoal := by $negTac:tactic))
 
 @[noinline] private def checkSchemaSatAndExamples (sc : SchemaCtx) (resolved : Array ResolvedField)
-    (whereRawExprs : Array (Array Syntax)) (exampleStxs rejectStxs : Array Syntax) : CommandElabM Unit := do
+    (finalDefs : Array (Option Term)) (whereRawExprs : Array (Array Syntax)) (exampleStxs rejectStxs : Array Syntax) : CommandElabM Unit := do
   let (simpTac, pfTac) ← Lang.runPQ mkSchemaRefinementTacsPure
   if !exampleStxs.isEmpty then
     Lang.foldlCmd exampleStxs.zipIdx () fun _ (exStx, idx) => elabSchemaExampleClause sc pfTac exStx (idx == 0)
@@ -339,20 +339,21 @@ private def parseSchemaFieldAssigns (sc : SchemaCtx) (clauseKind : String) (stx 
     Lang.foldlCmd resolved.zipIdx () fun _ (rf, i) => do
       if rf.isRefined then
         checkFieldUnsat sc.fs[i]! rf.valTy rf.predTerm simpTac
-          m!"{sc.kindName} `{sc.t.getId}` is unsatisfiable: field `{sc.fs[i]!.getId}` has contradictory `where` constraints (`{sc.whereLabels[i]!}`) -- no value can ever satisfy it.\n\nHint: Fix or remove the conflicting `where` conditions on `{sc.fs[i]!.getId}`."
+          m!"Schema `{sc.t.getId}` is unsatisfiable: field `{sc.fs[i]!.getId}` has contradictory `where` constraints (`{sc.whereLabels[i]!}`) -- no value can ever satisfy it.\n\nHint: Fix or remove the conflicting `where` conditions on `{sc.fs[i]!.getId}`."
     if let some synthTerms ← Lang.foldlCmd resolved.zipIdx (some #[]) fun acc? (rf, i) => do
         let some arr := acc? | return none
+        if let some d := finalDefs[i]! then return some (arr.push d)
         return (← synthesizeFieldWitness? pfTac rf whereRawExprs[i]!).map arr.push then
       let (fs, witId) := (sc.fs, mkIdentFrom sc.t (sc.t.getId ++ `_witness))
       Lang.elabPureCmd `(command| private def $witId : $(sc.t) := { $[$fs:ident := $synthTerms:term],* })
       emitSatisfiableCmdsRaw sc.isPrivate sc.t sc.cbns sc.cbts sc.tApp sc.t witId
   Lang.foldlCmd rejectStxs () fun _ rejStx => elabSchemaRejectsClause sc simpTac rejStx
 
-private def parseDataHeader (kindLow : String) (t : Ident) (ctxStx itemsStx : Syntax) (whereArgIdx : Nat) : CommandElabM ParsedDataHeader := do
+private def parseSchemaHeader (t : Ident) (ctxStx itemsStx : Syntax) : CommandElabM ParsedDataHeader := do
   let (cbns, cbts) ← parseCtxBinders ctxStx; let tId := t.getId
   let addUniq (label : String) (item : Syntax) (seen : Std.HashSet Name) (arr : Array Syntax) : CommandElabM (Std.HashSet Name × Array Syntax) := do
     let nm : Ident := ⟨item.getArg 1⟩
-    if seen.contains nm.getId then throwErrorAt nm s!"duplicate {label} `{nm.getId}` in `{kindLow} {tId}`"
+    if seen.contains nm.getId then throwErrorAt nm s!"duplicate {label} `{nm.getId}` in `schema {tId}`"
     return (seen.insert nm.getId, arr.push item)
   let mut (fStxs, exampleStxs, rejectStxs, invStxs) : Array Syntax × Array Syntax × Array Syntax × Array Syntax := (#[], #[], #[], #[])
   let mut (seenEx, seenRej, seenInv) : Std.HashSet Name × Std.HashSet Name × Std.HashSet Name := ({}, {}, {})
@@ -362,9 +363,9 @@ private def parseDataHeader (kindLow : String) (t : Ident) (ctxStx itemsStx : Sy
     | `Qed.schemaRejects => let (s, a) ← addUniq "rejects" item seenRej rejectStxs; seenRej := s; rejectStxs := a
     | `Qed.schemaInv     => let (s, a) ← addUniq "invariant" item seenInv invStxs; seenInv := s; invStxs := a
     | _ => fStxs := fStxs.push item
-  if fStxs.isEmpty then throwErrorAt t s!"`{kindLow} {tId}` must declare at least one field"
+  if fStxs.isEmpty then throwErrorAt t s!"`schema {tId}` must declare at least one field"
   let fs : Array Ident := fStxs.map (⟨·[0]⟩)
-  let whereRawExprs := fStxs.map fun f => if (f.getArg whereArgIdx).getNumArgs == 2 then ((f.getArg whereArgIdx).getArg 1).getSepArgs else #[]
+  let whereRawExprs := fStxs.map fun f => if (f.getArg 4).getNumArgs == 2 then ((f.getArg 4).getArg 1).getSepArgs else #[]
   let whereClauses ← Lang.mapCmd whereRawExprs fun ws => Lang.mapCmd ws fun w => liftMacroM (lowerSimpleQedExpr .propInv w)
   return { cbns, cbts, fStxs, exampleStxs, rejectStxs, invStxs, fs, whereRawExprs, whereLabels := whereRawExprs.map (fmtWhereLabel · "constraint"), whereClauses }
 
@@ -392,74 +393,65 @@ private def parseDataHeader (kindLow : String) (t : Ident) (ctxStx itemsStx : Sy
   if resolved.all (·.isProto) then cmds := cmds ++ (← mkStructProtoCmdsPure sc.t fieldSpecs { ctxBinders, emitBytesCodec := true, emitLawful := resolved.all (·.isLawfulP), invCheck? })
   return cmds
 
-@[noinline] private def elabDataCmd (isSchema : Bool) (doc? : Option (TSyntax ``Lean.Parser.Command.docComment)) (isPrivate : Bool)
-    (t : Ident) (ctxStx itemsStx : Syntax) : CommandElabM Unit := do
-  let (tId, kindLow, kindName, whereIdx) := (t.getId, if isSchema then "schema" else "record", if isSchema then "Schema" else "Record", if isSchema then 3 else 4)
-  let hdr ← parseDataHeader kindLow t ctxStx itemsStx whereIdx
+@[noinline, command_elab schemaCmd] def elabSchemaCmd : CommandElab := fun stx => do
+  let (doc?, isPrivate, t, ctxStx, itemsStx) :=
+    (extractOptDoc (stx.getArg 0), (stx.getArg 1).getNumArgs == 1, (⟨stx.getArg 3⟩ : Ident), stx.getArg 4, stx.getArg 6)
+  let tId := t.getId
+  let hdr ← parseSchemaHeader t ctxStx itemsStx
   let qctx ← getPureQuotCtxCmd
-  let rawSpecs ← Lang.mapCmd hdr.fStxs fun f =>
-    if isSchema then liftMacroM (lowerSchemaFieldSpec (f.getArg 2)) else do return (← liftPureErr (lowerQedTypeInfoPure qctx (f.getArg 2) false)).term
-  let resolved ← liftTermElabM (elabDataFieldsAux qctx isSchema hdr.cbns hdr.cbts hdr.fs rawSpecs hdr.whereClauses)
+  let rawSpecs ← Lang.mapCmd hdr.fStxs fun f => liftMacroM (lowerSchemaFieldSpec (f.getArg 2))
+  let resolved ← liftTermElabM (elabSchemaFieldsAux qctx hdr.cbns hdr.cbts hdr.fs rawSpecs hdr.whereClauses)
   let invInfo? ← elabSchemaInvDef? t hdr resolved isPrivate
   let sc : SchemaCtx := {
-    kindName, t, cbns := hdr.cbns, cbts := hdr.cbts, tApp := qctx.runPure (mkAppTermsPure ⟨t.raw⟩ (hdr.cbns.map (⟨·.raw⟩))),
+    t, cbns := hdr.cbns, cbts := hdr.cbts, tApp := qctx.runPure (mkAppTermsPure ⟨t.raw⟩ (hdr.cbns.map (⟨·.raw⟩))),
     fs := hdr.fs, inputs := resolved.map (·.input), valTys := resolved.map (·.valTy),
     preds := resolved.map (·.predTerm), refined := resolved.map (·.isRefined), whereLabels := hdr.whereLabels, invInfo?, isPrivate }
-  let cmds ← if isSchema then Lang.runPQ do
-    let (draftId, fs) := (mkIdent (tId ++ `Draft), hdr.fs)
-    let draftFields ← Lang.mapPQ fs fun f => return ({ ident := f, wireKey := f.getId.toString, valTy := ← `(String) } : StructFieldSpec)
-    let schemaFields := (fs.zip resolved).map fun (f, rf) =>
-      ({ ident := f, wireKey := f.getId.toString, valTy := rf.valTy, codecTerm? := if rf.isRefined then some rf.input else none } : StructFieldSpec)
-    return #[← `(command| structure $draftId where $[$fs:ident : String := ""]* deriving Inhabited, DecidableEq, Repr),
-             ← `(command| def $(mkIdent (tId ++ `Draft ++ `empty)) : $draftId := {})] ++
-      (← mkStructJsonCmdsPure draftId draftFields { fixedDepthBound := some 1 }) ++ (← mkSchemaCoreCmdsPure sc draftId) ++
-      (← mkDataCodecCmdsPure sc resolved (Array.replicate fs.size false) schemaFields)
-  else do
-    let rawDefStxs := hdr.fStxs.map fun f => if (f.getArg 3).getNumArgs == 2 then some ((f.getArg 3).getArg 1) else none
-    let (_, pfTac) := qctx.runPure mkSchemaRefinementTacsPure
-    let (defTerms, finalDefs) ← Lang.foldlCmd (Array.range hdr.fs.size) (#[], #[]) fun (dts, fds) i => do
+  let rawDefStxs := hdr.fStxs.map fun f => if (f.getArg 3).getNumArgs == 2 then some ((f.getArg 3).getArg 1) else none
+  let (_, pfTac) := qctx.runPure mkSchemaRefinementTacsPure
+  let (defTerms, finalDefs) ← Lang.foldlCmd (Array.range hdr.fs.size) (#[], #[]) fun (dts, fds) i => do
+    let (f, rf) := (hdr.fs[i]!, resolved[i]!)
+    match rawDefStxs[i]! with
+    | none => return (dts.push none, fds.push none)
+    | some dStx =>
+        let defT ← liftMacroM (lowerSimpleQedExpr .val dStx)
+        let checked ← mkCheckedFieldVal rf.isRefined hdr.cbns.isEmpty rf.predTerm defT dStx pfTac fun s =>
+          m!"Schema `{tId}` default for field `{f.getId}` failed `where` constraint:\n  • value `{if s.isEmpty then "<default>" else s}` does not satisfy `{hdr.whereLabels[i]!}`"
+        return (dts.push (some defT), fds.push (some checked))
+  let invHasDefault ← match sc.invInfo? with
+    | some info =>
+        let allDefs := defTerms.filterMap id
+        if allDefs.size == hdr.fs.size && hdr.cbns.isEmpty then tryCheckPropWithTactic (qctx.runPure (mkAppTermsPure ⟨info.invId.raw⟩ allDefs)) pfTac else pure false
+    | none => pure false
+  let hasForm := resolved.all (·.hasCodec)
+  let cmds ← Lang.runPQ do
+    let (binders, fieldSpecs) ← Lang.foldlPQ (Array.range hdr.fs.size) ((#[] : Array (TSyntax ``Lean.Parser.Command.structExplicitBinder)), (#[] : Array StructFieldSpec)) fun (bs, sps) i => do
       let (f, rf) := (hdr.fs[i]!, resolved[i]!)
-      match rawDefStxs[i]! with
-      | none => return (dts.push none, fds.push none)
-      | some dStx =>
-          let defT ← liftMacroM (lowerSimpleQedExpr .val dStx)
-          let checked ← mkCheckedFieldVal rf.isRefined hdr.cbns.isEmpty rf.predTerm defT dStx pfTac fun s =>
-            m!"Record `{tId}` default for field `{f.getId}` failed `where` constraint:\n  • value `{if s.isEmpty then "<default>" else s}` does not satisfy `{hdr.whereLabels[i]!}`"
-          return (dts.push (some defT), fds.push (some checked))
-    let invHasDefault ← match sc.invInfo? with
-      | some info =>
-          let allDefs := defTerms.filterMap id
-          if allDefs.size == hdr.fs.size && hdr.cbns.isEmpty then tryCheckPropWithTactic (qctx.runPure (mkAppTermsPure ⟨info.invId.raw⟩ allDefs)) pfTac else pure false
-      | none => pure false
-    Lang.runPQ do
-      let (binders, fieldSpecs) ← Lang.foldlPQ (Array.range hdr.fs.size) ((#[] : Array (TSyntax ``Lean.Parser.Command.structExplicitBinder)), (#[] : Array StructFieldSpec)) fun (bs, sps) i => do
-        let (f, rf) := (hdr.fs[i]!, resolved[i]!)
-        let fieldTy ← if rf.isRefined then `(Qed.Field $(rf.predTerm)) else pure rf.valTy
-        let b ← match finalDefs[i]! with
-          | none => `(Lean.Parser.Command.structExplicitBinder| ($f:ident : $fieldTy))
-          | some d => `(Lean.Parser.Command.structExplicitBinder| ($f:ident : $fieldTy := $d))
-        return (bs.push b, sps.push { ident := f, wireKey := f.getId.toString, valTy := fieldTy })
-      let binders ← match sc.invInfo? with
-        | none => pure binders
-        | some info => do
-            let invB ← if invHasDefault then `(Lean.Parser.Command.structExplicitBinder| (_inv : $(info.invAppInFs) := by $pfTac:tactic))
-              else `(Lean.Parser.Command.structExplicitBinder| (_inv : $(info.invAppInFs)))
-            pure (binders.push invB)
-      let (cbns, cbts) := (hdr.cbns, hdr.cbts)
-      return #[← `(command| $[$doc?:docComment]? structure $t $[($cbns:ident : $cbts:term)]* where $[$binders:structExplicitBinder]*)] ++
-        (← mkDataCodecCmdsPure sc resolved (rawDefStxs.map Option.isSome) fieldSpecs)
+      let fieldTy ← if rf.isRefined then `(Qed.Field $(rf.predTerm)) else pure rf.valTy
+      let b ← match finalDefs[i]! with
+        | none => `(Lean.Parser.Command.structExplicitBinder| ($f:ident : $fieldTy))
+        | some d => `(Lean.Parser.Command.structExplicitBinder| ($f:ident : $fieldTy := $d))
+      let spec : StructFieldSpec :=
+        if rf.hasCodec then { ident := f, wireKey := f.getId.toString, valTy := rf.valTy, codecTerm? := if rf.isRefined then some rf.input else none }
+        else { ident := f, wireKey := f.getId.toString, valTy := fieldTy }
+      return (bs.push b, sps.push spec)
+    let binders ← match sc.invInfo? with
+      | none => pure binders
+      | some info => do
+          let invB ← if invHasDefault then `(Lean.Parser.Command.structExplicitBinder| (_inv : $(info.invAppInFs) := by $pfTac:tactic))
+            else `(Lean.Parser.Command.structExplicitBinder| (_inv : $(info.invAppInFs)))
+          pure (binders.push invB)
+    let (cbns, cbts) := (hdr.cbns, hdr.cbts)
+    let structCmd ← `(command| $[$doc?:docComment]? structure $t $[($cbns:ident : $cbts:term)]* where $[$binders:structExplicitBinder]*)
+    let formCmds ← if hasForm then mkSchemaFormCmdsPure sc (mkIdent (tId ++ `Draft)) else pure #[]
+    let codecCmds ← mkDataCodecCmdsPure sc resolved (rawDefStxs.map Option.isSome) fieldSpecs
+    return #[structCmd] ++ formCmds ++ codecCmds
   Lang.foldlCmd cmds () fun _ c => elabCmdWithVis isPrivate c
-  if isSchema || sc.refined.any id || !hdr.exampleStxs.isEmpty || !hdr.rejectStxs.isEmpty || sc.invInfo?.isSome then
-    checkSchemaSatAndExamples sc resolved hdr.whereRawExprs hdr.exampleStxs hdr.rejectStxs
-  if isSchema then
+  if sc.refined.any id || !hdr.exampleStxs.isEmpty || !hdr.rejectStxs.isEmpty || sc.invInfo?.isSome then
+    checkSchemaSatAndExamples sc resolved finalDefs hdr.whereRawExprs hdr.exampleStxs hdr.rejectStxs
+  if hasForm then
     let fullSchema := (← getCurrNamespace) ++ tId
     modifyEnv fun env => schemaFormRegistry.addEntry env {
       fullName := fullSchema ++ `Form, formViewName := fullSchema ++ `formView, ctxBinders := hdr.cbns.map (·.getId.eraseMacroScopes) }
-
-@[noinline, command_elab schemaCmd] def elabSchemaCmd : CommandElab := fun stx =>
-  elabDataCmd true none false ⟨stx.getArg 1⟩ (stx.getArg 2) (stx.getArg 4)
-@[noinline, command_elab recordCmd] def elabRecordCmd : CommandElab := fun stx =>
-  elabDataCmd false (extractOptDoc (stx.getArg 0)) ((stx.getArg 1).getNumArgs == 1) ⟨stx.getArg 3⟩ (stx.getArg 4) (stx.getArg 6)
 
 @[noinline] private def mkPayloadVariantProtoPure (tId : Name) (toId fromId fsId tagId : Ident) (emitLawful : Bool) (v : ParsedEnumVariant) (vi : Nat) :
     PureQuotM (TSyntax ``Lean.Parser.Term.matchAltExpr × TSyntax ``Lean.Parser.Term.matchAltExpr × Option (TSyntax ``Lean.Parser.Tactic.inductionAlt × TSyntax ``Lean.Parser.Tactic.inductionAlt)) := do
@@ -574,11 +566,11 @@ private def parseDataHeader (kindLow : String) (t : Ident) (ctxStx itemsStx : Sy
     | none     => `(command| $[$doc?:docComment]? def $cId := $rhsT))
 
 @[noinline] private def mkFieldCmdsPure (doc? : Option (TSyntax ``Lean.Parser.Command.docComment)) (t vId : Ident)
-    (cbns : Array Ident) (cbts : Array Term) (rawTy predBody : Term) (currNs : Name) (whereLabel : String) : PureQuotM (Term × TSyntax `command × Array (TSyntax `command)) := do
+    (cbns : Array Ident) (cbts : Array Term) (rawTy predBody : Term) (validFull : Name) (whereLabel : String) : PureQuotM (Term × TSyntax `command × Array (TSyntax `command)) := do
   let tId := t.getId; let validId := mkIdentFrom t (tId ++ `Valid)
   let (tApp, validApp) := (← mkAppTermsPure ⟨t.raw⟩ (cbns.map (⟨·.raw⟩)), ← mkAppTermsPure ⟨validId.raw⟩ (cbns.map (⟨·.raw⟩)))
   let validCmd ← `(command| abbrev $validId $[($cbns:ident : $cbts:term)]* ($vId:ident : $rawTy) : Prop := $predBody)
-  let (validCId, parseErrLit) := (mkCIdent (currNs ++ tId ++ `Valid), Syntax.mkStrLit s!"invalid {tId}: failed constraint `{whereLabel}`")
+  let (validCId, parseErrLit) := (mkCIdent validFull, Syntax.mkStrLit s!"invalid {tId}: failed constraint `{whereLabel}`")
   return (tApp, validCmd, #[
     ← `(command| $[$doc?:docComment]? abbrev $t $[($cbns:ident : $cbts:term)]* : Type := Qed.Field ($validApp)),
     ← `(command| @[inline] abbrev $(mkIdentFrom t (tId ++ `make)) $[($cbns:ident : $cbts:term)]* ($vId:ident : $rawTy)
@@ -587,25 +579,57 @@ private def parseDataHeader (kindLow : String) (t : Ident) (ctxStx itemsStx : Sy
     ← `(command| @[inline] def $(mkIdentFrom t (tId ++ `parse)) $[($cbns:ident : $cbts:term)]* ($vId:ident : $rawTy) : Except String ($tApp) := Qed.Field.parse ($validApp) $parseErrLit $vId)])
 
 @[noinline, command_elab fieldCmd] def elabFieldCmd : CommandElab := fun stx => do
-  let doc? := extractOptDoc (stx.getArg 0); let t : Ident := ⟨stx.getArg 2⟩; let tId := t.getId
-  let (cbns, cbts) ← parseCtxBinders (stx.getArg 3)
+  let doc? := extractOptDoc (stx.getArg 0); let isPrivate := (stx.getArg 1).getNumArgs == 1
+  let t : Ident := ⟨stx.getArg 3⟩; let tId := t.getId
+  let (cbns, cbts) ← parseCtxBinders (stx.getArg 4)
   let qctx ← getPureQuotCtxCmd
-  let rawTy := (← liftPureErr (lowerQedTypeInfoPure qctx (stx.getArg 5) false)).term
-  let vId : Ident := ⟨stx.getArg 7⟩; let rawWheres := (stx.getArg 9).getSepArgs
+  let rawTy := (← liftPureErr (lowerQedTypeInfoPure qctx (stx.getArg 6) false)).term
+  let vId : Ident := ⟨stx.getArg 8⟩; let rawWheres := (stx.getArg 10).getSepArgs
   let whereLabel := fmtWhereLabel rawWheres "constraint"
   let wherePreds ← Lang.mapCmd rawWheres fun w => liftMacroM (lowerSimpleQedExpr .propInv w)
   let (predBody, predTerm) := qctx.runPure do let b ← mkConjBody wherePreds; return (b, ← `(fun $vId:ident : $rawTy => $b))
   let (tyName, hasInhab) ← liftTermElabM <| withCtxDecls cbns cbts do
     let α ← elabType rawTy; discard <| checkRefinementDecidable "field" t α predTerm
     return (((← whnf α).constName?.getD .anonymous), ← probeInst ``Inhabited α)
-  let (tApp, validCmd, cmds) := qctx.runPure (mkFieldCmdsPure doc? t vId cbns cbts rawTy predBody (← getCurrNamespace) whereLabel)
-  elabCommand validCmd; Lang.foldlCmd cmds () fun _ c => elabCommand c
-  if cbns.isEmpty then
-    let (simpTac, pfTac) := qctx.runPure mkSchemaRefinementTacsPure
+  let env ← getEnv
+  let validBase := (← getCurrNamespace) ++ tId ++ `Valid
+  let validFull := if isPrivate then mkPrivateName env validBase else validBase
+  let (tApp, validCmd, cmds) := qctx.runPure (mkFieldCmdsPure doc? t vId cbns cbts rawTy predBody validFull whereLabel)
+  elabCmdWithVis isPrivate validCmd; Lang.foldlCmd cmds () fun _ c => elabCmdWithVis isPrivate c
+  let mut (exampleStxs, rejectStxs) : Array Syntax × Array Syntax := (#[], #[])
+  let mut (seenEx, seenRej) : Std.HashSet Name × Std.HashSet Name := ({}, {})
+  for item in (stx.getArg 11).getArgs do
+    let nm : Ident := ⟨item.getArg 1⟩
+    if item.getKind == `Qed.fieldExample then
+      if seenEx.contains nm.getId then throwErrorAt nm s!"duplicate example `{nm.getId}` in `field {tId}`"
+      seenEx := seenEx.insert nm.getId; exampleStxs := exampleStxs.push item
+    else
+      if seenRej.contains nm.getId then throwErrorAt nm s!"duplicate rejects `{nm.getId}` in `field {tId}`"
+      seenRej := seenRej.insert nm.getId; rejectStxs := rejectStxs.push item
+  let (simpTac, pfTac) := qctx.runPure mkSchemaRefinementTacsPure
+  if !exampleStxs.isEmpty then
+    Lang.foldlCmd exampleStxs.zipIdx () fun _ (exStx, idx) => do
+      let (exName, valStx) : Ident × Syntax := (⟨exStx.getArg 1⟩, exStx.getArg 3)
+      let valTerm ← liftMacroM (lowerSimpleQedExpr .val valStx)
+      let checked ← mkCheckedFieldVal true cbns.isEmpty predTerm valTerm valStx pfTac fun s =>
+        m!"Field `{tId}` example `{exName.getId}` failed `where` constraint:\n  • value `{if s.isEmpty then "<value>" else s}` does not satisfy `{whereLabel}`\n\nHint: Update example `{exName.getId}` so it satisfies `{whereLabel}`, or weaken the `where` rule."
+      let sampleId := mkIdentFrom exName (tId ++ exName.getId)
+      elabCmdWithVis isPrivate (qctx.runPure `(command| def $sampleId $[($cbns:ident : $cbts:term)]* : $tApp := $checked))
+      if idx == 0 then emitSatisfiableCmdsRaw isPrivate t cbns cbts tApp exStx (qctx.runPure (mkAppTermsPure ⟨sampleId.raw⟩ (cbns.map (⟨·.raw⟩))))
+  else if cbns.isEmpty then
     checkFieldUnsat t rawTy predTerm simpTac
       m!"Field `{tId}` is unsatisfiable: contradictory `where` constraints (`{whereLabel}`) -- no value can ever satisfy it.\n\nHint: Fix or remove the conflicting `where` conditions on `{tId}`."
-    let rf : ResolvedField := .mk rawTy rawTy predTerm true false false false false false false tyName hasInhab false
-    if let some witness ← synthesizeFieldWitness? pfTac rf rawWheres then emitSatisfiableCmdsRaw false t cbns cbts tApp t witness
+    let rf : ResolvedField := .mk rawTy rawTy predTerm true false false false false false false false tyName hasInhab false
+    if let some witness ← synthesizeFieldWitness? pfTac rf rawWheres then emitSatisfiableCmdsRaw isPrivate t cbns cbts tApp t witness
+  Lang.foldlCmd rejectStxs () fun _ rejStx => do
+    let (rejName, valStx) : Ident × Syntax := (⟨rejStx.getArg 1⟩, rejStx.getArg 3)
+    let valTerm ← liftMacroM (lowerSimpleQedExpr .val valStx)
+    let (negGoal, negTac) := qctx.runPure do return (← `(¬ ($predTerm $valTerm)), ← mkRejectsNegTacPure simpTac)
+    if cbns.isEmpty then
+      unless ← tryCheckPropWithTactic negGoal negTac do
+        throwErrorAt rejStx m!"Field `{tId}` `rejects {rejName.getId}` failed: value `{stxSnippet valStx}` unexpectedly satisfies `{whereLabel}`.\n\nHint: Strengthen the `where` rule or fix the negative test case `{rejName.getId}`."
+    let thmId := mkIdentFrom rejName (tId ++ (Name.mkSimple s!"rejects_{rejName.getId}"))
+    elabCmdWithVis isPrivate (qctx.runPure `(command| theorem $thmId $[($cbns:ident : $cbts:term)]* : $negGoal := by $negTac:tactic))
 
 end SchemaElab
 end Qed

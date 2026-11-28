@@ -18,9 +18,9 @@ example : (∃ _x : OrderWithExample, True) ∧ (∃ _x : BoundedQty, True) ∧ 
 bad_schema "Schema `UnsatRange` is unsatisfiable: field `quantity` has contradictory `where` constraints" UnsatRange : quantity : Nat where 10 <= quantity, quantity <= 5
 bad_schema "Schema `UnsatBool` is unsatisfiable: field `flag` has contradictory `where` constraints" UnsatBool : flag : Bool where flag == true, flag == false
 bad_schema "Schema `BadExampleVal` example `tooMany` failed `where` constraint on field `quantity`:\n  • value `99` does not satisfy `1 <= quantity, quantity <= 10`" BadExampleVal :
-  name : String where 1 <= name.length | quantity : Nat where 1 <= quantity, quantity <= 10 | example tooMany: name = "Alice", quantity = 99
+  name : String where 1 <= name.length || quantity : Nat where 1 <= quantity, quantity <= 10 || example tooMany: name = "Alice", quantity = 99
 bad_schema "Schema `MissingExampleField` example `incomplete`: missing required field `quantity`" MissingExampleField :
-  name : String where 1 <= name.length | quantity : Nat where 1 <= quantity | example incomplete: name = "Alice"
+  name : String where 1 <= name.length || quantity : Nat where 1 <= quantity || example incomplete: name = "Alice"
 
 /-! ## 1B. Unified Component `example` (Concrete & Parametric Proofs) -/
 component ReachCounter:
@@ -39,8 +39,8 @@ component ReachCounter:
 example : (∃ s : ReachCounter.State, s.count ≤ 10 ∧ s.count = 5) ∧ (∀ n ≤ 10, ∃ s : ReachCounter.State, s.count ≤ 10 ∧ s.count = n) :=
   ⟨Qed.inv_nonvacuous_of_reachable ReachCounter.canAdd5 ReachCounter.bounded.1 ReachCounter.bounded.2,
    fun n h => Qed.inv_nonvacuous_of_reachable (ReachCounter.addAny n h) ReachCounter.bounded.1 ReachCounter.bounded.2⟩
-bad_comp "Example `BadReach.cantReach5` failed to prove `count == 5`:\n  • must satisfy:  False" BadReach : state count : Nat = 0 | action inc: count += 1 | example cantReach5: .inc, .inc -> count == 5 | view: <span>{count}</span>
-bad_comp "Example `BadParamReach.addTooMuch` failed to prove `count == n`:\n  • must satisfy:  0 = n" BadParamReach : state count : Nat = 0 | action inc(n: Nat): if count + n <= 10: count += n | example addTooMuch(n: Nat): .inc(n) -> count == n | view: <span>{count}</span>
+bad_comp "Example `BadReach.cantReach5` failed to prove `count == 5`:\n  • must satisfy:  False" BadReach : state count : Nat = 0 || action inc: count += 1 || example cantReach5: .inc, .inc -> count == 5 || view: <span>{count}</span>
+bad_comp "Example `BadParamReach.addTooMuch` failed to prove `count == n`:\n  • must satisfy:  0 = n" BadParamReach : state count : Nat = 0 || action inc(n: Nat): if count + n <= 10: count += n || example addTooMuch(n: Nat): .inc(n) -> count == n || view: <span>{count}</span>
 
 /-! ## 2. Compile-Time Accessibility (A11y) Proofs -/
 style a11yPrimary:
@@ -100,12 +100,12 @@ example : ScheduledWorker.jobs.size = 4 ∧ ScheduledWorker.verifiedJobs.size = 
 example (s : ScheduledWorker.State) : Qed.Server.MultiCoreStep ScheduledWorker.StateInv ⟨s, []⟩
     ⟨s, [(ScheduledWorker.verifiedJobs[0]'(by decide)).runM (m := Qed.Server.ThreadProg ScheduledWorker.State)]⟩ :=
   Qed.Server.verifiedJob_spawn_step (ScheduledWorker.verifiedJobs[0]'(by decide)) s []
-bad_srv "background job `badZero` interval must be positive (got `0s`)" BadZeroJob : state n : Nat = 0 | every 0s badZero: n += 1
-bad_srv "unknown duration unit `d` in `every 2d badUnit`" BadUnitJob : state n : Nat = 0 | every 2d badUnit: n += 1
-bad_srv "Server invariant `bounded` failed in `overflow`:\n  • must satisfy:  count + 1 <= 10" BadInvJob : state count : Nat = 0 | invariant bounded: count <= 10 | every 1s overflow: count += 1
-bad_srv "Server invariant `mono` failed in `shrink`:\n  • must satisfy:  s.total - 1 >= s.total" BadMonoJob : state total : Nat = 5 | invariant mono: total >= old(total) | every 10s shrink: atomic: total -= 1
-bad_srv "cannot access server state `count` outside an `atomic` block in `racySync`" BadRacyJob : state count : Nat = 0 | every 30s racySync: let _ = await HealthPing.ping()?; count += 1
-bad_srv "cannot use `await` inside an `atomic` block" BadAwaitInAtomicJob : state count : Nat = 0 | every 30s badLock: atomic: let _ = await HealthPing.ping()?; count += 1
+bad_srv "background job `badZero` interval must be positive (got `0s`)" BadZeroJob : state n : Nat = 0 || every 0s badZero: n += 1
+bad_srv "unknown duration unit `d` in `every 2d badUnit`" BadUnitJob : state n : Nat = 0 || every 2d badUnit: n += 1
+bad_srv "Server invariant `bounded` failed in `overflow`:\n  • must satisfy:  count + 1 <= 10" BadInvJob : state count : Nat = 0 || invariant bounded: count <= 10 || every 1s overflow: count += 1
+bad_srv "Server invariant `mono` failed in `shrink`:\n  • must satisfy:  s.total - 1 >= s.total" BadMonoJob : state total : Nat = 5 || invariant mono: total >= old(total) || every 10s shrink: atomic: total -= 1
+bad_srv "cannot access server state `count` outside an `atomic` block in `racySync`" BadRacyJob : state count : Nat = 0 || every 30s racySync: let _ = await HealthPing.ping()?; count += 1
+bad_srv "cannot use `await` inside an `atomic` block" BadAwaitInAtomicJob : state count : Nat = 0 || every 30s badLock: atomic: let _ = await HealthPing.ping()?; count += 1
 
 /-! ## 5. Verified Typed Dictionaries (`{K: V}`) -/
 example : Qed.LawfulJson (Qed.Dict String Nat) × Qed.LawfulJson (Qed.Dict Nat String) × Qed.LawfulProto (Qed.Dict String Nat) × Qed.LawfulProto (Qed.Dict Nat (Array String)) :=
@@ -132,7 +132,7 @@ server ScoreboardApi:
   rpc clear(name: String) -> Unit: scores.remove(name)
   get "/scores": return json(scores)
   get "/by-id": let byId : {Nat: String} = {1: "one", 2: "two"}; return json(byId)
-bad_srv "Server invariant `capped` failed in `recordUnsafe`:\n  • must satisfy:  (if scores.contains name = true then scores.size else scores.size + 1) <= 100" BadDictCap : state scores : {String: Nat} | invariant capped: scores.size <= 100 | rpc recordUnsafe(name: String, pts: Nat) -> Unit: scores[name] = pts
+bad_srv "Server invariant `capped` failed in `recordUnsafe`:\n  • must satisfy:  (if scores.contains name = true then scores.size else scores.size + 1) <= 100" BadDictCap : state scores : {String: Nat} || invariant capped: scores.size <= 100 || rpc recordUnsafe(name: String, pts: Nat) -> Unit: scores[name] = pts
 
 /-! ## 6. Multi-Child Hoisted Component Verification & Flat Reconcile -/
 component HoistedPane:
@@ -171,9 +171,9 @@ component HoistedDashboard:
       sortAsc = true
   invariant countBounded: count <= 10
   example toggleModalEx: .toggleModal -> modalOpen == true
-  example toggleModalRfl: .toggleModal -> modalOpen == true := by rfl
+  example toggleModalRfl: .toggleModal -> modalOpen == true prove: rfl
   example upgradeRoundtrip(feat : String): .promptUpgrade(feat), .dismissUpgrade -> upgradePrompt == none
-  example upgradeRoundtripRfl(feat : String): .promptUpgrade(feat), .dismissUpgrade -> upgradePrompt == none := by rfl
+  example upgradeRoundtripRfl(feat : String): .promptUpgrade(feat), .dismissUpgrade -> upgradePrompt == none prove: rfl
   example sortFlip(col : String) where col != "": .sortBy(col), .sortBy(col) -> sortAsc == false
   example sortTracksCol(col : String): .sortBy(col), .sortBy(col) -> sortCol == col
   view:
@@ -234,18 +234,30 @@ component AsyncLaunchPanel:
       busy = false
       lastRel = rel
       launched.emit(rel)
+  action startGuarded:
+    let some(_) = user else: return
+    busy = true
+    let rel = await LaunchRpcSrv.trigger(appId) catch:
+      case .quota(msg): busy = false; errMsg = f"quota:{msg}"
+      case .forbidden: busy = false; errMsg = "forbidden"
+      case .failed(msg): busy = false; errMsg = msg
+    busy = false
+    lastRel = rel
+    launched.emit(rel)
+  example guardedUnauth with props { appId = "web" }: .startGuarded -> not busy and lastRel == ""
+  example guardedHappy with props { appId = "web" } from { user = some("alice") }: .startGuarded, on LaunchRpcSrv.trigger => ok("rel-g") -> not busy and lastRel == "rel-g" emits .launched("rel-g")
   example happyPath with props { appId = "web" } from { user = some("alice") }: .start, on LaunchRpcSrv.trigger => ok("rel-web") -> not busy and lastRel == "rel-web" and errMsg == "" emits .launched("rel-web")
-  example quotaDomainError with props { appId = "full" } from { user = some("alice") }: .start, on LaunchRpcSrv.trigger => err(.quota, "limit reached") -> not busy and errMsg == "quota:limit reached"
+  example quotaDomainError with props { appId = "full" } from { user = some("alice") }: .start, on LaunchRpcSrv.trigger => error(.quota, "limit reached") -> not busy and errMsg == "quota:limit reached"
   example networkError with props { appId = "web" } from { user = some("alice") }: .start, on LaunchRpcSrv.trigger => error("timeout") -> not busy and errMsg == "timeout"
   example unauthNoOp with props { appId = "web" }: .start -> not busy and lastRel == ""
   view: <section><button onClick={.start}>Launch</button><span>{lastRel}</span><span>{errMsg}</span></section>
-bad_comp "Example `BadCompExEmits.badEmits` failed" BadCompExEmits : prop step : Nat = 1 | event changed(next: Nat) | state count : Nat = 0 | action inc: count += step; changed.emit(count) | example badEmits with props { step = 2 }: .inc -> count == 2 emits .changed(99) | view: <span>{count}</span>
-bad_comp "`on ... => ...` in `example danglingReply` requires component `BadCompExNoAsync` to have `await` / async effects" BadCompExNoAsync : prop appId : String | session user | state busy : Bool = false | action noop: pass | example danglingReply with props { appId = "web" }: .noop, on LaunchRpcSrv.trigger => ok("rel-web") -> not busy | view: <span>{appId}</span>
-bad_comp "Example `BadCompExUnmatchedRpc.danglingReply` failed" BadCompExUnmatchedRpc : prop appId : String | session user | state busy : Bool = false | action noop: pass |
+bad_comp "Example `BadCompExEmits.badEmits` failed" BadCompExEmits : prop step : Nat = 1 || event changed(next: Nat) || state count : Nat = 0 || action inc: count += step; changed.emit(count) || example badEmits with props { step = 2 }: .inc -> count == 2 emits .changed(99) || view: <span>{count}</span>
+bad_comp "`on ... => ...` in `example danglingReply` requires component `BadCompExNoAsync` to have `await` / async effects" BadCompExNoAsync : prop appId : String || session user || state busy : Bool = false || action noop: pass || example danglingReply with props { appId = "web" }: .noop, on LaunchRpcSrv.trigger => ok("rel-web") -> not busy || view: <span>{appId}</span>
+bad_comp "Example `BadCompExUnmatchedRpc.danglingReply` failed" BadCompExUnmatchedRpc : prop appId : String || session user || state busy : Bool = false || action noop: pass ||
   action start:
     if user != none:
       let _ = await LaunchRpcSrv.trigger(appId) catch:
         case _: pass
       busy = false
-  | example danglingReply with props { appId = "web" }: .noop, on LaunchRpcSrv.trigger => ok("rel-web") -> not busy | view: <span>{appId}</span>
+  || example danglingReply with props { appId = "web" }: .noop, on LaunchRpcSrv.trigger => ok("rel-web") -> not busy || view: <span>{appId}</span>
 end VerificationChecks

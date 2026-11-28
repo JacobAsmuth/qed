@@ -54,8 +54,8 @@ macro_rules
           $[$its:cssBlockItem]*
         ))
 
-syntax "bad_deploy " str ident ident (" : " sepBy1(deployClause, " | "))? : command
-macro_rules | `(bad_deploy $msg:str $nm:ident $appNm:ident $[: $[$cs:deployClause]|*]?) => do
+syntax "bad_deploy " str ident ident (" : " sepBy1(deployClause, " || "))? : command
+macro_rules | `(bad_deploy $msg:str $nm:ident $appNm:ident $[: $[$cs:deployClause]||*]?) => do
   wrapExpectErr msg (← `(command|
     deploy $nm:ident:
       app $appNm:ident
@@ -68,43 +68,43 @@ macro "bad_fs " msg:str nm:ident srv:ident cli:ident : command => do
       client $cli:ident
       title "Bad"))
 
-macro "bad_ext " msg:str nm:ident " : " cs:sepBy1(extClause, " | ") : command => do
+macro "bad_ext " msg:str nm:ident " : " cs:sepBy1(extClause, " || ") : command => do
   wrapExpectErr msg (← `(command|
     external $nm:ident:
       $[$cs:extClause]*))
-macro "bad_svc " msg:str nm:ident " : " cs:sepBy1(srvClause, " | ") : command => do
+macro "bad_svc " msg:str nm:ident " : " cs:sepBy1(srvClause, " || ") : command => do
   wrapExpectErr msg (← `(command|
     service $nm:ident:
       $[$cs:srvClause]*))
-syntax "bad_srv " str ("[" ident "] ")? ident " : " sepBy1(srvClause, " | ") : command
-macro_rules | `(bad_srv $msg:str $[[$k:ident]]? $nm:ident : $[$cs:srvClause]|*) => do
+syntax "bad_srv " str ("[" ident "] ")? ident " : " sepBy1(srvClause, " || ") : command
+macro_rules | `(bad_srv $msg:str $[[$k:ident]]? $nm:ident : $[$cs:srvClause]||*) => do
   wrapExpectErr msg (← if k.any (·.getId == `stateless) then `(command|
     server stateless $nm:ident:
       $[$cs:srvClause]*) else `(command|
     server $nm:ident:
       $[$cs:srvClause]*))
 
-macro "bad_db_tbl " msg:str nm:ident tbl:ident " : " cs:sepBy1(dbTableClause, " | ") : command => do
+macro "bad_db_tbl " msg:str nm:ident tbl:ident " : " cs:sepBy1(dbTableClause, " || ") : command => do
   wrapExpectErr msg (← `(command|
     database $nm:ident:
       sqlite ".qed/bad.db"
       table $tbl:ident:
         $[$cs:dbTableClause]*))
 
-macro "bad_db_def " msg:str nm:ident " : " cs:sepBy1(dbClause, " | ") : command => do
+macro "bad_db_def " msg:str nm:ident " : " cs:sepBy1(dbClause, " || ") : command => do
   wrapExpectErr msg (← `(command|
     database $nm:ident:
       sqlite ".qed/bad.db"
       $[$cs:dbClause]*))
 
-macro "bad_db_raw " msg:str nm:ident " : " cs:sepBy1(dbClause, " | ") : command => do
+macro "bad_db_raw " msg:str nm:ident " : " cs:sepBy1(dbClause, " || ") : command => do
   wrapExpectErr msg (← `(command|
     database $nm:ident:
       $[$cs:dbClause]*))
 
-syntax "bad_fn " str ident "(" sepBy(ident " : " qedType, ",") ")" " -> " qedType (" | " sepBy1(qedFnContract, " | "))? " : " sepBy1(qedStmt, " | ") : command
+syntax "bad_fn " str ident "(" sepBy(ident " : " qedType, ",") ")" " -> " qedType (" || " sepBy1(qedFnContract, " || "))? " : " sepBy1(qedStmt, " || ") : command
 macro_rules
-  | `(bad_fn $msg:str $nm:ident($[$ps:ident : $ts:qedType],*) -> $ret:qedType $[| $[$cs:qedFnContract]|*]? : $[$ss:qedStmt]|*) => do
+  | `(bad_fn $msg:str $nm:ident($[$ps:ident : $ts:qedType],*) -> $ret:qedType $[|| $[$cs:qedFnContract]||*]? : $[$ss:qedStmt]||*) => do
       let (s0, req0) := (ss[0]!, ← `(qedFnContract| requires true))
       let base ← `(command|
         fn $nm:ident($[$ps:ident : $ts:qedType],*) -> $ret:qedType:
@@ -113,7 +113,7 @@ macro_rules
       let b1 ← spliceNode base (· == req0.raw) ((cs.getD #[]).map (·.raw))
       wrapExpectErr msg (← spliceStmts b1 s0 ss)
 
-macro "bad_db " msg:str dbNm:ident " : " cs:sepBy1(srvClause, " | ") : command => do
+macro "bad_db " msg:str dbNm:ident " : " cs:sepBy1(srvClause, " || ") : command => do
   wrapExpectErr msg (← `(command|
     server $(Lean.mkIdent `BadDbSrv):ident:
       use $(Lean.mkIdent `db):ident : $dbNm:ident
@@ -127,9 +127,9 @@ macro "bad_db1 " msg:str dbNm:ident fn:ident "(" p:ident ":" pt:qedType ")" " ->
         requires ($(Lean.mkIdent `ctx):ident).userId != $(Lean.mkIdent `none):ident
         $body:qedStmt))
 
-syntax "bad_db_auth " str ident (" [" ident "]")? ident "(" sepBy(ident " : " qedType, ",") ")" " -> " qedType (" | " sepBy1(qedExpr, ","))? " : " sepBy1(qedStmt, " | ") : command
+syntax "bad_db_auth " str ident (" [" ident "]")? ident "(" sepBy(ident " : " qedType, ",") ")" " -> " qedType (" || " sepBy1(qedExpr, ","))? " : " sepBy1(qedStmt, " || ") : command
 macro_rules
-  | `(bad_db_auth $msg:str $dbNm:ident $[[$ro:ident]]? $fn:ident($[$ps:ident : $ts:qedType],*) -> $ret:qedType $[| $[$reqs:qedExpr],*]? : $[$ss:qedStmt]|*) => do
+  | `(bad_db_auth $msg:str $dbNm:ident $[[$ro:ident]]? $fn:ident($[$ps:ident : $ts:qedType],*) -> $ret:qedType $[|| $[$reqs:qedExpr],*]? : $[$ss:qedStmt]||*) => do
       let (s0, allReqs) := (ss[0]!, #[← `(qedExpr| $(Lean.mkIdent `auth):ident)] ++ reqs.getD #[])
       let base ← if ro.any (·.getId == `ro) then `(command|
         server $(Lean.mkIdent `BadDbSrv):ident:
@@ -145,22 +145,22 @@ macro_rules
             $s0:qedStmt)
       wrapExpectErr msg (← spliceStmts base s0 ss)
 
-macro "bad_comp_view " msg:str nm:ident st:ident " : " ty:qedType " = " v:qedExpr " | " viewE:qedExpr : command => do
+macro "bad_comp_view " msg:str nm:ident st:ident " : " ty:qedType " = " v:qedExpr " || " viewE:qedExpr : command => do
   wrapExpectErr msg (← `(command|
     component $nm:ident:
       state $st:ident : $ty:qedType = $v:qedExpr
       view: $viewE:qedExpr))
 
-macro "bad_comp_act " msg:str nm:ident st:ident " : " ty:qedType " = " v:qedExpr " | " act:ident " : " ss:sepBy1(qedStmt, ";") : command => do
+macro "bad_comp_act " msg:str nm:ident st:ident " : " ty:qedType " = " v:qedExpr " || " act:ident " : " ss:sepBy1(qedStmt, ";") : command => do
   wrapExpectErr msg (← `(command|
     component $nm:ident:
       state $st:ident : $ty:qedType = $v:qedExpr
       action $act:ident: $[$ss:qedStmt];*
       view: <span>{$st:ident}</span>))
 
-syntax "bad_comp_inv " str ident ident " : " qedType " = " qedExpr " | " ident " : " qedExpr " | " ident " : " sepBy1(qedStmt, " | ") : command
+syntax "bad_comp_inv " str ident ident " : " qedType " = " qedExpr " || " ident " : " qedExpr " || " ident " : " sepBy1(qedStmt, " || ") : command
 macro_rules
-  | `(bad_comp_inv $msg:str $nm:ident $st:ident : $ty:qedType = $v:qedExpr | $inv:ident : $invE:qedExpr | $act:ident : $[$ss:qedStmt]|*) => do
+  | `(bad_comp_inv $msg:str $nm:ident $st:ident : $ty:qedType = $v:qedExpr || $inv:ident : $invE:qedExpr || $act:ident : $[$ss:qedStmt]||*) => do
       let s0 := ss[0]!
       let base ← `(command|
         component $nm:ident:
@@ -180,9 +180,9 @@ macro_rules
           query $qn:ident = $fn:ident($[$args:qedExpr],*) $[if $c:qedExpr]?
           view: <span>ok</span>))
 
-syntax "bad_comp_sub " str ident ident " = " ident "(" sepBy(qedExpr, ",") ")" (" if " qedExpr)? (" | " ident " : " qedStmt)? : command
+syntax "bad_comp_sub " str ident ident " = " ident "(" sepBy(qedExpr, ",") ")" (" if " qedExpr)? (" || " ident " : " qedStmt)? : command
 macro_rules
-  | `(bad_comp_sub $msg:str $nm:ident $sn:ident = $fn:ident($[$args:qedExpr],*) $[if $c:qedExpr]? $[| $a:ident : $s:qedStmt]?) => do
+  | `(bad_comp_sub $msg:str $nm:ident $sn:ident = $fn:ident($[$args:qedExpr],*) $[if $c:qedExpr]? $[|| $a:ident : $s:qedStmt]?) => do
       let act := a.getD (Lean.mkIdent `_unused)
       let st ← match s with | some st => pure st | none => `(qedStmt| pass)
       let base ← `(command|
@@ -201,9 +201,9 @@ macro "bad_comp_sess " msg:str nm:ident " : " s:qedStmt : command => do
       action $(Lean.mkIdent `go):ident: $s:qedStmt
       view: <span>ok</span>))
 
-syntax "bad_spec_act " str ident (" : " sepBy1(qedStmt, " | ")) : command
+syntax "bad_spec_act " str ident (" : " sepBy1(qedStmt, " || ")) : command
 macro_rules
-  | `(bad_spec_act $msg:str $nm:ident : $[$ss:qedStmt]|*) => do
+  | `(bad_spec_act $msg:str $nm:ident : $[$ss:qedStmt]||*) => do
       let (rem, s0) := (Lean.mkIdent `remaining, ss[0]!)
       let base ← `(command|
         component $nm:ident:
@@ -216,19 +216,15 @@ macro_rules
 
 section RawBadCmds
 open Lean Parser Qed.Lang
-@[command_parser] def badSchemaCmd : Parser := leading_parser opaqueP ("bad_schema " >> strLit >> ident >> " : " >> sepBy1 Qed.schemaItemP " | ")
-@[command_parser] def badRecCmd    : Parser := leading_parser opaqueP ("bad_rec "    >> strLit >> ident >> " : " >> sepBy1 Qed.recordItemP " | ")
-@[command_parser] def badEnumCmd   : Parser := leading_parser opaqueP ("bad_enum "   >> strLit >> ident >> " : " >> sepBy1 Qed.enumVariantP " | ")
-@[command_parser] def badCompCmd   : Parser := leading_parser opaqueP ("bad_comp "   >> strLit >> ident >> " : " >> sepBy1 Qed.compClause " | " >> " | view: " >> categoryParser `qedExpr 0 >> optional (" | " >> sepBy1 Qed.compInvAny " | "))
+@[command_parser] def badSchemaCmd : Parser := leading_parser opaqueP ("bad_schema " >> strLit >> ident >> " : " >> sepBy1 Qed.schemaItemP " || ")
+@[command_parser] def badEnumCmd   : Parser := leading_parser opaqueP ("bad_enum "   >> strLit >> ident >> " : " >> sepBy1 Qed.enumVariantP " || ")
+@[command_parser] def badCompCmd   : Parser := leading_parser opaqueP ("bad_comp "   >> strLit >> ident >> " : " >> sepBy1 Qed.compClause " || " >> " || view: " >> categoryParser `qedExpr 0 >> optional (" || " >> sepBy1 Qed.compInvAny " || "))
 
 @[noinline] private def expandSimpleBad (kind : Name) (mkBase : TSyntax `ident → MacroM (TSyntax `command)) : Macro := fun stx => do
   wrapExpectErr ⟨stx.getArg 1⟩ (← spliceNode (← mkBase ⟨stx.getArg 2⟩) (·.isOfKind kind) (stx.getArg 4).getSepArgs)
 
 @[macro badSchemaCmd] def expandBadSchema : Macro := expandSimpleBad `Qed.schemaField fun nm => `(command|
   schema $nm:ident:
-    _d : Nat)
-@[macro badRecCmd]    def expandBadRec    : Macro := expandSimpleBad `Qed.recordField fun nm => `(command|
-  record $nm:ident:
     _d : Nat)
 @[macro badEnumCmd]   def expandBadEnum   : Macro := expandSimpleBad `Qed.enumVariant fun nm => `(command|
   enum $nm:ident:

@@ -162,9 +162,9 @@ def blockHasAtomic (stmts : Array Lean.Syntax) : Bool := stmts.any (stxAny (·.g
 private def stmtChildSuites (stx : Lean.Syntax) : Array Lean.Syntax × Array (Array Lean.Name × Array Lean.Syntax) :=
   match stx.getKind with
   | ``qedStmtIf => (#[stx.getArg 1], #[(#[], suiteStmts (stx.getArg 3))] ++ (desugarElifs (stx.getArg 4).getArgs (stx.getArg 5)).elim #[] fun es => #[(#[], es)])
-  | ``qedStmtIfLet => (#[stx.getArg 4], #[(collectQedPatIds (stx.getArg 2), suiteStmts (stx.getArg 6))] ++ (extractElseSuite (stx.getArg 7)).elim #[] fun es => #[(#[], es)])
+  | ``qedStmtIfLet => (#[stx.getArg 4], #[(collectQedPatIds (stx.getArg 2), suiteStmts (stx.getArg 6))] ++ (desugarElifs (stx.getArg 7).getArgs (stx.getArg 8)).elim #[] fun es => #[(#[], es)])
   | ``qedStmtMatch => ((stx.getArg 1).getSepArgs, (stx.getArg 3).getArgs.map fun c => (collectCasePatIds (extractCasePatAlts (c.getArg 1)), suiteStmts (c.getArg 3)))
-  | ``qedStmtFor => let b := stx.getArg 1; (#[stx.getArg 3], #[(if b.isIdent then #[b.getId.eraseMacroScopes] else #[], suiteStmts (stx.getArg 5))])
+  | ``qedStmtFor => (#[stx.getArg 3], #[(collectLetBinderIds (stx.getArg 1), suiteStmts (stx.getArg 5))])
   | ``qedStmtAtomic => (#[], #[(#[], suiteStmts (stx.getArg 2))])
   | ``qedStmtDbTransaction => (#[], #[(#[], suiteStmts (stx.getArg 3))])
   | ``qedStmtLetElse => (#[stx.getArg 3], #[(#[], extractLetElseStmts stx)])
@@ -191,15 +191,15 @@ private def knownQMethodSet : Std.HashSet String :=
   #["toNat?", "toInt?", "head?", "back?", "getLast?", "get?", "find?", "findIdx?", "findSome?", "indexOf?",
     "str?", "nat?", "int?", "bool?", "num?", "arr?", "obj?", "strAt?", "natAt?", "intAt?", "boolAt?", "pathStr?",
     "parse?", "decode?", "decodeUrl?", "decodeString?", "fromUTF8?", "fromIso?", "parseNat?", "parseInt?",
-    "lookup?", "getElem?", "maxAge?"].foldl (·.insert ·) {}
+    "lookup?", "getElem?", "maxAge?", "ofString?", "sqlIdent?"].foldl (·.insert ·) {}
 
 private def leafOfDottedStr (s : String) : String := match s.splitOn "." |>.reverse with | h :: _ => h | [] => s
 
 partial def exprHasUnwrapWith (knownQ boundLocals : Std.HashSet String) (stx : Lean.Syntax) : Bool :=
   match stx.getKind with
-  | ``qedUnwrap => true | ``qedDotIdent | ``qedLam1 | ``qedLamN | ``qedAllIn | ``qedAnyIn | ``qedAllVars => false
+  | ``qedUnwrap => true | ``qedDotIdent | ``qedLam1 | ``qedLamN | ``qedAllIn | ``qedAnyIn | ``qedAllVars | ``qedAnyVars => false
   | ``qedIdent => let s := (stx.getArg 0).getId.toString; s.endsWith "?" && !knownQ.contains (leafOfDottedStr s) && !boundLocals.contains s
-  | ``qedProj => let f := (stx.getArg 2).getId.toString; (f.endsWith "?" && !knownQ.contains f) || exprHasUnwrapWith knownQ boundLocals (stx.getArg 0)
+  | ``qedProj => ((stx.getArg 2).isIdent && let f := (stx.getArg 2).getId.toString; f.endsWith "?" && !knownQ.contains f) || exprHasUnwrapWith knownQ boundLocals (stx.getArg 0)
   | _ => stx.getArgs.any (exprHasUnwrapWith knownQ boundLocals)
 
 def exprHasUnwrap (stx : Lean.Syntax) : Bool := exprHasUnwrapWith knownQMethodSet {} stx
@@ -379,6 +379,18 @@ private def httpRespSpecs : Array (String × Name × Nat) := #[
       return some dbTerm
     if chain.length == 2 && !ctxHasIdent ctx aliasName then
       let methName := chain[1]!
+      if aliasName == "Db" && methName == "postgres" then
+        let (posArgs, namedArgs) ← splitCallArgs "Db.postgres" rawArgs (some ["ssrf_guard", "name"])
+        if posArgs.size < 1 || posArgs.size > 2 then
+          exprErr stx "`Db.postgres(url[, ssrf_guard = true][, name = \"dynamic_pg\"])` expects a PostgreSQL URL"
+        let urlT ← go .val posArgs[0]!
+        let ssrfT ← match findNamedArg? namedArgs "ssrf_guard" with
+          | some s => go .val s
+          | none => if let some p1 := posArgs[1]? then go .val p1 else pure (mkCIdent `Bool.true)
+        let nameT ← match findNamedArg? namedArgs "name" with
+          | some s => go .val s
+          | none => pure (Syntax.mkStrLit "dynamic_pg")
+        return some (qctx.runPure (Db.mkAppC `Qed.Server.Db.PgHandle.connect #[urlT, ssrfT, nameT]))
       let svcOpt? : Option (ServiceInfo × Bool) ← match ctx.services.find? (·.1 == aliasName) with
         | some (_, si) => pure (some (si, false))
         | none => pure ((lookupService? (← getEnv) (← getCurrNamespace) (← getOpenDecls) (Name.mkSimple aliasName)).map (·, true))
@@ -422,8 +434,11 @@ private def hoistAwait (recGo : ExprMode → Syntax → SrvExprM Term) (stx awai
       let (ctx, qctx) ← read; let (cid, q) := peelTrailingQ (← liftM (m := CommandElabM) getKnownQLeafNames) (ctxHasIdent ctx) id
       return qctx.runPure (finishTermMode mode (← liftM <| hoistPureUnwraps stx ctx q (← resolveDottedIdent qctx stx ctx cid)))
     lowerProj := fun stx objT fld mode => do
-      let (ctx, qctx) ← read; let (cf, q) := peelTrailingQ (← liftM (m := CommandElabM) getKnownQLeafNames) (fun _ => false) fld
-      return qctx.runPure (finishTermMode mode (← liftM <| hoistPureUnwraps stx ctx q (qctx.runPure `(($objT).$cf:ident))))
+      let (ctx, qctx) ← read
+      if fld.isIdent then
+        let (cf, q) := peelTrailingQ (← liftM (m := CommandElabM) getKnownQLeafNames) (fun _ => false) ⟨fld⟩
+        return qctx.runPure (finishTermMode mode (← liftM <| hoistPureUnwraps stx ctx q (qctx.runPure `(($objT).$cf:ident))))
+      else return qctx.runPure (finishTermMode mode (qctx.runPure (mkProjTermPure objT fld)))
     lowerIndex := fun _ arrT idxT mode => do return (← read).2.runPure (finishTermMode mode (← `(srvGetElem($arrT, $idxT))))
     lowerCall := lowerSrvCallHook
     lowerUnwrap := fun stx innerRaw mode => do
@@ -470,7 +485,9 @@ private partial def parseLValPath (qctx : PureQuotCtx) (ctx : LowerCtx) (stx : S
             lowerErr stx s!"cannot mutate unknown state field `{rStr}` ({avail})"
           let _ ← checkStateRead stx ctx rStr; modify fun s => { s with mutated := pushUnique s.mutated rStr }
           return (mkIdentFrom stx root, rest.toArray.map (LValStep.field <| mkIdentFrom stx ·))
-  | ``qedProj => let (r, ps) ← parseLValPath qctx ctx (stx.getArg 0); return (r, ps.push (.field ⟨stx.getArg 2⟩))
+  | ``qedProj =>
+      unless (stx.getArg 2).isIdent do lowerErr stx "cannot mutate a tuple projection"
+      let (r, ps) ← parseLValPath qctx ctx (stx.getArg 0); return (r, ps.push (.field ⟨stx.getArg 2⟩))
   | ``qedIndex =>
       if (stx.getArg 4).getNumArgs == 0 then
         let (r, ps) ← parseLValPath qctx ctx (stx.getArg 0); return (r, ps.push (.index (← (lowerExprM .val (stx.getArg 2)).run (ctx, qctx))))
@@ -623,7 +640,7 @@ private def isBareUnwrapExpr (allowAwait : Bool) (knownQ : Std.HashSet String) (
   let u := unwrapParens1 eStx
   u.getKind == ``qedUnwrap || (allowAwait && u.getKind == ``qedAwait && (unwrapParens1 (u.getArg 1)).getKind == ``qedUnwrap) ||
   (eStx.getKind == ``qedIdent && let s := (eStx.getArg 0).getId.toString; s.endsWith "?" && !knownQ.contains (leafOfDottedStr s) && !ctxHasIdent ctx s) ||
-  (eStx.getKind == ``qedProj && let f := (eStx.getArg 2).getId.toString; f.endsWith "?" && !knownQ.contains f)
+  (eStx.getKind == ``qedProj && (eStx.getArg 2).isIdent && let f := (eStx.getArg 2).getId.toString; f.endsWith "?" && !knownQ.contains f)
 
 /-! ## Unified Pure & Async Statement Block Lowering (`lowerBlock`) -/
 
@@ -761,10 +778,8 @@ private def rejectSrvAssignPredict (stmt : Syntax) : LowerM Unit := do
       let opStr := ((stmt.getArg 1).reprint.getD "=").trimAscii.toString
       let (rhsTerm, steps) ← withCollectedHoists ((lowerExprM .val (stmt.getArg 2)).run (pCtx, qctx))
       pure (stmt.getArg 0, steps, fun pathSteps curLeaf => do
-        let val ← match opStr with
-          | "=" => pure rhsTerm | "+=" => pure <| qctx.runPure `(Qed.Lang.QedVal.val $curLeaf + Qed.Lang.QedVal.val $rhsTerm)
-          | "-=" => pure <| qctx.runPure `(Qed.Lang.QedVal.val $curLeaf - Qed.Lang.QedVal.val $rhsTerm)
-          | _ => lowerErr (stmt.getArg 1) s!"unsupported assignment operator `{opStr}`"
+        let val ← match applyAssignOpPure qctx (stmt.getArg 1) opStr curLeaf rhsTerm with
+          | .ok t => pure t | .error (ref, msg) => lowerErr ref msg
         return if pathSteps.isEmpty then qctx.runPure `(srvAutoField($val)) else val)
     else if let some (targetStx, elemStx) := matchPushCall? (stmt.getArg 0) then
       let (elemTerm, steps) ← withCollectedHoists ((lowerExprM .val elemStx).run (pCtx, qctx))
@@ -900,8 +915,7 @@ private def rejectSrvAssignPredict (stmt : Syntax) : LowerM Unit := do
   let binderStx := stmt.getArg 1; let iterStx := stmt.getArg 3; let bodyStmts := suiteStmts (stmt.getArg 5)
   if let some badInv := (forSuiteInvs (stmt.getArg 5))[0]? then
     lowerErr badInv "loop `invariant` clauses are only supported in pure `fn` functions"
-  if binderStx.isIdent then
-    let bNm := binderStx.getId.eraseMacroScopes
+  for bNm in collectLetBinderIds binderStx do
     if ctx.mutLocals.any (·.getId.eraseMacroScopes == bNm) then lowerErr binderStx s!"`for` loop variable `{bNm}` shadows mutable variable `{bNm}`; use a different loop variable name"
   let (iterTerm, steps) ← withCollectedHoists ((lowerExprM .val iterStx).run (ctx, qctx))
   let mutated := collectMutatedIds bodyStmts; let usedMuts := ctx.mutLocals.filter fun m => mutated.contains m.getId.eraseMacroScopes
@@ -910,7 +924,7 @@ private def rejectSrvAssignPredict (stmt : Syntax) : LowerM Unit := do
   let restTerm ← recBlock ctx rest; let isRange := isRangeCallExpr iterStx; let isPure := mode matches .pure ..
   let fullTerm := qctx.runPure do
     let initSt ← mkMutPack usedMuts.toList; let bodyWithUnpack ← wrapMutUnpack stParam usedMuts.toList bodyInner
-    let lam ← if binderStx.isIdent then `(fun $stParam:ident $(⟨binderStx⟩):ident => $bodyWithUnpack) else `(fun $stParam:ident _ => $bodyWithUnpack)
+    let lam ← mkForLoopLamPure "_srvElem" stParam binderStx bodyWithUnpack
     let someArm ← wrapLoopRet mode ctx ⟨retValId.raw⟩ fun v => do match mode with | .pure _ _ sCur => mkPureLeaf ctx (← materializeState sCur (pureOvs ctx)) (← Db.mkOptTerm (some v)) | _ => pure v
     let afterLoop ← wrapMutUnpack resSt usedMuts.toList (← `(match $resRet:ident with | Option.some $retValId:ident => $someArm | Option.none => $restTerm))
     if isPure then
@@ -1001,7 +1015,7 @@ private def rejectSrvAssignPredict (stmt : Syntax) : LowerM Unit := do
       let patStx := stmt.getArg 2; let patTerm ← liftMacroM (lowerQedPat patStx)
       let (scrutTerm, steps) ← withCollectedHoists ((lowerExprM .val (stmt.getArg 4)).run (bCtx, qctx)); let hMatch ← freshIdent "_srvM"
       wrapHoists qctx mode bCtx steps (← lowerBranch qctx mode bCtx rest (suiteStmts (stmt.getArg 6)) (pushPatLocals bCtx (collectQedPatIds patStx))
-        (extractElseSuite (stmt.getArg 7)) false (fun t e => `(match $hMatch:ident : $scrutTerm:term with | $patTerm => $t | _ => $e)) recSame recWithState)
+        (desugarElifs (stmt.getArg 7).getArgs (stmt.getArg 8)) false (fun t e => `(match $hMatch:ident : $scrutTerm:term with | $patTerm => $t | _ => $e)) recSame recWithState)
   | ``qedStmtMatch =>
       let (matchT, allSteps) ← lowerMatchScrutineesAndAlts qctx bCtx stmt rest recSame; wrapHoists qctx mode bCtx allSteps matchT
   | ``qedStmtFor => lowerSrvForFoldCore qctx mode bCtx stmt rest recSame

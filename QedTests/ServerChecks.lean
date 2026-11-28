@@ -10,20 +10,20 @@ external PingApi:
 schema CheckedItem:
   label : String where 1 <= label.length <= 32
   stock : Nat    where stock <= 100
-bad_srv "cannot access server state `count` outside an `atomic` block in `bump`" BadToctouRead : state count : Nat = 0 | rpc bump() -> Nat!: let c = count; await PingApi.ping()?; return c
-bad_srv "cannot access server state `count` outside an `atomic` block in `bump`" BadOutsideAtomicMut : state count : Nat = 0 | rpc bump() -> Nat!: await PingApi.ping()?; count += 1; return 1
-bad_srv "redundant `atomic` block: `bump` has no `await` calls" BadRedundantAtomic : state count : Nat = 0 | rpc bump() -> Nat: atomic: count += 1; return count
-bad_srv "cannot use `await` inside an `atomic` block" BadAwaitInAtomic : state count : Nat = 0 |
+bad_srv "cannot access server state `count` outside an `atomic` block in `bump`" BadToctouRead : state count : Nat = 0 || rpc bump() -> Nat!: let c = count; await PingApi.ping()?; return c
+bad_srv "cannot access server state `count` outside an `atomic` block in `bump`" BadOutsideAtomicMut : state count : Nat = 0 || rpc bump() -> Nat!: await PingApi.ping()?; count += 1; return 1
+bad_srv "redundant `atomic` block: `bump` has no `await` calls" BadRedundantAtomic : state count : Nat = 0 || rpc bump() -> Nat: atomic: count += 1; return count
+bad_srv "cannot use `await` inside an `atomic` block" BadAwaitInAtomic : state count : Nat = 0 ||
   rpc bump() -> Nat!:
     await PingApi.ping()?
     atomic: await PingApi.ping()?; count += 1
     return 1
 bad_srv "unhandled fallible `await` expression" BadUnhandledError : rpc callIt() -> String: let res = await PingApi.ping(); return "ok"
-bad_srv "Array index `idx` could be out of bounds for `items`:\n  • must satisfy:  idx < items.size" BadArrayBounds : state items : Nat[] = [10, 20] | rpc readAt(idx: Nat) -> Nat: return items[idx]
+bad_srv "Array index `idx` could be out of bounds for `items`:\n  • must satisfy:  idx < items.size" BadArrayBounds : state items : Nat[] = [10, 20] || rpc readAt(idx: Nat) -> Nat: return items[idx]
 bad_srv "Schema field rule `1 <= \"\".length and \"\".length <= 32` failed for `\"\"`." BadFieldRefinement : rpc makeEmpty() -> CheckedItem: return CheckedItem(label="", stock=5)
-bad_srv "Server invariant `maxStock` failed in `overflow`:\n  • must satisfy:  stock + 50 <= 100" BadSingleStateInv : state stock : Nat = 10 | invariant maxStock: stock <= 100 | rpc overflow() -> Nat: stock += 50; return stock
-bad_srv "Server invariant `ordersMonotonic` failed in `resetOrders`:\n  • must satisfy:  0 >= orders" BadTwoStateInv : state orders : Nat = 5 | invariant ordersMonotonic: orders >= old(orders) | rpc resetOrders() -> Nat: orders = 0; return orders
-bad_srv "Server invariant `authItems` failed in `unauthenticatedPush`:\n  • must satisfy:  items.push x = items or ctx.userId != none" BadMutatingAuthInv : state items : Nat[] = [1] | invariant authItems: mutating items requires ctx.userId != none | rpc unauthenticatedPush(x: Nat) -> Nat: items.push(x); return items.size
+bad_srv "Server invariant `maxStock` failed in `overflow`:\n  • must satisfy:  stock + 50 <= 100" BadSingleStateInv : state stock : Nat = 10 || invariant maxStock: stock <= 100 || rpc overflow() -> Nat: stock += 50; return stock
+bad_srv "Server invariant `ordersMonotonic` failed in `resetOrders`:\n  • must satisfy:  0 >= orders" BadTwoStateInv : state orders : Nat = 5 || invariant ordersMonotonic: orders >= old(orders) || rpc resetOrders() -> Nat: orders = 0; return orders
+bad_srv "Server invariant `authItems` failed in `unauthenticatedPush`:\n  • must satisfy:  items.push x = items or ctx.userId != none" BadMutatingAuthInv : state items : Nat[] = [1] || invariant authItems: mutating items requires ctx.userId != none || rpc unauthenticatedPush(x: Nat) -> Nat: items.push(x); return items.size
 bad_srv "Server postcondition `ensures result > 10` failed in `compute`:\n  • must satisfy:  5 > 10" BadServerEnsures :
   rpc compute(x: Nat) -> Nat:
     ensures result > 10
@@ -38,7 +38,7 @@ server CheckedSrv:
 server OtherSrv:
   rpc ping() -> Nat: return 1
 bad_comp_sess "RPC `CheckedSrv.buy` precondition `1 <= qty <= 50` could not be proved here:\n  • must satisfy:  1 <= 0 and 0 <= 50" BadClientRequiresParam : if user.isSome: let _ = await CheckedSrv.buy(0) catch: case _: pass
-bad_comp "RPC `CheckedSrv.buy` requires an authenticated session (`ctx.userId != none`), but `BadClientRequiresAuth` has no `session` field." BadClientRequiresAuth : action go: let _ = await CheckedSrv.buy(1) catch: case _: pass | view: <span>ok</span>
+bad_comp "RPC `CheckedSrv.buy` requires an authenticated session (`ctx.userId != none`), but `BadClientRequiresAuth` has no `session` field." BadClientRequiresAuth : action go: let _ = await CheckedSrv.buy(1) catch: case _: pass || view: <span>ok</span>
 bad_comp_sess "`await CheckedSrv.buy(...)` has unhandled domain error(s): .limitReached" BadClientNonExhaustiveCatch :
   if user.isSome:
     let _ = await CheckedSrv.buy(1) catch:
@@ -84,12 +84,12 @@ component VerifiedQueryFlow:
   invariant echoedValid: echoed.all(v => 1 <= v <= 50)
   action setQty(q: Nat): if 1 <= q <= 50: qty = q
   view: <div><Await of={quote} as={v}><span>{f"{v}"}</span></Await><Await of={echoed} as={e}><span>{f"{e}"}</span></Await></div>
-bad_ext "`external BadAuthWs` declares client-usable `ws` channels and cannot attach server `auth` secrets" BadAuthWs : base "wss://ws.example.com" | auth bearer(secret("WS_SECRET")) | ws "/stream" feed() -> String
+bad_ext "`external BadAuthWs` declares client-usable `ws` channels and cannot attach server `auth` secrets" BadAuthWs : base "wss://ws.example.com" || auth bearer(secret("WS_SECRET")) || ws "/stream" feed() -> String
 bad_srv "Channel `ensures` postcondition failed at `emit`:\n  • must satisfy:  99 <= 50" BadEmitSrv :
   channel bounded() -> Nat:
     ensures event <= 50
     on_join: pass
-  | rpc pushBad() -> Unit: bounded.emit(99); return ()
+  || rpc pushBad() -> Unit: bounded.emit(99); return ()
 server WsCheckSrv:
   channel gauge(room: Nat) -> Nat:
     requires ctx.userId != none, room <= 10
@@ -101,7 +101,7 @@ server WsCheckSrv:
     on_leave: pass
 bad_comp_sub "RPC `WsCheckSrv.gauge` requires an authenticated session (`user != none`)" BadSubNoAuth g = WsCheckSrv.gauge(1)
 bad_comp_sub "RPC `WsCheckSrv.gauge` precondition `room <= 10` could not be proved here:\n  • must satisfy:  99 <= 10" BadSubBadParam g = WsCheckSrv.gauge(99) if user.isSome
-bad_comp_sub "RPC `WsCheckSrv.gauge.send` precondition `v <= 50` could not be proved here:\n  • must satisfy:  77 <= 50" BadSendParam g = WsCheckSrv.gauge(1) if user.isSome | go : g.send(77)
+bad_comp_sub "RPC `WsCheckSrv.gauge.send` precondition `v <= 50` could not be proved here:\n  • must satisfy:  77 <= 50" BadSendParam g = WsCheckSrv.gauge(1) if user.isSome || go : g.send(77)
 component SubOtherWs:
   session user
   subscribe g = WsCheckSrv.gauge(1) if user.isSome:
@@ -116,7 +116,7 @@ component VerifiedWsEnsures:
     on_message(v): lastVal = v
   action sendOk(n: Nat): if n <= 50: g.send(n)
   view: <span>{lastVal}</span>
-bad_srv "Server invariant `hitsBounded` failed in `POST /bad`:\n  • must satisfy:  hits + 5 <= 10" BadHttpRouteInv : state hits : Nat = 0 | invariant hitsBounded: hits <= 10 | post "/bad": hits += 5; return text("oops")
+bad_srv "Server invariant `hitsBounded` failed in `POST /bad`:\n  • must satisfy:  hits + 5 <= 10" BadHttpRouteInv : state hits : Nat = 0 || invariant hitsBounded: hits <= 10 || post "/bad": hits += 5; return text("oops")
 bad_srv "`send(...)` is only available inside `stream \"/...\":` routes" BadSendOutsideStream : get "/bad-send": send("nope"); return text("ok")
 component SimpleHeadPage:
   head:
@@ -128,15 +128,15 @@ example : (SimpleHeadPage.app.headFor SimpleHeadPage.init).title = some "Simple 
 bad_comp "`case` inside `head:` requires a `route` declaration on `component BadHeadCase`" BadHeadCase :
   head:
     case .home: title "Nope"
-  | view: <main>ok</main>
+  || view: <main>ok</main>
 
 -- Stateless `server` and per-viewer `channel ... project(...)` with `blindTo`
-record RawGameRoom:
+schema RawGameRoom:
   code           : String
   secretLocation : String
   secretPack     : String
   spyIds         : String[]
-record RedactedGameView:
+schema RedactedGameView:
   code           : String
   secretLocation : String?
   secretPack     : String?
@@ -157,7 +157,7 @@ server stateless RedactedHub:
     room.emit(code, { code = code, secretLocation = loc, secretPack = pack, spyIds = spies })
 check_decls [RedactedHub.is_stateless, RedactedHub.room_project_ensures, RedactedHub.room_project_blindTo, RedactedHub.room_project_channel_ensures]
 example : RedactedHub.wsProject { userId := some "alice" } "other" ByteArray.empty ByteArray.empty = .passthrough := rfl
-bad_srv "`server stateless BadStatelessSrv` forbids in-memory `state` field `count`" [stateless] BadStatelessSrv : state count : Nat = 0 | rpc getCount() -> Nat: return count
+bad_srv "`server stateless BadStatelessSrv` forbids in-memory `state` field `count`" [stateless] BadStatelessSrv : state count : Nat = 0 || rpc getCount() -> Nat: return count
 bad_srv "`blindTo raw.secretLocation` failed in `LeakyProjSrv.room_project`" [stateless] LeakyProjSrv :
   channel room(code: String) -> RedactedGameView:
     project(raw: RawGameRoom):
@@ -173,7 +173,7 @@ external GcpAdcExt:
   base "https://run.googleapis.com"
   auth gcpMetadata
   get "/v2/projects/:proj/locations/:tab" listLocs(proj: String, tab: ExtTab) -> String
-record EchoReq:
+schema EchoReq:
   msg : String
 external GcpIdExt:
   base "https://my-svc.run.app"
@@ -226,7 +226,7 @@ server GuardedApi:
     on_join: pass
     on_send(msg: String): feed.emit(msg)
 check_decls [Qed.Server.ApiError.wireMessage_prod_5xx]
-bad_srv "`read_only rpc badMut` is not read-only: it mutates server state" BadReadOnlyMutSrv : state x : Nat = 0 | read_only rpc badMut() -> Nat: x += 1; return x
+bad_srv "`read_only rpc badMut` is not read-only: it mutates server state" BadReadOnlyMutSrv : state x : Nat = 0 || read_only rpc badMut() -> Nat: x += 1; return x
 bad_srv "`read_only rpc badCookie` is not read-only: it sets or clears cookies" BadReadOnlyCookieSrv : read_only rpc badCookie() -> Unit: setCookie("a", "b")
 
 /-! ## Phase 3 Tests: Richer `external`, `service`, `Crypto`/`Time`/`Random`/`secret`, Default Params, Guard-`let`, `prove:` -/
@@ -254,8 +254,8 @@ external UnguardedLocalApi:
   base "http://127.0.0.1:1"
   ssrf_guard false
   get "/ping" ping() -> String
-bad_ext "`Form(T)` is only supported for HTTP request body parameters, not response types" BadFormRetApi : base "https://api.example.com" | get "/bad" bad() -> Form(StripeCheckoutReq)
-bad_ext "HTTP status code `999` in `ok [...]` must be between 100 and 599" BadOkStatusApi : base "https://api.example.com" | get "/bad" bad() -> String ok [200, 999]
+bad_ext "`Form(T)` is only supported for HTTP request body parameters, not response types" BadFormRetApi : base "https://api.example.com" || get "/bad" bad() -> Form(StripeCheckoutReq)
+bad_ext "HTTP status code `999` in `ok [...]` must be between 100 and 599" BadOkStatusApi : base "https://api.example.com" || get "/bad" bad() -> String ok [200, 999]
 
 private def doublePlus (n : Nat) : Nat := n + n + 1
 private theorem doublePlus_odd (n : Nat) : doublePlus n % 2 = 1 := by unfold doublePlus; omega
@@ -453,7 +453,7 @@ bad_svc "Server postcondition `ensures ensures_fails 400` failed in `actuallySuc
   fn actuallySucceeds(n: Nat) -> Nat!:
     ensures_fails 400
     return n + 1
-bad_svc "proved that the proposition" BadSrvExampleSvc : fn inc(n: Nat) -> Nat!: return n + 1 |
+bad_svc "proved that the proposition" BadSrvExampleSvc : fn inc(n: Nat) -> Nat!: return n + 1 ||
   example wrongResult:
     call inc(1)
     expect ok(99)
@@ -517,10 +517,10 @@ server WorkerLoopSrv:
   every 30s heartbeat:
     no_http, no_decrypt
     atomic: processed += 0
-bad_ext "has no matching `where region : Enum` or `where region in [...]` allowlist" BadMissingBaseWhere : base "https://{region}-run.googleapis.com" | get "/ping" ping(region: String) -> String
-bad_ext "must be a unit `enum`" BadPayloadEnumWhere : base "https://{p}.example.com" where p : PayloadEnum | get "/ping" ping(p: PayloadEnum) -> String
-bad_ext "invalid expanded `base` origin" BadExpandedOrigin : base "https://{host}.example.com" where host in ["good", "bad@evil"] | get "/ping" ping(host: String) -> String
-bad_ext "requires a matching parameter `region` on endpoint `ping`" BadMissingEndpointBaseParam : base "https://{region}-run.googleapis.com" where region : CloudRegion | get "/ping" ping() -> String
+bad_ext "has no matching `where region : Enum` or `where region in [...]` allowlist" BadMissingBaseWhere : base "https://{region}-run.googleapis.com" || get "/ping" ping(region: String) -> String
+bad_ext "must be a unit `enum`" BadPayloadEnumWhere : base "https://{p}.example.com" where p : PayloadEnum || get "/ping" ping(p: PayloadEnum) -> String
+bad_ext "invalid expanded `base` origin" BadExpandedOrigin : base "https://{host}.example.com" where host in ["good", "bad@evil"] || get "/ping" ping(host: String) -> String
+bad_ext "requires a matching parameter `region` on endpoint `ping`" BadMissingEndpointBaseParam : base "https://{region}-run.googleapis.com" where region : CloudRegion || get "/ping" ping() -> String
 bad_srv "Server invariant `no_http` failed in `badJob`" BadEveryNoHttpSrv :
   every 10s badJob -> Bool:
     no_http
@@ -635,4 +635,165 @@ server ErgoStatefulSrv:
       let (delta, bonus) = pair
       total += delta
     return .ok(bonus)
+
+/-! ## Issue #22 Items 3 & 4: Unified Metadata `invariant`s, `Time.sleepMs`, OIDC `Http`, & `Proc`/`Fs` Effects -/
+
+external MetaStatusExt:
+  base "https://status.example.com"
+  get "/health" status() -> String
+  invariant noSecrets: secrets == []
+  invariant originPinned: allowedBaseOrigins == ["https://status.example.com"]
+
+database MetaPolicyDb:
+  url secret("META_TEST_DB_URL")
+  table entries:
+    id      : String primary_key where 1 <= id.length <= 32
+    ownerId : String immutable   where 1 <= ownerId.length <= 32
+    payload : encrypted(String, key = secret("META_TEST_ENC_KEY"))
+    policy read, write requires some(row.ownerId) == ctx.userId
+    invariant cols: metaColNames == ["id", "ownerId"]
+    invariant hasRls: "read" in policies and "write" in policies
+  invariant exactSecrets: secrets == ["META_TEST_DB_URL", "META_TEST_ENC_KEY"]
+  invariant allRls: all t in tables: "read" in t.policies and "write" in t.policies
+
+server stateless MetaGuardedApi:
+  get "/api/health":
+    return text("ok")
+  get "/api/me":
+    requires auth
+    return text(uid)
+  read_only rpc health() -> String:
+    no_http, no_db_write, no_proc, no_fs
+    return "ok"
+  read_only rpc whoami() -> String:
+    requires auth
+    no_http, no_db_write, no_proc, no_fs
+    return uid
+  every 5s pollWorkerJob -> Bool:
+    await Time.sleepMs(10)
+    return true
+  invariant noSecrets: secrets == []
+  invariant allReadOnly: all r in rpcs: r.isReadOnly
+  invariant rpcAuth: all r in rpcs: r.name == "health" or r.requiresAuth
+  invariant apiAuth: all r in routes: not r.path.startsWith("/api/") or r.path == "/api/health" or r.requiresAuth
+
+service EffectfulWorkerSvc:
+  fn pollHealthWithBackoff(url: WebhookUrl) -> (UInt32, String, Nat)!:
+    no_proc, no_fs, no_db_write
+    let t0 = await Time.nowMs()
+    await Time.sleepMs(250)
+    let resp = await Http.getOidc(url)?
+    let t1 = await Time.nowMs()
+    return (resp.status, (String.fromUTF8?(resp.body)).getD(""), t1 - t0)
+
+  fn runBuildInTmp(cfgFile: String) -> String!:
+    no_http, no_db_write
+    let initCfg = await Fs.readText(cfgFile)?
+    let dir = await Fs.mktempDir("build-")?
+    let subDir = f"{dir}/out"
+    let _ = await Fs.mkdirAll(subDir)?
+    let outPath = f"{subDir}/qed.toml"
+    let _ = await Fs.writeText(outPath, initCfg)?
+    let existsBefore = await Fs.pathExists(outPath)
+    let saved = await Fs.readText(outPath)?
+    let out = await Proc.execOk("echo", [saved])?
+    let _ = await Fs.removeAll(dir)?
+    let existsAfter = await Fs.pathExists(outPath)
+    return f"{existsBefore}:{existsAfter}:{out}"
+
+  invariant noSecrets: secrets == []
+  invariant allReadOnly: all f in fns: f.isReadOnly
+
+  example backoffAndOidc:
+    with now = 1000
+    with http GET "https://my-app.a.run.app/health" => 200 "healthy"
+    call pollHealthWithBackoff(Qed.Server.WebhookUrl.make("https://my-app.a.run.app/health"))
+    expect ok((200, "healthy", 250))
+    expect slept_ms == 250
+    expect http_calls == 1
+    expect http[0].auth == .gcpMetadata(some("https://my-app.a.run.app"))
+    expect http[0].ssrfGuard == true
+
+  example procAndFsFlow:
+    with file "/etc/build.toml" = "app=demo"
+    with proc "echo" => 0 "ok-built"
+    call runBuildInTmp("/etc/build.toml")
+    expect ok("true:false:ok-built")
+    expect proc_calls == 1
+
+invariant crossBlockMetaNoSecrets:
+  MetaStatusExt.secrets == [] and MetaGuardedApi.secrets == [] and EffectfulWorkerSvc.secrets == []
+invariant crossBlockTablePolicies:
+  MetaPolicyDb.entries.metaColNames == ["id", "ownerId"] and "read" in MetaPolicyDb.entries.policies
+
+check_decls [MetaStatusExt.noSecrets, MetaStatusExt.originPinned,
+  MetaPolicyDb.entries.cols, MetaPolicyDb.entries.hasRls, MetaPolicyDb.exactSecrets, MetaPolicyDb.allRls,
+  MetaGuardedApi.noSecrets, MetaGuardedApi.allReadOnly, MetaGuardedApi.rpcAuth, MetaGuardedApi.apiAuth,
+  EffectfulWorkerSvc.noSecrets, EffectfulWorkerSvc.allReadOnly,
+  crossBlockMetaNoSecrets, crossBlockTablePolicies]
+
+bad_ext "Invariant `BadSecretExt.noSecrets` failed" BadSecretExt :
+  base "https://secret.example.com" || auth bearer(secret("EXT_KEY")) || get "/ping" ping() -> String || invariant noSecrets: secrets == []
+
+bad_db_def "Invariant `BadDbMetaInv.noSecs` failed" BadDbMetaInv :
+  table t:
+    id : String primary_key where 1 <= id.length <= 16
+  || invariant noSecs: all tbl in tables: "read" in tbl.policies
+
+bad_db_tbl "Invariant `BadTblMetaInv.t.badCols` failed" BadTblMetaInv t :
+  id : String primary_key where 1 <= id.length <= 16 || invariant badCols: metaColNames == ["other"]
+
+bad_srv "Invariant `BadRouteAuthInv.apiAuth` failed" [stateless] BadRouteAuthInv :
+  get "/api/secret": return text("oops") ||
+  invariant apiAuth: all r in routes: not r.path.startsWith("/api/") or r.requiresAuth
+
+bad_svc "Server invariant `no_http` failed in `badOidcNoHttp`" BadOidcNoHttpSvc :
+  fn badOidcNoHttp(url: WebhookUrl) -> String!:
+    no_http
+    return await Http.getOidcString(url)?
+
+bad_svc "Server invariant `no_proc` failed in `badNoProc`" BadNoProcSvc :
+  fn badNoProc() -> String!:
+    no_proc
+    return await Proc.execOk("echo", ["hi"])?
+
+bad_svc "Server invariant `no_fs` failed in `badNoFs`" BadNoFsSvc :
+  fn badNoFs(p: String) -> String!:
+    no_fs
+    return await Fs.readText(p)?
+
+expect_err "Invariant `badTopLevelMeta` failed" in
+  invariant badTopLevelMeta: MetaPolicyDb.secrets == []
+
+/-! ## Server Expected Syntax: `for (k, v)`, `if let`/`elif let`, Tuple `.1`/`.2`, Compound Assigns -/
+
+server ExpectedSyntaxSrv:
+  state score : Nat = 2
+
+  rpc foldPairsAndOps(pairs: (Nat, Nat)[], a: Nat?, b: Nat?) -> Nat!:
+    let mut bonus : Nat = 1
+    for (k, v) in pairs:
+      bonus += k * v
+    if let some(x) = a:
+      score *= x
+    elif let some(y) = b:
+      score |= y
+    elif bonus > 10:
+      score <<= 1
+    else:
+      score ^= 1
+    let pair = (score, bonus)
+    return pair.1 + pair.2
+
+  example runOpsBranchA:
+    call foldPairsAndOps([(2, 3), (4, 5)], some(5), none)
+    expect ok(37)
+
+  example runOpsBranchB:
+    call foldPairsAndOps([(1, 1)], none, some(4))
+    expect ok(8)
+
+  example runOpsBranchElif:
+    call foldPairsAndOps([(3, 4)], none, none)
+    expect ok(17)
 end ServerChecks

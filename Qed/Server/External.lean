@@ -57,7 +57,7 @@ def decodeRespString (res : Except ApiError OutboundResp) : Except ApiError Stri
 
 namespace Webhook
 
-private def splitHttpsOriginAndPath (raw : String) : String × String :=
+def splitHttpsOriginAndPath (raw : String) : String × String :=
   match Qed.Str.splitChar (String.ofList (raw.toList.drop 8)) '/' with
   | [] => (raw, "/") | host :: rest => ("https://" ++ host, if rest.isEmpty then "/" else "/" ++ String.intercalate "/" rest)
 
@@ -90,6 +90,81 @@ instance {σ : Type} (url : WebhookUrl) (mime : String) (body : Bytes) : SafeIO 
   ⟨progEffSpec_postRaw_bind url _ _ (fun _ => trivial) fun _ => .pure _ trivial⟩
 
 end Webhook
+
+end Qed.Server
+
+namespace Qed.Http
+open Qed.Server
+
+/-- Send an SSRF-guarded dynamic-origin HTTPS request authenticated with a GCP metadata OIDC token
+    whose audience defaults to the validated `https://<host>` origin of `url`. -/
+@[noinline, nospecialize] def requestOidcRaw {m : Type → Type} [Monad m] [MonadServer m]
+    (method : String) (url : WebhookUrl) (headers : List (String × String) := [])
+    (body : Bytes := ByteArray.empty) (audience? : Option String := none) : m (Except ApiError OutboundResp) :=
+  let (origin, path) := Webhook.splitHttpsOriginAndPath url.raw
+  MonadServer.httpCall {
+    serviceName := "Http", baseOrigin := origin, method, pathAndQuery := path, headers, body,
+    auth := .gcpMetadata (some (audience?.getD origin)), ssrfGuard := true
+  }
+
+section HttpSpecs
+variable {σ β : Type} {Inv : σ → Prop} {A : Prop} {Step : σ → σ → Prop} {EffOk : ServerEffect → Prop}
+  (method : String) (url : WebhookUrl) (headers : List (String × String)) (body : Bytes) (audience? : Option String)
+
+theorem progEffSpec_requestOidcRaw {Post : Except ApiError OutboundResp → Prop}
+    (hEff : ∀ req, EffOk (.httpCall req)) (hPost : ∀ r, Post r) :
+    ProgEffSpec Inv A Step EffOk Post (requestOidcRaw (m := ThreadProg σ) method url headers body audience?) :=
+  .io (.httpCall _) _ (hEff _) fun _ => .pure _ (hPost _)
+
+theorem progEffSpec_requestOidcRaw_bind {Post : β → Prop} {k : Except ApiError OutboundResp → ThreadProg σ β}
+    (hEff : ∀ req, EffOk (.httpCall req)) (hk : ∀ r, ProgEffSpec Inv A Step EffOk Post (k r)) :
+    ProgEffSpec Inv A Step EffOk Post (requestOidcRaw (m := ThreadProg σ) method url headers body audience? >>= k) :=
+  (progEffSpec_requestOidcRaw method url headers body audience? hEff fun _ => trivial).bind fun r _ => hk r
+end HttpSpecs
+
+@[noinline, nospecialize] def getOidc {m : Type → Type} [Monad m] [MonadServer m]
+    (url : WebhookUrl) (headers : List (String × String) := []) (audience? : Option String := none) :
+    m (Except ApiError OutboundResp) :=
+  requestOidcRaw "GET" url headers ByteArray.empty audience?
+
+@[noinline, nospecialize] def getOidcString {m : Type → Type} [Monad m] [MonadServer m]
+    (url : WebhookUrl) (headers : List (String × String) := []) (audience? : Option String := none) :
+    m (Except ApiError String) :=
+  (fun r => decodeRespString (r.bind checkHttpOk)) <$> requestOidcRaw "GET" url headers ByteArray.empty audience?
+
+@[noinline, nospecialize] def getOidcJson {Resp : Type} {m : Type → Type} [Monad m] [MonadServer m] [FromJson Resp]
+    (url : WebhookUrl) (headers : List (String × String) := []) (audience? : Option String := none) :
+    m (Except ApiError Resp) :=
+  (fun r => decodeRespJson (r.bind checkHttpOk)) <$> requestOidcRaw "GET" url (("Accept", "application/json") :: headers) ByteArray.empty audience?
+
+@[noinline, nospecialize] def postOidcJson {Payload Resp : Type} {m : Type → Type} [Monad m] [MonadServer m] [ToJson Payload] [FromJson Resp]
+    (url : WebhookUrl) (payload : Payload) (audience? : Option String := none) :
+    m (Except ApiError Resp) :=
+  (fun r => decodeRespJson (r.bind checkHttpOk)) <$>
+    requestOidcRaw "POST" url [("Content-Type", "application/json"), ("Accept", "application/json")] (Json.render (toJson payload)).toUTF8 audience?
+
+section HttpSafeIO
+variable {σ : Type}
+instance (method : String) (url : WebhookUrl) (headers : List (String × String)) (body : Bytes) (aud? : Option String) :
+    SafeIO (requestOidcRaw (m := ThreadProg σ) method url headers body aud?) :=
+  ⟨progEffSpec_requestOidcRaw method url headers body aud? (fun _ => trivial) fun _ => trivial⟩
+instance (url : WebhookUrl) (headers : List (String × String)) (aud? : Option String) :
+    SafeIO (getOidc (m := ThreadProg σ) url headers aud?) :=
+  ⟨progEffSpec_requestOidcRaw "GET" url headers ByteArray.empty aud? (fun _ => trivial) fun _ => trivial⟩
+instance (url : WebhookUrl) (headers : List (String × String)) (aud? : Option String) :
+    SafeIO (getOidcString (m := ThreadProg σ) url headers aud?) :=
+  ⟨progEffSpec_requestOidcRaw_bind "GET" url headers ByteArray.empty aud? (fun _ => trivial) fun _ => .pure _ trivial⟩
+instance {Resp : Type} [FromJson Resp] (url : WebhookUrl) (headers : List (String × String)) (aud? : Option String) :
+    SafeIO (getOidcJson (Resp := Resp) (m := ThreadProg σ) url headers aud?) :=
+  ⟨progEffSpec_requestOidcRaw_bind "GET" url _ ByteArray.empty aud? (fun _ => trivial) fun _ => .pure _ trivial⟩
+instance {Payload Resp : Type} [ToJson Payload] [FromJson Resp] (url : WebhookUrl) (payload : Payload) (aud? : Option String) :
+    SafeIO (postOidcJson (Payload := Payload) (Resp := Resp) (m := ThreadProg σ) url payload aud?) :=
+  ⟨progEffSpec_requestOidcRaw_bind "POST" url _ _ aud? (fun _ => trivial) fun _ => .pure _ trivial⟩
+end HttpSafeIO
+
+end Qed.Http
+
+namespace Qed.Server
 
 /-! ## `external` Command Elaborator -/
 
@@ -228,14 +303,18 @@ open Lean Elab Command
   | _ => return .gcpMetadata (if (c.getArg 2).getNumArgs == 3 then some (⟨(c.getArg 2).getArg 1⟩ : TSyntax `str).getString else none)
 
 @[noinline] private def parseExternalClauses (svcIdent : Ident) (svcName : Name) (clauses : Array Syntax) :
-    CommandElabM (ParsedBaseSpec × AuthSpec × Bool × Array Syntax × Array Syntax) := do
-  let (base?, auth?, ssrf?, eps, ws) ← foldlCmd clauses (none, none, none, #[], #[]) fun (b?, a?, s?, eps, ws) c => do
+    CommandElabM (ParsedBaseSpec × AuthSpec × Bool × Array Syntax × Array Syntax × Array (Ident × Array Syntax)) := do
+  let (base?, auth?, ssrf?, eps, ws, invs) ← foldlCmd clauses (none, none, none, #[], #[], #[]) fun (b?, a?, s?, eps, ws, invs) c => do
     match c.getKind with
-    | ``extBaseClause => return (← setOptOnce b? c s!"`base` clause in `external {svcName}`" (parseBaseClause svcName c), a?, s?, eps, ws)
-    | ``extSsrfGuardClause => return (b?, a?, ← setOptOnce s? c s!"`ssrf_guard` clause in `external {svcName}`" (pure <| let ov := c.getArg 1; ov.getNumArgs != 1 || (ov.getArg 0).getId.eraseMacroScopes != `false), eps, ws)
-    | ``extAuthBearer | ``extAuthHeader | ``extAuthGcp | ``extAuthGcpMeta => return (b?, ← setOptOnce a? c s!"`auth` clause in `external {svcName}`" (parseAuthClause c), s?, eps, ws)
-    | ``extEndpointClause => return (b?, a?, s?, eps.push c, ws)
-    | ``extWsClause => return (b?, a?, s?, eps, ws.push c)
+    | ``extBaseClause => return (← setOptOnce b? c s!"`base` clause in `external {svcName}`" (parseBaseClause svcName c), a?, s?, eps, ws, invs)
+    | ``extSsrfGuardClause => return (b?, a?, ← setOptOnce s? c s!"`ssrf_guard` clause in `external {svcName}`" (pure <| let ov := c.getArg 1; ov.getNumArgs != 1 || (ov.getArg 0).getId.eraseMacroScopes != `false), eps, ws, invs)
+    | ``extAuthBearer | ``extAuthHeader | ``extAuthGcp | ``extAuthGcpMeta => return (b?, ← setOptOnce a? c s!"`auth` clause in `external {svcName}`" (parseAuthClause c), s?, eps, ws, invs)
+    | ``extEndpointClause => return (b?, a?, s?, eps.push c, ws, invs)
+    | ``extWsClause => return (b?, a?, s?, eps, ws.push c, invs)
+    | ``extInvClause =>
+        let invId : Ident := ⟨c.getArg 1⟩; let leaf := invId.getId.eraseMacroScopes
+        if invs.any (·.1.getId.eraseMacroScopes == leaf) then errAt invId s!"duplicate invariant `{leaf}` in `external {svcName}`"
+        return (b?, a?, s?, eps, ws, invs.push (invId, (c.getArg 3).getSepArgs))
     | _ => errAt c "unexpected clause in `external` block"
   let some baseSpec := base? | errAt svcIdent s!"`external {svcName}` must declare `base \"https://...\"` or `base \"wss://...\"`"
   if eps.isEmpty && ws.isEmpty then errAt svcIdent s!"`external {svcName}` must declare at least one HTTP endpoint or `ws` channel"
@@ -244,7 +323,7 @@ open Lean Elab Command
     errAt baseSpec.ref s!"`external {svcName}` declares HTTP endpoints, so every allowed `base` origin must use `https://` or `http://` (got `{orig}`)"
   if !ws.isEmpty && !baseSpec.vars.isEmpty then errAt baseSpec.ref s!"multi-origin `base ... where ...` in `external {svcName}` is only supported for HTTP endpoints (not client `ws` channels)"
   if !ws.isEmpty && auth?.isSome then errAt svcIdent s!"`external {svcName}` declares client-usable `ws` channels and cannot attach server `auth` secrets; split server-authenticated HTTP endpoints into a separate `external` block"
-  return (baseSpec, auth?.getD .none, ssrf?.getD true, eps, ws)
+  return (baseSpec, auth?.getD .none, ssrf?.getD true, eps, ws, invs)
 
 @[noinline] private def lowerUrlPartsPure (segSpecs : Array UrlSegSpec) (querySpecs : Array (String × QueryValSpec)) (paramIdents : Array Ident) : PureQuotM (Term × Array Term) := do
   let findParam (pn : String) : Ident := paramIdents.find? (·.getId.toString == pn) |>.getD (mkIdent (Name.mkSimple pn))
@@ -295,17 +374,16 @@ private def isUnitExtType (ty : Qed.Lang.LoweredQedType) : Bool := !ty.isProto &
 @[noinline] private def mkBaseResolverCmdsPure (svcIdent : Ident) (svcName : Name) (baseSpec : ParsedBaseSpec) :
     PureQuotM (Ident × Array (TSyntax `command) × TSyntax `command) := do
   let mkS (leaf : Name) := mkIdentFrom svcIdent (svcName ++ leaf)
-  let (allowedId, resolveId, validId) := (mkS `allowedBaseOrigins, mkS `resolveBaseOrigin, mkS `resolveBaseOrigin_valid)
+  let (resolveId, validId) := (mkS `resolveBaseOrigin, mkS `resolveBaseOrigin_valid)
   let vIds := baseSpec.vars.map (·.ident); let vIdTerms : Array Term := vIds.map (⟨·.raw⟩)
   let vTys : Array Term := baseSpec.vars.map fun v => match v.domain with | .unitEnum tyId _ => ⟨tyId.raw⟩ | .strList _ => mkCIdent ``String
   let vBs ← mkTypedBindersPure vIds vTys
   let casesTacs ← mapPQ (baseSpec.vars.filterMap fun v => match v.domain with | .unitEnum .. => some v.ident | .strList .. => none) fun eId => `(tactic| all_goals cases $eId:ident)
-  let allowCmd ← mkStrArrDefPure allowedId baseSpec.allowedOrigins
   let resCall ← Qed.Lang.mkAppTermsPure resolveId vIdTerms
   if baseSpec.isTotal then
     let bodyT ← mkBaseConcatPure baseSpec #[]
     let tac ← `(Lean.Parser.Tactic.tacticSeq| unfold $resolveId; $[$casesTacs:tactic]*; all_goals qedCloseGroundKernel)
-    return (resolveId, #[allowCmd, ← mkDefValPure resolveId vBs (mkCIdent ``String) bodyT false false],
+    return (resolveId, #[← mkDefValPure resolveId vBs (mkCIdent ``String) bodyT false false],
       ← mkSrvThmPure validId vBs (← mkPropEqTrue (← mkAppC ``Qed.Server.isValidBaseOrigin #[resCall])) tac)
   let strVars := baseSpec.vars.filter fun v => match v.domain with | .strList _ => true | .unitEnum .. => false
   let rec buildBranch (idx : Nat) (subst : Array (String × String)) : PureQuotM (Term × Term) := do
@@ -323,7 +401,7 @@ private def isUnitExtType (ty : Qed.Lang.LoweredQedType) : Bool := !ty.isProto &
   let (origId, hId) := (mkIdent `_orig, mkIdent `_h)
   let retTy ← mkAppC ``Except #[mkCIdent ``Qed.Server.ApiError, mkCIdent ``String]
   let thmBs := vBs ++ (← mkTypedBindersPure #[origId, hId] #[mkCIdent ``String, ← `($resCall = Except.ok $origId)])
-  return (resolveId, #[allowCmd, ← mkDefValPure resolveId vBs retTy bodyT false false],
+  return (resolveId, #[← mkDefValPure resolveId vBs retTy bodyT false false],
     ← `(command| theorem $validId $[$thmBs:bracketedBinder]* : $(← mkPropEqTrue (← mkAppC ``Qed.Server.isValidBaseOrigin #[origId])) := $bodyPf $hId))
 
 @[noinline] private def mkExtEncodePure (codec : Qed.ExtWsCodec) (val : Term) (forHttp : Bool) : PureQuotM Term := do
@@ -499,24 +577,25 @@ private def extCodecMeta : Qed.ExtWsCodec → Option String × String
     clientReqConst := reqConst?, clientReqLabel := reqLabel, sendHelperConst }
   return existingNames.push chName
 
-@[noinline] private def mkExternalHeaderPure (svcIdent : Ident) (svcName : Name) (baseOrigin : String) (secretsList : Array String) (authSpec : AuthSpec) :
-    PureQuotM (Ident × Term × Array (TSyntax `command)) := do
+@[noinline] private def mkExternalHeaderPure (svcIdent : Ident) (svcName : Name) (baseOrigin : String)
+    (allowedOrigins secretsList : Array String) (authSpec : AuthSpec) :
+    PureQuotM (Ident × Ident × Ident × Term × Array (TSyntax `command)) := do
   let mkS (leaf : Name) := mkIdentFrom svcIdent (svcName ++ leaf)
-  let baseId := mkS `baseUrl
+  let (baseId, secretsId, allowedId) := (mkS `baseUrl, mkS `secrets, mkS `allowedBaseOrigins)
   let authTerm : Term ← match authSpec with
     | .none => pure (mkCIdent ``Qed.Server.AuthSpec.none)
     | .bearerSecret v => mkAppC ``Qed.Server.AuthSpec.bearerSecret #[quote v]
     | .headerSecret h v => mkAppC ``Qed.Server.AuthSpec.headerSecret #[quote h, quote v]
     | .gcpServiceAccount v sc => mkAppC ``Qed.Server.AuthSpec.gcpServiceAccount #[quote v, quote sc]
     | .gcpMetadata aud? => mkAppC ``Qed.Server.AuthSpec.gcpMetadata #[quote aud?]
-  return (baseId, authTerm, #[← mkDefValPure baseId #[] (mkCIdent ``String) (quote baseOrigin) false (!secretsList.isEmpty),
-    ← mkStrArrDefPure (mkS `secrets) secretsList, ← mkMarkerThmPure (mkS `_qed_external_marker)])
+  return (baseId, secretsId, allowedId, authTerm, #[← mkDefValPure baseId #[] (mkCIdent ``String) (quote baseOrigin) false (!secretsList.isEmpty),
+    ← mkStrArrDefPure secretsId secretsList, ← mkStrArrDefPure allowedId allowedOrigins, ← mkMarkerThmPure (mkS `_qed_external_marker)])
 
 @[noinline, command_elab externalCmd] def elabExternalCmd : CommandElab := fun stx => do
   let svcIdent : Ident := ⟨stx.getArg 2⟩; let (svcName, svcNameStr) := (svcIdent.getId, svcIdent.getId.toString)
-  let (baseSpec, authSpec, ssrfGuard, epClauses, wsClauses) ← parseExternalClauses svcIdent svcName (stx.getArg 4).getArgs
+  let (baseSpec, authSpec, ssrfGuard, epClauses, wsClauses, invClauses) ← parseExternalClauses svcIdent svcName (stx.getArg 4).getArgs
   let (baseOrigin, fullSvcName, secretsList) := (baseSpec.rawTemplate, (← getCurrNamespace) ++ svcName, authSpec.requiredSecrets.toArray)
-  let (baseId, authTerm, hdrCmds) ← runPQ (mkExternalHeaderPure svcIdent svcName baseOrigin secretsList authSpec)
+  let (baseId, secretsId, allowedId, authTerm, hdrCmds) ← runPQ (mkExternalHeaderPure svcIdent svcName baseOrigin baseSpec.allowedOrigins secretsList authSpec)
   foldlCmd hdrCmds () fun _ c => elabCommand c
   let (resolveBaseId?, validCmd?) ← if baseSpec.vars.isEmpty then pure (none, none) else do
     let (resId, defCmds, validCmd) ← runPQ (mkBaseResolverCmdsPure svcIdent svcName baseSpec)
@@ -524,6 +603,10 @@ private def extCodecMeta : Qed.ExtWsCodec → Option String × String
   let m1 ← foldlCmd epClauses #[] (elabExternalEndpoint svcName (Syntax.mkStrLit svcNameStr) baseId baseSpec resolveBaseId? authTerm ssrfGuard)
   let methods ← foldlCmd wsClauses m1 (elabExternalWsChannel svcName fullSvcName svcNameStr baseId)
   if let some vc := validCmd? then elabCommand vc
+  let invAliases : Array (String × Term) := #[("secrets", secretsId), ("allowedBaseOrigins", allowedId)]
+  let invUnfolds : Array Name := #[fullSvcName ++ `secrets, fullSvcName ++ `allowedBaseOrigins]
+  foldlCmd invClauses () fun _ (invId, exprs) =>
+    Qed.Verify.Core.elabStaticMetaInv svcNameStr (fullSvcName ++ invId.getId.eraseMacroScopes) invAliases invUnfolds invId exprs
   modifyEnv fun env => externalRegistry.addEntry env { serviceName := fullSvcName, baseOrigin, secrets := secretsList, methods := methods.map (fullSvcName ++ ·) }
 
 end ExternalElab

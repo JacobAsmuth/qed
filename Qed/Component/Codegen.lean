@@ -262,6 +262,15 @@ private def queryMethTable : List (String × Nat × Name × Bool) :=
       | ``qedStmtPass   => compileStmts spec sBase mutated out? cmds rest
       | ``qedStmtReturn => Lang.runPQ do mkUpdateRetPure spec (← flushMutatedPure sBase mutated) out? cmds
       | ``qedStmtLet    => lowerLetStmt s (lowerCompExpr .val) (← compileStmts spec sBase mutated out? cmds rest)
+      | ``qedStmtLetElse =>
+          let elseStmts := extractLetElseStmts s
+          unless compBlockAlwaysReturns elseStmts do
+            throwErrorAt s "guard `let ... = ... else` branch in component action must `return` on all paths"
+          let (patT, scrutT) := (← liftMacroM (lowerQedPat (s.getArg 1)), ← lowerCompExpr .val (s.getArg 3))
+          let sFlushed ← Lang.runPQ (flushMutatedPure sBase mutated)
+          let thenT ← compileStmts spec sFlushed #[] out? cmds rest
+          let elseT ← compileStmts spec sFlushed #[] out? cmds elseStmts.toList
+          Lang.runPQ `(match $(mkIdent `_qedLetElse):ident : $scrutT:term with | $patT:term => $thenT | _ => $elseT)
       | ``qedStmtIf | ``qedStmtIfLet | ``qedStmtMatch =>
           let passTail := !rest.isEmpty && hasReturnStmt s; let sFlushed ← Lang.runPQ (flushMutatedPure sBase mutated)
           let branchTerm ← lowerControlFlowStmt s (lowerCompExpr .val) fun seq => compileStmts spec sFlushed #[] out? cmds (seq.toList ++ if passTail then rest else [])
@@ -332,7 +341,7 @@ def mkSubBranchesPure (spec : ComponentSpec) (sub : SubDecl) (elseTerm : Term) (
 @[noinline] private def mkSiteUpdateArm (spec : ComponentSpec) (site : SetSite) : CommandElabM MatchAltStx := do
   let rhs0 ← match site.stmts? with
     | some stmts =>
-        if stmts.all fun st => ![``qedStmtAssign, ``qedStmtExpr, ``qedStmtIf, ``qedStmtIfLet, ``qedStmtMatch, ``qedStmtPass].contains st.getKind then
+        if stmts.all fun st => ![``qedStmtAssign, ``qedStmtExpr, ``qedStmtIf, ``qedStmtIfLet, ``qedStmtLetElse, ``qedStmtMatch, ``qedStmtPass].contains st.getKind then
           throwErrorAt stmts[0]! s!"action `{site.ctor}` has no state update or effect; add a state assignment, effect, or `pass`"
         compileStmts spec (← Lang.runPQ `(s)) #[] none #[] stmts.toList
     | none => Lang.runPQ do mkUpdateRetPure spec (← flushAssignsPure (← `(s)) site.assigns) site.send?

@@ -22,7 +22,7 @@ enum FixturePhase:
 enum FixtureRole:
   none
   agent(name: String, extra: String?)
-record FixtureRoom:
+schema FixtureRoom:
   code  : String
   phase : FixturePhase = .lobby
   spies : Nat          = 1 where 1 <= spies <= 4
@@ -43,12 +43,12 @@ theorem fixture_codecs_sound (p : FixturePhase) (r : FixtureRole) (rm : FixtureR
    Proto.decode_encode rm, LawfulJson.fromJson_toJson rm,
    LawfulJson.fromJson_toJson s⟩
 
-record FixtureSecret:
+schema FixtureSecret:
   code   : String
   secret : String
   spies  : String[]
 
-record FixtureRedacted:
+schema FixtureRedacted:
   code   : String
   secret : String?
 

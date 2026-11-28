@@ -453,6 +453,13 @@ private def runAead (op : ByteArray → ByteArray → ByteArray → IO (Except S
   | .error e => Db.PgWire.releaseConn { conn' with healthy := false }; return .error s!"postgres BEGIN failed: {e}"
   | .ok cReady => return .ok (← pgTxBox.modifyGet fun (n, m) => (n, (n + 1, m.insert n cReady)))
 
+private def sanitizeTmpPrefix (pfx : String) : String :=
+  let clean := String.ofList (pfx.toList.filter fun c => c.isAlphanum || c == '-' || c == '_')
+  if clean.isEmpty then "qed-" else clean
+
+private def runNativeIo {α : Type} (act : IO α) : IO (Except ApiError α) :=
+  try .ok <$> act catch e => return .error (ApiError.internal e.toString)
+
 @[implicit_reducible] private def mkNativeServerInstWith (gcpCache? : Option (Prim.StateBox (Array GcpTokenCacheEntry)))
     (cookieSink? : Option (IO.Ref (Array SetCookie)) := none) (sseSink? : Option (IO.Ref (Array SseEvent)) := none)
     (dbCache? : Option DbResolveCache := none) (ssrfGuard : Bool := true) : MonadServer IO where
@@ -477,11 +484,28 @@ private def runAead (op : ByteArray → ByteArray → ByteArray → IO (Except S
         | _ => pure ()
     | .setCookie c => if let some ref := cookieSink? then ref.modify (·.push c) else pure ()
     | .sendSse ev => if let some ref := sseSink? then ref.modify (·.push ev) else pure ()
-    | .readEnv v => Prim.getEnv v | .nowMs => Prim.nowMs | .randomHex n => Prim.randomHex n
+    | .readEnv v => Prim.getEnv v | .nowMs => Prim.nowMs | .sleep ms => IO.sleep ms.toUInt32
+    | .randomHex n => Prim.randomHex n
     | .randomBytes n => Prim.randomBytes n | .hmacSha256 key msg => Prim.hmacSha256 key msg
     | .sha256 data => Prim.sha256 data | .constEq a b => Prim.constEq a b | .wsBroadcast t p => Prim.wsBroadcast t p
     | .aeadEncrypt kEnv fb aad pt => runAead Prim.aeadEncrypt kEnv fb aad pt
     | .aeadDecrypt kEnv fb aad ct => runAead Prim.aeadDecrypt kEnv fb aad ct
+    | .procExec cmd args cwd? env => runNativeIo do
+        let out ← IO.Process.output { cmd, args, cwd := cwd?.map System.FilePath.mk, env := env.toArray }
+        return { exitCode := out.exitCode, stdout := out.stdout, stderr := out.stderr }
+    | .fsRead path => runNativeIo (IO.FS.readBinFile path)
+    | .fsWrite path data => runNativeIo (IO.FS.writeBinFile path data)
+    | .fsMkdirAll path => runNativeIo (IO.FS.createDirAll path)
+    | .fsRemoveAll path => runNativeIo do
+        let p : System.FilePath := path
+        if ← p.pathExists then
+          if ← p.isDir then IO.FS.removeDirAll p else IO.FS.removeFile p
+    | .fsExists path => (System.FilePath.mk path).pathExists
+    | .fsMktempDir pfx => runNativeIo do
+        let base := (← IO.getEnv "TMPDIR").getD "/tmp"
+        let dir := s!"{base}/{sanitizeTmpPrefix pfx}{← Prim.randomHex 8}"
+        IO.FS.createDirAll dir
+        return dir
 
 @[implicit_reducible] def mkNativeServerInst (gcpCache? : Option (Prim.StateBox (Array GcpTokenCacheEntry)))
     (cookieSink? : Option (IO.Ref (Array SetCookie)) := none) (sseSink? : Option (IO.Ref (Array SseEvent)) := none) : MonadServer IO :=

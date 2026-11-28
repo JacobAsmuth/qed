@@ -87,6 +87,11 @@ initialize currentCompSessionRef : IO.Ref (Option Ident)              ← IO.mkR
       match st.getKind with
       | ``qedStmtPass => compileClassifyStmts spec rest
       | ``qedStmtLet  => lowerLetStmt st (lowerCompExpr .val) (← compileClassifyStmts spec rest)
+      | ``qedStmtLetElse =>
+          let (patT, scrutT) := (← liftMacroM (lowerQedPat (st.getArg 1)), ← lowerCompExpr .val (st.getArg 3))
+          let thenT ← compileClassifyStmts spec rest
+          let elseT ← compileClassifyStmts spec (extractLetElseStmts st).toList
+          Lang.runPQ `(match $(mkIdent `_qedLetElse):ident : $scrutT:term with | $patT:term => $thenT | _ => $elseT)
       | ``qedStmtIf | ``qedStmtIfLet | ``qedStmtMatch => lowerControlFlowStmt st (lowerCompExpr .val) fun seq => compileClassifyStmts spec seq.toList
       | _ => if let some (_, wrap) ← lowerMutStmt? spec st false then wrap (← compileClassifyStmts spec rest) else compileClassifyStmts spec rest
 

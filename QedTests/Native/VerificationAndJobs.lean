@@ -266,7 +266,19 @@ def run : IO Bool := do
     let st1 ← Prim.atomicRead box id; c.checkEq "heartbeat & markReset ran 5 ticks" (st1.ticks, st1.resets) (5, 5); c.check "final state preserves bounded invariant" (st1.ticks ≤ 50)
     let (box2, ioJobs2, stopFlag2) ← mkJobs; let tasks2 ← Qed.Server.spawnServerJobs ioJobs2 (stopFlag? := some stopFlag2) (maxTicks := 1000)
     IO.sleep 60; stopFlag2.set true; tasks2.forM fun t => discard <| IO.wait t
-    let st2 ← Prim.atomicRead box2 id; c.check "background job ticked before stopFlag" (st2.ticks ≥ 1 && st2.ticks < 50))]
+    let st2 ← Prim.atomicRead box2 id; c.check "background job ticked before stopFlag" (st2.ticks ≥ 1 && st2.ticks < 50)
+    letI : MonadServer IO := srvInst
+    do
+      Qed.Time.sleepMs 5
+      c.expectOk "Fs.mktempDir ok" (← Qed.Fs.mktempDir "qed-native-test-") fun dir => do
+        let fpath := s!"{dir}/hello.txt"
+        c.check "Fs.writeText ok" (← Qed.Fs.writeText fpath "qed-fs-ok").isOk
+        c.check "Fs.pathExists before remove" (← Qed.Fs.pathExists fpath)
+        c.checkEq "Fs.readText matches" (← Qed.Fs.readText fpath) (.ok "qed-fs-ok")
+        c.expectOk "Proc.execOk echo ok" (← Qed.Proc.execOk "echo" #["qed-proc-ok"]) fun out =>
+          c.checkEq "Proc.execOk stdout" out.trimmed "qed-proc-ok"
+        c.check "Fs.removeAll ok" (← Qed.Fs.removeAll dir).isOk
+        c.check "Fs.pathExists false after remove" (!(← Qed.Fs.pathExists dir)))]
   c.finish
 
 end QedTests.Native.VerificationAndJobs

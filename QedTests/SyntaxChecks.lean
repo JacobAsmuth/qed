@@ -34,8 +34,8 @@ component HelperApp:
   state draft : String = ""
   action localEvent(m: LocalNested.ParentMsg): pass
   view: importedHelper({ id = 8, label = draft }).map(.localEvent)
-bad_comp "`label` is a read-only `prop` and cannot be assigned (`state` fields: `count`)" ReadOnly : prop label : String | state count : Nat = 0 | action change: label = "changed" | view: <span>{label}</span>
-bad_comp "duplicate action name `save`" DuplicateAction : state count : Nat = 0 | action save: count = 1 | action save: count = 2 | view: <span>{count}</span>
+bad_comp "`label` is a read-only `prop` and cannot be assigned (`state` fields: `count`)" ReadOnly : prop label : String || state count : Nat = 0 || action change: label = "changed" || view: <span>{label}</span>
+bad_comp "duplicate action name `save`" DuplicateAction : state count : Nat = 0 || action save: count = 1 || action save: count = 2 || view: <span>{count}</span>
 component Owned:
   prop caption : String
   state id : Nat
@@ -43,7 +43,7 @@ component Owned:
   key id
   action increment: count = count + 1
   view: <button title={caption} onClick={.increment}>{count}</button>
-route_enum Section:
+enum Section:
   overview
   architecture = "arch"
   benchmarks   = "bench"
@@ -164,9 +164,9 @@ component GoodLazy:
   state m : Nat = 7
   view: <div><a href={goodSafeUrl}>Docs</a><a href={url("/about")}>About</a>{Qed.lazy((k: Nat) => <span>{k}</span>, m / 2)}</div>
 def sneakyBlock {msg : Type} : Html msg := <div>bad</div>
-bad_comp_view "Invalid HTML / XSS check failed for this view:\n  • `<div>` cannot be nested inside `<p>` or a heading (`<h1>-<h6>`)" BadOpaqueNesting u : Unit = () | <p>{sneakyBlock}</p>
-bad_comp_view "Qed.lazy function must not capture state directly" BadLazyCapturesModel m : Nat = 1 | <div>{Qed.lazy((k: Nat) => <span>{k + m}</span>, m / 2)}</div>
-bad_comp "SSR hydration mismatch: `ephemeral` field affects the rendered view:\n  • view mismatch after rehydration:  \"hi\" = b" BadEphemeralReadByView : state a : Nat = 1 | ephemeral b : String = "hi" | view: <div>{a}{b}</div>
+bad_comp_view "Invalid HTML / XSS check failed for this view:\n  • `<div>` cannot be nested inside `<p>` or a heading (`<h1>-<h6>`)" BadOpaqueNesting u : Unit = () || <p>{sneakyBlock}</p>
+bad_comp_view "Qed.lazy function must not capture state directly" BadLazyCapturesModel m : Nat = 1 || <div>{Qed.lazy((k: Nat) => <span>{k + m}</span>, m / 2)}</div>
+bad_comp "SSR hydration mismatch: `ephemeral` field affects the rendered view:\n  • view mismatch after rehydration:  \"hi\" = b" BadEphemeralReadByView : state a : Nat = 1 || ephemeral b : String = "hi" || view: <div>{a}{b}</div>
 
 -- Sub-components, `Field`, `<Await>`, & fractional CSS checks
 style fracStyle:
@@ -221,7 +221,7 @@ component EarlyReturnCheck:
     if n <= 0: return
     x += n
   view: <span>{x}</span>
-  invariant xPos: 0 <= x := by intro m msg h; cases msg <;> simp_all [update] <;> split <;> simp_all <;> omega
+  invariant xPos: 0 <= x prove: intro m msg h; cases msg <;> simp_all [update] <;> split <;> simp_all <;> omega
 def lazyBadge {msg : Type} (k : Nat) : Html msg := <span>{k}</span>
 component FineGrainedCheck:
   state count : Nat = 1
@@ -230,8 +230,8 @@ component FineGrainedCheck:
   view: <div><span class="c">{count}</span>{<p>zero</p> if count == 0 else <p>nonzero</p>}{Qed.lazy(lazyBadge, count)}<ul>{for n in items: <li key={n}>{n}</li>}</ul></div>
 example : ((EarlyReturnCheck.update { x := 5 } (.step 0)).x == 5 && (EarlyReturnCheck.update { x := 5 } (.step 3)).x == 8 &&
   (match FineGrainedCheck.app.template with | .element "div" _ [.element "span" _ [.dyn _], .ifElse _ _ _, .memo _, .keyedList "ul" _ _ _ _ _ _ (some _)] => true | _ => false)) = true := by decide +kernel
-bad_comp_inv "Invariant `BadUnguardedDecrease.inRange` failed in `BadUnguardedDecrease.update`:\n  • action `decrease` must satisfy:  1 <= quantity - 1 and quantity - 1 <= 10" BadUnguardedDecrease quantity : Nat = 1 | inRange : 1 <= quantity <= 10 | decrease : quantity -= 1
-bad_comp_act "`qunatity` is not a `state` field of this component (did you mean `quantity`?) (`state` fields: `quantity`)" BadStateFieldTypo quantity : Nat = 1 | inc : qunatity += 1
+bad_comp_inv "Invariant `BadUnguardedDecrease.inRange` failed in `BadUnguardedDecrease.update`:\n  • action `decrease` must satisfy:  1 <= quantity - 1 and quantity - 1 <= 10" BadUnguardedDecrease quantity : Nat = 1 || inRange : 1 <= quantity <= 10 || decrease : quantity -= 1
+bad_comp_act "`qunatity` is not a `state` field of this component (did you mean `quantity`?) (`state` fields: `quantity`)" BadStateFieldTypo quantity : Nat = 1 || inc : qunatity += 1
 style safeBtnStyle:
   background-color: #111
 style dangerBtnStyle:
@@ -240,9 +240,9 @@ component StyleLacksGood:
   state ok : Bool = true
   view: <div><button role="submit" {safeBtnStyle}>OK</button><span>safe</span></div>
   invariant noDanger: roleLacks("submit", dangerBtnStyle), tagLacks("span", dangerBtnStyle)
-bad_comp "Styling invariant `BadRoleLacks.noDanger` failed in `BadRoleLacks.view`:\n  • `roleLacks(\"submit\", dangerBtnStyle)` does not hold in every state" BadRoleLacks : state ok : Bool = true | view: <button role="submit" {dangerBtnStyle}>Bad</button> | invariant noDanger: roleLacks("submit", dangerBtnStyle)
-bad_comp "Invariant `BadPropInit.nonNeg` failed on initial state `BadPropInit.init`:\n  • initial state must satisfy:  0 <= -1" BadPropInit : prop offset : Int = 0 | state count : Int = -1 | action nop: pass | invariant nonNeg: 0 <= count | view: <span>{count}</span>
-bad_comp "SSR rehydration can violate the component's state invariant:\n  • after rehydration must satisfy:  5 <= shown + 0" BadEphemeralInv : state shown : Int = 5 | ephemeral cache : Int = 0 | action shift: shown = 0; cache = 5 | invariant totalMin: 5 <= shown + cache | view: <span>{shown}</span>
+bad_comp "Styling invariant `BadRoleLacks.noDanger` failed in `BadRoleLacks.view`:\n  • `roleLacks(\"submit\", dangerBtnStyle)` does not hold in every state" BadRoleLacks : state ok : Bool = true || view: <button role="submit" {dangerBtnStyle}>Bad</button> || invariant noDanger: roleLacks("submit", dangerBtnStyle)
+bad_comp "Invariant `BadPropInit.nonNeg` failed on initial state `BadPropInit.init`:\n  • initial state must satisfy:  0 <= -1" BadPropInit : prop offset : Int = 0 || state count : Int = -1 || action nop: pass || invariant nonNeg: 0 <= count || view: <span>{count}</span>
+bad_comp "SSR rehydration can violate the component's state invariant:\n  • after rehydration must satisfy:  5 <= shown + 0" BadEphemeralInv : state shown : Int = 5 || ephemeral cache : Int = 0 || action shift: shown = 0; cache = 5 || invariant totalMin: 5 <= shown + cache || view: <span>{shown}</span>
 
 -- Self-hosted `<Schema.Form>` & unified syntax checks
 component SelfHostedFormKeep:
@@ -259,7 +259,7 @@ component MultiParamAndAutoDefaults:
   view: <button onClick={.pushBoth(4, "hi")}>{xs.size}</button>
 example : MultiParamAndAutoDefaults.update MultiParamAndAutoDefaults.init (.pushBoth 4 "hi") = ({ xs := #[4], x := some 4 }, some (.emitted 4 "hi")) ∧
     MultiParamAndAutoDefaults.init.xs = #[] ∧ MultiParamAndAutoDefaults.init.x = none := ⟨rfl, rfl, rfl⟩
-bad_comp_view "use `Nat[]` instead of `Array Nat`" BadArrayType xs : Array Nat = [] | <span>{xs.size}</span>
+bad_comp_view "use `Nat[]` instead of `Array Nat`" BadArrayType xs : Array Nat = [] || <span>{xs.size}</span>
 bad_schema "use `Nat?` instead of `Option Nat`" BadOptType : val : Option Nat
 bad_schema "use `jsonOnly(String)` with parentheses instead of `jsonOnly String`" BadJsonOnly : id : jsonOnly String
 
@@ -356,7 +356,7 @@ enum RoleCard:
 enum TickEvent:
   empty
   tick(t: Nat, label: String)
-record RoomSnapshotRec:
+schema RoomSnapshotRec:
   code       : String
   phase      : GamePhase = .lobby
   spyCount   : Nat       = 1 where 1 <= spyCount <= 4
@@ -369,7 +369,7 @@ schema OptSchema:
   note  : String?
   phase : GamePhase?
 deriving instance Repr, DecidableEq for OptSchema
-record CustomInhabRec:
+schema CustomInhabRec:
   count : Nat
 instance : Inhabited CustomInhabRec := ⟨{ count := 42 }⟩
 example (s : OptSchema) : String × Option String := (s.title, s.note)
@@ -388,18 +388,18 @@ mapping RoomFrameMap:
   decode(frame):
     let bytes = Proto.decodeHex(frame)?
     return Proto.decode(bytes)?
-bad_enum "duplicate variant `a` in `enum DupEnum`" DupEnum : a | a
+bad_enum "duplicate variant `a` in `enum DupEnum`" DupEnum : a || a
 bad_enum "duplicate field `x` in variant `pair` of `enum DupEnumField`" DupEnumField : pair(x: Nat, x: String)
-bad_rec "Record `BadRecDefault` default for field `qty` failed `where` constraint" BadRecDefault : qty : Nat = 99 where 1 <= qty <= 4
-bad_rec "Record `UnsatRec` is unsatisfiable: field `qty` has contradictory `where` constraints" UnsatRec : qty : Nat where 10 <= qty, qty <= 2
+bad_schema "Schema `BadRecDefault` default for field `qty` failed `where` constraint" BadRecDefault : qty : Nat = 99 where 1 <= qty <= 4
+bad_schema "Schema `UnsatRec` is unsatisfiable: field `qty` has contradictory `where` constraints" UnsatRec : qty : Nat where 10 <= qty, qty <= 2
 
 -- Pure `fn` contracts (`requires`, `ensures`, `if`, `blindTo`)
-record SecretRoom:
+schema SecretRoom:
   code           : String
   secretLocation : String
   secretPack     : String
   spyIds         : String[]
-record RedactedView:
+schema RedactedView:
   code           : String
   secretLocation : String?
   secretPack     : String?
@@ -430,12 +430,12 @@ fn redactSingleField(room: SecretRoom, viewerId: String) -> String?:
   return some(room.secretLocation)
 check_decls [projectSecretRoom_ensures_1, projectSecretRoom_ensures_2, projectSecretRoom_blindTo,
   clampRoundMins_ensures, hideWholeParam_ensures, hideWholeParam_blindTo, redactSingleField_blindTo]
-bad_fn "`blindTo room.secretLocation` failed in `leakyProjection`" leakyProjection(room: SecretRoom, viewerId: String) -> RedactedView |
+bad_fn "`blindTo room.secretLocation` failed in `leakyProjection`" leakyProjection(room: SecretRoom, viewerId: String) -> RedactedView ||
   if viewerId in room.spyIds:
     ensures result.secretLocation == none
     blindTo room.secretLocation
-  : let isSpy = viewerId in room.spyIds | return { code = f"{room.code}:{room.secretLocation}", secretLocation = none if isSpy else some(room.secretLocation), secretPack = none, isSpy = isSpy }
-bad_fn "`ensures` contract failed for `badClamp`" badClamp(n: Nat) -> Nat | ensures result <= 10 : return n
+  : let isSpy = viewerId in room.spyIds || return { code = f"{room.code}:{room.secretLocation}", secretLocation = none if isSpy else some(room.secretLocation), secretPack = none, isSpy = isSpy }
+bad_fn "`ensures` contract failed for `badClamp`" badClamp(n: Nat) -> Nat || ensures result <= 10 : return n
 
 -- Component `fn` (pure + state-mutating), implication invariants, per-action `prove:`, and keyed hoisted sub-components
 enum ViewTab:
@@ -471,12 +471,12 @@ component CompFnAndProve:
       case inc: omega
   view: <div><span>{heading("Room")}</span><PureFnBadge name={title}/></div>
 check_decls [CompFnAndProve.homeClean, CompFnAndProve.nonNeg, CompFnAndProve.app_view_eq]
-bad_comp "unknown action/message `noSuchAction` in `prove:` on invariant `BadProveCase.ok`" BadProveCase : state n : Nat = 0 | action inc: n += 1 |
+bad_comp "unknown action/message `noSuchAction` in `prove:` on invariant `BadProveCase.ok`" BadProveCase : state n : Nat = 0 || action inc: n += 1 ||
   invariant ok: n >= 0
     prove:
       case noSuchAction: omega
-  | view: <span>{n}</span>
-bad_comp "`fn reset` has no `-> ReturnType` and mutates component state" BadMutFnInPure : prop x : Nat = 0 | fn reset(): pass | view: <span>{x}</span>
+  || view: <span>{n}</span>
+bad_comp "`fn reset` has no `-> ReturnType` and mutates component state" BadMutFnInPure : prop x : Nat = 0 || fn reset(): pass || view: <span>{x}</span>
 
 -- Keyed / conditional hoisted sub-components with lifecycle reset, `start`, and lifted `subscribe`
 server SubHostSrv:
@@ -564,7 +564,7 @@ router PolishRoute:
   item                              = "/items/:id"
   appTab(slug: ShortSlug, tab: PolishTab) = "/apps/:slug/:tab"
   report(day: Date)                 = "/reports/:day"
-record NestedFilter:
+schema NestedFilter:
   page   : Nat      = 0
   search : String   = ""
   tags   : String[] = []
@@ -631,14 +631,14 @@ component MultiStyleSpliceDemo:
 bad_style "duplicate CSS property `padding` in the same style block" BadDupCssProp :
   padding: 4px
   padding: 8px
-bad_comp "recursive `await` call cycle in component `fn ping`" BadAsyncCycleComp : state x : String = "" |
+bad_comp "recursive `await` call cycle in component `fn ping`" BadAsyncCycleComp : state x : String = "" ||
   fn ping():
     let _r = await PolishRpcSrv.saveItem("a") catch:
       case _: pass
     pong()
-  | fn pong(): ping() | action go: ping() | view: <span>{x}</span>
-bad_comp "cannot use `await` inside pure component `fn pureBad`; remove `-> ReturnType` for an async mutating helper, or perform `await` in the calling `action`" BadPureAwaitComp : state x : String = "" | fn pureBad() -> String: let r = await PolishRpcSrv.saveItem("a"); return r | view: <span>{x}</span>
-bad_enum "duplicate wire name `dup` in `enum BadDupWireEnum`" BadDupWireEnum : a = "dup" | b = "dup"
+  || fn pong(): ping() || action go: ping() || view: <span>{x}</span>
+bad_comp "cannot use `await` inside pure component `fn pureBad`; remove `-> ReturnType` for an async mutating helper, or perform `await` in the calling `action`" BadPureAwaitComp : state x : String = "" || fn pureBad() -> String: let r = await PolishRpcSrv.saveItem("a"); return r || view: <span>{x}</span>
+bad_enum "duplicate wire name `dup` in `enum BadDupWireEnum`" BadDupWireEnum : a = "dup" || b = "dup"
 expect_err "Field `BadImpossibleField` is unsatisfiable" in field BadImpossibleField : Nat where n => n > 10, n < 5
 check_decls [ShortSlug.satisfiable, ServicePort.satisfiable, SessionParentShell.app_view_eq, MultiStyleSpliceDemo.app_view_eq]
 
@@ -672,7 +672,7 @@ example : Qed.LawfulJson Wide24Schema × Qed.LawfulProto Wide24Schema × Qed.Law
   (inferInstance, inferInstance, inferInstance)
 
 /-! ## Grammar Upgrades (`private`/`const`, `for`/`mut`/`range`/`break`/`continue`, `??`, enum examples) -/
-private record PrivateToken:
+private schema PrivateToken:
   label : String where 1 <= label.length <= 16
   score : Nat    where score <= 100
   example okTok: label = "alpha", score = 42
@@ -744,13 +744,13 @@ example : (let tok := PrivateToken.okTok
   (match PrivateMsg.note "ok" with | .note s => s == "ok" | .ping => false) &&
   DEFAULT_STEP == 3 && SECRET_CAP == 100 && ALLOWED_REGIONS == #["us", "eu"] &&
   OrderRole.admin.isPrivileged && !OrderRole.viewer.isPrivileged) = true := by decide +kernel
-bad_fn "`break` can only be used inside a `for` loop" badBreakOutsideFor(n: Nat) -> Nat : break | return n
-bad_fn "`continue` can only be used inside a `for` loop" badContinueOutsideFor(n: Nat) -> Nat : continue | return n
-bad_fn "cannot assign to `x` in pure" badAssignImmutable(n: Nat) -> Nat : let x = n | x = 5 | return x
-bad_fn "mutable variable `acc` is already declared in this scope" badDupLetMut(n: Nat) -> Nat : let mut acc = 0 | let mut acc = n | return acc
-bad_fn "shadows mutable variable `acc`" badForShadowMut(n: Nat) -> Nat : let mut acc = 0 | for acc in range(n): acc += 1 | return acc
-bad_fn "`range(...)` expects 1, 2, or 3 arguments" badRangeZero() -> Nat : let mut s = 0 | for i in range(): s += i | return s
-bad_fn "`range(...)` expects 1, 2, or 3 arguments" badRangeFour() -> Nat : let mut s = 0 | for i in range(0, 10, 2, 1): s += i | return s
+bad_fn "`break` can only be used inside a `for` loop" badBreakOutsideFor(n: Nat) -> Nat : break || return n
+bad_fn "`continue` can only be used inside a `for` loop" badContinueOutsideFor(n: Nat) -> Nat : continue || return n
+bad_fn "cannot assign to `x` in pure" badAssignImmutable(n: Nat) -> Nat : let x = n || x = 5 || return x
+bad_fn "mutable variable `acc` is already declared in this scope" badDupLetMut(n: Nat) -> Nat : let mut acc = 0 || let mut acc = n || return acc
+bad_fn "shadows mutable variable `acc`" badForShadowMut(n: Nat) -> Nat : let mut acc = 0 || for acc in range(n): acc += 1 || return acc
+bad_fn "`range(...)` expects 1, 2, or 3 arguments" badRangeZero() -> Nat : let mut s = 0 || for i in range(): s += i || return s
+bad_fn "`range(...)` expects 1, 2, or 3 arguments" badRangeFour() -> Nat : let mut s = 0 || for i in range(0, 10, 2, 1): s += i || return s
 
 /-! ## Ground Kernel `example`, Cons Patterns, Tuple `let`, Multiline Signatures & Type Inference -/
 fn parseBigJsonAndEncode(raw: String) -> Except String String:
@@ -847,11 +847,11 @@ fn mkDeepKey10?(a: Nat, b: Nat, c: Nat, g: Nat, d: String, e: String, f: String)
   return some(f"pfx-{a}-{b}-{c}-{g}-{d}-{e}-{f}")
 check_decls [mkGcpSecretId?_ensures_1, mkGcpSecretId?_ensures_2, mkBucketKey?_ensures, mkIntKey?_ensures,
   mkHelperKey?_ensures, clamp0_100_ensures, normalizePort_ensures, mkScopedKey_ensures, mkDeepKey10?_ensures]
-bad_fn "`ensures` contract failed for `mkBadSecretId?`:\n  • action `right` must satisfy:  env = e2\n  • action `right` must satisfy:  name = n2" mkBadSecretId?(tenantId: Nat, env: String, name: String) -> String? |
+bad_fn "`ensures` contract failed for `mkBadSecretId?`:\n  • action `right` must satisfy:  env = e2\n  • action `right` must satisfy:  name = n2" mkBadSecretId?(tenantId: Nat, env: String, name: String) -> String? ||
   ensures all t2: Nat, e2: String, n2: String: if result.isSome and result == mkBadSecretId?(t2, e2, n2): tenantId == t2 and env == e2 and name == n2 :
-  if env not in ["dev", "dev-eu", "prod"]: return none | if name.length == 0: return none | return some(f"qed-t{tenantId}-{env}-{name}")
-bad_fn "`ensures` contract failed for `mkBadConcat`:\n  • action `left` must satisfy:  a = a2\n  • action `right` must satisfy:  b = b2" mkBadConcat(a: Nat, b: Nat) -> String | ensures all a2: Nat, b2: Nat: result == mkBadConcat(a2, b2) -> a == a2 and b == b2 : return f"k-{a}{b}"
-bad_fn "`ensures` contract failed for `mkBadValidity?`" mkBadValidity?(tenantId: Nat, name: String) -> String? | ensures if let some(id) = result: isValidGcpSecretId(id) : if name.length == 0: return none | return some(f"k-{tenantId}-{name}")
+  if env not in ["dev", "dev-eu", "prod"]: return none || if name.length == 0: return none || return some(f"qed-t{tenantId}-{env}-{name}")
+bad_fn "`ensures` contract failed for `mkBadConcat`:\n  • action `left` must satisfy:  a = a2\n  • action `right` must satisfy:  b = b2" mkBadConcat(a: Nat, b: Nat) -> String || ensures all a2: Nat, b2: Nat: result == mkBadConcat(a2, b2) -> a == a2 and b == b2 : return f"k-{a}{b}"
+bad_fn "`ensures` contract failed for `mkBadValidity?`" mkBadValidity?(tenantId: Nat, name: String) -> String? || ensures if let some(id) = result: isValidGcpSecretId(id) : if name.length == 0: return none || return some(f"k-{tenantId}-{name}")
 
 /-! ## Issue #22 Section 2: Ground `String.all`, Helper `Char -> Bool`, `List.mem_cons`, `::`, `qedSeqLit%`, `Repr Json` -/
 fn isGcpSecretCharHelper(c: Char) -> Bool:
@@ -867,10 +867,10 @@ fn mkSecretWithHelper?(tenantId: Nat, name: String) -> String?:
   if not name.all(c => c.isLower or c.isDigit or c == '_'): return none
   if toString(tenantId).length > 20: return none
   return some(f"t-{tenantId}-{name}")
-record Sec2AlertEv:
+schema Sec2AlertEv:
   kind: String
   msg: String
-record Sec2Snap:
+schema Sec2Snap:
   requests: Nat
   errors: Nat
   latencyMs: Nat
@@ -897,19 +897,19 @@ fn consAndJsonExample(n: Nat, xs: List Nat) -> List Nat:
     let pol = Json.object([("k", .str("v")), ("bindings", Json.array([Json.object([("role", .str("r")), ("members", Json.array([.str("m")]))])]))]);
     pol.strAtD("k") == "v"
   return n + 1 :: n + 2 :: xs
-record JsonPayloadRec:
+schema JsonPayloadRec:
   label: String
   body: Json
 example : Repr JsonPayloadRec := inferInstance
 check_decls [isValidGcpSecretIdHelper_example_ok, isValidGcpSecretIdHelper_example_bad, mkSecretWithHelper?_ensures,
   evaluateSec2Alerts_ensures, evaluateSec2AlertsMut_ensures, consAndJsonExample_example_consOk, consAndJsonExample_example_jsonPolOk]
-bad_fn "`example` failed for `badGroundStrAll`" badGroundStrAll(s: String) -> Bool | example wrong: badGroundStrAll("abc") == false : return s.all(c => c >= 'a' and c <= 'z')
-bad_fn "`example` failed for `badGroundBigBase64`" badGroundBigBase64(s: String) -> String |
+bad_fn "`example` failed for `badGroundStrAll`" badGroundStrAll(s: String) -> Bool || example wrong: badGroundStrAll("abc") == false : return s.all(c => c >= 'a' and c <= 'z')
+bad_fn "`example` failed for `badGroundBigBase64`" badGroundBigBase64(s: String) -> String ||
   example wrong: badGroundBigBase64("abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz") == "wrong" :
   return Qed.Base64.encode(s.toUTF8)
 
 /-! ## Issue #22 Section 1.3: Pure `fn` `for`-Loop Invariants (Phase A + Phase B + Diagnostics) -/
-record LoopShard:
+schema LoopShard:
   id     : String
   active : Bool
   used   : Nat
@@ -967,7 +967,7 @@ fn findFirstGtLoop(xs: Nat[], threshold: Nat) -> Nat?:
     found = some(x)
     break
   return found
-record LoopCand:
+schema LoopCand:
   id       : String
   active   : Bool
   weight   : Nat
@@ -1356,4 +1356,359 @@ expect_err "`ensures` contract failed for `badUnsortedFn`" in
   fn badUnsortedFn(xs: Nat[]) -> Nat[]:
     ensures result.isSorted()
     return xs
+
+/-! ## Issue #22 Item 1: Bitwise (`&`, `|`, `^`, `<<`, `>>`, `~`), Exponentiation (`**`), & Constant-Time Equality -/
+
+schema BitOpsOut:
+  powVal  : Nat
+  bandVal : Nat
+  borVal  : Nat
+  bxorVal : Nat
+  shlVal  : Nat
+  shrVal  : Nat
+  negPow  : Int
+
+fn bitOpsAndPowDemo(a: Nat, b: Nat) -> BitOpsOut:
+  example powRightAssoc: (bitOpsAndPowDemo(2, 3)).powVal == 512
+  example bitPrec:
+    let r = bitOpsAndPowDemo(0xf0, 0x3c);
+    r.bandVal == 0x30 and r.borVal == 0xfc and r.bxorVal == 0xcc and r.shlVal == 0x3c0 and r.shrVal == 0x3c and r.negPow == -4
+  return {
+    powVal = a ** 3 ** 2,
+    bandVal = a & b,
+    borVal = a | b,
+    bxorVal = a ^ b,
+    shlVal = a << 2,
+    shrVal = a >> 2,
+    negPow = -(2 : Int) ** 2
+  }
+
+fn bitPrecedenceChecks(x: Nat, opt: Nat?) -> (Bool, Nat, Nat):
+  example tightCmp: (bitPrecedenceChecks(0x5a, none)).fst == true
+  example tightCoal: (bitPrecedenceChecks(0, none)).snd.fst == 0x3
+  example xorTighterThanOr: (bitPrecedenceChecks(0, some(5))).snd.snd == 1
+  return (x & 0x0f == 0x0a, opt ?? 0x1 | 0x2, 1 | 2 ^ 3)
+
+fn bitNotU8(x: UInt8) -> UInt8:
+  example invLow: bitNotU8(0x0f) == 0xf0
+  return ~x
+
+fn fnv1a64(s: String) -> UInt64:
+  example emptyVec: fnv1a64("") == 0xcbf29ce484222325
+  example foobarVec: fnv1a64("foobar") == 0x85944171f73967e8
+  let bytes = s.toUTF8
+  let mut h : UInt64 = 0xcbf29ce484222325
+  for i in range(bytes.size):
+    let b = bytes.get!(i).toUInt64
+    h = (h ^ b) * 0x100000001b3
+  return h
+
+fn u64ToHexLower(v: UInt64) -> String:
+  example zeroHex: u64ToHexLower(0) == "0000000000000000"
+  example deadbeefHex: u64ToHexLower(0x0123456789abcdef) == "0123456789abcdef"
+  let digits = "0123456789abcdef".toUTF8
+  let mut out = ByteArray.emptyWithCapacity(16)
+  for i in range(16):
+    let shift : UInt64 = ((15 - i) * 4).toUInt64
+    let nib = ((v >> shift) & 0xf).toNat
+    out = out.push(digits.get!(nib))
+  return String.fromUTF8!(out)
+
+fn verifyBytesCtEq(a: Bytes, b: Bytes) -> Bool:
+  ensures result == (a == b)
+  example eqSame: verifyBytesCtEq("secret".toUTF8, "secret".toUTF8) == true
+  example neqDiff: verifyBytesCtEq("secret".toUTF8, "secrex".toUTF8) == false
+  example neqLen: verifyBytesCtEq("abc".toUTF8, "abcd".toUTF8) == false
+  return Bytes.ctEq(a, b)
+
+fn verifyBytesDotCtEq(a: Bytes, b: Bytes) -> Bool:
+  ensures result == (a == b)
+  return a.ctEq(b)
+
+fn verifyStrCtEq(a: String, b: String) -> Bool:
+  ensures result == (a == b)
+  example eqStr: verifyStrCtEq("tok_123", "tok_123") == true
+  example neqStr: verifyStrCtEq("tok_123", "tok_124") == false
+  return Str.ctEq(a, b)
+
+fn verifyStrDotCtEq(a: String, b: String) -> Bool:
+  ensures result == (a == b)
+  return a.ctEq(b)
+
+check_decls [bitOpsAndPowDemo_example_powRightAssoc, bitOpsAndPowDemo_example_bitPrec,
+  bitPrecedenceChecks_example_tightCmp, bitPrecedenceChecks_example_tightCoal, bitPrecedenceChecks_example_xorTighterThanOr,
+  bitNotU8_example_invLow, fnv1a64_example_emptyVec, fnv1a64_example_foobarVec,
+  u64ToHexLower_example_zeroHex, u64ToHexLower_example_deadbeefHex,
+  verifyBytesCtEq_ensures, verifyBytesCtEq_example_eqSame, verifyBytesCtEq_example_neqDiff, verifyBytesCtEq_example_neqLen,
+  verifyBytesDotCtEq_ensures, verifyStrCtEq_ensures, verifyStrCtEq_example_eqStr, verifyStrCtEq_example_neqStr,
+  verifyStrDotCtEq_ensures]
+
+bad_fn "`ensures` contract failed for `badCtEqFlip`" badCtEqFlip(a: String, b: String) -> Bool ||
+  ensures result == (a == b) : return not Str.ctEq(a, b)
+
+/-! ## Grammar Simplification: Contextual Keywords, Unified `schema`, and `prove:` Everywhere -/
+
+/-- Documented schema proving previously reserved Qed keywords are usable as field names. -/
+schema ContextualKwFields:
+  schema    : String = "public"
+  style     : String = "default"
+  theme     : String = "light"
+  server    : String = "api"
+  database  : String = "main"
+  router    : String = "root"
+  deploy    : String = "prod"
+  external  : String = "ext"
+  fullstack : String = "web"
+  component : String = "app"
+  keyframes : String = "fade"
+  invariant : String = "ok"
+  holds_in  : String = "v"
+  assuming  : String = "p"
+
+fn contextualKwParams(schema: String, style: String, theme: String, server: String, database: String, router: String) -> String:
+  example allJoined: contextualKwParams("s", "st", "th", "sv", "db", "rt") == "s:st:th:sv:db:rt"
+  return f"{schema}:{style}:{theme}:{server}:{database}:{router}"
+
+private structure OpaquePlainVal where (n : Nat) deriving DecidableEq, Repr, Inhabited
+
+schema PlainNonCodecSchema:
+  tag : String = "ok"
+  raw : OpaquePlainVal
+
+private def encStep (n : Nat) : Nat := n + 7
+private def decStep (n : Nat) : Except String Nat := if n >= 7 then .ok (n - 7) else .error "small"
+
+mapping ManualProveMap:
+  from x : Nat where x <= 50
+  to   y : Nat where y <= 57
+  encode(x): return encStep(x)
+  decode(y): return decStep(y)?
+  prove:
+    case encode_ok:
+      simp only [ManualProveMap.toTarget, ManualProveMap.SourceInv, ManualProveMap.TargetInv, encStep, Qed.Lang.QedVal.val_id] at *; omega
+    case roundtrip:
+      simp only [ManualProveMap.toSource, ManualProveMap.rawDecode, ManualProveMap.toTarget, ManualProveMap.SourceInv,
+        encStep, decStep, Qed.Lang.QedVal.val_id, ge_iff_le] at *
+      have h7 : ∀ n : Nat, 7 ≤ n + 7 := fun n => Nat.le_add_left 7 n
+      simp only [h7, ↓reduceIte, Qed.MappingUnwrap.unwrap_ok, Except.bind, Nat.add_sub_cancel]
+      exact dite_eq_left ‹_›
+
+/-- Documented top-level invariant with explicit `prove:` block. -/
+invariant topLevelManualProve: 2 + 2 == 4
+  prove:
+    rfl
+
+check_decls [contextualKwParams_example_allJoined, ManualProveMap.encode_ok, ManualProveMap.roundtrip,
+  ManualProveMap.decode_encode, topLevelManualProve]
+example : (default : ContextualKwFields).schema = "public" ∧ (default : ContextualKwFields).router = "root" ∧
+    (default : PlainNonCodecSchema).tag = "ok" := ⟨rfl, rfl, rfl⟩
+
+/-! ## Remaining Expected Syntax: `elif`/`elif let`, `for (k, v)`, `.1`/`.2`, Compound Assigns, `any x:`, `field` `example`/`rejects`, `///` & `private` Parity -/
+
+fn exprElifDemo(n: Nat) -> String:
+  example z: exprElifDemo(0) == "zero"
+  example s: exprElifDemo(5) == "small"
+  example m: exprElifDemo(42) == "medium"
+  example l: exprElifDemo(100) == "large"
+  return if n == 0: "zero"
+    elif n < 10: "small"
+    elif n < 100: "medium"
+    else: "large"
+
+fn exprElifLetDemo(a: Nat?, b: Nat?, flag: Bool) -> Nat:
+  example hitA: exprElifLetDemo(some(3), some(7), true) == 3
+  example hitB: exprElifLetDemo(none, some(7), true) == 70
+  example hitFlag: exprElifLetDemo(none, none, true) == 42
+  example hitElse: exprElifLetDemo(none, none, false) == 0
+  return if let some(x) = a: x
+    elif let some(y) = b: y * 10
+    elif flag: 42
+    else: 0
+
+fn stmtIfLetElifDemo(a: Nat?, b: Nat?, flag: Bool) -> Nat:
+  example sA: stmtIfLetElifDemo(some(4), none, false) == 5
+  example sB: stmtIfLetElifDemo(none, some(6), false) == 12
+  example sF: stmtIfLetElifDemo(none, none, true) == 99
+  example sE: stmtIfLetElifDemo(none, none, false) == 0
+  if let some(x) = a:
+    return x + 1
+  elif let some(y) = b:
+    return y * 2
+  elif flag:
+    return 99
+  else:
+    return 0
+
+fn sumTuplePairs(pairs: (Nat, Nat)[]) -> Nat:
+  ensures result >= pairs.size
+  example twoPairs: sumTuplePairs([(1, 2), (3, 4)]) == 12
+  let mut acc : Nat = 0
+  for (a, b) in pairs:
+    invariant acc >= seen.length
+    acc += a + b + 1
+  return acc
+
+fn sumNestedTuples(xs: (Nat, (Nat, Nat))[]) -> Nat:
+  example oneTriple: sumNestedTuples([(1, (2, 3)), (10, (20, 30))]) == 66
+  let mut acc : Nat = 0
+  for (a, (b, c)) in xs:
+    acc += a + b + c
+  return acc
+
+fn tupleProjDemo(p: (Nat, (String, Nat))) -> Nat:
+  ensures result == p.1 + p.2.2 + p.2.1.length
+  example sampleProj: tupleProjDemo((5, ("abc", 7))) == 15
+  return p.1 + p.2.2 + p.2.1.length
+
+fn compoundAssignDemo(start: Nat) -> Nat:
+  example runAll: compoundAssignDemo(3) == 16
+  let mut x : Nat = start
+  x *= 4
+  x /= 2
+  x %= 5
+  x <<= 3
+  x |= 5
+  x &= 15
+  x ^= 1
+  x >>= 1
+  x *= 2 + 1
+  x -= 2
+  return x
+
+/-- Documented component exercising JSX `elif`/`elif let`, statement `if let`/`elif`, and compound assignments. -/
+component ElifAndCompoundComp:
+  state mode : Nat = 0
+  state sel : String? = none
+  state val : Nat = 2
+  action step(optA: Nat?, optB: Nat?):
+    if let some(a) = optA:
+      val *= a
+    elif let some(b) = optB:
+      val |= b
+    elif mode == 1:
+      val <<= 1
+    else:
+      val ^= 3
+  view:
+    <div>
+      {if mode == 0:
+        <button onClick={val *= 2}>double</button>
+      elif let some(label) = sel:
+        <span>{label}</span>
+      elif mode == 1:
+        <p>one</p>
+      else:
+        <p>other</p>}
+    </div>
+
+/-- Documented private top-level invariant with unbounded `any` quantifier. -/
+private invariant existsWitnessInv: any x: Nat: x == 42
+  prove:
+    exact ⟨42, rfl⟩
+
+/-- Documented private field with inline `example` and `rejects`. -/
+private field TagCode : String
+  where s => s.length >= 2 and s.length <= 8
+  example okTag: "abc"
+  rejects tooShort: "x"
+  rejects tooLong: "123456789"
+
+/-- Documented private router. -/
+private router PrivatePageRoute:
+  home = "/"
+  item(id: Nat) = "/items/:id"
+
+/-- Documented private mapping. -/
+private mapping PrivateShiftMap:
+  from x : Nat where x <= 100
+  to   y : Nat where y <= 101
+  encode(x): return x + 1
+  decode(y):
+    if y == 0: fail("zero")
+    return y - 1
+
+/-- Documented private view invariant. -/
+private invariant privateElifHasDiv: hasTag("div") holds_in ElifAndCompoundComp.view
+
+check_decls [exprElifDemo_example_z, exprElifDemo_example_s, exprElifDemo_example_m, exprElifDemo_example_l,
+  exprElifLetDemo_example_hitA, exprElifLetDemo_example_hitB, exprElifLetDemo_example_hitFlag, exprElifLetDemo_example_hitElse,
+  stmtIfLetElifDemo_example_sA, stmtIfLetElifDemo_example_sB, stmtIfLetElifDemo_example_sF, stmtIfLetElifDemo_example_sE,
+  sumTuplePairs_ensures, sumTuplePairs_example_twoPairs, sumNestedTuples_example_oneTriple,
+  tupleProjDemo_ensures, tupleProjDemo_example_sampleProj, compoundAssignDemo_example_runAll,
+  existsWitnessInv, TagCode.okTag, TagCode.satisfiable, TagCode.rejects_tooShort, TagCode.rejects_tooLong,
+  PrivatePageRoute.round_trip, PrivateShiftMap.encode_ok, PrivateShiftMap.roundtrip, privateElifHasDiv]
+
+expect_err "Field `BadExField` example `bad` failed `where` constraint" in
+  field BadExField : Nat
+    where n => n >= 10
+    example bad: 5
+
+expect_err "Field `BadRejField` `rejects bad` failed" in
+  field BadRejField : Nat
+    where n => n >= 10
+    rejects bad: 20
+
+expect_err "any x, x + 1 = 0" in
+  invariant badAnyDiag: any x: Nat: x + 1 == 0
+
+/-! ## Grammar Polish: Trailing Commas, Single-Line/Unit `fn`, Quantifier & Lambda Tuples, Record Compound Updates, Component `let ... else` -/
+
+fn oneLineDouble(x: Nat,) -> Nat: return x * 2
+fn implicitUnitNoop(_x: Nat): pass
+fn implicitUnitEarly(flag: Bool):
+  if flag: return
+  pass
+
+schema RecUpdBox:
+  a : Nat
+  b : Nat
+  c : Nat
+
+fn recordCompoundUpdate(box: RecUpdBox,) -> RecUpdBox:
+  ensures result.a == box.a + 2 and result.b == box.b * 3
+  example updOk:
+    recordCompoundUpdate({ a = 4, b = 5, c = 2, },) == { a = 6, b = 15, c = 6, }
+  return { box with a += 2, b *= 3, c |= 4, }
+
+fn trailingAndTupleQuantDemo(pairs: (Nat, Nat,)[],) -> Nat[]:
+  ensures all (k, v) in pairs: k + v >= k
+  example mapFilterPairs:
+    trailingAndTupleQuantDemo([(1, 2,), (5, 3,), (2, 10,),]) == [3, 12,]
+  let ok = all (k, v) in pairs: k + v >= 0
+  let hasBig = any (_, v) in pairs: v >= 10
+  if not ok and not hasBig: return []
+  return pairs.filter(((k, v)) => k < v).map(((k, v): (Nat, Nat)) => k + v)
+
+component GuardLetElseComp:
+  state selected : Nat? = none
+  state total : Nat = 0
+  action addSelected(bonus: Nat,):
+    let some(v) = selected else: return
+    total += v + bonus
+  action clearIfEmpty():
+    let some(_) = selected else return
+    selected = none
+  example guardMiss: .addSelected(5,) -> total == 0
+  example guardHit from { selected = some(7,), total = 1, }: .addSelected(3,) -> total == 11
+  view: <div><span>{total}</span></div>
+
+check_decls [recordCompoundUpdate_ensures, recordCompoundUpdate_example_updOk,
+  trailingAndTupleQuantDemo_ensures, trailingAndTupleQuantDemo_example_mapFilterPairs,
+  GuardLetElseComp.guardMiss, GuardLetElseComp.guardHit]
+
+example : oneLineDouble 21 = 42 ∧ implicitUnitNoop 1 = () ∧ implicitUnitEarly true = () := ⟨rfl, rfl, rfl⟩
+
+expect_err "requires a base record" in
+  fn badRecCompoundNoBase() -> RecUpdBox:
+    return { a += 1, b = 2, c = 3 }
+
+expect_err "guard `let ... = ... else` branch in component action must `return` on all paths" in
+  component BadCompLetElse:
+    state x : Nat? = none
+    state y : Nat = 0
+    action go():
+      let some(v) = x else:
+        y = 1
+      y = v
+    view: <span>{y}</span>
 end SyntaxChecks

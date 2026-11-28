@@ -24,12 +24,12 @@ schema PriceTick:
 schema PricePing:
   action : String
 
-record SecretBroadcast:
+schema SecretBroadcast:
   roomId      : Nat
   secret      : String
   redactedFor : String[]
 
-record SecretView:
+schema SecretView:
   roomId : Nat
   secret : String?
 

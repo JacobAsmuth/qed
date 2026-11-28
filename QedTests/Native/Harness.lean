@@ -137,11 +137,18 @@ def TestChecker.checkRaw400 (c : TestChecker) (port : UInt16) (label raw : Strin
   c.expectOk label (← rawTcpReq port raw.toUTF8) fun resp => c.check label ((utf8Str resp).startsWith "HTTP/1.1 400 ")
 def TestChecker.checkRawNoLeak (c : TestChecker) (port : UInt16) (label reqPath forbidden : String) : IO Unit := do
   c.expectOk label (← rawTcpReq port s!"GET {reqPath} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n".toUTF8) fun resp => let s := utf8Str resp; c.check label (!s.contains forbidden) s
-def TestChecker.checkCliCases (c : TestChecker) (run : Array String → IO (UInt32 × String)) (cases : List (String × Array String × Bool × List String × List String)) (parallel : Bool := false) : IO Unit := do
+def TestChecker.checkCliCases (c : TestChecker) (run : Array String → IO (UInt32 × String)) (cases : List (String × Array String × Bool × List String × List String))
+    (parallel : Bool := false) (maxConcurrency : Nat := 4) : IO Unit := do
   let verify (lbl : String) (rc : UInt32) (out : String) (wantOk : Bool) (has omits : List String) := c.check lbl ((rc == 0) == wantOk && hasAll out has && omits.all (!out.contains ·)) out
-  if parallel then
-    let ts ← cases.mapM fun (lbl, args, wantOk, has, omits) => return (lbl, wantOk, has, omits, ← IO.asTask (prio := .dedicated) (run args))
-    ts.forM fun (lbl, wantOk, has, omits, t) => do match ← IO.wait t with | .ok (rc, out) => verify lbl rc out wantOk has omits | .error e => c.check lbl false (toString e)
+  if parallel && maxConcurrency > 1 then
+    let rec go : Nat → List (String × Array String × Bool × List String × List String) → IO Unit
+      | 0, _ | _, [] => pure ()
+      | fuel + 1, rem => do
+          let batch := rem.take maxConcurrency
+          let ts ← batch.mapM fun (lbl, args, wantOk, has, omits) => return (lbl, wantOk, has, omits, ← IO.asTask (prio := .dedicated) (run args))
+          ts.forM fun (lbl, wantOk, has, omits, t) => do match ← IO.wait t with | .ok (rc, out) => verify lbl rc out wantOk has omits | .error e => c.check lbl false (toString e)
+          go fuel (rem.drop maxConcurrency)
+    go cases.length cases
   else cases.forM fun (lbl, args, wantOk, has, omits) => do let (rc, out) ← run args; verify lbl rc out wantOk has omits
 
 @[noinline, nospecialize] private def TestChecker.checkRpcDomain {ε E α : Type} [ErrMsg ε] [Qed.FromProto E] [Qed.FromProto α] (c : TestChecker) (label : String) (res : Except ε ByteArray) (k : Except (Qed.RpcDomainError E) α → IO Unit) : IO Unit :=

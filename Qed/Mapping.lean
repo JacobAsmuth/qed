@@ -18,17 +18,20 @@ private def mapUsingListP : Parser := node `Qed.mapUsingList (atomic (symbol "us
 private def mapSideSpecP : Parser :=
   node `Qed.mapSideNamed (atomic (ident >> ":") >> mpType >> optional (checkLineEq >> symbol "where" >> sepBy1 mpExpr ",")) <|>
   node `Qed.mapSidePlain mpType
+private def mapProveCaseP : Parser :=
+  mpNode `Qed.mapProveCase (atomic (kw "case" >> sepBy1 (identEq `encode_ok <|> identEq `roundtrip) "," >> ":") >> checkColGt "expected indented proof tactics" >> Parser.Tactic.tacticSeq)
 private def mapClauseP : Parser :=
   mpNode `Qed.mapFromClause (atomic (symbol "from") >> mapSideSpecP) <|>
   mpNode `Qed.mapToClause (atomic (identEq `to) >> mapSideSpecP) <|>
   mpNode `Qed.mapUsingClause mapUsingListP <|>
   mpNode `Qed.mapEncodeClause (atomic (identEq `encode >> checkNoWsBefore "" >> "(") >> ident >> ")" >> ":" >> qedSuite) <|>
   mpNode `Qed.mapDecodeClause (atomic (identEq `decode >> checkNoWsBefore "" >> "(") >> ident >> ")" >> ":" >> qedSuite) <|>
-  mpNode `Qed.mapProveUsingClause (atomic (identEq `prove >> (identEq `encode_ok <|> identEq `roundtrip)) >> mapUsingListP) <|>
-  mpNode `Qed.mapProveByClause (atomic (identEq `prove >> (identEq `encode_ok <|> identEq `roundtrip)) >> ":=" >> "by" >> Parser.Tactic.tacticSeq)
-@[command_parser] def mappingCmd : Parser := opaqueP (mpNode `Qed.mappingCmd
-  (atomic (identEq `mapping) >> ident >> optional (checkLineEq >> "(" >> sepBy1 schemaCtxParamP "," >> ")") >> ":" >>
-    checkColGt "expected indented `mapping` clauses (`from`, `to`, `encode`, `decode`)" >> many1Indent mapClauseP))
+  mpNode `Qed.mapProveClause (atomic (identEq `prove >> ":") >> checkColGt "expected indented `case encode_ok:` or `case roundtrip:` proofs" >> many1Indent mapProveCaseP)
+@[command_parser] def mappingCmd : Parser := opaqueP (node `Qed.mappingCmd (
+  optional Command.docComment >> withPosition (
+    atomic (optional (symbol "private") >> identEq `mapping) >> ident >>
+    optional (checkLineEq >> "(" >> sepBy1 schemaCtxParamP "," >> ")") >> ":" >>
+    checkColGt "expected indented `mapping` clauses (`from`, `to`, `encode`, `decode`)" >> many1Indent mapClauseP)))
 
 syntax (name := qedMapProveTac) "qedMapProve" "[" ident,* "]" "[" term,* "]" str str str : tactic
 end MappingParsers
@@ -162,9 +165,9 @@ private def parseMapSideSpec (ref : Ident) (fallbackName : Name) (spec : Syntax)
     return (⟨spec.getArg 0⟩, tyT, if (spec.getArg 3).getNumArgs == 2 then ((spec.getArg 3).getArg 1).getSepArgs else #[])
   return (mkIdentFrom ref fallbackName, (← liftPureErr (lowerQedTypeInfoPure qctx (spec.getArg 0) false)).term, #[])
 
-@[noinline] private def mkMappingCmdsPure (mId : Ident) (cbns : Array Ident) (cbts : Array Term)
+@[noinline] private def mkMappingCmdsPure (doc? : Option (TSyntax ``Lean.Parser.Command.docComment)) (mId : Ident) (cbns : Array Ident) (cbts : Array Term)
     (srcVar tgtVar encParam decParam : Ident) (srcTy tgtTy srcInvBody tgtInvBody encBody decBody : Term)
-    (hasSrcWhere : Bool) (tgtLabel : String) (encOkUsing rtUsing : Array Term) (encOkBy? rtBy? : Option Syntax) :
+    (hasSrcWhere : Bool) (tgtLabel : String) (usingTerms : Array Term) (encOkBy? rtBy? : Option Syntax) :
     PureQuotM (Array (TSyntax `command)) := do
   let mName := mId.getId; let sub (s : Name) := mkIdentFrom mId (mName ++ s)
   let appCtx (id : Ident) : PureQuotM Term := mkAppTermsPure ⟨id.raw⟩ (cbns.map (⟨·.raw⟩))
@@ -175,10 +178,10 @@ private def parseMapSideSpec (ref : Ident) (fallbackName : Name) (spec : Syntax)
   let (mapApp, encApp, decApp, encOkApp, decOkApp, rtApp) := (← appCtx mapId, ← appCtx encId, ← appCtx decId, ← appCtx encOkId, ← appCtx decOkId, ← appCtx rtId)
   let encOkPfTac : TSyntax ``Lean.Parser.Tactic.tacticSeq ← match encOkBy? with
     | some seq => pure ⟨seq⟩
-    | none => `(Lean.Parser.Tactic.tacticSeq| qedMapProve [$toTgtId:ident, $srcInvId:ident, $tgtInvId:ident] [$[$encOkUsing:term],*] $(Syntax.mkStrLit tgtLabel) $(Syntax.mkStrLit mName.toString) "Align `from` and `to` `where` constraints, add `using [lemma]`, or supply `prove encode_ok := by ...`.")
+    | none => `(Lean.Parser.Tactic.tacticSeq| qedMapProve [$toTgtId:ident, $srcInvId:ident, $tgtInvId:ident] [$[$usingTerms:term],*] $(Syntax.mkStrLit tgtLabel) $(Syntax.mkStrLit mName.toString) "Align `from` and `to` `where` constraints, add `using [lemma]`, or supply `prove:` with `case encode_ok:`.")
   let rtPfTac : TSyntax ``Lean.Parser.Tactic.tacticSeq ← match rtBy? with
     | some seq => pure ⟨seq⟩
-    | none => `(Lean.Parser.Tactic.tacticSeq| qedMapProve [$toSrcId:ident, $rawDecId:ident, $toTgtId:ident, $srcInvId:ident] [$[$rtUsing:term],*] "round-trip `decode(encode(x)) == ok(x)`" $(Syntax.mkStrLit mName.toString) "Ensure `decode` inverts `encode`, add `using [lemma]`, or supply `prove roundtrip := by ...`.")
+    | none => `(Lean.Parser.Tactic.tacticSeq| qedMapProve [$toSrcId:ident, $rawDecId:ident, $toTgtId:ident, $srcInvId:ident] [$[$usingTerms:term],*] "round-trip `decode(encode(x)) == ok(x)`" $(Syntax.mkStrLit mName.toString) "Ensure `decode` inverts `encode`, add `using [lemma]`, or supply `prove:` with `case roundtrip:`.")
   let (toSrcBody, decOkBody, encInTy, encBody2, decBody2, decEncBody) ←
     if hasSrcWhere then pure (
       ← `(($rawDecApp b).bind fun _a => if _h : $srcInvApp _a then Except.ok _a else Except.error "mapping decode violated source constraint"),
@@ -188,27 +191,28 @@ private def parseMapSideSpec (ref : Ident) (fallbackName : Name) (spec : Syntax)
   return #[
     ← `(command| abbrev $srcId : Type := $srcTy),
     ← `(command| abbrev $tgtId : Type := $tgtTy),
-    ← `(command| set_option linter.unusedVariables false in abbrev $srcInvId $[($cbns:ident : $cbts:term)]* ($srcVar:ident : $srcId) : Prop := $srcInvBody),
-    ← `(command| set_option linter.unusedVariables false in abbrev $tgtInvId $[($cbns:ident : $cbts:term)]* ($tgtVar:ident : $tgtId) : Prop := $tgtInvBody),
-    ← `(command| set_option linter.unusedVariables false in def $toTgtId $[($cbns:ident : $cbts:term)]* ($encParam:ident : $srcId) : $tgtId := $encBody),
-    ← `(command| set_option linter.unusedVariables false in def $rawDecId $[($cbns:ident : $cbts:term)]* ($decParam:ident : $tgtId) : Except String $srcId := $decBody),
-    ← `(command| def $toSrcId $[($cbns:ident : $cbts:term)]* (b : $tgtId) : Except String $srcId := $toSrcBody),
-    ← `(command| set_option linter.unusedVariables false in theorem $decOkId $[($cbns:ident : $cbts:term)]* (b : $tgtId) (a : $srcId) (h : $toSrcApp b = Except.ok a) : $srcInvApp a := $decOkBody),
-    ← `(command| set_option linter.unusedVariables false in theorem $encOkId $[($cbns:ident : $cbts:term)]* (a : $srcId) (ha : $srcInvApp a) : $tgtInvApp ($toTgtApp a) := by $encOkPfTac),
-    ← `(command| set_option linter.unusedVariables false in theorem $rtId $[($cbns:ident : $cbts:term)]* (a : $srcId) (ha : $srcInvApp a) : $toSrcApp ($toTgtApp a) = Except.ok a := by $rtPfTac),
-    ← `(command| def $mapId $[($cbns:ident : $cbts:term)]* : Qed.Mapping ($srcInvApp) ($tgtInvApp) := ⟨$toTgtApp, $toSrcApp, $encOkApp, $decOkApp, $rtApp⟩),
+    ← `(command| set_option linter.unusedVariables false in abbrev $srcInvId $[($cbns:ident : $cbts:term)]* ($srcVar:ident : $srcTy) : Prop := $srcInvBody),
+    ← `(command| set_option linter.unusedVariables false in abbrev $tgtInvId $[($cbns:ident : $cbts:term)]* ($tgtVar:ident : $tgtTy) : Prop := $tgtInvBody),
+    ← `(command| set_option linter.unusedVariables false in def $toTgtId $[($cbns:ident : $cbts:term)]* ($encParam:ident : $srcTy) : $tgtTy := $encBody),
+    ← `(command| set_option linter.unusedVariables false in def $rawDecId $[($cbns:ident : $cbts:term)]* ($decParam:ident : $tgtTy) : Except String $srcTy := $decBody),
+    ← `(command| def $toSrcId $[($cbns:ident : $cbts:term)]* (b : $tgtTy) : Except String $srcTy := $toSrcBody),
+    ← `(command| set_option linter.unusedVariables false in theorem $decOkId $[($cbns:ident : $cbts:term)]* (b : $tgtTy) (a : $srcTy) (h : $toSrcApp b = Except.ok a) : $srcInvApp a := $decOkBody),
+    ← `(command| set_option linter.unusedVariables false in theorem $encOkId $[($cbns:ident : $cbts:term)]* (a : $srcTy) (ha : $srcInvApp a) : $tgtInvApp ($toTgtApp a) := by $encOkPfTac),
+    ← `(command| set_option linter.unusedVariables false in theorem $rtId $[($cbns:ident : $cbts:term)]* (a : $srcTy) (ha : $srcInvApp a) : $toSrcApp ($toTgtApp a) = Except.ok a := by $rtPfTac),
+    ← `(command| $[$doc?:docComment]? def $mapId $[($cbns:ident : $cbts:term)]* : Qed.Mapping ($srcInvApp) ($tgtInvApp) := ⟨$toTgtApp, $toSrcApp, $encOkApp, $decOkApp, $rtApp⟩),
     ← `(command| def $encId $[($cbns:ident : $cbts:term)]* (a : $encInTy) : Qed.Field ($tgtInvApp) := $encBody2),
     ← `(command| def $decId $[($cbns:ident : $cbts:term)]* (b : $tgtId) : Except String $encInTy := $decBody2),
     ← `(command| theorem $decEncId $[($cbns:ident : $cbts:term)]* (a : $encInTy) : $decApp ($encApp a).val = Except.ok a := $decEncBody)]
 
 @[noinline, command_elab mappingCmd] def elabMappingCmd : CommandElab := fun stx => do
-  let mId : Ident := ⟨stx.getArg 1⟩; let mName := mId.getId
-  let (cbns, cbts) ← parseCtxBinders (stx.getArg 2)
+  let doc? := extractOptDoc (stx.getArg 0); let isPrivate := (stx.getArg 1).getNumArgs == 1
+  let mId : Ident := ⟨stx.getArg 3⟩; let mName := mId.getId
+  let (cbns, cbts) ← parseCtxBinders (stx.getArg 4)
   let mut src? : Option (Ident × Term × Array Syntax) := none; let mut tgt? : Option (Ident × Term × Array Syntax) := none
   let mut enc? : Option (Ident × Array Syntax) := none; let mut dec? : Option (Ident × Array Syntax) := none
-  let mut (sharedUsing, encOkUsing, rtUsing) : Array Term × Array Term × Array Term := (#[], #[], #[])
+  let mut sharedUsing : Array Term := #[]
   let mut (encOkBy?, rtBy?) : Option Syntax × Option Syntax := (none, none)
-  for c in (stx.getArg 4).getArgs do
+  for c in (stx.getArg 6).getArgs do
     match c.getKind with
     | `Qed.mapFromClause =>
         if src?.isSome then throwErrorAt c s!"duplicate `from` clause in `mapping {mName}`"
@@ -223,11 +227,16 @@ private def parseMapSideSpec (ref : Ident) (fallbackName : Name) (spec : Syntax)
     | `Qed.mapDecodeClause =>
         if dec?.isSome then throwErrorAt c s!"duplicate `decode` clause in `mapping {mName}`"
         dec? := some (⟨c.getArg 2⟩, suiteStmts (c.getArg 5))
-    | `Qed.mapProveUsingClause =>
-        let ts := ((c.getArg 2).getArg 2).getSepArgs.map (⟨·⟩)
-        if (c.getArg 1).getId.eraseMacroScopes == `encode_ok then encOkUsing := encOkUsing ++ ts else rtUsing := rtUsing ++ ts
-    | `Qed.mapProveByClause =>
-        if (c.getArg 1).getId.eraseMacroScopes == `encode_ok then encOkBy? := some (c.getArg 4) else rtBy? := some (c.getArg 4)
+    | `Qed.mapProveClause =>
+        for pc in (c.getArg 2).getArgs do
+          let tac := pc.getArg 3
+          for nmStx in (pc.getArg 1).getSepArgs do
+            if nmStx.getId.eraseMacroScopes == `encode_ok then
+              if encOkBy?.isSome then throwErrorAt nmStx s!"duplicate `case encode_ok:` in `mapping {mName}`"
+              encOkBy? := some tac
+            else
+              if rtBy?.isSome then throwErrorAt nmStx s!"duplicate `case roundtrip:` in `mapping {mName}`"
+              rtBy? := some tac
     | _ => throwErrorAt c s!"unexpected clause in `mapping {mName}`"
   let some (srcVar, srcTy, srcWheres) := src? | throwErrorAt mId s!"`mapping {mName}` requires a `from <x : Type>` (or `from <Type>`) clause"
   let some (tgtVar, tgtTy, tgtWheres) := tgt? | throwErrorAt mId s!"`mapping {mName}` requires a `to <y : Type>` (or `to <Type>`) clause"
@@ -238,8 +247,9 @@ private def parseMapSideSpec (ref : Ident) (fallbackName : Name) (spec : Syntax)
   let encBody ← (lowerMapStmts false (ctxNames.push encParam.getId.eraseMacroScopes.toString) encStmts).run' (0, #[])
   let decBody ← (lowerMapStmts true (ctxNames.push decParam.getId.eraseMacroScopes.toString) decStmts).run' (0, #[])
   let tgtLabel := if tgtWheres.isEmpty then "target invariant" else s!"target constraint `{fmtWhereLabel tgtWheres}`"
-  Lang.elabPureCmds (mkMappingCmdsPure mId cbns cbts srcVar tgtVar encParam decParam srcTy tgtTy srcInvBody tgtInvBody encBody decBody
-    (!srcWheres.isEmpty) tgtLabel (sharedUsing ++ encOkUsing) (sharedUsing ++ rtUsing) encOkBy? rtBy?)
+  let cmds ← Lang.runPQ (mkMappingCmdsPure doc? mId cbns cbts srcVar tgtVar encParam decParam srcTy tgtTy srcInvBody tgtInvBody encBody decBody
+    (!srcWheres.isEmpty) tgtLabel sharedUsing encOkBy? rtBy?)
+  Lang.foldlCmd cmds () fun _ c => elabCmdWithVis isPrivate c
 
 end MappingElab
 end Qed

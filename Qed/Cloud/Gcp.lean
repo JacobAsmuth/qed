@@ -65,6 +65,10 @@ structure PreviewSpec where
   (protection : PreviewProtection := .team_only) (ttlSec : Nat := 7 * 86400)
 deriving Inhabited, DecidableEq
 
+abbrev PreviewSpec.subdomain (p : PreviewSpec) : Option String := p.subdomain?
+abbrev PreviewSpec.host (p : PreviewSpec) : Option HostPattern := p.host?
+abbrev PreviewSpec.ttl_sec (p : PreviewSpec) : Nat := p.ttlSec
+
 def PreviewSpec.resolvedHost? (p : PreviewSpec) (prodDomain? : Option String) : Option HostPattern :=
   p.host?.orElse fun _ => match prodDomain?, p.subdomain? with | some prod, some sub => some (derivePreviewHost prod sub) | _, _ => none
 

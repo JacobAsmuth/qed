@@ -754,7 +754,7 @@ ffi_export! {
             thread::spawn(move || {
                 unsafe { lean_initialize_thread() };
                 #[cfg(target_os = "linux")] let fd = create_listener(bind_ip, port, true).map_err(|e| format!("bind {bind_ip}:{port}: {e}"));
-                #[cfg(not(target_os = "linux"))] let fd = if dup_fd >= 0 { Ok(dup_fd) } else { Err("dup listener socket".into()) };
+                #[cfg(not(target_os = "linux"))] let fd = if dup_fd >= 0 { Ok(dup_fd) } else { Err("dup listener socket") };
                 match fd { Ok(lfd) => Worker::spawn_and_run(lfd, inbox, idx, ps, cbs_c, rl_c), Err(e) => eprintln!("✗ worker {idx} failed to {e}") }
                 unsafe { lean_finalize_thread() };
             })

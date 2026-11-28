@@ -80,12 +80,13 @@ When a client `component` invokes a `server` `def` via `await` or `query`, Qed c
 - **Client `invariant` -> Server `requires`:** Component `invariant`s, literals, `if`/`if let` branches, and `Field`/`Ensured` values are automatically available as hypotheses to discharge every server parameter `requires` clause at compile time.
 - **Server `ensures` -> Client `invariant`:** Server `ensures` postconditions are encoded via zero-trust `Ensured α p`, where `FromProto` re-verifies `p` on untrusted bytes, and unpacked into continuation hypotheses across `let x = await Server.fn(...) catch: ...` and `Cached.all` invariants on reactive `query` fields. See [`Examples/CloudBooks.lean`](../Examples/CloudBooks.lean) and [`QedTests/ServerChecks.lean`](../QedTests/ServerChecks.lean).
 
-**Custom proofs with `using [lemma]` or `:= by`.** When a property depends on a custom recursive domain function or an unverified helper that automation cannot guess, pass a lemma with `using [myLemma]` or attach a Lean tactic proof with `:= by`. Inside a `component`, `init` is discharged automatically and `update` is in scope, so the proof handles preservation starting with `intro m msg h`:
+**Custom proofs with `using [lemma]` or `prove:`.** When a property depends on a custom recursive domain function or an unverified helper that automation cannot guess, pass a lemma with `using [myLemma]` or attach a Lean tactic proof with `prove:`. Inside a `component`, `init` is discharged automatically and `update` is in scope, so the proof handles preservation starting with `intro m msg h` (or per-action `case <action>:` branches):
 
 ```lean
-invariant customGraphAcyclic: isAcyclic(nodes) := by
-  intro m msg h
-  cases msg <;> simp_all [update, isAcyclic_addEdge]
+invariant customGraphAcyclic: isAcyclic(nodes)
+  prove:
+    intro m msg h
+    cases msg <;> simp_all [update, isAcyclic_addEdge]
 ```
 
 ## Lifting invariants over child collections
@@ -125,9 +126,10 @@ data, Qed prints a proof skeleton using `forEachLift`, which closes all supporte
 you only fill in the remaining case:
 
 ```lean
-invariant feedSafe: Card.cardSafe_pred for_each cards using Card.cardSafe := by
-  forEachLift update Card.cardSafe Card.cardSafe_pred
-  case rank => … -- prove only the custom branch
+invariant feedSafe: Card.cardSafe_pred for_each cards using Card.cardSafe
+  prove:
+    forEachLift update Card.cardSafe Card.cardSafe_pred
+    case rank => ... -- prove only the custom branch
 ```
 
 ### Lifting view rules with `for_each`
@@ -200,7 +202,7 @@ From here, one of three things is true:
 
 1. **The handler has a bug:** for example, a missing `if` guard or state reset.
 2. **The invariant is too strong or imprecise:** make sure it isn't trivially `True`, either.
-3. **Automation needs a hint:** add `:= by` to supply a collection or domain lemma.
+3. **Automation needs a hint:** add `prove:` to supply a collection or domain lemma.
 
 ## Common invariant patterns
 
@@ -214,7 +216,7 @@ From here, one of three things is true:
 | **Cached totals** | `total == (items.map(i => i.price)).sum` | Derived field stays in sync with its source list. |
 
 The first four usually prove automatically. The last two quantify over collections and
-typically take a two-line `:= by` proof using `cases msg <;> simp_all [update] <;> omega` plus a
+typically take a two-line `prove:` block using `cases msg <;> simp_all [update] <;> omega` plus a
 list or array lemma.
 
 ## When you don't need an invariant

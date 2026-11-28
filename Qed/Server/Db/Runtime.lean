@@ -575,4 +575,221 @@ def withTransaction {m : Type → Type} {α : Type} [Monad m] [MonadServer m]
       | .error e => MonadServer.dbTxRollback cfg tid; return .error e
       | .ok v => (·.map fun () => v) <$> MonadServer.dbTxCommit cfg tid
 
+/-! ## Dynamic Read-Only PostgreSQL Connections & `pg_catalog` Introspection (`PgHandle`) -/
+
+structure PgTableInfo where
+  schemaName : String
+  name       : String
+  owner      : String
+deriving Inhabited, DecidableEq, Repr
+
+structure PgColumnInfo where
+  name        : String
+  dataType    : String
+  nullable    : Bool
+  defaultExpr : Option String := none
+  ordinalPos  : Nat := 0
+deriving Inhabited, DecidableEq, Repr
+
+structure PgIndexInfo where
+  name       : String
+  definition : String
+deriving Inhabited, DecidableEq, Repr
+
+structure PgConstraintInfo where
+  name       : String
+  columnName : String
+  ordinalPos : Nat := 0
+deriving Inhabited, DecidableEq, Repr
+
+structure PgTableStat where
+  schemaName : String
+  name       : String
+  liveRows   : Int := 0
+deriving Inhabited, DecidableEq, Repr
+
+private def jField {α : Type} [FromJson α] (j : Json) (k : String) : Except String α :=
+  j.field k >>= fromJson
+
+instance : ToJson PgTableInfo := ⟨fun t => .obj [("schemaName", toJson t.schemaName), ("name", toJson t.name), ("owner", toJson t.owner)]⟩
+instance : FromJson PgTableInfo := ⟨fun j => do return { schemaName := ← jField j "schemaName", name := ← jField j "name", owner := ← jField j "owner" }⟩
+instance : ToJson PgColumnInfo := ⟨fun c => .obj [("name", toJson c.name), ("dataType", toJson c.dataType), ("nullable", toJson c.nullable), ("defaultExpr", toJson c.defaultExpr), ("ordinalPos", toJson c.ordinalPos)]⟩
+instance : FromJson PgColumnInfo := ⟨fun j => do return { name := ← jField j "name", dataType := ← jField j "dataType", nullable := ← jField j "nullable", defaultExpr := (j.get? "defaultExpr").bind (·.str?), ordinalPos := ← jField j "ordinalPos" }⟩
+instance : ToJson PgIndexInfo := ⟨fun x => .obj [("name", toJson x.name), ("definition", toJson x.definition)]⟩
+instance : FromJson PgIndexInfo := ⟨fun j => do return { name := ← jField j "name", definition := ← jField j "definition" }⟩
+instance : ToJson PgConstraintInfo := ⟨fun x => .obj [("name", toJson x.name), ("columnName", toJson x.columnName), ("ordinalPos", toJson x.ordinalPos)]⟩
+instance : FromJson PgConstraintInfo := ⟨fun j => do return { name := ← jField j "name", columnName := ← jField j "columnName", ordinalPos := ← jField j "ordinalPos" }⟩
+instance : ToJson PgTableStat := ⟨fun s => .obj [("schemaName", toJson s.schemaName), ("name", toJson s.name), ("liveRows", toJson s.liveRows)]⟩
+instance : FromJson PgTableStat := ⟨fun j => do return { schemaName := ← jField j "schemaName", name := ← jField j "name", liveRows := ← jField j "liveRows" }⟩
+
+qed_equiv_codec% proto [] (PgTableInfo,
+  fun t => (t.schemaName, t.name, t.owner), fun p : String × String × String => ⟨p.1, p.2.1, p.2.2⟩, fun ⟨_, _, _⟩ => rfl)
+qed_equiv_codec% proto [] (PgColumnInfo,
+  fun c => (c.name, c.dataType, c.nullable, c.defaultExpr, c.ordinalPos),
+  fun p : String × String × Bool × Option String × Nat => ⟨p.1, p.2.1, p.2.2.1, p.2.2.2.1, p.2.2.2.2⟩, fun ⟨_, _, _, _, _⟩ => rfl)
+qed_equiv_codec% proto [] (PgIndexInfo,
+  fun x => (x.name, x.definition), fun p : String × String => ⟨p.1, p.2⟩, fun ⟨_, _⟩ => rfl)
+qed_equiv_codec% proto [] (PgConstraintInfo,
+  fun x => (x.name, x.columnName, x.ordinalPos), fun p : String × String × Nat => ⟨p.1, p.2.1, p.2.2⟩, fun ⟨_, _, _⟩ => rfl)
+qed_equiv_codec% proto [] (PgTableStat,
+  fun s => (s.schemaName, s.name, s.liveRows), fun p : String × String × Int => ⟨p.1, p.2.1, p.2.2⟩, fun ⟨_, _, _⟩ => rfl)
+
+/-! ### Verified Read-Only `pg_catalog` / `information_schema` `SqlQuery` Builders -/
+
+def pgSchemasQuery : SqlQuery :=
+  .selectSchema sql!"information_schema" sql!"schemata" [sql!"schema_name"] .litTrue (some (sql!"schema_name", .asc))
+
+def pgTablesQuery (schema : String := "public") : SqlQuery :=
+  .selectSchema sql!"pg_catalog" sql!"pg_tables"
+    [sql!"schemaname", sql!"tablename", sql!"tableowner"]
+    (.binOp .eq (.col sql!"schemaname") (.param (.text schema)))
+    (some (sql!"tablename", .asc))
+
+def pgColumnsQuery (tableName : String) (schema : String := "public") : SqlQuery :=
+  .selectSchema sql!"information_schema" sql!"columns"
+    [sql!"column_name", sql!"data_type", sql!"is_nullable", sql!"column_default", sql!"ordinal_position"]
+    (.binOp .and (.binOp .eq (.col sql!"table_schema") (.param (.text schema)))
+                 (.binOp .eq (.col sql!"table_name") (.param (.text tableName))))
+    (some (sql!"ordinal_position", .asc))
+
+def pgIndexesQuery (tableName : String) (schema : String := "public") : SqlQuery :=
+  .selectSchema sql!"pg_catalog" sql!"pg_indexes"
+    [sql!"indexname", sql!"indexdef"]
+    (.binOp .and (.binOp .eq (.col sql!"schemaname") (.param (.text schema)))
+                 (.binOp .eq (.col sql!"tablename") (.param (.text tableName))))
+    (some (sql!"indexname", .asc))
+
+def pgKeyColumnsQuery (tableName : String) (schema : String := "public") : SqlQuery :=
+  .selectSchema sql!"information_schema" sql!"key_column_usage"
+    [sql!"constraint_name", sql!"column_name", sql!"ordinal_position"]
+    (.binOp .and (.binOp .eq (.col sql!"table_schema") (.param (.text schema)))
+                 (.binOp .eq (.col sql!"table_name") (.param (.text tableName))))
+    (some (sql!"ordinal_position", .asc))
+
+def pgTableStatsQuery (schema : String := "public") : SqlQuery :=
+  .selectSchema sql!"pg_catalog" sql!"pg_stat_user_tables"
+    [sql!"schemaname", sql!"relname", sql!"n_live_tup"]
+    (.binOp .eq (.col sql!"schemaname") (.param (.text schema)))
+    (some (sql!"relname", .asc))
+
+private def pgCell {α : Type} [FromSql α] (r : DbRow) (idx : Nat) (lbl : String) : Except String α :=
+  match r[idx]? with
+  | some v => FromSql.fromSql v
+  | none => .error s!"missing column {idx} ({lbl})"
+
+private def pgOptTextCell (r : DbRow) (idx : Nat) : Option String :=
+  match r[idx]? with | some (.text s) => some s | _ => none
+
+private def pgNullableCell (r : DbRow) (idx : Nat) : Except String Bool :=
+  match r[idx]? with
+  | some (.bool b) => .ok b
+  | some (.text s) => .ok (s == "YES" || s == "yes" || s == "Yes" || s == "TRUE" || s == "true" || s == "True" || s == "T" || s == "t" || s == "1")
+  | some (.int i) => .ok (i != 0)
+  | some _ => .error "expected boolean or YES/NO text for is_nullable"
+  | none => .error s!"missing column {idx} (is_nullable)"
+
+private def decodePgRows {α : Type} (dec : DbRow → Except String α) (res : DbResult) : Except ApiError (Array α) :=
+  (res.rows.toList.mapM (decodeRowErr dec)).map List.toArray
+
+/-- Read-only handle for a dynamic runtime PostgreSQL connection URL (SSRF-guarded by default). -/
+structure PgHandle where
+  config : DbConfig
+deriving Inhabited
+
+namespace PgHandle
+
+/-- Build a dynamic read-only PostgreSQL handle for a runtime connection URL. -/
+@[inline] def connect (url : String) (ssrfGuard : Bool := true) (name : String := "dynamic_pg") : PgHandle :=
+  ⟨DbConfig.forPostgresUrl url ssrfGuard name⟩
+
+@[inline, specialize]
+def runReadOnly {m : Type → Type} {α : Type} [Monad m] [MonadServer m]
+    (pg : PgHandle) (q : SqlQuery) (_hRO : q.isWrite = false) (dec : DbResult → Except ApiError α) : m (Except ApiError α) :=
+  (·.bind dec) <$> MonadServer.dbExec pg.config q
+
+instance {σ α : Type} (pg : PgHandle) (q : SqlQuery) (hRO : q.isWrite = false) (dec : DbResult → Except ApiError α) :
+    SafeIO (PgHandle.runReadOnly (m := ThreadProg σ) pg q hRO dec) :=
+  ⟨noAtomic_exec_map _ _⟩
+
+section ReadOnlyOps
+variable {m : Type → Type} [Monad m] [MonadServer m]
+
+def queryReadOnly (pg : PgHandle) (q : SqlQuery) (hRO : q.isWrite = false := by decide) : m (Except ApiError DbResult) :=
+  pg.runReadOnly q hRO .ok
+
+def listSchemas (pg : PgHandle) : m (Except ApiError (Array String)) :=
+  pg.runReadOnly pgSchemasQuery rfl (decodePgRows fun r => pgCell r 0 "schema_name")
+
+def listTables (pg : PgHandle) (schemaName : String := "public") : m (Except ApiError (Array PgTableInfo)) :=
+  pg.runReadOnly (pgTablesQuery schemaName) rfl (decodePgRows fun r => do
+    return { schemaName := ← pgCell r 0 "schemaname", name := ← pgCell r 1 "tablename", owner := ← pgCell r 2 "tableowner" })
+
+def listColumns (pg : PgHandle) (table : SqlIdent) (schemaName : String := "public") : m (Except ApiError (Array PgColumnInfo)) :=
+  pg.runReadOnly (pgColumnsQuery table.raw schemaName) rfl (decodePgRows fun r => do
+    return { name := ← pgCell r 0 "column_name", dataType := ← pgCell r 1 "data_type",
+             nullable := ← pgNullableCell r 2, defaultExpr := pgOptTextCell r 3,
+             ordinalPos := Int.toNat (← pgCell (α := Int) r 4 "ordinal_position") })
+
+def listIndexes (pg : PgHandle) (table : SqlIdent) (schemaName : String := "public") : m (Except ApiError (Array PgIndexInfo)) :=
+  pg.runReadOnly (pgIndexesQuery table.raw schemaName) rfl (decodePgRows fun r => do
+    return { name := ← pgCell r 0 "indexname", definition := ← pgCell r 1 "indexdef" })
+
+def listKeyColumns (pg : PgHandle) (table : SqlIdent) (schemaName : String := "public") : m (Except ApiError (Array PgConstraintInfo)) :=
+  pg.runReadOnly (pgKeyColumnsQuery table.raw schemaName) rfl (decodePgRows fun r => do
+    return { name := ← pgCell r 0 "constraint_name", columnName := ← pgCell r 1 "column_name",
+             ordinalPos := Int.toNat (← pgCell (α := Int) r 2 "ordinal_position") })
+
+def listTableStats (pg : PgHandle) (schemaName : String := "public") : m (Except ApiError (Array PgTableStat)) :=
+  pg.runReadOnly (pgTableStatsQuery schemaName) rfl (decodePgRows fun r => do
+    return { schemaName := ← pgCell r 0 "schemaname", name := ← pgCell r 1 "relname", liveRows := ← pgCell r 2 "n_live_tup" })
+
+def countRows (pg : PgHandle) (table : SqlIdent) : m (Except ApiError Nat) :=
+  pg.runReadOnly (.count table .litTrue) rfl (decodeFirstCell (α := Int) Int.toNat none 0 "count")
+
+def countRowsInSchema (pg : PgHandle) (schema table : SqlIdent) : m (Except ApiError Nat) :=
+  pg.runReadOnly (.countSchema schema table .litTrue) rfl (decodeFirstCell (α := Int) Int.toNat none 0 "count")
+
+def selectRows (pg : PgHandle) (table : SqlIdent) (limit : Nat := 100) (offset : Nat := 0)
+    (orderBy? : Option (SqlIdent × SqlOrderDir) := none) : m (Except ApiError (Array DbRow)) :=
+  pg.runReadOnly (.selectAll table .litTrue orderBy? (some limit) (if offset == 0 then none else some offset)) rfl
+    fun res => .ok res.rows
+
+def selectCols (pg : PgHandle) (table : SqlIdent) (cols : List SqlIdent) (limit : Nat := 100) (offset : Nat := 0)
+    (orderBy? : Option (SqlIdent × SqlOrderDir) := none) : m (Except ApiError (Array DbRow)) :=
+  pg.runReadOnly (.select table cols .litTrue orderBy? (some limit) (if offset == 0 then none else some offset)) rfl
+    fun res => .ok res.rows
+
+def selectSchema (pg : PgHandle) (schema table : SqlIdent) (cols : List SqlIdent := [])
+    (whereExpr : SqlExpr := .litTrue) (orderBy? : Option (SqlIdent × SqlOrderDir) := none)
+    (limit? : Option Nat := some 100) (offset? : Option Nat := none) : m (Except ApiError (Array DbRow)) :=
+  pg.runReadOnly (.selectSchema schema table cols whereExpr orderBy? limit? offset?) rfl
+    fun res => .ok res.rows
+
+end ReadOnlyOps
+
+section SafeIOInstances
+variable {σ : Type}
+instance (pg : PgHandle) (q : SqlQuery) (hRO : q.isWrite = false) :
+    SafeIO (pg.queryReadOnly (m := ThreadProg σ) q hRO) := ⟨noAtomic_exec_map _ _⟩
+instance (pg : PgHandle) : SafeIO (pg.listSchemas (m := ThreadProg σ)) := ⟨noAtomic_exec_map _ _⟩
+instance (pg : PgHandle) (sc : String) : SafeIO (pg.listTables (m := ThreadProg σ) sc) := ⟨noAtomic_exec_map _ _⟩
+instance (pg : PgHandle) (t : SqlIdent) (sc : String) : SafeIO (pg.listColumns (m := ThreadProg σ) t sc) := ⟨noAtomic_exec_map _ _⟩
+instance (pg : PgHandle) (t : SqlIdent) (sc : String) : SafeIO (pg.listIndexes (m := ThreadProg σ) t sc) := ⟨noAtomic_exec_map _ _⟩
+instance (pg : PgHandle) (t : SqlIdent) (sc : String) : SafeIO (pg.listKeyColumns (m := ThreadProg σ) t sc) := ⟨noAtomic_exec_map _ _⟩
+instance (pg : PgHandle) (sc : String) : SafeIO (pg.listTableStats (m := ThreadProg σ) sc) := ⟨noAtomic_exec_map _ _⟩
+instance (pg : PgHandle) (t : SqlIdent) : SafeIO (pg.countRows (m := ThreadProg σ) t) := ⟨noAtomic_exec_map _ _⟩
+instance (pg : PgHandle) (sc t : SqlIdent) : SafeIO (pg.countRowsInSchema (m := ThreadProg σ) sc t) := ⟨noAtomic_exec_map _ _⟩
+instance (pg : PgHandle) (t : SqlIdent) (lim off : Nat) (ob? : Option (SqlIdent × SqlOrderDir)) :
+    SafeIO (pg.selectRows (m := ThreadProg σ) t lim off ob?) := ⟨noAtomic_exec_map _ _⟩
+instance (pg : PgHandle) (t : SqlIdent) (cols : List SqlIdent) (lim off : Nat) (ob? : Option (SqlIdent × SqlOrderDir)) :
+    SafeIO (pg.selectCols (m := ThreadProg σ) t cols lim off ob?) := ⟨noAtomic_exec_map _ _⟩
+instance (pg : PgHandle) (sc t : SqlIdent) (cols : List SqlIdent) (w : SqlExpr) (ob? : Option (SqlIdent × SqlOrderDir))
+    (lim? off? : Option Nat) : SafeIO (pg.selectSchema (m := ThreadProg σ) sc t cols w ob? lim? off?) := ⟨noAtomic_exec_map _ _⟩
+end SafeIOInstances
+end PgHandle
+
+/-- Shorthand constructor for a dynamic read-only PostgreSQL handle. -/
+@[inline] def postgres (url : String) (ssrfGuard : Bool := true) (name : String := "dynamic_pg") : PgHandle :=
+  PgHandle.connect url ssrfGuard name
+
 end Qed.Server.Db

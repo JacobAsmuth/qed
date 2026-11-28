@@ -52,7 +52,8 @@ private def rewriteNotEqAtom (chunk : String) : String :=
 
 private def asciiReplacements : Array (String × String) := #[
   (" ≤ ", " <= "), (" ≥ ", " >= "), (" ≠ ", " != "), (" ∧ ", " and "), (" ∨ ", " or "), (" → ", " -> "), (" ↔ ", " <-> "),
-  ("≤", "<="), ("≥", ">="), ("≠", "!="), ("¬(", "not ("), ("¬", "not "), ("∀ ", "all "), ("∃ ", "exists ")]
+  (" ^ ", " ** "), (" &&& ", " & "), (" ||| ", " | "), (" ^^^ ", " ^ "), (" <<< ", " << "), (" >>> ", " >> "), ("~~~", "~"),
+  ("≤", "<="), ("≥", ">="), ("≠", "!="), ("¬(", "not ("), ("¬", "not "), ("∀ ", "all "), ("∃ ", "any ")]
 
 def toQedAscii (raw : String) (stripPrefixes : List String := []) : String :=
   let collapsed := String.intercalate " " (((String.ofList (stripMacroDaggersLoop false raw.toList)).split Char.isWhitespace).toList.filterMap fun sl => if sl.isEmpty then none else some sl.toString)

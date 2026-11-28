@@ -135,6 +135,10 @@ initialize externalRegistry : Lean.SimplePersistentEnvExtension ExternalServiceI
 def exprCallsOld (stx : Lean.Syntax) : Bool :=
   Qed.Lang.stxAny (fun s => s.getKind == ``Qed.Lang.qedCall && (s.getArg 0).getKind == ``Qed.Lang.qedIdent && ((s.getArg 0).getArg 0).getId.eraseMacroScopes == `old) stx
 
+def exprMentionsAnyIdent (names : Array String) (stx : Lean.Syntax) : Bool :=
+  Qed.Lang.stxAny (fun s => s.getKind == ``Qed.Lang.qedIdent && match ((s.getArg 0).getId.eraseMacroScopes).components with
+    | r :: _ => names.contains r.toString | [] => false) stx
+
 structure DbEncKeyInfo where
   (keyEnv : String) (fallback? : Option String := none) (isBytes : Bool := false) (prevKeys : List (String × Option String) := [])
 deriving Inhabited
@@ -169,7 +173,7 @@ abbrev lookupAuth? (env : Lean.Environment) (currNs : Lean.Name) (openDecls : Li
 
 structure ServiceMethodInfo where
   (name : String) (defConst : Lean.Name) (minParamCount paramCount : Nat) (isMonadic isFallible : Bool)
-  (takesCtx dbWrite hasCookieOp hasEnsures : Bool := false)
+  (takesCtx dbWrite hasCookieOp hasEnsures requiresAuth : Bool := false)
 deriving Inhabited
 
 structure ServiceInfo where

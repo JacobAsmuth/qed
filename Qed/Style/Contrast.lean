@@ -155,6 +155,10 @@ def findStylesContrastViolations (minX100 : Nat) (extraPalette : List ThemeColor
   let palette := styles.flatMap (·.themePalette) ++ extraPalette; styles.flatMap (Style.contrastViolations minX100 palette fallbackBg?)
 def checkStylesContrast (minX100 : Nat) (extraPalette : List ThemeColorEntry) (fallbackBg? : Option ContrastFallbackBg := none) (styles : List Style) : Bool :=
   (findStylesContrastViolations minX100 extraPalette fallbackBg? styles).isEmpty
+def ContrastFallbackBg.ofToken (tok : TypedToken Color) : ContrastFallbackBg :=
+  { css := s!"var(--{tok.name})", rgb? := none, tok? := some tok.name }
+def Theme.checkContrast (th : Theme) (styles : List Style) (minX100 : Nat := 450) (bg? : Option (TypedToken Color) := none) : Bool :=
+  checkStylesContrast minX100 th.colorPalette (bg?.map ContrastFallbackBg.ofToken) styles
 def formatContrastViolations (minX100 : Nat) (vs : List ContrastViolation) : String :=
   if vs.isEmpty then "" else s!"WCAG contrast check failed (required >= {formatContrastX100 minX100}):\n" ++
     String.intercalate "\n" (vs.map fun v => s!"  • style `{v.styleName}` ({v.scope}): color `{v.fgCss}` on background-color `{v.bgCss}` is {formatContrastX100 v.ratioX100}")

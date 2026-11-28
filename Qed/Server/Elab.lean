@@ -22,7 +22,7 @@ private structure ParsedChanHeader where
   (project? : Option (Lean.Ident × Lean.Term × Lean.Ident) := none) (sig : SrvChanSig)
 
 private structure ParsedSrvEffContract where
-  (ref : Lean.Syntax) (guards ensPreds errPreds : Array Lean.Syntax := #[]) (effTags : Array Lean.Name := #[])
+  (ref : Lean.Syntax) (guards ensPreds : Array Lean.Syntax := #[]) (effTags : Array Lean.Name := #[])
   (fails? : Option (Option Nat) := none) (tac? : Option (Lean.TSyntax ``Lean.Parser.Tactic.tacticSeq) := none)
 
 private structure ParsedSrvBlind where
@@ -129,11 +129,11 @@ private def wrapWithBeforePure (beforeRun? : Option Term) (body : Term) : PureQu
 
 private structure ContractGrpAcc where
   (acc : ParsedSrvContracts) (ref? : Option Syntax := none) (tags : Array Name := #[])
-  (ens err : Array Syntax := #[]) (fails? : Option (Option Nat) := none) (tac? : Option (TSyntax ``Lean.Parser.Tactic.tacticSeq) := none)
+  (ens : Array Syntax := #[]) (fails? : Option (Option Nat) := none) (tac? : Option (TSyntax ``Lean.Parser.Tactic.tacticSeq) := none)
 
 private def ContractGrpAcc.flush (g : ContractGrpAcc) (guards : Array Syntax) : ContractGrpAcc :=
-  if g.tags.isEmpty && g.ens.isEmpty && g.err.isEmpty && g.fails?.isNone then g
-  else { acc := { g.acc with effSpecs := g.acc.effSpecs.push { ref := g.ref?.getD Syntax.missing, guards, effTags := g.tags, ensPreds := g.ens, errPreds := g.err, fails? := g.fails?, tac? := g.tac? } } }
+  if g.tags.isEmpty && g.ens.isEmpty && g.fails?.isNone then g
+  else { acc := { g.acc with effSpecs := g.acc.effSpecs.push { ref := g.ref?.getD Syntax.missing, guards, effTags := g.tags, ensPreds := g.ens, fails? := g.fails?, tac? := g.tac? } } }
 
 @[noinline] private partial def collectSrvContracts (kindLabel : String) (guards : Array Syntax) (clauses : Array Syntax) (acc0 : ParsedSrvContracts) : CommandElabM ParsedSrvContracts := do
   let gFinal ← foldlCmd clauses ({ acc := acc0 } : ContractGrpAcc) fun g cl => do
@@ -145,10 +145,9 @@ private def ContractGrpAcc.flush (g : ContractGrpAcc) (guards : Array Syntax) : 
     | ``srvEnsuresLine =>
         let (ps, t?) := ((cl.getArg 1).getSepArgs, Qed.parseOptTacSeq (cl.getArg 2))
         if guards.isEmpty then
-          if t?.isSome && g.acc.topEnsTac?.isSome then errAt cl s!"at most one `prove:` / `:= by` block is allowed per {kindLabel}"
+          if t?.isSome && g.acc.topEnsTac?.isSome then errAt cl s!"at most one `prove:` block is allowed per {kindLabel}"
           return { g with acc := { g.acc with topEnsures := g.acc.topEnsures ++ ps, topEnsTac? := g.acc.topEnsTac?.orElse fun _ => t? } }
         return { g with ref?, ens := g.ens ++ ps, tac? := g.tac?.orElse fun _ => t? }
-    | ``srvEnsuresErrLine => return { g with ref?, err := g.err ++ (cl.getArg 1).getSepArgs, tac? := g.tac?.orElse fun _ => Qed.parseOptTacSeq (cl.getArg 2) }
     | ``srvEnsuresFailsLine =>
         let cOpt := cl.getArg 1
         return { g with ref?, fails? := some (if cOpt.getNumArgs == 1 then some (⟨cOpt.getArg 0⟩ : TSyntax `num).getNat else none), tac? := g.tac?.orElse fun _ => Qed.parseOptTacSeq (cl.getArg 2) }
@@ -167,31 +166,29 @@ private structure EffContractCtx where
   (callT payloadTerm errTyTerm : Term) (innerOpt? : Option Term) (unfoldIds : Array Ident := #[])
 
 private def effTagField? : Name → Option Name
-  | `no_http => some `isHttp | `no_decrypt => some `isDecrypt | `no_crypto => some `isCrypto | `no_db_write => some `isDbWrite | _ => none
+  | `no_http => some `isHttp | `no_decrypt => some `isDecrypt | `no_crypto => some `isCrypto
+  | `no_db_write => some `isDbWrite | `no_proc => some `isProc | `no_fs => some `isFs | _ => none
 
 private def mkGuardBindersPure (guardTerms : Array Term) : PureQuotM (Array (TSyntax `Lean.Parser.Term.bracketedBinder)) :=
   mapIdxPQ guardTerms fun g i => `(bracketedBinder| ($(mkIdent (Name.mkSimple s!"_hIf_{i}")):ident : $g))
 
-@[noinline] private def mkEffPostBodyPure (outVar : Ident) (x : EffContractCtx) (ensTms errTms : Array Term) (fails? : Option (Option Nat)) : PureQuotM (Bool × Term) := do
+@[noinline] private def mkEffPostBodyPure (outVar : Ident) (x : EffContractCtx) (ensTms : Array Term) (fails? : Option (Option Nat)) : PureQuotM (Bool × Term) := do
   let mut parts : Array Term := #[]
   if !ensTms.isEmpty then
     let resId := mkIdent `result; let pLam ← `(fun ($resId:ident : $(x.innerOpt?.getD x.payloadTerm)) => $(← Qed.mkConjBody ensTms (ascribeProp := false)))
     parts := parts.push (← if !x.isFallible then (if x.innerOpt?.isSome then `(∀ _r, $outVar = Option.some _r → $pLam _r) else `($pLam $outVar))
       else mkAppC (if x.innerOpt?.isSome then ``Qed.Server.srvEnsPostOpt else ``Qed.Server.srvEnsPost) #[pLam, outVar])
-  if !errTms.isEmpty then
-    let errId := mkIdent `err; let errBody ← Qed.mkConjBody errTms (ascribeProp := false)
-    parts := parts.push (← mkAppC ``Qed.Server.srvEnsErrPost #[← `(fun ($errId:ident : $(x.errTyTerm)) => let code := ($errId).code; let status := ($errId).code; let message := ($errId).message; $errBody), outVar])
   if let some code? := fails? then
     parts := parts.push (← match code? with | none => mkAppC ``Qed.Server.srvEnsFails #[outVar] | some code => mkAppC ``Qed.Server.srvEnsFailsCode #[Syntax.mkNumLit (toString code), outVar])
   return (parts.isEmpty, ← if parts.isEmpty then pure (mkCIdent ``True : Term) else Qed.mkConjBody parts (ascribeProp := false))
 
 @[noinline] private def mkEffContractCmdPure (c : SrvElabCtx) (x : EffContractCtx) (ec : ParsedSrvEffContract) (idx : Nat)
-    (guardTms ensTms errTms : Array Term) : PureQuotM (TSyntax `command) := do
+    (guardTms ensTms : Array Term) : PureQuotM (TSyntax `command) := do
   let (bBs, guardBs, effVar, outVar, fnLit) := (← mkTypedBindersPure x.binderIds x.binderTys, ← mkGuardBindersPure guardTms, mkIdent `_eff, mkIdent `_srvOut, Syntax.mkStrLit x.fnStr)
   let effPred : Term ← if ec.effTags.isEmpty then pure (mkCIdent ``True : Term) else Qed.mkConjBody (← mapPQ ec.effTags fun tn => `(($effVar:ident).$(mkIdent (effTagField? tn |>.getD `isHttp)) = false)) (ascribeProp := false)
-  let (noPost, postBody) ← mkEffPostBodyPure outVar x ensTms errTms ec.fails?
+  let (noPost, postBody) ← mkEffPostBodyPure outVar x ensTms ec.fails?
   let lblStr := String.intercalate ", " ((ec.effTags.map (·.toString)) ++ (if ensTms.isEmpty then #[] else #["ensures"]) ++
-    (if errTms.isEmpty then #[] else #["ensures_error"]) ++ (match ec.fails? with | some none => #["ensures_fails"] | some (some code) => #[s!"ensures_fails {code}"] | none => #[])).toList
+    (match ec.fails? with | some none => #["ensures_fails"] | some (some code) => #[s!"ensures_fails {code}"] | none => #[])).toList
   let (thmId, retTy) := (c.subId (x.thmBaseLeaf.appendAfter s!"_contract_{idx + 1}") x.fnIdent, ← if x.isFallible then mkAppC ``Except #[x.errTyTerm, x.payloadTerm] else pure x.payloadTerm)
   if x.isMonadic then
     let allUnfolds := x.unfoldIds ++ c.statefulHelperIds
@@ -218,10 +215,9 @@ private def mkGuardBindersPure (guardTerms : Array Term) : PureQuotM (Array (TSy
   let lowerG (s : Syntax) : CommandElabM Term := liftMacroCmd (lowerSimpleQedExpr .propInv s)
   foldlSrv contracts.effSpecs.zipIdx () fun _ (ec, idx) => do
     if let some tn := ec.effTags.find? fun t => (effTagField? t).isNone then srvErrAt ec.ref s!"unknown effect constraint `{tn}`"
-    if !ec.errPreds.isEmpty && !x.isFallible then srvErrAt ec.ref s!"`ensures_error` requires a fallible (`T!`) {x.fnStr}"
     if ec.fails?.isSome && !x.isFallible then srvErrAt ec.ref s!"`ensures_fails` requires a fallible (`T!`) {x.fnStr}"
-    let (gTms, eTms, erTms) ← liftM do return (← mapCmd ec.guards lowerG, ← mapCmd ec.ensPreds lowerG, ← mapCmd ec.errPreds lowerG)
-    emit (← runSrvPQ (mkEffContractCmdPure c x ec idx gTms eTms erTms))
+    let (gTms, eTms) ← liftM do return (← mapCmd ec.guards lowerG, ← mapCmd ec.ensPreds lowerG)
+    emit (← runSrvPQ (mkEffContractCmdPure c x ec idx gTms eTms))
   let paramNames := x.paramIds.map (·.getId.eraseMacroScopes)
   foldlSrv contracts.blinds.zipIdx () fun _ (bl, idx) => do
     let thmId := c.subId (x.thmBaseLeaf.appendAfter s!"_blindTo_{idx + 1}") x.fnIdent
@@ -460,7 +456,7 @@ private def FnElabInfo.defId (i : FnElabInfo) (c : SrvElabCtx) : Ident := c.subI
 private def FnElabInfo.mkRes (i : FnElabInfo) (c : SrvElabCtx) (mon fal tAtom mutS dbW hasCk : Bool) (shIds : Array Ident := #[]) :
     Option ServiceMethodInfo × SrvHelperSig × Array Ident :=
   let (n, fnStr) := (i.pp.idents.size, i.fnStr)
-  (if !i.isService then none else some { name := fnStr, defConst := c.fullSrvName ++ i.defLeaf, minParamCount := i.pp.minParamCount, paramCount := n, isMonadic := mon, isFallible := fal, takesCtx := i.takesCtx, dbWrite := dbW, hasCookieOp := hasCk, hasEnsures := i.ensRes?.isSome },
+  (if !i.isService then none else some { name := fnStr, defConst := c.fullSrvName ++ i.defLeaf, minParamCount := i.pp.minParamCount, paramCount := n, isMonadic := mon, isFallible := fal, takesCtx := i.takesCtx, dbWrite := dbW, hasCookieOp := hasCk, hasEnsures := i.ensRes?.isSome, requiresAuth := i.reqs.requiresAuth },
    { name := fnStr, defId := i.defId c, minParamCount := i.pp.minParamCount, paramCount := n, isMonadic := mon, isFallible := fal, takesAtomic := tAtom, takesEnvs := !i.isService, takesCtx := i.takesCtx, mutatesState := mutS, dbWrite := dbW, hasCookieOp := hasCk }, shIds)
 
 @[noinline] private def emitFnDefAndProofs (info : FnElabInfo) (isMonadic outIsFallible : Bool) (retTy bodyTerm : Term) : SrvElabM Bool := do
@@ -693,8 +689,9 @@ private def termMentionsRoot (v : String) (t : Term) : Bool :=
 
 private inductive SrvExCheck where | ok (rk : Nat) (val? : Option Term) | err (code? : Option (TSyntax `num)) | status (val : Term) | prop (p : Term)
 private inductive SrvExStep where
-  | withEq (kw : Name) (val : Term) | withStrEq (isEnv : Bool) (key : String) (val : Term) | withRole (val : Term) | withUser (val? : Option Term)
+  | withEq (kw : Name) (val : Term) | withStrEq (kw : Name) (key : String) (val : Term) | withRole (val : Term) | withUser (val? : Option Term)
   | withHttp (isOk : Bool) (method url : String) (code : TSyntax `num) (payload? : Option Term)
+  | withProc (cmd : String) (code : TSyntax `num) (stdout? : Option Term)
   | seedDb (tblRowId : Ident) (tblStr : String) (rows : Sum (Array Term) Term)
   | callSvc (fnId : Ident) (takesCtx isMonadic : Bool) (args : Array Term)
   | callRpc (dispId : Ident) (fnStr : String) (reqTy respTy : Term) (args : Array Term)
@@ -705,7 +702,7 @@ private inductive SrvExStep where
   let (steps, rk) := acc; let c := ctx.c; let push (s : SrvExStep) (nk : Nat := rk) := pure (steps.push s, nk)
   match it.getKind with
   | `Qed.Server.srvExWithEq => push (.withEq (it.getArg 1).getId.eraseMacroScopes (← lowerSrvExVal (it.getArg 3)))
-  | `Qed.Server.srvExWithStrEq => push (.withStrEq ((it.getArg 1).getId.eraseMacroScopes == `env) (⟨it.getArg 2⟩ : TSyntax `str).getString (← lowerSrvExVal (it.getArg 4)))
+  | `Qed.Server.srvExWithStrEq => push (.withStrEq (it.getArg 1).getId.eraseMacroScopes (⟨it.getArg 2⟩ : TSyntax `str).getString (← lowerSrvExVal (it.getArg 4)))
   | `Qed.Server.srvExWithExpr =>
       let vStx := it.getArg 2
       if (it.getArg 1).getId.eraseMacroScopes == `role then push (.withRole (← lowerSrvExVal vStx))
@@ -713,6 +710,9 @@ private inductive SrvExStep where
   | `Qed.Server.srvExWithHttp =>
       let payload? ← if (it.getArg 6).getNumArgs == 1 then some <$> lowerSrvExVal ((it.getArg 6).getArg 0) else pure none
       push (.withHttp ((it.getArg 1).getId.eraseMacroScopes == `http) (it.getArg 2).getId.eraseMacroScopes.toString.toUpper (⟨it.getArg 3⟩ : TSyntax `str).getString ⟨it.getArg 5⟩ payload?)
+  | `Qed.Server.srvExWithProc =>
+      let stdout? ← if (it.getArg 5).getNumArgs == 1 then some <$> lowerSrvExVal ((it.getArg 5).getArg 0) else pure none
+      push (.withProc (⟨it.getArg 2⟩ : TSyntax `str).getString ⟨it.getArg 4⟩ stdout?)
   | `Qed.Server.srvExDb =>
       let (tblRowId, tblStr) ← resolveSrvExDbTable c ⟨it.getArg 2⟩; let rawRows := it.getArg 4
       let rows ← if rawRows.getKind == ``qedArrLit then Sum.inl <$> mapCmd (rawRows.getArg 1).getSepArgs lowerSrvExVal else Sum.inr <$> lowerSrvExVal rawRows
@@ -743,6 +743,7 @@ private def srvExTraceSpecs : Array (Name × List Name) := #[
   (`http_calls, [`trace, `httpCalls, `length]), (`http, [`trace, `httpCalls, `toArray]),
   (`decrypt_calls, [`trace, `decryptCount]), (`encrypt_calls, [`trace, `encryptCount]),
   (`db_queries, [`trace, `dbQueries, `length]), (`cookies, [`trace, `cookies, `toArray]),
+  (`slept_ms, [`trace, `sleptMs]), (`proc_calls, [`trace, `procCalls, `length]),
   (`db_count, [`db, `countRows]), (`state, [`shared])]
 
 @[noinline] private def wrapSrvExCheckPure (stId : Ident) (checkT rest : Term) : PureQuotM Term := do
@@ -768,8 +769,8 @@ private def srvExEqSpecs : Array (Name × Bool × Name × Option Name) := #[
         letR tgt (← mkAppC fn #[tgt, ← match ty? with | some tn => mkAscribePure vT (mkCIdent tn) | none => pure vT])
       else if kw == `ctx then letR ctxId (← mkAscribePure vT (mkCIdent ``Qed.Server.RequestCtx))
       else letR stId (← mkAppC ``Qed.Server.Eval.setShared #[stId, ← mkAscribePure vT ctx.stateTy])
-  | .withStrEq isEnv k vT =>
-      let (tgt, fn) := if isEnv then (envId, ``Qed.Server.Eval.setEnvVar) else (ctxId, ``Qed.Server.Eval.setHeader)
+  | .withStrEq kw k vT =>
+      let (tgt, fn) := if kw == `env then (envId, ``Qed.Server.Eval.setEnvVar) else if kw == `file then (stId, ``Qed.Server.Eval.seedMemFile) else (ctxId, ``Qed.Server.Eval.setHeader)
       letR tgt (← mkAppC fn #[tgt, Syntax.mkStrLit k, vT])
   | .withRole vT => letR ctxId (← mkAppC ``Qed.Server.Eval.setRole #[ctxId, vT])
   | .withUser u? => letR ctxId (← mkAppC ``Qed.Server.Eval.setUser #[ctxId, ← mkOptTermPure u?])
@@ -778,6 +779,11 @@ private def srvExEqSpecs : Array (Name × Bool × Name × Option Name) := #[
       let stub ← mkAppC (if isOk then ``Qed.Server.Eval.HttpStub.ok else ``Qed.Server.Eval.HttpStub.err)
         #[Syntax.mkStrLit m, Syntax.mkStrLit u, codeT, p?.getD (Syntax.mkStrLit (if isOk then "" else "upstream error"))]
       letR stId (← mkAppC ``Qed.Server.Eval.pushHttpStub #[stId, stub])
+  | .withProc cmd code out? =>
+      let codeT ← mkAscribePure ⟨code.raw⟩ (mkCIdent ``UInt32)
+      let outT := out?.getD (Syntax.mkStrLit "")
+      let stub ← `(Qed.Server.Eval.ProcStub.mk $(Syntax.mkStrLit cmd) [] (Except.ok { exitCode := $codeT, stdout := $outT, stderr := "" }) false)
+      letR stId (← mkAppC ``Qed.Server.Eval.pushProcStub #[stId, stub])
   | .seedDb tblRowId tblStr rows =>
       let rowsT ← match rows with | .inl elems => mkListLitPure (← mapPQ elems (mkAscribePure · tblRowId)) | .inr v => mkAscribePure v (← mkAppC ``List #[tblRowId])
       letR stId (← mkAppC ``Qed.Server.Eval.seedDbRows #[stId, Syntax.mkStrLit tblStr, mkIdentFrom tblRowId (tblRowId.getId ++ `schema), mkIdentFrom tblRowId (tblRowId.getId ++ `encodeRow), rowsT])
@@ -856,16 +862,6 @@ private def srvExEqSpecs : Array (Name × Bool × Name × Option Name) := #[
     let some (mi?, hs, sh) ← withReader (fun (c : SrvElabCtx) => { c with helpers := hSigs, statefulHelperIds := shIds }) (elabStatelessOrHelperFn isService hlc) | return none
     return some (mi?.elim mInfos mInfos.push, hSigs.push hs, shIds ++ sh)
 
-private def checkAuthInvs {α β : Type} (invs : Array α) (invIdOf : α → Ident) (what : α → String) (missingOf : α → Array β) (fmtItem : β → String) : SrvElabM Unit :=
-  foldlSrv invs () fun _ inv => do
-    let missing := missingOf inv
-    unless missing.isEmpty do
-      let id := invIdOf inv
-      srvErrAt id s!"server invariant `{id.getId}` violated: {what inv} without `requires auth`: {String.intercalate ", " (missing.toList.map fmtItem)}"
-
-private def mkNoSecretsInvsPure (c : SrvElabCtx) (invIds : Array Ident) : PureQuotM (Array (TSyntax `command)) :=
-  mapPQ invIds fun id => `(command| theorem $(c.subId id.getId id) : $(c.subId `secrets) = #[] := rfl)
-
 @[noinline] private def elabServerBody (b : ParsedServerBlock) (isStateless : Bool) : SrvElabM Unit := do
   let c ← read
   if c.hasState then unless (← elabServerStateCmds b.stateDecls) do return
@@ -888,10 +884,11 @@ private def mkNoSecretsInvsPure (c : SrvElabCtx) (invIds : Array Ident) : PureQu
       let elabHook? (lbl : String) (leaf : Name) (c? : Option Syntax) := match b.authDecl?, c? with | some (_, ai), some hc => Option.map some <$> elabServerAuthHook lbl leaf ai hc | _, _ => pure (some none)
       let some onCreateRun? ← elabHook? "onCreateAccount" `_onCreateAccount b.onCreateAccountClause? | return
       let some onSignInRun? ← elabHook? "onSignIn" `_onSignIn b.onSignInClause? | return
-      elabServerDispatchCmds methodInfos dispatchArms (chanHeaders.map (·.chStr)) wsDispatchArms wsProjectArms httpDispatchArms jobNames onCreateRun? onSignInRun?
-      checkAuthInvs b.routesAuthInvs (·.1) (fun x => s!"routes matching \"{x.2.1}\"") (fun (_, pfx, excs) => httpRoutes.filter fun r => r.2.1.startsWith pfx && !excs.contains r.2.1 && !r.2.2) (fun r => s!"`{r.1} {r.2.1}`")
-      checkAuthInvs b.rpcsAuthInvs (·.1) (fun _ => "RPCs") (fun (_, excs) => methodInfos.filter fun m => !excs.contains m.name && !m.requiresAuth) (fun m => s!"`{m.name}`")
-      elabSrvPureCmds do return (← mapPQ (b.routesAuthInvs.map (·.1) ++ b.rpcsAuthInvs.map (·.1)) fun id => mkMarkerThmPure (c.subId id.getId id)) ++ (← mkNoSecretsInvsPure c b.noSecretsInvs)
+      elabServerDispatchCmds methodInfos dispatchArms (chanHeaders.map (·.chStr)) wsDispatchArms wsProjectArms httpDispatchArms httpRoutes jobNames onCreateRun? onSignInRun?
+      let srvAliases : Array (String × Term) := #[("secrets", c.subId `secrets), ("rpcs", c.subId `rpcs), ("routes", c.subId `routes)]
+      let srvUnfolds : Array Name := #[c.fullSrvName ++ `secrets, c.fullSrvName ++ `rpcs, c.fullSrvName ++ `routes]
+      foldlSrv b.metaInvs () fun _ (invId, exprs) =>
+        liftM <| Qed.Verify.Core.elabStaticMetaInv c.srvName.toString (c.fullSrvName ++ invId.getId.eraseMacroScopes) srvAliases srvUnfolds invId exprs
       elabSrvExamples false b.exampleClauses #[] rpcWireMap
 
 @[noinline] private def elabServerOrServiceCore (isService : Bool) (priorRep priorUnrep : Nat) (stx : Syntax) : CommandElabM Unit := do
@@ -908,7 +905,14 @@ private def mkNoSecretsInvsPure (c : SrvElabCtx) (invIds : Array Ident) : PureQu
       let some (methodInfos, _, _) ← elabHelpersLoop true b.helperClauses | return
       let (reqSecrets, ownSecrets, usedExts, allDbs, allEnvs) ← collectServerSecretsAndExts
       elabSrvPureCmds do
-        return #[← mkStrArrDefPure (initCtx.subId `secrets) reqSecrets, ← mkMarkerThmPure (initCtx.subId `_qed_service_marker)] ++ (← mkNoSecretsInvsPure initCtx b.noSecretsInvs)
+        let fnMetaTs ← mapPQ methodInfos fun m => mkAppC ``Qed.Server.RpcMeta.mk #[Syntax.mkStrLit m.name, quote m.requiresAuth, quote (!m.dbWrite)]
+        return #[← mkStrArrDefPure (initCtx.subId `secrets) reqSecrets,
+          ← `(command| def $(initCtx.subId `fns) : Array Qed.Server.RpcMeta := #[$[$fnMetaTs:term],*]),
+          ← mkMarkerThmPure (initCtx.subId `_qed_service_marker)]
+      let svcAliases : Array (String × Term) := #[("secrets", initCtx.subId `secrets), ("fns", initCtx.subId `fns)]
+      let svcUnfolds : Array Name := #[initCtx.fullSrvName ++ `secrets, initCtx.fullSrvName ++ `fns]
+      foldlSrv b.metaInvs () fun _ (invId, exprs) =>
+        liftM <| Qed.Verify.Core.elabStaticMetaInv srvName.toString (initCtx.fullSrvName ++ invId.getId.eraseMacroScopes) svcAliases svcUnfolds invId exprs
       elabSrvExamples true b.exampleClauses methodInfos
       modifyEnv fun env => serviceRegistry.addEntry env { serviceName := initCtx.fullSrvName, shortName := srvName.toString, secrets := reqSecrets, ownSecrets, envVars := allEnvs, externalServices := usedExts, databases := allDbs, methods := methodInfos }
     else elabServerBody b isStateless).run initCtx
@@ -955,8 +959,9 @@ private def collectReachableDefns (env : Environment) : Nat → List Name → St
         errAt cliIdent s!"`fullstack {fsName}` mounts `server {srvInfo.shortName}` (methods: [{String.intercalate ", " (srvInfo.methods.toList.map (·.name))}]), but client `{cliIdent.getId}` targets invalid RPC endpoint `{url}`"
 
 @[noinline, command_elab fullstackCmd] def elabFullstackCmd : CommandElab := fun stx => do
-  let fsIdent : Ident := ⟨stx.getArg 1⟩; let (fsName, currNs) := (fsIdent.getId, ← getCurrNamespace)
-  let (srvIdent?, cliIdent?, title?) ← foldlCmd (stx.getArg 3).getArgs ((none : Option Ident), (none : Option Ident), (none : Option String)) fun (s?, c?, t?) cl => do
+  let doc? := extractOptDoc (stx.getArg 0)
+  let fsIdent : Ident := ⟨stx.getArg 2⟩; let (fsName, currNs) := (fsIdent.getId, ← getCurrNamespace)
+  let (srvIdent?, cliIdent?, title?) ← foldlCmd (stx.getArg 4).getArgs ((none : Option Ident), (none : Option Ident), (none : Option String)) fun (s?, c?, t?) cl => do
     match cl.getKind with
     | `Qed.Server.fsServerClause => return (← setOptOnce s? cl "`server` clause in `fullstack`" (pure ⟨cl.getArg 1⟩), c?, t?)
     | `Qed.Server.fsClientClause => return (s?, ← setOptOnce c? cl "`client` clause in `fullstack`" (pure ⟨cl.getArg 1⟩), t?)
@@ -973,7 +978,7 @@ private def collectReachableDefns (env : Environment) : Nat → List Name → St
     if ← liftCoreM (Qed.isFailedComponent cliIdent.getId) then return
     if (← liftCoreM (Qed.lookupComponent? cliIdent.getId)).isSome then errAt cliIdent s!"component `{cliIdent.getId}` in `fullstack {fsName}` is not a top-level mountable app (remove `prop`, `bind`, `children`, `event`, and uninitialized `state` fields)"
     else errAt cliIdent s!"unknown `client` `{cliIdent.getId}` in `fullstack {fsName}`; specify a top-level `component` or `Qed.App` value"
-  elabPureCmd `(command| abbrev $(mkIdentFrom fsIdent (fsName ++ `clientApp)) := $cliTarget)
+  elabPureCmd `(command| $[$doc?:docComment]? abbrev $(mkIdentFrom fsIdent (fsName ++ `clientApp)) := $cliTarget)
   let cliCompName := if resolvedCli.getString! == "app" then resolvedCli.getPrefix else resolvedCli
   verifyFullstackRpcClosure env fsName srvInfo cliIdent resolvedCli
   let pageTitle := title?.getD fsName.toString; let srvShortLit := Syntax.mkStrLit srvInfo.shortName

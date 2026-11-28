@@ -40,14 +40,14 @@ bad_spec_act "Predicted response for `StoreSrv.placeOrder` does not satisfy serv
       case _: pass
     remaining = rem
 bad_comp "cannot run side effects or emit events inside a speculative continuation after `predict`" BadSpecPerform :
-  session user | port log : String | state remaining : Nat = 10 | invariant validRemaining: remaining <= 10000 |
+  session user || port log : String || state remaining : Nat = 10 || invariant validRemaining: remaining <= 10000 ||
   action buy:
     if user.isSome and 1 <= remaining:
       let rem = await StoreSrv.placeOrder(1) predict remaining - 1 catch:
         case _: pass
       remaining = rem
       log.send("bought")
-  | view: <span>{remaining}</span>
+  || view: <span>{remaining}</span>
 bad_spec_act "cannot `await` inside a speculative continuation after `predict`" BadSpecNestedAwait :
   if user.isSome and 1 <= remaining:
     let rem = await StoreSrv.placeOrder(1) predict remaining - 1 catch:
@@ -69,8 +69,8 @@ bad_spec_act "`rollback` requires a `predict` clause on the same `await`" BadRol
       catch:
         case _: pass
     remaining = rem
-bad_comp_act "`predict`, `on_confirm`, `rollback`, and `catch` can only be used on an `await` server RPC call" BadPredictOnNonAwait count : Nat = 0 | bump : let n = count + 1 predict 2; count = n
-bad_comp_act "`predict` can only be used on an `await` server RPC call" BadPredictOnAssign count : Nat = 0 | bump : count = 1 predict 2
+bad_comp_act "`predict`, `on_confirm`, `rollback`, and `catch` can only be used on an `await` server RPC call" BadPredictOnNonAwait count : Nat = 0 || bump : let n = count + 1 predict 2; count = n
+bad_comp_act "`predict` can only be used on an `await` server RPC call" BadPredictOnAssign count : Nat = 0 || bump : count = 1 predict 2
 bad_spec_act "`predict:` computes a predicted server response and cannot mutate state or perform side effects" BadMutateInPredict :
   if user.isSome:
     let rem = await StoreSrv.placeOrder(1)
@@ -81,12 +81,12 @@ bad_spec_act "`predict:` computes a predicted server response and cannot mutate 
 bad_srv "`predict`, `on_confirm`, and `rollback` are only supported on client `component` `await` calls, not in `server` functions" BadServerPredict : rpc f() -> Nat: let x = 1 predict 1; return x
 bad_spec_act "`await StoreSrv.placeOrder(...)` has unhandled domain error(s): .outOfStock" BadPredictUnhandledDomainErr :
   if user.isSome and 1 <= remaining: let rem = await StoreSrv.placeOrder(1) predict remaining - 1; remaining = rem
-bad_comp_inv "Invariant `BadRollbackInv.bounded` failed in `BadRollbackInv.update`:\n  • `rollback` branch must satisfy:  20000 <= 10000" BadRollbackInv val : Nat = 0 | bounded : val <= 10000 | go :
+bad_comp_inv "Invariant `BadRollbackInv.bounded` failed in `BadRollbackInv.update`:\n  • `rollback` branch must satisfy:  20000 <= 10000" BadRollbackInv val : Nat = 0 || bounded : val <= 10000 || go :
   let r = await StoreSrv.claim(1) predict 1
     rollback: val = 20000
     catch:
       case _: pass
-  | val = r
+  || val = r
 
 /-! ## 2. Positive Runtime & Proof Tests -/
 component CheckoutSpec:

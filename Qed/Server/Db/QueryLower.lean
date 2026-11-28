@@ -160,7 +160,7 @@ private def mkPolHint (label fallback pfx : String) : String := if label.isEmpty
     (forbidEncAll : Bool := false) (colQualPfx : String := "") : CommandElabM (Array (Ident × DbColumnInfo × String × Syntax)) :=
   Lang.mapCmd items fun item => do
     let colId : Ident := ⟨item.getArg 0⟩; let colName := colId.getId.eraseMacroScopes.toString
-    let setOp := if allowCompoundOp then (item.getArg 1).getAtomVal else "="
+    let setOp := if allowCompoundOp then ((item.getArg 1).reprint.getD "=").trimAscii.toString else "="
     let col ← findDbCol colId tbl colName (fun c t => s!"{ctxLabel} references unknown column `{c}` on table `{t}`")
     if forbidPk && col.isPrimaryKey then mkDbErr colId s!"{ctxLabel} cannot modify `primary_key` column `{colName}`"
     if forbidImmutable && col.isImmutable then mkDbErr colId s!"cannot update `immutable` column `{colQualPfx}{colName}` in {ctxLabel}"
@@ -271,6 +271,7 @@ private def extractDirectScopedCol? (scopes : Array (String × DbTableInfo × St
   let mentionsScope (s : Syntax) : Bool :=
     scopes.any (fun (v, tbl, _) => if v.isEmpty then tbl.columns.any (fun c => stxMentionsVar c.name s) else stxMentionsVar v s) || stxAny (·.getKind == ``qedAnyIn) s
   if k == ``qedAnyIn then
+    unless (u.getArg 1).isIdent do mkDbErr (u.getArg 1) "cross-table `any <alias> in <table>:` expects a plain table alias identifier"
     let aliasId : Ident := ⟨u.getArg 1⟩; let aliasStr := aliasId.getId.eraseMacroScopes.toString
     unless isSafeSqlIdent aliasStr do mkDbErr aliasId s!"invalid SQL alias `{aliasStr}` in `any {aliasStr} in ...`"
     if scopes.any (·.1 == aliasStr) then mkDbErr aliasId s!"alias `{aliasStr}` in `any {aliasStr} in ...` shadows an outer row/table variable"
@@ -294,16 +295,17 @@ private def extractDirectScopedCol? (scopes : Array (String × DbTableInfo × St
         else sub side
     | none => sub side
   if k == ``qedProj then
-    let fld := (u.getArg 2).getId.eraseMacroScopes.toString
-    if fld == "length" then return qctx.runPure (mkAppC `Qed.Server.Db.SqlExpr.strLen #[← sub (u.getArg 0)])
-    else mkDbErr u s!"unsupported row projection `.{fld}` inside SQL query expression"
+    if (u.getArg 2).isIdent && (u.getArg 2).getId.eraseMacroScopes == `length then
+      return qctx.runPure (mkAppC `Qed.Server.Db.SqlExpr.strLen #[← sub (u.getArg 0)])
+    else mkDbErr u s!"unsupported row projection `.{stxSnippet (u.getArg 2)}` inside SQL query expression"
   else if let some (_, op) := sqlBinOps.find? (·.1 == k) then return qctx.runPure (mkSqlBinOpPure op (← sub (u.getArg 0)) (← sub (u.getArg 2)))
   else if k == ``qedNot then return qctx.runPure (mkAppC `Qed.Server.Db.SqlExpr.not #[← sub (u.getArg 1)])
   else if k == ``qedCmp then lowerRowSqlCmp qctx mentionsScope lowerVal sub lowerSide u
   else if k == ``qedExprIf || k == ``qedTernary then
-    let (cI, tI, eI) := if k == ``qedTernary then (2, 0, 3) else (1, 3, 4); let eOpt := u.getArg eI
-    if eOpt.getNumArgs == 0 then mkDbErr u "conditional `if` inside SQL `where`/`set` clause requires an `else` branch"
-    let (condStx, thenStx, elseStx) := (u.getArg cI, u.getArg tI, eOpt.getArg (eOpt.getNumArgs - 1))
+    let (cI, tI, elseStx?) := if k == ``qedTernary then (2, 0, extractOptElseExpr? (u.getArg 3))
+      else (1, 3, desugarExprElifs? (u.getArg 4).getArgs (u.getArg 5))
+    let some elseStx := elseStx? | mkDbErr u "conditional `if` inside SQL `where`/`set` clause requires an `else` branch"
+    let (condStx, thenStx) := (u.getArg cI, u.getArg tI)
     if !mentionsScope condStx then
       let (cT, tSql, eSql) := (← lowerVal condStx, ← sub thenStx, ← sub elseStx)
       return qctx.runPure `(if ($cT : Bool) then $tSql else $eSql)
@@ -313,13 +315,13 @@ private def extractDirectScopedCol? (scopes : Array (String × DbTableInfo × St
         mkSqlBinOpPure `Qed.Server.Db.SqlBinOp.or (← mkSqlBinOpPure `Qed.Server.Db.SqlBinOp.and cSql tSql)
           (← mkSqlBinOpPure `Qed.Server.Db.SqlBinOp.and (← mkAppC `Qed.Server.Db.SqlExpr.not #[cSql]) eSql)
   else if k == ``qedExprIfLet then
-    let scrutStx := u.getArg 4; let eOpt := u.getArg 7
-    if eOpt.getNumArgs == 0 then mkDbErr u "conditional `if let` inside SQL `where` clause requires an `else:` branch"
+    let scrutStx := u.getArg 4
+    let some elseStx := desugarExprElifs? (u.getArg 7).getArgs (u.getArg 8) | mkDbErr u "conditional `if let` inside SQL `where` clause requires an `else:` branch"
     if mentionsScope scrutStx then mkDbErr scrutStx "`if let` scrutinee inside SQL `where` cannot depend on a row column; match an outer `Option` variable instead"
     let patT ← liftMacroM (lowerQedPat (u.getArg 2)); let scrutT ← lowerVal scrutStx
     let patLocals := (collectQedPatIds (u.getArg 2)).map (·.toString)
     let thenSql ← lowerRowSqlExprGo qctx (fun locs e => lowerValWithLocals (patLocals ++ locs) e) dbInfo scopes (u.getArg 6)
-    return qctx.runPure `(match $scrutT:term with | $patT:term => $thenSql | _ => $(← sub (eOpt.getArg (eOpt.getNumArgs - 1))))
+    return qctx.runPure `(match $scrutT:term with | $patT:term => $thenSql | _ => $(← sub elseStx))
   else if k == ``qedCall then lowerRowSqlMethod qctx mentionsScope lowerVal sub u
   else mkDbErr u s!"unsupported expression `{stxSnippet u}` in SQL `where`/`set` clause (use row columns, comparisons, `and`/`or`/`not`, `any m in tbl:`, `in`, arithmetic, `.length`, `.startsWith`, `.contains`, `xs.contains(r.col)`, or bound variables)"
 
@@ -586,15 +588,19 @@ private structure UpdateFieldAcc where
     if !valMentionsRow && !isIdentNamed valStx (fun n => n == `true || n == `false) then pure <| c.q (mkTypedSqlParamTerm c.rowTyId fId wrappedVal)
     else lowerRowSqlExprGo c.qctx c.lowerValWithLocals c.dbInfo #[(setRowName, c.tbl, c.tbl.tableName)] valStx
   let (lv, sp, post?, uf?) ←
-    if setOp == "+=" || setOp == "-=" then
+    if setOp == "+=" || setOp == "-=" || setOp == "*=" then
       if colInfo.encKey?.isSome then mkDbErr valStx s!"cannot update encrypted column `{c.qualName}.{colName}` using `{setOp}`"
       if !(colInfo.isNat || colInfo.isInt) || colInfo.isNullable then
         mkDbErr colId s!"atomic `{setOp}` requires a non-null integer (`Nat` or `Int`) column, but `{c.tbl.tableName}.{colName}` is not"
       let deltaT := c.q (c.wrapField (← c.lowerValWithLocals #[setRowName] valStx)); let deltaSqlT ← lowerSetSql deltaT
+      let sqlBinOp := if setOp == "+=" then `Qed.Server.Db.SqlBinOp.add else if setOp == "-=" then `Qed.Server.Db.SqlBinOp.sub else `Qed.Server.Db.SqlBinOp.mul
       let (lv, sp) := c.q do
-        let sqlE ← mkSqlBinOpPure (if setOp == "+=" then `Qed.Server.Db.SqlBinOp.add else `Qed.Server.Db.SqlBinOp.sub) (← mkAppC `Qed.Server.Db.SqlExpr.col #[colSqlId]) deltaSqlT
-        return (← (if setOp == "+=" then `(($setRowVar.$fId + $deltaT)) else `(($setRowVar.$fId - $deltaT))), ← mkPairTerm colSqlId sqlE)
+        let sqlE ← mkSqlBinOpPure sqlBinOp (← mkAppC `Qed.Server.Db.SqlExpr.col #[colSqlId]) deltaSqlT
+        let leanE ← if setOp == "+=" then `(($setRowVar.$fId + $deltaT)) else if setOp == "-=" then `(($setRowVar.$fId - $deltaT)) else `(($setRowVar.$fId * $deltaT))
+        return (leanE, ← mkPairTerm colSqlId sqlE)
       pure (lv, sp, none, if setOp == "-=" && colInfo.isNat then some (colName, fId, deltaT) else none)
+    else if setOp != "=" then
+      mkDbErr valStx s!"unsupported compound assignment `{setOp}` in database `set` (supported: `=`, `+=`, `-=`, `*=`)"
     else
       if colInfo.encKey?.isSome && valMentionsRow then
         mkDbErr valStx s!"cannot update encrypted column `{c.qualName}.{colName}` using a row-dependent SQL expression"

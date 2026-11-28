@@ -18,8 +18,7 @@ structure ParsedServerBlock where
   (dbDecls : Array (Lean.Ident × DatabaseInfo) := #[]) (serviceDecls : Array (Lean.Ident × ServiceInfo) := #[])
   (authDecl? : Option (Lean.Ident × AuthInfo) := none) (envDecls : Array ParsedEnvDecl := #[])
   (stateDecls : Array ParsedStateDecl := #[]) (mutInvs : Array ParsedMutInv := #[]) (invs : Array ParsedInv := #[])
-  (routesAuthInvs : Array (Lean.Ident × String × Array String) := #[]) (rpcsAuthInvs : Array (Lean.Ident × Array String) := #[])
-  (noSecretsInvs : Array Lean.Ident := #[])
+  (rawInvs : Array (Lean.Ident × Array Lean.Syntax) := #[]) (metaInvs : Array (Lean.Ident × Array Lean.Syntax) := #[])
   (helperClauses fnClauses chanClauses httpClauses jobClauses exampleClauses : Array Lean.Syntax := #[])
   (beforeClause? onCreateAccountClause? onSignInClause? : Option Lean.Syntax := none)
 
@@ -183,9 +182,6 @@ def lowerSrvExpr (ctx : LowerCtx) (mode : ExprMode) (stx : Syntax) : SrvElabM Te
 partial def unwrapDocClause (c : Syntax) : Option (TSyntax ``Lean.Parser.Command.docComment) × Syntax :=
   if c.getKind == ``srvDocClause then let (inner?, body) := unwrapDocClause (c.getArg 1); (inner?.orElse fun _ => some ⟨c.getArg 0⟩, body) else (none, c)
 
-private def parseExceptList (optStx : Syntax) : Array String :=
-  if optStx.getNumArgs == 4 then (optStx.getArg 2).getSepArgs.map fun s => (⟨s⟩ : TSyntax `str).getString else #[]
-
 private def checkUniqueDecl (b : ParsedServerBlock) (blockKind : String) (srvName : Name) (id : Ident) : CommandElabM Unit := do
   let nm := id.getId
   if b.dbDecls.any (·.1.getId == nm) || b.serviceDecls.any (·.1.getId == nm) || b.authDecl?.any (·.1.getId == nm) ||
@@ -212,15 +208,12 @@ private def checkUniqueInv (seen : Array Name) (blockKind : String) (srvName : N
 
 @[noinline] private def parseServerOnlyClause (srvName : Name) (b : ParsedServerBlock) (seenInv : Array Name) (rawC c : Syntax) : CommandElabM (ParsedServerBlock × Array Name) := do
   match c.getKind with
-  | ``srvInvRoutesAuthClause => let id : Ident := ⟨c.getArg 1⟩; return ({ b with routesAuthInvs := b.routesAuthInvs.push (id, (⟨c.getArg 4⟩ : TSyntax `str).getString, parseExceptList (c.getArg 5)) }, ← checkUniqueInv seenInv "server" srvName id)
-  | ``srvInvRpcsAuthClause => let id : Ident := ⟨c.getArg 1⟩; return ({ b with rpcsAuthInvs := b.rpcsAuthInvs.push (id, parseExceptList (c.getArg 4)) }, ← checkUniqueInv seenInv "server" srvName id)
   | ``srvStateClause =>
       let id : Ident := ⟨c.getArg 1⟩; let ty ← liftMacroCmd (lowerSrvType (c.getArg 3) false s!"state field `{id.getId}`"); checkUniqueDecl b "server" srvName id
       let (initStx?, defT?) ← if (c.getArg 4).getNumArgs == 2 then pure (some ((c.getArg 4).getArg 1), none)
         else match ← liftMacroCmd (inferQedTypeDefault? (c.getArg 3)) with | some dt => pure (none, some dt) | none => errAt id s!"state field `{id.getId}` requires an initial value `= ...`"
       return ({ b with stateDecls := b.stateDecls.push (id, ty.term, initStx?, defT?) }, seenInv)
   | ``srvInvMutatingClause => let id : Ident := ⟨c.getArg 1⟩; return ({ b with mutInvs := b.mutInvs.push (⟨c.getArg 4⟩, c.getArg 6, s!"mutating:{id.getId}") }, ← checkUniqueInv seenInv "server" srvName id)
-  | ``srvInvClause => let id : Ident := ⟨c.getArg 1⟩; return ({ b with invs := b.invs ++ (c.getArg 3).getSepArgs.map fun e => (e, exprCallsOld e, id.getId.toString) }, ← checkUniqueInv seenInv "server" srvName id)
   | ``srvBeforeClause => return ({ b with beforeClause? := ← setOptOnce b.beforeClause? c s!"`before` middleware in `server {srvName}`" (pure c) }, seenInv)
   | ``srvFnClause => return ({ b with fnClauses := b.fnClauses.push rawC }, seenInv)
   | ``srvChannelClause => return ({ b with chanClauses := b.chanClauses.push c }, seenInv)
@@ -242,18 +235,26 @@ private def checkUniqueInv (seen : Array Name) (blockKind : String) (srvName : N
       let def? := if !isSecret && (c.getArg 4).getNumArgs == 2 then some (⟨(c.getArg 4).getArg 1⟩ : TSyntax `str).getString else none
       return ({ b with envDecls := b.envDecls.push { ident := id, osKey, default? := def?, isSecret } }, seenInv)
   | ``srvHelperFnClause => return ({ b with helperClauses := b.helperClauses.push rawC }, seenInv)
-  | ``srvInvNoSecretsClause =>
-      let id : Ident := ⟨c.getArg 1⟩; return ({ b with noSecretsInvs := b.noSecretsInvs.push id }, ← checkUniqueInv seenInv blockKind srvName id)
+  | ``srvInvClause =>
+      let id : Ident := ⟨c.getArg 1⟩
+      return ({ b with rawInvs := b.rawInvs.push (id, (c.getArg 3).getSepArgs) }, ← checkUniqueInv seenInv blockKind srvName id)
   | ``srvExampleClause => return ({ b with exampleClauses := b.exampleClauses.push rawC }, seenInv)
   | _ =>
-      if isService then errAt c s!"only `use`, `env`, `secret`, `fn`, `example`, and `invariant ... : no_required_secrets` declarations are allowed in stateless `service {srvName}`"
+      if isService then errAt c s!"only `use`, `env`, `secret`, `fn`, `example`, and `invariant` declarations are allowed in stateless `service {srvName}`"
       parseServerOnlyClause srvName b seenInv rawC c
 
 @[noinline] def parseServerClauses (srvIdent : Ident) (srvName : Name) (clauses : Array Syntax) (isService : Bool := false) : CommandElabM ParsedServerBlock := do
-  let (b, _) ← foldlCmd clauses ({}, #[]) (parseOneServerClause srvName isService)
+  let (b0, _) ← foldlCmd clauses ({}, #[]) (parseOneServerClause srvName isService)
   if isService then
-    if b.helperClauses.isEmpty then errAt srvIdent s!"`service {srvName}` must declare at least one `fn`"
-    return b
+    if b0.helperClauses.isEmpty then errAt srvIdent s!"`service {srvName}` must declare at least one `fn`"
+    return { b0 with metaInvs := b0.rawInvs }
+  let stateNames := b0.stateDecls.map (·.1.getId.toString)
+  let metaNames : Array String := #["secrets", "rpcs", "routes"]
+  let b := b0.rawInvs.foldl (init := b0) fun acc (invId, exprs) =>
+    if exprs.all fun e => !exprCallsOld e && !exprMentionsAnyIdent stateNames e && exprMentionsAnyIdent metaNames e then
+      { acc with metaInvs := acc.metaInvs.push (invId, exprs) }
+    else
+      { acc with invs := acc.invs ++ exprs.map fun e => (e, exprCallsOld e, invId.getId.toString) }
   for (c?, lbl) in [(b.onCreateAccountClause?, "onCreateAccount"), (b.onSignInClause?, "onSignIn")] do
     if let some c := c? then if b.authDecl?.isNone then errAt c s!"`{lbl}` in `server {srvName}` requires `use auth : <Auth>`"
   if b.fnClauses.isEmpty && b.chanClauses.isEmpty && b.httpClauses.isEmpty && b.jobClauses.isEmpty && b.onCreateAccountClause?.isNone && b.onSignInClause?.isNone then
@@ -269,10 +270,12 @@ partial def scanCtxEnv (envVars locals : Array String) (stx : Syntax) : Bool × 
       | root :: _ => let r := root.toString; if locals.contains r then (false, false) else (r == "ctx", envVars.contains r) | [] => (false, false)
   | ``qedProj => scanCtxEnv envVars locals (stx.getArg 0)
   | ``qedLam1 => scanCtxEnv envVars (locals ++ if (stx.getArg 0).isIdent then #[(stx.getArg 0).getId.toString] else #[]) (stx.getArg 2)
-  | ``qedLamN => scanCtxEnv envVars (locals ++ (stx.getArg 1).getSepArgs.filterMap fun b => if b.isIdent then some b.getId.toString else none) (stx.getArg 4)
+  | ``qedLamN => scanCtxEnv envVars (locals ++ (stx.getArg 1).getSepArgs.flatMap fun p => (collectLetBinderIds (p.getArg 0)).map (·.toString)) (stx.getArg 4)
   | ``qedAllIn | ``qedAnyIn =>
-      let (c1, e1) := scanCtxEnv envVars locals (stx.getArg 3); let (c2, e2) := scanCtxEnv envVars (locals.push (stx.getArg 1).getId.toString) (stx.getArg 5); (c1 || c2, e1 || e2)
-  | ``qedAllVars => scanCtxEnv envVars (locals ++ (stx.getArg 1).getSepArgs.map fun b => (qedAllVarIdent b).getId.toString) (stx.getArg 3)
+      let (c1, e1) := scanCtxEnv envVars locals (stx.getArg 3)
+      let (c2, e2) := scanCtxEnv envVars (locals ++ (collectLetBinderIds (stx.getArg 1)).map (·.toString)) (stx.getArg 5)
+      (c1 || c2, e1 || e2)
+  | ``qedAllVars | ``qedAnyVars => scanCtxEnv envVars (locals ++ (stx.getArg 1).getSepArgs.map fun b => (qedAllVarIdent b).getId.toString) (stx.getArg 3)
   | _ => stx.getArgs.foldl (fun (ac, ae) ch => let (c, e) := scanCtxEnv envVars locals ch; (ac || c, ae || e)) (false, false)
 
 def isAuthReqLabel (s : String) : Bool := s.contains "ctx.userId" || s.contains "ctx.isAuthenticated" || s.contains "ctx.bearerToken"
@@ -473,6 +476,7 @@ private def mergeSvcIntoAcc (acc : SecExtAcc) (si : ServiceInfo) : SecExtAcc :=
 @[noinline] private def mkServerDispatchCmdsPure (c : SrvElabCtx) (methodInfos : Array ServerMethodInfo) (reqSecrets : Array String)
     (dispatchArms : Array (TSyntax ``Lean.Parser.Term.matchAltExpr)) (chanNames : Array String)
     (wsDispatchArms wsProjectArms httpDispatchArms : Array (TSyntax ``Lean.Parser.Term.matchAltExpr))
+    (httpRoutes : Array (String × String × Bool))
     (onCreateRun? onSignInRun? : Option Term) : PureQuotM (Array (TSyntax `command)) := do
   let mut cmds : Array (TSyntax `command) := #[]
   if c.hasState then cmds := cmds.push (← `(command|
@@ -480,9 +484,13 @@ private def mergeSvcIntoAcc (acc : SecExtAcc) (si : ServiceInfo) : SecExtAcc :=
         $(c.stateInvId) st.shared := Qed.Server.concurrent_schedule_preserves_inv $(c.stateInvId) $(c.subId `initState) st $(c.subId `inv_init) hsched))
   let (atomicBs, strTy, bytesTy, u8Ty) := (← c.atomicBindersPure, mkCIdent ``String, mkCIdent ``ByteArray, mkCIdent ``UInt8)
   let (mVar, wsKVar, wsCVar, wsPVar, wsPayVar, hMVar, hPVar) := (mkIdent `method, mkIdent `wsKind, mkIdent `wsChannel, mkIdent `wsParams, mkIdent `wsPayload, mkIdent `httpMethod, mkIdent `httpPath)
+  let rpcMetaTs ← mapPQ methodInfos fun m => mkAppC ``Qed.Server.RpcMeta.mk #[Syntax.mkStrLit m.name, quote m.requiresAuth, quote m.isReadOnly]
+  let routeMetaTs ← mapPQ httpRoutes fun (m, p, reqA) => mkAppC ``Qed.Server.RouteMeta.mk #[Syntax.mkStrLit m, Syntax.mkStrLit p, quote reqA]
   cmds := cmds ++ #[
     ← mkStrArrDefPure (c.subId `secrets) reqSecrets, ← mkMarkerThmPure (c.subId `_qed_server_marker),
     ← mkStrArrDefPure (c.subId `readOnlyMethods) ((methodInfos.filter (·.isReadOnly)).map (·.name)),
+    ← `(command| def $(c.subId `rpcs) : Array Qed.Server.RpcMeta := #[$[$rpcMetaTs:term],*]),
+    ← `(command| def $(c.subId `routes) : Array Qed.Server.RouteMeta := #[$[$routeMetaTs:term],*]),
     ← mkStrListDefPure (c.subId `methods) (methodInfos.map (·.name)), ← mkStrListDefPure (c.subId `channels) chanNames,
     ← mkDispatchDefPure c `dispatchM atomicBs #[mVar, mkIdent `reqBytes] #[strTy, bytesTy] bytesTy
       (← mkMatchFb1Pure mVar dispatchArms (← mkPureErr ``Qed.Server.ApiError.notFound (← `("unknown RPC method: " ++ $mVar))))]
@@ -504,10 +512,11 @@ private def mergeSvcIntoAcc (acc : SecExtAcc) (si : ServiceInfo) : SecExtAcc :=
 
 @[noinline] def elabServerDispatchCmds (methodInfos : Array ServerMethodInfo) (dispatchArms : Array (TSyntax ``Lean.Parser.Term.matchAltExpr))
     (chanNames : Array String) (wsDispatchArms : Array (TSyntax ``Lean.Parser.Term.matchAltExpr))
-    (wsProjectArms httpDispatchArms : Array (TSyntax ``Lean.Parser.Term.matchAltExpr) := #[]) (jobNames : Array String := #[])
+    (wsProjectArms httpDispatchArms : Array (TSyntax ``Lean.Parser.Term.matchAltExpr) := #[])
+    (httpRoutes : Array (String × String × Bool) := #[]) (jobNames : Array String := #[])
     (onCreateRun? onSignInRun? : Option Term := none) : SrvElabM Unit := do
   let c ← read; let (reqSecrets, ownSecrets, usedExts, allDbs, allEnvs) ← collectServerSecretsAndExts
-  elabSrvPureCmds (mkServerDispatchCmdsPure c methodInfos reqSecrets dispatchArms chanNames wsDispatchArms wsProjectArms httpDispatchArms onCreateRun? onSignInRun?)
+  elabSrvPureCmds (mkServerDispatchCmdsPure c methodInfos reqSecrets dispatchArms chanNames wsDispatchArms wsProjectArms httpDispatchArms httpRoutes onCreateRun? onSignInRun?)
   modifyEnv fun env => serverRegistry.addEntry env {
     serverName := c.fullSrvName, shortName := c.srvName.toString, hasState := c.hasState, secrets := reqSecrets, ownSecrets,
     envVars := allEnvs, externalServices := usedExts, methods := methodInfos, channels := chanNames, jobs := jobNames, databases := allDbs,

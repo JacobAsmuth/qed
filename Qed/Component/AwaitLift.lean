@@ -346,6 +346,22 @@ private def mkUnpackedBodyPure (st : Syntax) (wrapKind : EnsuredWrapKind) (valVa
               pure (bIds.foldl (init := outerParams) fun acc nm => acc.filter (·.1.getId.eraseMacroScopes != nm), localNames ++ bIds)
             pushAndGo outer' locals'
       | ``qedStmtReturn => return (#[st], none)
+      | ``qedStmtLetElse =>
+          let patStx := st.getArg 1; let elseStmts := extractLetElseStmts st
+          unless compBlockAlwaysReturns elseStmts do
+            throwErrorAt st "guard `let ... = ... else` branch in component action must `return` on all paths"
+          let patIds := collectQedPatIds patStx
+          let outer' := patIds.foldl (init := outerParams) fun acc nm => acc.filter (·.1.getId.eraseMacroScopes != nm)
+          let locals' := localNames ++ patIds
+          if stmtContainsAwait st || rest.any stmtContainsAwait then
+            let (thenL, thenC?) ← go outer' locals' preStmts rest
+            let (elseL, elseC?) ← go outerParams localNames preStmts elseStmts.toList
+            let info := st.getHeadInfo
+            let mkIfL (t e : Array Syntax) :=
+              Syntax.node info ``qedStmtIfLet #[Syntax.atom info "if", Syntax.atom info "let", patStx, Syntax.atom info "=", st.getArg 3, Syntax.atom info ":",
+                packSuite st t, Syntax.node info nullKind #[], Syntax.node info nullKind #[Syntax.atom info "else", Syntax.atom info ":", packSuite st e]]
+            return (#[mkIfL thenL elseL], if thenC?.isNone && elseC?.isNone then none else some #[mkIfL (thenC?.getD #[]) (elseC?.getD #[])])
+          else pushAndGo outer' locals'
       | ``qedStmtIf | ``qedStmtIfLet | ``qedStmtMatch =>
           if stmtContainsAwait st || (hasReturnStmt st && rest.any stmtContainsAwait) then
             unless rest.isEmpty || hasReturnStmt st do

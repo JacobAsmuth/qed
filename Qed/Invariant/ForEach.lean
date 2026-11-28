@@ -105,7 +105,7 @@ private def feFallbackOps : List FeOp :=
   unless goals.isEmpty do
     let predStr := (pred.raw.reprint.getD "the contract").trimmed
     Qed.Diag.throwUnsolvedGoals m!"Invariant `{nm.getId}` failed to lift `{predStr}` across `{upd.getId}`:"
-      m!"\n\nHint: Ensure newly inserted elements satisfy `{predStr}`, or prove only the remaining branch:\n  invariant {nm.getId} : {predStr} for_each … using {childInv.getId} := by\n    forEachLift {upd.getId} {childInv.getId} {predStr}\n    case {← goals[0]!.getTag} => …"
+      m!"\n\nHint: Ensure newly inserted elements satisfy `{predStr}`, or prove only the remaining branch:\n  invariant {nm.getId} : {predStr} for_each ... using {childInv.getId}\n    prove:\n      forEachLift {upd.getId} {childInv.getId} {predStr}\n      case {← goals[0]!.getTag} => ..."
       (ref? := some nm) (goals? := some goals)
       (formatGoal? := some fun g => g.withContext do
         let ty ← instantiateMVars (← g.getType); let s ← Qed.Diag.ppQedExpr ty ["m"]
@@ -168,7 +168,7 @@ private def attrSimpNames : Array Name := #[``Qed.attrRole, ``Qed.attrValue, ``Q
 @[noinline] private def runDischargeStyledForEach (view field childStyled nm : Ident) (pred : Term) : TacticM Unit := withFreshHeartbeatsT do
   runForEachStyleLift view childStyled; let predStr := (pred.raw.reprint.getD "the rule").trimmed
   Qed.Diag.throwUnsolvedGoals m!"Styling invariant `{nm.getId}` failed to lift `{predStr}` over `{field.getId}` in `{view.getId}`:"
-    m!"\n\nHint: Finish the remaining branch with `forEachStyleLift`:\n  invariant {nm.getId} : {predStr} for_each {field.getId} using {childStyled.getId} := by\n    forEachStyleLift {view.getId} {childStyled.getId}\n    …"
+    m!"\n\nHint: Finish the remaining branch with `forEachStyleLift`:\n  invariant {nm.getId} : {predStr} for_each {field.getId} using {childStyled.getId}\n    prove:\n      forEachStyleLift {view.getId} {childStyled.getId}\n      ..."
     (ref? := some nm) (formatGoal? := some fun g => g.withContext do
       let s ← Qed.Diag.ppQedExpr (← g.getType) ["m"]
       let why := if s.contains "everyElementL" then s!"child list didn't match `{childStyled.getId}`: check that both use the same role and styles." else "an element outside the collection wasn't covered: check if the parent view also renders that role."

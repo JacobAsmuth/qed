@@ -119,6 +119,9 @@ def evalSqlQuery (cfg : DbConfig) (db0 : MemDb) (q : SqlQuery) : MemDb × Except
   let db := db0.ensureTables cfg.tables
   let withTbl (tn : SqlIdent) (f : MemTable → MemDb × Except ApiError DbResult) :=
     (db.findTable tn.raw).elim (db, .error (ApiError.internal s!"unknown table `{tn.raw}` in in-memory evaluator")) f
+  let withSchemaTbl (sc tn : SqlIdent) (f : MemTable → MemDb × Except ApiError DbResult) :=
+    ((db.findTable (sc.raw ++ "." ++ tn.raw)).orElse fun _ => db.findTable tn.raw).elim
+      (db, .error (ApiError.internal s!"unknown table `{sc.raw}.{tn.raw}` in in-memory evaluator")) f
   let evalWhere (t : MemTable) (tn : SqlIdent) (w : SqlExpr) (r : DbRow) : Bool := sqlValToBool (evalSqlExpr db [(tn.raw, t.columns, r)] 64 w)
   let filterRows (t : MemTable) (tn : SqlIdent) (w : SqlExpr) : List DbRow := t.rows.filter (evalWhere t tn w)
   let uniqueCols (tn : SqlIdent) : List SqlIdent :=
@@ -127,17 +130,20 @@ def evalSqlQuery (cfg : DbConfig) (db0 : MemDb) (q : SqlQuery) : MemDb × Except
     cols.any fun pc => t.rows.any fun r => getRowCol t.columns r pc.raw == getRowCol t.columns newRow pc.raw
   let appendRow (t : MemTable) (newRow : DbRow) (ret : List SqlIdent) : MemDb × Except ApiError DbResult :=
     (db.upsertTable { t with rows := t.rows ++ [newRow] }, .ok { rows := if ret.isEmpty then #[] else #[projectRow t.columns ret newRow], affected := 1 })
+  let runSelectOn (t : MemTable) (tn : SqlIdent) (cols? : Option (List SqlIdent)) (w : SqlExpr) (ob : Option (SqlIdent × SqlOrderDir)) (lim off : Option Nat) :=
+    let sliced := sliceRows lim off (sortRowsBy t.columns ob (filterRows t tn w))
+    let out := cols?.elim sliced fun cols => sliced.map (projectRow t.columns cols); (db, .ok { rows := out.toArray, affected := out.length })
   let runSelect (tn : SqlIdent) (cols? : Option (List SqlIdent)) (w : SqlExpr) (ob : Option (SqlIdent × SqlOrderDir)) (lim off : Option Nat) :=
-    withTbl tn fun t =>
-      let sliced := sliceRows lim off (sortRowsBy t.columns ob (filterRows t tn w))
-      let out := cols?.elim sliced fun cols => sliced.map (projectRow t.columns cols); (db, .ok { rows := out.toArray, affected := out.length })
+    withTbl tn fun t => runSelectOn t tn cols? w ob lim off
   let runTransform (t : MemTable) (ret : List SqlIdent) (useRetLen : Bool) (step : DbRow → Option (Option DbRow × DbRow)) :=
     let (outRows, retRows, aff) := transformRows t.columns ret step t.rows
     (db.upsertTable { t with rows := outRows }, .ok { rows := retRows.toArray, affected := if useRetLen then retRows.length else aff })
   match q with
   | .select tn cols w ob lim off => runSelect tn (some cols) w ob lim off
   | .selectAll tn w ob lim off => runSelect tn none w ob lim off
+  | .selectSchema sc tn cols w ob lim off => withSchemaTbl sc tn fun t => runSelectOn t tn (if cols.isEmpty then none else some cols) w ob lim off
   | .count tn w => withTbl tn fun t => (db, .ok { rows := #[#[.int (Int.ofNat (filterRows t tn w).length)]], affected := 1 })
+  | .countSchema sc tn w => withSchemaTbl sc tn fun t => (db, .ok { rows := #[#[.int (Int.ofNat (filterRows t tn w).length)]], affected := 1 })
   | .aggregate op tn col w => withTbl tn fun t =>
       let vals := (filterRows t tn w).filterMap fun r => sqlValToInt? (getRowCol t.columns r col.raw)
       let aggVal : SqlVal := match op, vals with
@@ -186,16 +192,31 @@ private def matchHttpStub (req : OutboundReq) : List HttpStub → Option (Except
   | [] => none
   | s :: rest => if stubMatches s req then some (s.resp, if s.once || rest.any (stubMatches · req) then rest else s :: rest) else (matchHttpStub req rest).map fun (r, rest') => (r, s :: rest')
 
+structure ProcStub where
+  (cmd : String) (argsPrefix : List String := []) (resp : Except ApiError ProcOutput) (once : Bool := false)
+deriving Inhabited
+
+private def procStubMatches (s : ProcStub) (cmd : String) (args : Array String) : Bool :=
+  s.cmd == cmd && (args.toList.take s.argsPrefix.length == s.argsPrefix)
+private def matchProcStub (cmd : String) (args : Array String) : List ProcStub → Option (Except ApiError ProcOutput × List ProcStub)
+  | [] => none
+  | s :: rest =>
+      if procStubMatches s cmd args then some (s.resp, if s.once || rest.any (procStubMatches · cmd args) then rest else s :: rest)
+      else (matchProcStub cmd args rest).map fun (r, rest') => (r, s :: rest')
+
 structure EvalEnv where (envVars : List (String × String) := []) (nowMs : UInt64 := 1700000000000) deriving Inhabited
 
 structure EvalTrace where
   (httpCalls : List OutboundReq := []) (dbQueries : List SqlQuery := []) (cookies : List SetCookie := [])
   (sseEvents : List SseEvent := []) (wsBroadcasts : List WsEmit := []) (encryptCount decryptCount : Nat := 0)
+  (sleptMs : Nat := 0) (procCalls : List (String × Array String × Option String) := [])
 deriving Inhabited
 
 structure EvalState (σ : Type) where
   (shared : σ) (db : MemDb := []) (httpStubs : List HttpStub := []) (txSaved : List (UInt64 × MemDb) := [])
-  (nextTxId : UInt64 := 1) (rngCounter : Nat := 0) (trace : EvalTrace := {})
+  (nextTxId : UInt64 := 1) (rngCounter : Nat := 0) (nowOffsetMs : UInt64 := 0)
+  (memFs : List (String × ByteArray) := []) (memDirs : List String := []) (procStubs : List ProcStub := []) (tmpCounter : Nat := 0)
+  (trace : EvalTrace := {})
 deriving Inhabited
 
 structure EvalResult (σ α : Type) where (value : α) (state : EvalState σ) deriving Inhabited
@@ -216,12 +237,32 @@ private def stepEffect {σ : Type} (env : EvalEnv) (st : EvalState σ) (eff : Se
   | .setCookie c => withTr (fun t => { t with cookies := t.cookies ++ [c] }) ()
   | .sendSse ev => withTr (fun t => { t with sseEvents := t.sseEvents ++ [ev] }) ()
   | .wsBroadcast tp p => withTr (fun t => { t with wsBroadcasts := t.wsBroadcasts ++ [{ topic := tp, payload := p }] }) ()
-  | .readEnv v => (st, env.envVars.lookup v) | .nowMs => (st, env.nowMs)
+  | .readEnv v => (st, env.envVars.lookup v) | .nowMs => (st, env.nowMs + st.nowOffsetMs)
+  | .sleep ms => ({ st with nowOffsetMs := st.nowOffsetMs + ms.toUInt64, trace := { st.trace with sleptMs := st.trace.sleptMs + ms } }, ())
   | .randomHex n => ({ st with rngCounter := st.rngCounter + 1 }, mockRandomHex st.rngCounter n)
   | .randomBytes n => ({ st with rngCounter := st.rngCounter + 1 }, mockRandomBytes st.rngCounter n)
   | .hmacSha256 k m => (st, mockHmacSha256 k m) | .sha256 d => (st, mockSha256 d) | .constEq a b => (st, a == b)
   | .aeadEncrypt kEnv fb? aad pt => withTr (fun t => { t with encryptCount := t.encryptCount + 1 }) (mockAeadEncrypt env.envVars kEnv fb? aad pt)
   | .aeadDecrypt kEnv fb? aad ct => withTr (fun t => { t with decryptCount := t.decryptCount + 1 }) (mockAeadDecrypt env.envVars kEnv fb? aad ct)
+  | .procExec cmd args cwd? _env =>
+      let tr := { st.trace with procCalls := st.trace.procCalls ++ [(cmd, args, cwd?)] }
+      match matchProcStub cmd args st.procStubs with
+      | some (resp, stubs') => ({ st with procStubs := stubs', trace := tr }, resp)
+      | none => ({ st with trace := tr }, .error (ApiError.internal s!"unmocked Proc.exec `{cmd}`"))
+  | .fsRead path =>
+      match st.memFs.lookup path with
+      | some bs => (st, .ok bs)
+      | none => (st, .error (ApiError.notFound s!"file not found: {path}"))
+  | .fsWrite path data => ({ st with memFs := (path, data) :: st.memFs.filter (·.1 != path) }, .ok ())
+  | .fsMkdirAll path => ({ st with memDirs := if st.memDirs.contains path then st.memDirs else path :: st.memDirs }, .ok ())
+  | .fsRemoveAll path =>
+      let pfx := path ++ "/"
+      ({ st with memFs := st.memFs.filter fun (k, _) => k != path && !Qed.Str.startsWith k pfx,
+                 memDirs := st.memDirs.filter fun d => d != path && !Qed.Str.startsWith d pfx }, .ok ())
+  | .fsExists path => (st, st.memFs.any (·.1 == path) || st.memDirs.contains path)
+  | .fsMktempDir pfx =>
+      let dir := s!"/tmp/{pfx}{st.tmpCounter}"
+      ({ st with tmpCounter := st.tmpCounter + 1, memDirs := dir :: st.memDirs }, .ok dir)
 
 def evalProg {σ α : Type} (env : EvalEnv) (st : EvalState σ) : ThreadProg σ α → EvalResult σ α
   | .pure a => ⟨a, st⟩ | .io eff k => let (st', resp) := stepEffect env st eff; evalProg env st' (k resp)
@@ -239,6 +280,9 @@ def setUser (c : RequestCtx) : Option String → RequestCtx
   | some u => { c with userId := some u, authMethod := if c.authMethod == .none then .bearer else c.authMethod }
 def setShared {σ : Type} (s : EvalState σ) (v : σ) : EvalState σ := { s with shared := v }
 def pushHttpStub {σ : Type} (s : EvalState σ) (stub : HttpStub) : EvalState σ := { s with httpStubs := s.httpStubs ++ [stub] }
+def pushProcStub {σ : Type} (s : EvalState σ) (stub : ProcStub) : EvalState σ := { s with procStubs := s.procStubs ++ [stub] }
+def seedMemFile {σ : Type} (s : EvalState σ) (path content : String) : EvalState σ :=
+  { s with memFs := (path, content.toUTF8) :: s.memFs.filter (·.1 != path) }
 def seedDbRows {σ Row : Type} (s : EvalState σ) (tbl : String) (sch : TableSchema) (enc : Row → List (SqlIdent × SqlVal)) (rows : List Row) : EvalState σ :=
   { s with db := s.db.seedEncoded tbl (sch.columns.map (·.name.raw)) (rows.map enc) }
 def httpStatus : Except ApiError (Option HttpResponse) → Nat | .ok (some r) => r.status | .ok none => 404 | .error e => e.code

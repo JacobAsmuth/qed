@@ -1169,4 +1169,108 @@ def containsNoneBytes (haystack : String) (needles : List String) : Bool :=
 
 end Str
 
+/-! ## Pure Constant-Time Byte & String Equality (`Qed.Bytes.ctEq`, `Qed.Str.ctEq`) -/
+
+abbrev Bytes := ByteArray
+
+namespace Bytes
+
+private def ctXorDiffLoop (a b : ByteArray) : Nat → UInt8 → UInt8
+  | 0, acc => acc
+  | rem + 1, acc =>
+      let i := a.size - (rem + 1)
+      let ba : UInt8 := if h : i < a.size then a.data[i] else 0
+      let bb : UInt8 := if h : i < b.size then b.data[i] else 0
+      ctXorDiffLoop a b rem (acc ||| (ba ^^^ bb))
+
+/-- Pure, allocation-free, structurally recursive constant-time XOR accumulator across all bytes. -/
+def ctXorDiff (a b : Bytes) : UInt8 := ctXorDiffLoop a b a.size 0
+
+/-- Pure constant-time equality on `ByteArray` / `Qed.Bytes` with no early exit on byte mismatch. -/
+def ctEq (a b : Bytes) : Bool :=
+  if a.size == b.size then ctXorDiff a b == 0 else false
+
+theorem uint8_or_eq_zero {x y : UInt8} : (x ||| y) = 0 ↔ x = 0 ∧ y = 0 := by
+  constructor
+  · intro h
+    have hv : (x.toBitVec ||| y.toBitVec) = 0#8 := congrArg UInt8.toBitVec h
+    have hx : x.toBitVec = 0#8 := BitVec.eq_of_getLsbD_eq fun i _ => by
+      have hi := congrArg (·.getLsbD i) hv; simp only [BitVec.getLsbD_or, BitVec.getLsbD_zero, Bool.or_eq_false_iff] at hi ⊢; exact hi.1
+    have hy : y.toBitVec = 0#8 := BitVec.eq_of_getLsbD_eq fun i _ => by
+      have hi := congrArg (·.getLsbD i) hv; simp only [BitVec.getLsbD_or, BitVec.getLsbD_zero, Bool.or_eq_false_iff] at hi ⊢; exact hi.2
+    exact ⟨UInt8.eq_of_toBitVec_eq hx, UInt8.eq_of_toBitVec_eq hy⟩
+  · rintro ⟨rfl, rfl⟩; rfl
+
+theorem uint8_xor_eq_zero {x y : UInt8} : (x ^^^ y) = 0 ↔ x = y := by
+  constructor
+  · intro h
+    have hv : (x.toBitVec ^^^ y.toBitVec) = 0#8 := congrArg UInt8.toBitVec h
+    exact UInt8.eq_of_toBitVec_eq (BitVec.eq_of_getLsbD_eq fun i _ => by
+      have hi := congrArg (·.getLsbD i) hv
+      simp only [BitVec.getLsbD_xor, BitVec.getLsbD_zero] at hi
+      cases h1 : x.toBitVec.getLsbD i <;> cases h2 : y.toBitVec.getLsbD i <;> simp_all)
+  · rintro rfl; exact UInt8.eq_of_toBitVec_eq BitVec.xor_self
+
+private theorem ctXorDiffLoop_eq_zero_iff (a b : ByteArray) (hsz : a.size = b.size) :
+    ∀ (rem : Nat) (_hrem : rem ≤ a.size) (acc : UInt8),
+      ctXorDiffLoop a b rem acc = 0 ↔ acc = 0 ∧ ∀ i (hi : i < a.size), a.size - rem ≤ i → a.data[i] = b.data[i]'(by change i < b.size; omega)
+  | 0, _, acc => by
+      simp only [ctXorDiffLoop, Nat.sub_zero]
+      exact ⟨fun h => ⟨h, fun i hi hge => by omega⟩, fun ⟨h, _⟩ => h⟩
+  | rem + 1, hrem, acc => by
+      have hiLt : a.size - (rem + 1) < a.size := by omega
+      have hiLtB : a.size - (rem + 1) < b.size := hsz ▸ hiLt
+      simp only [ctXorDiffLoop, hiLt, hiLtB, ↓reduceDIte]
+      rw [ctXorDiffLoop_eq_zero_iff a b hsz rem (by omega), uint8_or_eq_zero, uint8_xor_eq_zero]
+      constructor
+      · rintro ⟨⟨hacc, hcur⟩, hrest⟩
+        refine ⟨hacc, fun i hi hge => ?_⟩
+        if heq : i = a.size - (rem + 1) then subst heq; exact hcur
+        else exact hrest i hi (by omega)
+      · rintro ⟨hacc, hall⟩
+        exact ⟨⟨hacc, hall (a.size - (rem + 1)) hiLt (Nat.le_refl _)⟩, fun i hi hge => hall i hi (by omega)⟩
+
+theorem ctXorDiff_eq_zero_iff {a b : ByteArray} (hsz : a.size = b.size) : ctXorDiff a b = 0 ↔ a = b := by
+  unfold ctXorDiff
+  rw [ctXorDiffLoop_eq_zero_iff a b hsz a.size (Nat.le_refl _) 0]
+  simp only [Nat.sub_self, Nat.zero_le, forall_const, true_and]
+  constructor
+  · intro h
+    cases a with | mk da => cases b with | mk db =>
+      congr 1; exact Array.ext hsz fun i hi1 _ => h i hi1
+  · rintro rfl; intro i _; rfl
+
+@[simp] theorem ctEq_eq_true_iff (a b : ByteArray) : ctEq a b = true ↔ a = b := by
+  unfold ctEq
+  if hsz : a.size = b.size then
+    have hbeq : (a.size == b.size) = true := beq_iff_eq.2 hsz
+    simp only [hbeq, ↓reduceIte, beq_iff_eq]
+    exact ctXorDiff_eq_zero_iff hsz
+  else
+    have hbeq : (a.size == b.size) = false := beq_false_of_ne hsz
+    simp only [hbeq, Bool.false_eq_true, ↓reduceIte, false_iff]
+    intro heq; exact hsz (congrArg ByteArray.size heq)
+
+@[simp] theorem ctEq_eq_beq (a b : ByteArray) : ctEq a b = (a == b) :=
+  Bool.eq_iff_iff.2 (by rw [ctEq_eq_true_iff, beq_iff_eq])
+
+end Bytes
+
+namespace Str
+
+/-- Pure constant-time UTF-8 string equality backed by `Qed.Bytes.ctEq`. -/
+def ctEq (a b : String) : Bool := Qed.Bytes.ctEq a.toUTF8 b.toUTF8
+
+@[simp] theorem ctEq_eq_true_iff (a b : String) : ctEq a b = true ↔ a = b := by
+  unfold ctEq; rw [Qed.Bytes.ctEq_eq_true_iff]
+  exact ⟨fun h => String.toByteArray_inj.1 h, fun h => h ▸ rfl⟩
+
+@[simp] theorem ctEq_eq_beq (a b : String) : ctEq a b = (a == b) :=
+  Bool.eq_iff_iff.2 (by rw [ctEq_eq_true_iff, beq_iff_eq])
+
+end Str
+
+@[inline] abbrev _root_.ByteArray.ctEq : ByteArray → ByteArray → Bool := Qed.Bytes.ctEq
+@[inline] abbrev _root_.String.ctEq : String → String → Bool := Qed.Str.ctEq
+
 end Qed

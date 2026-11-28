@@ -13,44 +13,28 @@ syntax:max (name := qedOptType) term:max noWs "?" : term
 
 section RouterParsers
 open Lean Parser Qed.Lang
-private def routeEnumAltP : Parser := node `Qed.routeEnumAlt (ident >> optional ("=" >> strLit))
-@[command_parser] def routeEnumCmd : Parser := opaqueP (node `Qed.routeEnumCmd (withPosition
-  ("route_enum " >> ident >> ":" >> checkColGt "expected indented `route_enum` variants" >> many1Indent routeEnumAltP)))
 private def routeParamP : Parser := node `Qed.routeParam (ident >> optional (":" >> withPosition (categoryParser `qedType 0)))
 private def routeAltP : Parser := node `Qed.routeAlt (withPosition
-  (optional (symbol "*") >> ident >> optional (checkLineEq >> "(" >> sepBy1 routeParamP "," >> ")") >> optional ("=" >> strLit)))
-@[command_parser] def routerCmd : Parser := opaqueP (node `Qed.routerCmd (withPosition
-  ("router " >> ident >> ":" >> checkColGt "expected indented `router` routes" >> many1Indent routeAltP)))
+  (optional (symbol "*") >> ident >> optional (checkLineEq >> "(" >> commaSep1 routeParamP >> ")") >> optional ("=" >> strLit)))
+@[command_parser] def routerCmd : Parser := opaqueP (node `Qed.routerCmd (
+  optional Command.docComment >> withPosition (
+    atomic (optional (symbol "private") >> identEq `router >> ident >> ":") >>
+    checkColGt "expected indented `router` routes" >> many1Indent routeAltP)))
 end RouterParsers
 
 section RouterElab
-open Lean Qed.Lang
+open Lean Elab Command Qed.Lang
 
 private structure RouteAltInfo where mk ::
   (ctor : Ident) (params : Array (Ident × Term)) (segments : Array (Sum String Ident)) (marked : Bool)
 
-@[noinline] private def mkRouteEnumCmdPure (t : Ident) (alts : Array (Ident × Term)) : PureQuotM Syntax := do
-  let (toSegId, fromSegId, rtId) := (mkIdent (t.getId ++ `toSeg), mkIdent (t.getId ++ `fromSeg), mkIdent (t.getId ++ `round_trip))
-  let (ctors, slugs) := (alts.map (·.1), alts.map (·.2)); let ctorPats : Array Term := ctors.map fun c => mkIdent (t.getId ++ c.getId)
-  let parsePats := slugs.push (← `(_)); let parseRhss := (← Lang.mapPQ ctorPats fun cp => `(some $cp)).push (← `(none))
-  `(inductive $t:ident where $[| $ctors:ident]*
-    deriving Repr, DecidableEq, Inhabited
-    def $toSegId:ident (x : $t) : String := match x with $[| $ctorPats:term => $slugs:term]*
-    def $fromSegId:ident (s : String) : Option $t := match s with $[| $parsePats:term => $parseRhss:term]*
-    theorem $rtId:ident : ∀ a, $fromSegId:ident ($toSegId:ident a) = some a := by intro a; cases a <;> rfl
-    instance : RouteParam $t:ident := ⟨$toSegId, $fromSegId, $rtId⟩)
-
-@[noinline, macro routeEnumCmd] def expandRouteEnumCmd : Macro := fun stx =>
-  runPQMacro (mkRouteEnumCmdPure ⟨stx.getArg 1⟩ ((stx.getArg 3).getArgs.map fun alt =>
-    let c : Ident := ⟨alt.getArg 0⟩; (c, if (alt.getArg 1).getNumArgs == 2 then (⟨(alt.getArg 1).getArg 1⟩ : Term) else quote (toString c.getId))))
-
-@[noinline] private def parseRouteAlt (tName : Name) (strTy : Term) (alt : Syntax) : MacroM RouteAltInfo := do
-  let err (s : Syntax) (msg : String) := Macro.throwErrorAt s s!"router `{tName}`: {msg}"
+@[noinline] private def parseRouteAlt (tName : Name) (strTy : Term) (alt : Syntax) : CommandElabM RouteAltInfo := do
+  let err (s : Syntax) (msg : String) := throwErrorAt s s!"router `{tName}`: {msg}"
   let (marked, c) := ((alt.getArg 0).getNumArgs == 1, (⟨alt.getArg 1⟩ : Ident))
   let rawBs := if (alt.getArg 2).getNumArgs == 3 then ((alt.getArg 2).getArg 1).getSepArgs else #[]
   let seg : Option (TSyntax `str) := if (alt.getArg 3).getNumArgs == 2 then some ⟨(alt.getArg 3).getArg 1⟩ else none
-  let explicitBs ← rawBs.mapM fun b => do
-    let ty ← if (b.getArg 1).getNumArgs == 2 then do pure (← lowerQedType ((b.getArg 1).getArg 1) false).1 else pure strTy
+  let explicitBs ← Lang.mapCmd rawBs fun b => do
+    let ty ← if (b.getArg 1).getNumArgs == 2 then do pure (← liftMacroM (lowerQedType ((b.getArg 1).getArg 1) false)).1 else pure strTy
     pure ((⟨b.getArg 0⟩ : Ident), ty)
   let rawSegs := seg.elim #[toString c.getId] fun s => ((s.getString.splitOn "/").filter (· ≠ "")).toArray
   let pathDesc := seg.elim s!"`/{c.getId}`" fun s => s!"`{s.getString}`"
@@ -76,34 +60,36 @@ private structure RouteAltInfo where mk ::
     let bT : Term := ⟨b.raw⟩; `(match (RouteParam.fromSeg $bT : Option $bt) with | some $bT => $body | none => none)
   return (← `($ctorId $bs*), ← `([$printSeg,*]), ← `([$parseSeg,*]), parseBody)
 
-@[noinline] private def mkRouterCmdPure (t : Ident) (alts : Array RouteAltInfo) (markedCtor : Option Ident) : PureQuotM Syntax := do
+@[noinline] private def mkRouterCmdsPure (doc? : Option (TSyntax ``Lean.Parser.Command.docComment)) (t : Ident)
+    (alts : Array RouteAltInfo) (markedCtor : Option Ident) : PureQuotM (Array (TSyntax `command)) := do
   let (printId, parseId, rtId) := (mkIdent (t.getId ++ `print), mkIdent (t.getId ++ `parse), mkIdent (t.getId ++ `round_trip))
   let (toPathId, toUrlId, fromPathId) := (mkIdent (t.getId ++ `toPath), mkIdent (t.getId ++ `toUrl), mkIdent (t.getId ++ `fromPath))
   let (ctorNames, ctorBs, ctorBts) := (alts.map (·.ctor), alts.map (·.params.map (·.1)), alts.map (·.params.map (·.2)))
   let rows ← Lang.mapPQ alts (mkRouterRowPure t.getId)
   let (printPats, printRhss) := (rows.map (·.1), rows.map (·.2.1))
   let (parsePatsAll, parseRhssAll) := ((rows.map (·.2.2.1)).push (← `(_)), (rows.map (·.2.2.2)).push (← `(none)))
-  let inhCmd : TSyntax `command ← markedCtor.elim `(deriving instance Inhabited for $t) fun mc => `(instance : Inhabited $t := ⟨$(mkIdent (t.getId ++ mc.getId))⟩)
-  `(inductive $t:ident where $[| $ctorNames:ident $[($ctorBs:ident : $ctorBts:term)]*]*
-    deriving Repr, DecidableEq
-    $inhCmd:command
-    def $printId:ident (r : $t) : List String := match r with $[| $printPats:term => $printRhss:term]*
-    def $parseId:ident (p : List String) : Option $t := match p with $[| $parsePatsAll:term => $parseRhssAll:term]*
-    theorem $rtId:ident : ∀ a, $parseId:ident ($printId:ident a) = some a := by
+  let inhCmd : TSyntax `command ← markedCtor.elim `(command| deriving instance Inhabited for $t) fun mc => `(command| instance : Inhabited $t := ⟨$(mkIdent (t.getId ++ mc.getId))⟩)
+  return #[
+    ← `(command| $[$doc?:docComment]? inductive $t:ident where $[| $ctorNames:ident $[($ctorBs:ident : $ctorBts:term)]*]* deriving Repr, DecidableEq),
+    inhCmd,
+    ← `(command| def $printId:ident (r : $t) : List String := match r with $[| $printPats:term => $printRhss:term]*),
+    ← `(command| def $parseId:ident (p : List String) : Option $t := match p with $[| $parsePatsAll:term => $parseRhssAll:term]*),
+    ← `(command| theorem $rtId:ident : ∀ a, $parseId:ident ($printId:ident a) = some a := by
       intro a; cases a <;>
         (try simp only [$printId:ident, $parseId:ident, RouteParam.round_trip, RouteParam.toSeg_string, RouteParam.fromSeg_string]) <;>
-        (try simp [$printId:ident, $parseId:ident, RouteParam.round_trip])
-    instance : Router $t:ident := ⟨$printId, $parseId, $rtId⟩
-    @[inline, simp] def $toPathId:ident (r : $t) : String := Router.toURL r
-    @[inline, simp] def $toUrlId:ident (r : $t) : Url := Router.toUrl r
-    @[inline, simp] def $fromPathId:ident (p : String) : Option $t := Router.fromURL p
-    instance : ToString $t:ident := ⟨$toPathId⟩)
+        (try simp [$printId:ident, $parseId:ident, RouteParam.round_trip])),
+    ← `(command| instance : Router $t:ident := ⟨$printId, $parseId, $rtId⟩),
+    ← `(command| @[inline, simp] def $toPathId:ident (r : $t) : String := Router.toURL r),
+    ← `(command| @[inline, simp] def $toUrlId:ident (r : $t) : Url := Router.toUrl r),
+    ← `(command| @[inline, simp] def $fromPathId:ident (p : String) : Option $t := Router.fromURL p),
+    ← `(command| instance : ToString $t:ident := ⟨$toPathId⟩)]
 
-@[noinline, macro routerCmd] def expandRouterCmd : Macro := fun stx => do
-  let t : Ident := ⟨stx.getArg 1⟩; let strTy ← runPQMacro `(String)
-  let err (s : Syntax) (msg : String) := Macro.throwErrorAt s s!"router `{t.getId}`: {msg}"
+@[noinline, command_elab routerCmd] def elabRouterCmd : CommandElab := fun stx => do
+  let doc? := extractOptDoc (stx.getArg 0); let isPrivate := (stx.getArg 1).getNumArgs == 1
+  let t : Ident := ⟨stx.getArg 3⟩; let strTy ← Lang.runPQ `(String)
+  let err (s : Syntax) (msg : String) := throwErrorAt s s!"router `{t.getId}`: {msg}"
   let mut alts := #[]; let mut patShapes : Array (Ident × Array (Option String)) := #[]; let mut markedCtor : Option Ident := none
-  for alt in (stx.getArg 3).getArgs do
+  for alt in (stx.getArg 5).getArgs do
     let info ← parseRouteAlt t.getId strTy alt
     let patShape := info.segments.map fun | .inl s => some s | .inr _ => none
     for (prevC, prevPat) in patShapes do
@@ -114,7 +100,8 @@ private structure RouteAltInfo where mk ::
       if !info.params.isEmpty then err info.ctor s!"fallback route `{info.ctor.getId}` (marked `*`) must take no arguments because it handles arbitrary unmatched URLs"
       markedCtor := some info.ctor
     alts := alts.push info; patShapes := patShapes.push (info.ctor, patShape)
-  runPQMacro (mkRouterCmdPure t alts markedCtor)
+  let cmds ← Lang.runPQ (mkRouterCmdsPure doc? t alts markedCtor)
+  Lang.foldlCmd cmds () fun _ c => elabCmdWithVis isPrivate c
 end RouterElab
 
 private def decodeRouteSegs [Router R] (segs : List String) : Except String R := (Router.parse segs).elim (.error "invalid route") .ok

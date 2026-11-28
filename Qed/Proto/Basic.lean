@@ -2,8 +2,6 @@ import Qed.Html
 
 namespace Qed
 
-abbrev Bytes := ByteArray
-
 namespace Proto
 
 inductive WireVal where

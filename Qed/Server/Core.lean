@@ -442,25 +442,60 @@ structure OutboundResp where
   status  : UInt32
   body    : ByteArray
   headers : List (String × String) := []
-deriving Inhabited, BEq
+deriving Inhabited, DecidableEq
+
+/-- Output of a direct subprocess invocation (`Proc.exec`, without shell interpolation). -/
+structure ProcOutput where
+  exitCode : UInt32
+  stdout   : String
+  stderr   : String
+deriving Inhabited, DecidableEq, Repr
+
+instance : ToJson ProcOutput := ⟨fun o => .obj [("exitCode", toJson o.exitCode.toNat), ("stdout", .str o.stdout), ("stderr", .str o.stderr)]⟩
+instance : FromJson ProcOutput := ⟨fun j => do
+  let code : Nat ← j.field "exitCode" >>= fromJson
+  return { exitCode := code.toUInt32, stdout := ← j.field "stdout" >>= fromJson, stderr := ← j.field "stderr" >>= fromJson }⟩
+qed_equiv_codec% proto [] (ProcOutput,
+  fun o => (o.exitCode, o.stdout, o.stderr), fun p : UInt32 × String × String => ⟨p.1, p.2.1, p.2.2⟩, fun ⟨_, _, _⟩ => rfl)
+
+/-- Compile-time RPC/service method metadata exposed for `invariant` checks. -/
+structure RpcMeta where
+  name         : String
+  requiresAuth : Bool
+  isReadOnly   : Bool
+deriving Inhabited, DecidableEq, Repr
+
+/-- Compile-time HTTP route metadata exposed for `invariant` checks. -/
+structure RouteMeta where
+  method       : String
+  path         : String
+  requiresAuth : Bool
+deriving Inhabited, DecidableEq, Repr
 
 inductive ServerEffect : Type where
   | httpCall (req : OutboundReq) | dbExec (cfg : Db.DbConfig) (q : Db.SqlQuery) | dbExecDdl (cfg : Db.DbConfig)
   | dbTxBegin (cfg : Db.DbConfig) | dbTxExec (cfg : Db.DbConfig) (txId : UInt64) (q : Db.SqlQuery)
   | dbTxCommit (cfg : Db.DbConfig) (txId : UInt64) | dbTxRollback (cfg : Db.DbConfig) (txId : UInt64)
-  | setCookie (cookie : SetCookie) | sendSse (ev : SseEvent) | readEnv (v : String) | nowMs
+  | setCookie (cookie : SetCookie) | sendSse (ev : SseEvent) | readEnv (v : String) | nowMs | sleep (ms : Nat)
   | randomHex (n : UInt32) | randomBytes (n : UInt32) | hmacSha256 (key msg : ByteArray)
   | sha256 (data : ByteArray) | constEq (a b : ByteArray) | wsBroadcast (t : String) (p : ByteArray)
   | aeadEncrypt (keyEnv : String) (fallback? : Option String) (aad pt : ByteArray)
   | aeadDecrypt (keyEnv : String) (fallback? : Option String) (aad ct : ByteArray)
+  | procExec (cmd : String) (args : Array String) (cwd? : Option String) (env : List (String × Option String))
+  | fsRead (path : String) | fsWrite (path : String) (data : ByteArray)
+  | fsMkdirAll (path : String) | fsRemoveAll (path : String) | fsExists (path : String) | fsMktempDir (prefixStr : String)
 
 @[reducible] def ServerEffect.Resp : ServerEffect → Type
   | .httpCall _ => Except ApiError OutboundResp | .dbExec _ _ | .dbTxExec _ _ _ => Except ApiError Db.DbResult
   | .dbExecDdl _ | .dbTxCommit _ _ => Except ApiError Unit | .dbTxBegin _ => Except ApiError UInt64
-  | .dbTxRollback _ _ | .setCookie _ | .sendSse _ | .wsBroadcast _ _ => Unit
+  | .dbTxRollback _ _ | .setCookie _ | .sendSse _ | .wsBroadcast _ _ | .sleep _ => Unit
   | .readEnv _ => Option String | .nowMs => UInt64 | .randomHex _ => String | .randomBytes _ => ByteArray
   | .hmacSha256 _ _ | .sha256 _ => ByteArray | .constEq _ _ => Bool
   | .aeadEncrypt _ _ _ _ | .aeadDecrypt _ _ _ _ => Except ApiError ByteArray
+  | .procExec _ _ _ _ => Except ApiError ProcOutput
+  | .fsRead _ => Except ApiError ByteArray
+  | .fsWrite _ _ | .fsMkdirAll _ | .fsRemoveAll _ => Except ApiError Unit
+  | .fsExists _ => Bool | .fsMktempDir _ => Except ApiError String
 
 class MonadServer (m : Type → Type) where exec : (eff : ServerEffect) → m eff.Resp
 
@@ -478,6 +513,7 @@ variable {m : Type → Type} [MonadServer m]
 @[reducible, inline] def sendSse (ev : SseEvent) : m Unit := exec (.sendSse ev)
 @[reducible, inline] def readEnv (v : String) : m (Option String) := exec (.readEnv v)
 @[reducible, inline] def nowMs : m UInt64 := exec .nowMs
+@[reducible, inline] def sleep (ms : Nat) : m Unit := exec (.sleep ms)
 @[reducible, inline] def randomHex (n : UInt32) : m String := exec (.randomHex n)
 @[reducible, inline] def randomBytes (n : UInt32) : m ByteArray := exec (.randomBytes n)
 @[reducible, inline] def hmacSha256 (key msg : ByteArray) : m ByteArray := exec (.hmacSha256 key msg)
@@ -486,6 +522,13 @@ variable {m : Type → Type} [MonadServer m]
 @[reducible, inline] def wsBroadcast (t : String) (p : ByteArray) : m Unit := exec (.wsBroadcast t p)
 @[reducible, inline] def aeadEncrypt (keyEnv : String) (fallback? : Option String) (aad pt : ByteArray) : m (Except ApiError ByteArray) := exec (.aeadEncrypt keyEnv fallback? aad pt)
 @[reducible, inline] def aeadDecrypt (keyEnv : String) (fallback? : Option String) (aad ct : ByteArray) : m (Except ApiError ByteArray) := exec (.aeadDecrypt keyEnv fallback? aad ct)
+@[reducible, inline] def procExec (cmd : String) (args : Array String) (cwd? : Option String := none) (env : List (String × Option String) := []) : m (Except ApiError ProcOutput) := exec (.procExec cmd args cwd? env)
+@[reducible, inline] def fsRead (path : String) : m (Except ApiError ByteArray) := exec (.fsRead path)
+@[reducible, inline] def fsWrite (path : String) (data : ByteArray) : m (Except ApiError Unit) := exec (.fsWrite path data)
+@[reducible, inline] def fsMkdirAll (path : String) : m (Except ApiError Unit) := exec (.fsMkdirAll path)
+@[reducible, inline] def fsRemoveAll (path : String) : m (Except ApiError Unit) := exec (.fsRemoveAll path)
+@[reducible, inline] def fsExists (path : String) : m Bool := exec (.fsExists path)
+@[reducible, inline] def fsMktempDir (prefixStr : String) : m (Except ApiError String) := exec (.fsMktempDir prefixStr)
 end
 end MonadServer
 
@@ -558,6 +601,12 @@ variable {σ α β γ : Type} {Inv Inv₁ Inv₂ : σ → Prop} {A A₁ A₂ : P
   | .dbExec _ q | .dbTxExec _ _ q => q.isWrite
   | .dbExecDdl _ => true
   | _ => false
+
+@[reducible] def ServerEffect.isProc : ServerEffect → Bool
+  | .procExec _ _ _ _ => true | _ => false
+
+@[reducible] def ServerEffect.isFs : ServerEffect → Bool
+  | .fsRead _ | .fsWrite _ _ | .fsMkdirAll _ | .fsRemoveAll _ | .fsExists _ | .fsMktempDir _ => true | _ => false
 
 inductive ProgEffSpec {σ α : Type} (Inv : σ → Prop) (AllowAtomic : Prop) (Step : σ → σ → Prop)
     (EffOk : ServerEffect → Prop) (Post : α → Prop) : ThreadProg σ α → Prop where
@@ -1053,7 +1102,6 @@ end StructuralProgLemmas
 @[inline] def srvWithNewState {σ : Type} (sNew : σ) (P : σ → Prop) : Prop := P sNew
 @[inline] def srvEnsPost {ε α : Type} (P : α → Prop) : Except ε α → Prop | .ok r => P r | .error _ => True
 @[inline] def srvEnsPostOpt {ε α : Type} (P : α → Prop) : Except ε (Option α) → Prop | .ok (some r) => P r | _ => True
-@[inline] def srvEnsErrPost {ε α : Type} (P : ε → Prop) : Except ε α → Prop | .ok _ => True | .error e => P e
 @[inline] def srvEnsFails {ε α : Type} : Except ε α → Prop | .ok _ => False | .error _ => True
 @[inline] def srvEnsFailsCode {α : Type} (code : Nat) : Except ApiError α → Prop | .ok _ => False | .error e => e.code = code
 
@@ -1082,8 +1130,6 @@ variable {E ε σ α β γ ρ : Type}
 @[simp] theorem srvEnsPostOpt_some (P : α → Prop) (r : α) : srvEnsPostOpt (ε := ε) P (.ok (some r)) = P r := rfl
 @[simp] theorem srvEnsPostOpt_none (P : α → Prop) : srvEnsPostOpt (ε := ε) P (.ok none) = True := rfl
 @[simp] theorem srvEnsPostOpt_err (P : α → Prop) (e : ε) : srvEnsPostOpt P (.error e) = True := rfl
-@[simp] theorem srvEnsErrPost_ok (P : ε → Prop) (r : α) : srvEnsErrPost P (.ok r) = True := rfl
-@[simp] theorem srvEnsErrPost_err (P : ε → Prop) (e : ε) : srvEnsErrPost (α := α) P (.error e) = P e := rfl
 @[simp] theorem srvEnsFails_ok (r : α) : srvEnsFails (ε := ε) (.ok r) = False := rfl
 @[simp] theorem srvEnsFails_err (e : ε) : srvEnsFails (α := α) (.error e) = True := rfl
 @[simp] theorem srvEnsFailsCode_ok (c : Nat) (r : α) : srvEnsFailsCode c (.ok r) = False := rfl
@@ -1100,7 +1146,6 @@ theorem srvWithNewState_apply (s : σ) (P : σ → Prop) : srvWithNewState s P =
 @[simp] theorem prod_snd_srvLetEq (val : γ) (k : (x : γ) → x = val → α × β) : (srvLetEq val k).2 = srvLetEq val (fun x hx => (k x hx).2) := rfl
 @[simp] theorem srvEnsPost_srvLetEq (P : α → Prop) (val : γ) (k : (x : γ) → x = val → Except ε α) : srvEnsPost P (srvLetEq val k) = srvLetEq val (fun x hx => srvEnsPost P (k x hx)) := rfl
 @[simp] theorem srvEnsPostOpt_srvLetEq (P : α → Prop) (val : γ) (k : (x : γ) → x = val → Except ε (Option α)) : srvEnsPostOpt P (srvLetEq val k) = srvLetEq val (fun x hx => srvEnsPostOpt P (k x hx)) := rfl
-@[simp] theorem srvEnsErrPost_srvLetEq (P : ε → Prop) (val : γ) (k : (x : γ) → x = val → Except ε α) : srvEnsErrPost P (srvLetEq val k) = srvLetEq val (fun x hx => srvEnsErrPost P (k x hx)) := rfl
 @[simp] theorem srvEnsFails_srvLetEq (val : γ) (k : (x : γ) → x = val → Except ε α) : srvEnsFails (srvLetEq val k) = srvLetEq val (fun x hx => srvEnsFails (k x hx)) := rfl
 @[simp] theorem srvEnsFailsCode_srvLetEq (c : Nat) (val : γ) (k : (x : γ) → x = val → Except ApiError α) : srvEnsFailsCode c (srvLetEq val k) = srvLetEq val (fun x hx => srvEnsFailsCode c (k x hx)) := rfl
 @[simp] theorem srvSeq_srvLetEq (val : γ) (k : (x : γ) → x = val → σ × Option ρ) (next : σ → σ × Option ρ) : srvSeq (srvLetEq val k) next = srvLetEq val (fun x hx => srvSeq (k x hx) next) := rfl
@@ -1166,10 +1211,64 @@ open Qed.Server
 
 def nowMs {m : Type → Type} [Monad m] [MonadServer m] : m Nat := MonadServer.nowMs >>= fun ms => Pure.pure ms.toNat
 def nowSec {m : Type → Type} [Monad m] [MonadServer m] : m Nat := MonadServer.nowMs >>= fun ms => Pure.pure (ms.toNat / 1000)
+def sleepMs {m : Type → Type} [MonadServer m] (ms : Nat) : m Unit := MonadServer.sleep ms
+def sleepSec {m : Type → Type} [MonadServer m] (sec : Nat) : m Unit := MonadServer.sleep (sec * 1000)
 
 instance {σ : Type} : SafeIO (nowMs (m := ThreadProg σ)) := ⟨noAtomic_exec_map _ _⟩
 instance {σ : Type} : SafeIO (nowSec (m := ThreadProg σ)) := ⟨noAtomic_exec_map _ _⟩
+instance {σ : Type} (ms : Nat) : SafeIO (sleepMs (m := ThreadProg σ) ms) := ⟨.io (.sleep _) _ .pure⟩
+instance {σ : Type} (sec : Nat) : SafeIO (sleepSec (m := ThreadProg σ) sec) := ⟨.io (.sleep _) _ .pure⟩
 end Time
+
+namespace Proc
+open Qed.Server
+
+def exec {m : Type → Type} [MonadServer m] (cmd : String) (args : Array String := #[])
+    (cwd? : Option String := none) (env : List (String × Option String) := []) : m (Except ApiError ProcOutput) :=
+  MonadServer.procExec cmd args cwd? env
+
+def execOk {m : Type → Type} [Monad m] [MonadServer m] (cmd : String) (args : Array String := #[])
+    (cwd? : Option String := none) (env : List (String × Option String) := []) : m (Except ApiError String) :=
+  MonadServer.procExec cmd args cwd? env >>= fun r => Pure.pure <| r.bind fun out =>
+    if out.exitCode == 0 then .ok out.stdout
+    else .error (ApiError.internal s!"`{cmd}` exited with status {out.exitCode}: {out.stderr}")
+
+instance {σ : Type} (cmd : String) (args : Array String) (cwd? : Option String) (env : List (String × Option String)) :
+    SafeIO (exec (m := ThreadProg σ) cmd args cwd? env) := ⟨.io (.procExec _ _ _ _) _ .pure⟩
+instance {σ : Type} (cmd : String) (args : Array String) (cwd? : Option String) (env : List (String × Option String)) :
+    SafeIO (execOk (m := ThreadProg σ) cmd args cwd? env) := ⟨noAtomic_exec_map _ _⟩
+end Proc
+
+namespace Fs
+open Qed.Server
+
+def readBytes {m : Type → Type} [MonadServer m] (path : String) : m (Except ApiError ByteArray) :=
+  MonadServer.fsRead path
+def readText {m : Type → Type} [Monad m] [MonadServer m] (path : String) : m (Except ApiError String) :=
+  MonadServer.fsRead path >>= fun r => Pure.pure <| r.bind fun bs =>
+    (String.fromUTF8? bs).elim (.error (ApiError.internal s!"file `{path}` is not valid UTF-8")) .ok
+def writeBytes {m : Type → Type} [MonadServer m] (path : String) (data : ByteArray) : m (Except ApiError Unit) :=
+  MonadServer.fsWrite path data
+def writeText {m : Type → Type} [MonadServer m] (path : String) (text : String) : m (Except ApiError Unit) :=
+  MonadServer.fsWrite path text.toUTF8
+def mkdirAll {m : Type → Type} [MonadServer m] (path : String) : m (Except ApiError Unit) :=
+  MonadServer.fsMkdirAll path
+def removeAll {m : Type → Type} [MonadServer m] (path : String) : m (Except ApiError Unit) :=
+  MonadServer.fsRemoveAll path
+def pathExists {m : Type → Type} [MonadServer m] (path : String) : m Bool :=
+  MonadServer.fsExists path
+def mktempDir {m : Type → Type} [MonadServer m] (prefixStr : String := "qed-") : m (Except ApiError String) :=
+  MonadServer.fsMktempDir prefixStr
+
+instance {σ : Type} (path : String) : SafeIO (readBytes (m := ThreadProg σ) path) := ⟨.io (.fsRead _) _ .pure⟩
+instance {σ : Type} (path : String) : SafeIO (readText (m := ThreadProg σ) path) := ⟨noAtomic_exec_map _ _⟩
+instance {σ : Type} (path : String) (data : ByteArray) : SafeIO (writeBytes (m := ThreadProg σ) path data) := ⟨.io (.fsWrite _ _) _ .pure⟩
+instance {σ : Type} (path : String) (text : String) : SafeIO (writeText (m := ThreadProg σ) path text) := ⟨.io (.fsWrite _ _) _ .pure⟩
+instance {σ : Type} (path : String) : SafeIO (mkdirAll (m := ThreadProg σ) path) := ⟨.io (.fsMkdirAll _) _ .pure⟩
+instance {σ : Type} (path : String) : SafeIO (removeAll (m := ThreadProg σ) path) := ⟨.io (.fsRemoveAll _) _ .pure⟩
+instance {σ : Type} (path : String) : SafeIO (pathExists (m := ThreadProg σ) path) := ⟨.io (.fsExists _) _ .pure⟩
+instance {σ : Type} (prefixStr : String) : SafeIO (mktempDir (m := ThreadProg σ) prefixStr) := ⟨.io (.fsMktempDir _) _ .pure⟩
+end Fs
 
 namespace Random
 open Qed.Server

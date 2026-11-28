@@ -3,6 +3,7 @@ import Qed.Lang
 import Qed.Auth.Core
 import Qed.Server.Core
 import Qed.Server.Registry
+import Qed.Verify.Core
 
 namespace Qed.Auth
 
@@ -13,12 +14,13 @@ private def authClaimLineP : Parser :=
   node `Qed.Auth.authClaimLine (withPosition (ident >> ":" >> categoryParser `qedType 91 >> optional (checkLineEq >> "=" >> categoryParser `qedExpr 0)))
 private def authClauseP : Parser :=
   node `Qed.Auth.authEnvClause (withPosition (atomic (identEq `issuer <|> identEq `audience <|> identEq `clientId <|> identEq `clientSecret) >> qedEnvRef)) <|>
-  kwNode `Qed.Auth.authManagedClause `managed ("[" >> sepBy1 ident "," >> "]") <|>
-  kwNode `Qed.Auth.authProvidersClause `providers ("[" >> sepBy ident "," >> "]") <|>
+  kwNode `Qed.Auth.authManagedClause `managed ("[" >> commaSep1 ident >> "]") <|>
+  kwNode `Qed.Auth.authProvidersClause `providers ("[" >> commaSep ident >> "]") <|>
   kwNode `Qed.Auth.authSessionClause `session (identEq `ttl >> "=" >> numLit) <|>
-  kwNode `Qed.Auth.authClaimsClause `claims (":" >> checkColGt "expected indented `claims:` fields" >> many1Indent authClaimLineP)
+  kwNode `Qed.Auth.authClaimsClause `claims (":" >> checkColGt "expected indented `claims:` fields" >> many1Indent authClaimLineP) <|>
+  node `Qed.Auth.authInvClause (withPosition (atomic (identEq `invariant >> ident >> ":") >> sepBy1 (categoryParser `qedExpr 0) ","))
 @[command_parser] def authCmd : Parser := opaqueP (
-  node `Qed.Auth.authCmd (withPosition (atomic (identEq `auth >> ident >> ":") >> checkColGt "expected indented `auth` clauses" >> many1Indent authClauseP)))
+  node `Qed.Auth.authCmd (optional Command.docComment >> withPosition (atomic (identEq `auth >> ident >> ":") >> checkColGt "expected indented `auth` clauses" >> many1Indent authClauseP)))
 end AuthParsers
 
 open Lean Elab Command Qed.Lang Qed.Server
@@ -30,7 +32,7 @@ private structure ParsedClaimDecl where
 private def claimTypeSpecs : Array (String × AuthClaimKind × String × String) := #[
   ("String", .str, "String", "\"\""), ("Bool", .bool, "Bool", "false"),
   ("Nat", .nat, "Nat", "0"), ("Int", .int, "Int", "0"),
-  ("String?", .optStr, "Option String", "none"), ("OptionString", .optStr, "Option String", "none")]
+  ("String?", .optStr, "Option String", "none")]
 
 @[noinline] private def claimTyDefPure : AuthClaimKind → PureQuotM (Term × Term)
   | .str => pure (mkCIdent ``String, Syntax.mkStrLit "") | .bool => pure (mkCIdent ``Bool, mkCIdent ``Bool.false)
@@ -70,7 +72,7 @@ private def claimTypeSpecs : Array (String × AuthClaimKind × String × String)
 @[noinline] private def mkStructFieldPure (id : Ident) (val : Term) : PureQuotM (TSyntax `Lean.Parser.Term.structInstField) :=
   `(Lean.Parser.Term.structInstField| $id:ident := $val)
 
-@[noinline] private def mkAuthCmdsPure (authIdent : Ident) (authName : Name) (claims : Array ParsedClaimDecl)
+@[noinline] private def mkAuthCmdsPure (doc? : Option (TSyntax ``Lean.Parser.Command.docComment)) (authIdent : Ident) (authName : Name) (claims : Array ParsedClaimDecl)
     (secrets : Array String) (spec : OidcAuthSpec) : PureQuotM (Array (TSyntax `command)) := do
   let mkSub (leaf : Name) := mkIdentFrom authIdent (authName ++ leaf)
   let (userTyId, fromLookupId, fromClaimsId, fromCtxId) := (mkSub `User, mkSub `fromLookup, mkSub `fromClaims, mkSub `fromCtx)
@@ -91,7 +93,7 @@ private def claimTypeSpecs : Array (String × AuthClaimKind × String × String)
   let mkUrlCmd (leaf : Name) (pfx : String) := `(command| def $(mkSub leaf) (returnTo : Qed.HrefTarget := Qed.HrefTarget.root) : Qed.Url := Qed.Auth.mkAuthActionUrl $(Syntax.mkStrLit pfx) returnTo)
   let mkCtxThm (leaf : Name) (goal pf : Term) := `(command| theorem $(mkSub leaf) ($ctxId:ident : Qed.Server.RequestCtx) ($uId:ident : $userTyId) (h : $fromCtxId $ctxId = Option.some $uId) : $goal := $pf)
   return #[
-    ← `(command| structure $userTyId where $[$fStxs]* deriving Inhabited, DecidableEq, Repr),
+    ← `(command| $[$doc?:docComment]? structure $userTyId where $[$fStxs]* deriving Inhabited, DecidableEq, Repr),
     ← mkInst `instLawfulJsonUser ``Qed.LawfulJson (← mkAppC ``Qed.LawfulJson.iso #[mkCIdent ``inferInstance, toFn, fromFn, leftInv]),
     ← mkInst `instLawfulProtoUser ``Qed.LawfulProto (← mkAppC ``Qed.LawfulProto.ofEquiv #[toFn, fromFn, leftInv]),
     ← noUnusedVarsPure (← `(command| private def $fromLookupId ($uidId:ident : String) ($lookupId:ident : String → Option String) : $userTyId := { $[$lInits:structInstField],* })),
@@ -106,11 +108,14 @@ private def claimTypeSpecs : Array (String × AuthClaimKind × String × String)
 private structure AuthParseAcc where
   (isManaged hasExplicitOidc : Bool := false) (sessionTtlSec : Nat := 86400) (envRefs : Array (Name × String × Option String) := #[])
   (seen : Array Name := #[]) (providers secrets : Array String := #[]) (claims : Array ParsedClaimDecl := #[])
+  (invs : Array (Ident × Array Syntax) := #[])
 
 @[noinline] private def parseOneAuthClause (authShort : String) (acc : AuthParseAcc) (c : Syntax) : CommandElabM AuthParseAcc := do
   let k := c.getKind; let seenKey := if k == `Qed.Auth.authEnvClause then (c.getArg 0).getId.eraseMacroScopes else k
-  if acc.seen.contains seenKey then errAt c s!"duplicate clause in `auth {authShort}`"
-  let acc := { acc with seen := acc.seen.push seenKey }
+  let acc ← if k != `Qed.Auth.authInvClause then
+      if acc.seen.contains seenKey then errAt c s!"duplicate clause in `auth {authShort}`"
+      pure { acc with seen := acc.seen.push seenKey }
+    else pure acc
   let pushProvs (args : Array Syntax) := args.foldl (init := acc.providers) fun ps p => Lang.pushUnique ps p.getId.eraseMacroScopes.toString
   match k with
   | `Qed.Auth.authManagedClause =>
@@ -132,12 +137,19 @@ private structure AuthParseAcc where
         if cs.any (·.name == decl.name) then errAt decl.ident s!"duplicate claim `{decl.name}` in `auth {authShort}`"
         return cs.push decl
       return { acc with claims }
+  | `Qed.Auth.authInvClause =>
+      let invId : Ident := ⟨c.getArg 1⟩; let leaf := invId.getId.eraseMacroScopes
+      if [`User, `config, `secrets, `fromClaims, `fromCtx, `loginUrl, `logoutUrl].contains leaf then
+        errAt invId s!"invariant name `{leaf}` is reserved in `auth {authShort}`"
+      if acc.invs.any (·.1.getId.eraseMacroScopes == leaf) then errAt invId s!"duplicate invariant `{leaf}` in `auth {authShort}`"
+      return { acc with invs := acc.invs.push (invId, (c.getArg 3).getSepArgs) }
   | _ => errAt c s!"unexpected clause in `auth {authShort}`"
 
 @[noinline, command_elab authCmd] def elabAuthCmd : CommandElab := fun stx => do
-  let authIdent : Ident := ⟨stx.getArg 1⟩; let authName := authIdent.getId.eraseMacroScopes
+  let doc? := extractOptDoc (stx.getArg 0)
+  let authIdent : Ident := ⟨stx.getArg 2⟩; let authName := authIdent.getId.eraseMacroScopes
   let (fullAuthName, authShort) := ((← getCurrNamespace) ++ authName, authName.toString)
-  let acc ← foldlCmd (stx.getArg 3).getArgs ({} : AuthParseAcc) (parseOneAuthClause authShort)
+  let acc ← foldlCmd (stx.getArg 4).getArgs ({} : AuthParseAcc) (parseOneAuthClause authShort)
   let findEnv (k : Name) := (acc.envRefs.find? (·.1 == k)).map Prod.snd
   let (iss?, aud?, cid?, csec?) := (findEnv `issuer, findEnv `audience, findEnv `clientId, findEnv `clientSecret)
   let spec : OidcAuthSpec := {
@@ -148,7 +160,17 @@ private structure AuthParseAcc where
     clientSecretEnv? := if acc.isManaged then some "QED_AUTH_CLIENT_SECRET" else csec?.map (·.1),
     providers := acc.providers.toList, sessionTtlSec := acc.sessionTtlSec,
     claims := acc.claims.toList.map fun cl => { name := cl.name, typeName := cl.typeName, defaultValue := cl.defaultStr } }
-  elabPureCmds (mkAuthCmdsPure authIdent authName acc.claims acc.secrets spec)
+  elabPureCmds (mkAuthCmdsPure doc? authIdent authName acc.claims acc.secrets spec)
+  if !acc.invs.isEmpty then
+    let (cfgId, secId) : Term × Term := (mkCIdent (fullAuthName ++ `config), mkCIdent (fullAuthName ++ `secrets))
+    let (provT, ttlT, mgdT, clmT) ← runPQ do
+      return (← `(($cfgId).providers), ← `(($cfgId).sessionTtlSec), ← `(($cfgId).isManaged), ← `(($cfgId).claims))
+    let aliases : Array (String × Term) := #[
+      ("secrets", secId), ("config", cfgId), ("providers", provT),
+      ("session_ttl", ttlT), ("is_managed", mgdT), ("claims", clmT)]
+    let unfolds := #[fullAuthName ++ `secrets, fullAuthName ++ `config]
+    foldlCmd acc.invs () fun () (invId, exprs) =>
+      Qed.Verify.Core.elabStaticMetaInv authShort (fullAuthName ++ invId.getId.eraseMacroScopes) aliases unfolds invId exprs
   modifyEnv fun env => authRegistry.addEntry env { authName := fullAuthName, shortName := authShort, configConst := fullAuthName ++ `config, secrets := acc.secrets, spec }
 
 end Qed.Auth

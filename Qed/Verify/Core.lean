@@ -714,4 +714,86 @@ def fmtBlindTarget (t : ParsedBlindTarget) : String :=
     Qed.Lang.foldrPQ freshVars (← `($lhsCall = $rhsCall)) fun (fv, ty?) acc => match ty? with
       | some ty => `(∀ ($fv:ident : $ty), $acc) | none => `(∀ $fv:ident, $acc)
 
+private def staticInvNormNames : Array Name := #[
+  `Qed.Lang.QedVal.val_id, `Qed.Lang.QedSeqLit.ofList_array, `Qed.Lang.QedSeqLit.ofList_list,
+  `Qed.Lang.QedMemProp.memProp_array, `Qed.Lang.QedMemProp.memProp_list, ``Array.mem_def,
+  ``Bool.and_eq_true, ``Bool.or_eq_true, ``Bool.not_eq_true', ``Bool.not_eq_false',
+  ``decide_eq_true_eq, ``decide_eq_false_iff_not, ``beq_iff_eq, ``bne_iff_ne]
+
+@[noinline] def lowerStaticInvExpr (aliases : Array (String × Term)) (stx : Syntax) : Elab.Command.CommandElabM Term := do
+  let foldProjs (ref : Syntax) (base : Term) (fs : List Name) : ReaderT (Array String) Elab.Command.CommandElabM Term :=
+    fs.foldlM (init := base) fun acc f => `(($acc).$(mkIdentFrom ref f):ident)
+  let hooks : Qed.Lang.LowerHooks (ReaderT (Array String) Elab.Command.CommandElabM) :=
+    { Qed.Lang.LowerHooks.mkDefault (fun ref msg => throwErrorAt ref msg) with
+      withLocals := fun names => withReader (· ++ names)
+      lowerType := fun t => Elab.liftMacroM (return (← Qed.Lang.lowerQedType t false).1)
+      lowerPat := fun p => Elab.liftMacroM (Qed.Lang.lowerQedPat p)
+      lowerIdent := fun ref id mode => do
+        let locals ← read
+        match id.getId.eraseMacroScopes.components with
+        | [] => pure ⟨id.raw⟩
+        | root :: rest =>
+            let rs := root.toString
+            if locals.contains rs then pure ⟨id.raw⟩
+            else if let some (_, tgt) := aliases.find? (·.1 == rs) then foldProjs ref tgt rest
+            else if !rest.isEmpty then pure ⟨id.raw⟩
+            else match rs with
+              | "true" => if mode == .propInv then `(True) else `(true)
+              | "false" => if mode == .propInv then `(False) else `(false)
+              | "none" => `(Option.none)
+              | _ => pure ⟨id.raw⟩ }
+  (Qed.Lang.lowerQedExpr hooks .propInv stx).run #[]
+
+@[noinline] private def closeStaticInvSubgoal (unfolds : Array Name) (g : MVarId) : MetaM Bool := do
+  if ← tryCloseGroundKernel g (check := true) then return true
+  if ← tryCloseBasic g then return true
+  let (_, g1) ← g.intros
+  if ← tryCloseGroundKernel g1 (check := true) then return true
+  if ← tryCloseBasic g1 then return true
+  let ctx ← mkDynamicSimpCtx (staticInvNormNames ++ unfolds) none { zetaDelta := false } (withEqns := false)
+  match ← simpGoalOnly g1 ctx with
+  | none => return true
+  | some g2 =>
+      closeAllGoals (fun sg => do
+        if ← tryCloseGroundKernel sg (check := true) then return true
+        tryCloseBasic sg) (← splitGoalAnds g2)
+
+/-- Elaborate and verify a compile-time `invariant <name>: <qedExpr>,+` over static metadata or top-level propositions. -/
+@[noinline] def elabStaticMetaInv (scopeLabel : String) (fullDeclName : Name) (aliases : Array (String × Term))
+    (unfolds : Array Name) (invId : Ident) (exprs : Array Syntax) (pf? : Option Term := none)
+    (doc? : Option (TSyntax ``Lean.Parser.Command.docComment) := none) (isPrivate : Bool := false) : Elab.Command.CommandElabM Unit := do
+  let lowered ← Qed.Lang.mapCmd exprs (lowerStaticInvExpr aliases)
+  let combined ← Elab.liftMacroM <| Qed.mkConjBody lowered (ascribeProp := false)
+  let invLeaf := invId.getId.eraseMacroScopes
+  let dispName := if scopeLabel.isEmpty then invLeaf.toString else s!"{scopeLabel}.{invLeaf}"
+  if let some pfT := pf? then
+    let cmd ← Qed.Lang.runPQ `(command| $[$doc?:docComment]? theorem $(mkIdentFrom invId (`_root_ ++ fullDeclName)):ident : $combined := $pfT)
+    Qed.Lang.elabCmdWithVis isPrivate cmd
+    return
+  let res ← Elab.Command.liftTermElabM do
+    let propExpr ← instantiateMVars (← Term.elabTermEnsuringType combined (some (mkSort Level.zero)))
+    Term.synthesizeSyntheticMVarsNoPostponing
+    let propExpr ← instantiateMVars propExpr
+    let savedMsgs ← Core.getMessageLog; Core.resetMessageLog
+    let mvar ← Meta.mkFreshExprSyntheticOpaqueMVar propExpr
+    let ok ← try
+      let rem ← filterUnsolvedM (closeStaticInvSubgoal unfolds) (← splitGoalAnds mvar.mvarId!)
+      pure (rem.isEmpty && !(← Core.getMessageLog).hasErrors)
+    catch _ => pure false
+    Core.setMessageLog savedMsgs
+    if ok then return Except.ok (propExpr, ← instantiateMVars mvar)
+    else
+      let pp ← Qed.Diag.ppQedExpr propExpr
+      return Except.error pp
+  match res with
+  | .ok (propExpr, proofVal) =>
+      Elab.Command.liftTermElabM do
+        let env ← getEnv
+        let declName := if isPrivate then mkPrivateName env fullDeclName else fullDeclName
+        addDecl (.thmDecl { name := declName, levelParams := [], type := propExpr, value := proofVal })
+        addDeclarationRangesFromSyntax declName invId
+        addDocString' declName Syntax.missing doc?
+  | .error pp =>
+      throwErrorAt invId s!"Invariant `{dispName}` failed:\n  • must satisfy:  {pp}"
+
 end Qed.Verify.Core

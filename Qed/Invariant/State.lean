@@ -253,13 +253,13 @@ termination_by hypSplitFuel
     unless seenCases.contains cn do
       throwErrorAt cid s!"unknown action/message `{cn}` in `prove:` on invariant `{nm.getId}` (valid cases: {String.intercalate ", " (allCtors.toList.map toString)})"
   throwUnsolvedInvGoals nm m!"Invariant `{nm.getId}` failed in `{formatTargetName upd}`:"
-    m!"Hint: Guard the failing branch with `if ...:`, fix the update, or weaken the invariant.\n      If the rule does hold, add `using [lemma]`, a per-action `prove:` block, or a manual `:= by` proof."
+    m!"Hint: Guard the failing branch with `if ...:`, fix the update, or weaken the invariant.\n      If the rule does hold, add `using [lemma]` or a `prove:` block."
 
 elab_rules : tactic
   | `(tactic| qedDischargeInit [$[$usingL],*] $initT $nm $pred) => withFreshHeartbeatsT do
       (← getMainGoal).setTag `init; runInitPass usingL pred initT
       throwUnsolvedInvGoals nm m!"Invariant `{nm.getId}` failed on initial state `{formatTargetName initT}`:"
-        m!"Hint: Update the initial `state` values so `{nm.getId}` holds, add `using [lemma]`, or supply a `:= by` proof."
+        m!"Hint: Update the initial `state` values so `{nm.getId}` holds, add `using [lemma]`, or supply a `prove:` block."
   | `(tactic| qedDischargePreserved [$[$usingL],*] $upd $nm $pred $[from $init]? $[_qedProve [$[$proveCases],*]]?) =>
     runDischargePreserved usingL upd nm pred init proveCases
 
@@ -292,6 +292,8 @@ private def fnContractSimpNames : Array Name :=
     ``Option.isSome_none, ``Option.isSome_some, ``Option.isNone_none, ``Option.isNone_some, ``Qed.qedCoalesce_option,
     ``Qed.qedIterable_toList_list, ``Qed.qedIterable_toList_array, ``Qed.qedIterable_toList_range,
     ``Nat.min_def, ``Nat.max_def, ``Int.min_def, ``Int.max_def,
+    ``Qed.Bytes.ctEq_eq_beq, ``Qed.Str.ctEq_eq_beq, ``Qed.Bytes.uint8_or_eq_zero, ``Qed.Bytes.uint8_xor_eq_zero,
+    `Qed.Server.Db.SqlIdent.ofString?_isSome, `Qed.Server.Db.SqlIdent.ofString?_eq_some_iff, `Qed.Server.Db.SqlIdent.ofString?_raw_self,
     ``true_and, ``and_true, ``false_or, ``or_false, ``true_or, ``or_true, ``id_eq, ``ne_eq]
 private def ordSimpNames : Array Name := #[
   ``Qed.QedOrd.le_nat, ``Qed.QedOrd.le_int, ``Qed.QedOrd.le_char, ``Qed.QedOrd.le_string, ``Qed.QedOrd.le_bool,
@@ -1810,7 +1812,7 @@ private def exprHasQuantifier (e : Expr) : Bool :=
         let fnSimpCtx? ← try some <$> mkDynamicSimpCtx #[← realizeGlobalConstNoOverload fnId] none (withEqns := false) catch _ => pure none
         forEachGoal (splitFiniteEnumsAndProve fnId fnSimpCtx? 256)
   throwUnsolvedInvGoals thmId m!"`example` failed for `{fnId.getId}`:"
-    m!"Hint: Check the expected output in the `example`, fix `{fnId.getId}`, or supply a `prove:` / `:= by` proof."
+    m!"Hint: Check the expected output in the `example`, fix `{fnId.getId}`, or supply a `prove:` block."
 
 private def extractLoopProveTacs (optArgs : Option (Array (TSyntax ``qedLoopProveArg))) : Array (TSyntax ``Lean.Parser.Tactic.tacticSeq) :=
   match optArgs with
@@ -1826,12 +1828,12 @@ elab_rules : tactic
         if let some diag ← diagRef.get then formatLoopFailDiag fnId thmId false diag
         if let some cmpMsg ← cmpErrRef.get then
           throwErrorAt thmId s!"`ensures` contract failed for `{fnId.getId}`:\n  • {cmpMsg}"
-      throwUnsolvedInvGoals thmId m!"`ensures` contract failed for `{fnId.getId}`:" m!"Hint: Strengthen `requires` / `if` guards, fix the return value, or supply a `:= by` proof."
+      throwUnsolvedInvGoals thmId m!"`ensures` contract failed for `{fnId.getId}`:" m!"Hint: Strengthen `requires` / `if` guards, fix the return value, or supply a `prove:` block."
   | `(tactic| qedProveFnLoopInvs $fnId $thmId $[_qedLoopProve [$[$lpArgs:qedLoopProveArg],*]]?) =>
       runProveFnLoopInvs fnId thmId (extractLoopProveTacs lpArgs)
   | `(tactic| qedProveBlindTo $fnId $thmId $desc) => do
       runProveFnGoal fnId true
-      throwUnsolvedInvGoals thmId m!"`blindTo {desc.getString}` failed in `{fnId.getId}` (output may depend on blinded field/parameter):" m!"Hint: Redact every branch that reads {desc.getString} under this guard, strengthen the `if` condition, or supply a `:= by` proof."
+      throwUnsolvedInvGoals thmId m!"`blindTo {desc.getString}` failed in `{fnId.getId}` (output may depend on blinded field/parameter):" m!"Hint: Redact every branch that reads {desc.getString} under this guard, strengthen the `if` condition, or supply a `prove:` block."
   | `(tactic| qedProveFnExample ground $fnId $thmId) => runProveFnExample fnId thmId true
   | `(tactic| qedProveFnExample $fnId $thmId) => runProveFnExample fnId thmId false
 
@@ -1903,7 +1905,7 @@ private def lowerTypeOnly (s : Syntax) : CommandElabM Term := liftMacroM (return
     elabContractThm isPrivate thmId pBinders "_hExWhere_" ex.wheres (← lowerContractConj ex.preds) ex.tac? exTac
 
 @[noinline, command_elab fnCmd] def elabFnCmd : CommandElab := fun stx => do
-  let doc? := if (stx.getArg 0).getNumArgs == 1 then some (⟨(stx.getArg 0).getArg 0⟩ : TSyntax ``Lean.Parser.Command.docComment) else none
+  let doc? := Qed.Lang.extractOptDoc (stx.getArg 0)
   let isPrivate := (stx.getArg 1).getNumArgs == 1; let fnId : Ident := ⟨stx.getArg 3⟩
   let (_, paramIds, paramTys, defBinders) ← Qed.Lang.foldlCmd (stx.getArg 5).getSepArgs (false, #[], #[], #[]) fun (seenDef, ids, tys, bs) rp => do
     let pid : Ident := ⟨rp.getArg 0⟩
@@ -1916,13 +1918,15 @@ private def lowerTypeOnly (s : Syntax) : CommandElabM Term := liftMacroM (return
         if seenDef then throwErrorAt pid s!"non-default parameter `{pid.getId}` cannot follow a parameter with a default value in `fn {fnId.getId}`"
         pure (false, ← Qed.Lang.runPQ (mkTypedBinder pid pty))
     return (seen', ids.push pid, tys.push pty, bs.push b)
-  let retTy ← lowerTypeOnly (stx.getArg 8)
+  let optRet := stx.getArg 7
+  let (isUnitRet, retTy) ← if optRet.getNumArgs == 2 then do pure (false, ← lowerTypeOnly (optRet.getArg 1)) else do pure (true, ← Qed.Lang.runPQ `(Unit))
   let hasLoopInvRef ← IO.mkRef false
   let loopTacsRef ← IO.mkRef (#[] : Array (TSyntax ``Lean.Parser.Tactic.tacticSeq))
-  let bodyTerm ← lowerPureFnStmts s!"fn {fnId.getId}" (stx.getArg 11).getArgs.toList
+  let bodyTerm ← lowerPureFnStmts s!"fn {fnId.getId}" (suiteStmts (stx.getArg 10)).toList
     (onLoopInv? := some fun tac? => do hasLoopInvRef.set true; if let some ts := tac? then loopTacsRef.modify (·.push ts))
+    (allowImplicitUnit := isUnitRet)
   Qed.Lang.elabCmdWithVis isPrivate (← Qed.Lang.runPQ `(command| $[$doc?:docComment]? def $fnId $[$defBinders:bracketedBinder]* : $retTy := $bodyTerm))
-  elabPureFnContracts fnId fnId paramIds paramTys retTy (stx.getArg 10).getArgs #[] isPrivate (← hasLoopInvRef.get) (← loopTacsRef.get)
+  elabPureFnContracts fnId fnId paramIds paramTys retTy (stx.getArg 9).getArgs #[] isPrivate (← hasLoopInvRef.get) (← loopTacsRef.get)
 
 end FnElab
 end Qed

@@ -42,7 +42,7 @@ private def isForEachStyled (invStx : Syntax) : CommandElabM Bool := do
 @[noinline] private def elabForEachInlineInv (spec : ComponentSpec) (invStx : Syntax) (isStyled : Bool) : CommandElabM (Option Term) := do
   let (invId, pred, colField) := (resolveInvIdent invStx spec.t.getId, ← lowerCompExpr .val (invStx.getArg 2), (⟨invStx.getArg 4⟩ : Ident))
   let using? : Option Ident := if (invStx.getArg 6).getNumArgs == 2 then some ⟨(invStx.getArg 6).getArg 1⟩ else none
-  let pf? : Option Term := if (invStx.getArg 7).getNumArgs == 2 then some ⟨(invStx.getArg 7).getArg 1⟩ else none
+  let pf? : Option Term ← match parseOptTacSeq (invStx.getArg 7) with | some ts => some <$> Lang.runPQ `(by $ts) | none => pure none
   let (predToEmit, childInv) ← match using? with
     | some u => pure (pred, u)
     | none =>
@@ -87,12 +87,18 @@ private def isForEachStyled (invStx : Syntax) : CommandElabM Bool := do
       let saved ← get
       try elabIsolatedTheorem (← Lang.runPQ (mkViewAppInvCmdPure spec invId compFull vPred assumePred?)) catch _ => set saved
 
-private def parseProveCases (optNode : Syntax) : CommandElabM (Option (Array (TSyntax ``Qed.qedProveCase))) := do
-  if optNode.getNumArgs != 1 then return none
-  some <$> Lang.runPQ do Lang.mapPQ ((optNode.getArg 0).getArg 2).getArgs fun c => do
-    let caseIds : Array Ident := (c.getArg 1).getSepArgs.map (⟨·⟩)
-    let tacSeq : TSyntax ``Lean.Parser.Tactic.tacticSeq := ⟨c.getArg 3⟩
-    `(Qed.qedProveCase| $[$caseIds:ident],* => $tacSeq)
+private def parseInvProve (optNode : Syntax) : CommandElabM (Option (Array (TSyntax ``Qed.qedProveCase)) × Option Term) := do
+  if optNode.getNumArgs != 1 then return (none, none)
+  let body := (optNode.getArg 0).getArg 2
+  if body.getKind == `Qed.compInvProveCases then
+    let cases ← Lang.runPQ do Lang.mapPQ (body.getArg 0).getArgs fun c => do
+      let caseIds : Array Ident := (c.getArg 1).getSepArgs.map (⟨·⟩)
+      let tacSeq : TSyntax ``Lean.Parser.Tactic.tacticSeq := ⟨c.getArg 3⟩
+      `(Qed.qedProveCase| $[$caseIds:ident],* => $tacSeq)
+    return (some cases, none)
+  else
+    let tacSeq : TSyntax ``Lean.Parser.Tactic.tacticSeq := ⟨body.getArg 0⟩
+    return (none, some (← Lang.runPQ `(by $tacSeq)))
 
 @[noinline] private def mkStateInlineInvCmdsPure (spec : ComponentSpec) (invId : Ident) (clauses : Array Term) (using? : Option (Array Term))
     (prove? : Option (Array (TSyntax ``Qed.qedProveCase))) (pf? : Option Term) : PureQuotM (Term × Array CmdStx) := do
@@ -132,9 +138,7 @@ private def parseProveCases (optNode : Syntax) : CommandElabM (Option (Array (TS
     let hasHoldsIn := (invStx.getArg 3).getNumArgs > 0
     let assume? ← if hasHoldsIn && ((invStx.getArg 3).getArg 2).getNumArgs == 2 then do some <$> lowerCompExpr .val (← rwRawClause (((invStx.getArg 3).getArg 2).getArg 1)) else pure none
     let using? : Option (Array Term) := if (invStx.getArg 4).getNumArgs == 4 then some (((invStx.getArg 4).getArg 2).getSepArgs.map (⟨·⟩)) else none
-    let prove? ← parseProveCases (invStx.getArg 5)
-    let pf? : Option Term := if (invStx.getArg 6).getNumArgs == 2 then some ⟨(invStx.getArg 6).getArg 1⟩ else none
-    if prove?.isSome && pf?.isSome then throwErrorAt (invStx.getArg 5) "cannot combine per-action `prove:` with a manual `:= by` proof; use one or the other"
+    let (prove?, pf?) ← parseInvProve (invStx.getArg 5)
     let valClauses? ← if hasHoldsIn then some <$> lowerCompExprs .val rawClauses
       else if using?.isSome || prove?.isSome || rawClauses.isEmpty then pure none else try some <$> lowerCompExprs .val rawClauses catch _ => pure none
     let autoView ← match valClauses? with
@@ -252,7 +256,7 @@ private def lowerCompExRecOrExpr (node : Syntax) (validFields : Array Name) (kin
       some <$> lowerCompExpr .val ((optEmits.getArg 0).getArg 1)
     else pure none
   let lbl := Syntax.mkStrLit (let s := stxSnippet rawGoal; if s.isEmpty then "target" else s)
-  let manualTac? := if (cl.getArg 11).getNumArgs == 3 then some (⟨(cl.getArg 11).getArg 2⟩ : TSyntax `Lean.Parser.Tactic.tacticSeq) else none
+  let manualTac? := parseOptTacSeq (cl.getArg 11)
   elabIsolatedTheorem (← Lang.runPQ (mkCompExampleCmdPure spec thmId parsedParams whereTerms propsTerm? initTerm goalTerm emitsRaw? hasRpcReplies stepTerms lbl manualTac?))
 
 @[noinline] def elabCompReachableAndWitnesses (spec : ComponentSpec) : CommandElabM Unit :=

@@ -187,32 +187,54 @@ private def diagnoseStyling (predStr : String) (vName : Name) : String × String
 
 elab "qedStyleReduce " view:ident : tactic => runStyleReduce view
 elab "qedDischargeStyling" view:ident nm:ident predLit:str : tactic => withFreshHeartbeatsT (runDischargeStyling view nm predLit)
-syntax (name := invariantView) "invariant " ident " : " qedExpr,+ " holds_in " ident (" assuming " qedExpr)? (" := " term)? : command
+
+section InvariantViewParsers
+open Lean Parser Qed.Lang
+@[command_parser] def invariantCmd : Parser := opaqueP (node `Qed.invariantCmd (
+  optional Command.docComment >> withPosition (
+    atomic (optional (symbol "private") >> identEq `invariant >> ident >> ":") >> sepBy1 (categoryParser `qedExpr 0) "," >>
+    optional (node `Qed.invHoldsIn (atomic (identEq `holds_in) >> ident >> optional (atomic (identEq `assuming) >> categoryParser `qedExpr 0))) >>
+    qedOptProof)))
+end InvariantViewParsers
 
 section InvariantViewElab
 open Lean Elab Command
-@[noinline] private def elabInvariantViewCmd (name view : Ident) (rawPreds : Array (TSyntax `qedExpr))
-    (assumeE : Option (TSyntax `qedExpr)) (pf : Option Term) : CommandElabM Unit := do
-  let lowered ← Qed.Lang.mapCmd rawPreds fun p => liftMacroM (Qed.Lang.lowerSimpleQedExpr .val p.raw)
+@[noinline] private def elabInvariantViewCmd (doc? : Option (TSyntax ``Lean.Parser.Command.docComment)) (isPrivate : Bool)
+    (name view : Ident) (rawPreds : Array Syntax) (assumeE : Option Syntax) (pf : Option Term) : CommandElabM Unit := do
+  let lowered ← Qed.Lang.mapCmd rawPreds fun p => liftMacroM (Qed.Lang.lowerSimpleQedExpr .val p)
   let some p := lowered[0]? | throwErrorAt name "empty view invariant"
-  let predStr := String.intercalate ", " (rawPreds.toList.map fun p => (p.raw.reprint.getD "this rule").trimmed)
+  let predStr := String.intercalate ", " (rawPreds.toList.map fun p => (p.reprint.getD "this rule").trimmed)
   let assumeP? ← match assumeE with
     | none => pure none
     | some a =>
-        let uA := Qed.Lang.unwrapParens1 a.raw
-        let aT ← liftMacroM (Qed.Lang.lowerSimpleQedExpr (if uA.getKind == ``Qed.Lang.qedLam1 || uA.getKind == ``Qed.Lang.qedLamN then .propInv else .val) a.raw)
+        let uA := Qed.Lang.unwrapParens1 a
+        let aT ← liftMacroM (Qed.Lang.lowerSimpleQedExpr (if uA.getKind == ``Qed.Lang.qedLam1 || uA.getKind == ``Qed.Lang.qedLamN then .propInv else .val) a)
         some <$> if aT.raw.isIdent then try liftTermElabM (extractInvPred ⟨aT.raw⟩) catch _ => pure aT else pure aT
   let cmd ← Qed.Lang.runPQ do
     let pred ← Qed.Lang.foldlPQ (lowered.extract 1 lowered.size) p fun acc q => `(Qed.both $acc $q)
     let prop ← match assumeP? with
       | some P => `(∀ m, ($P) m → ($pred) ($view m) = true) | none => `(∀ m, ($pred) ($view m) = true)
     match pf with
-    | some pfT => `(theorem $name:ident : $prop := $pfT)
-    | none => `(set_option linter.unusedSimpArgs false in theorem $name:ident : $prop := by qedDischargeStyling $view $name $(Syntax.mkStrLit predStr))
-  elabCommand cmd
+    | some pfT => `(command| $[$doc?:docComment]? theorem $name:ident : $prop := $pfT)
+    | none => `(command| set_option linter.unusedSimpArgs false in $[$doc?:docComment]? theorem $name:ident : $prop := by qedDischargeStyling $view $name $(Syntax.mkStrLit predStr))
+  Qed.Lang.elabCmdWithVis isPrivate cmd
 
-elab_rules : command
-  | `(invariant $name:ident : $preds:qedExpr,* holds_in $view:ident $[assuming $assumeE:qedExpr]? $[ := $pf:term]?) =>
-    elabInvariantViewCmd name view preds.getElems assumeE pf
+@[noinline, command_elab invariantCmd] def elabInvariantCmd : CommandElab := fun stx => do
+  let doc? := Qed.Lang.extractOptDoc (stx.getArg 0)
+  let isPrivate := (stx.getArg 1).getNumArgs == 1
+  let name : Ident := ⟨stx.getArg 3⟩
+  let rawPreds := (stx.getArg 5).getSepArgs
+  let holdsOpt := stx.getArg 6
+  let pf? : Option Term ← match Qed.Lang.parseOptTacSeq (stx.getArg 7) with
+    | some tacSeq => some <$> Qed.Lang.runPQ `(by $tacSeq)
+    | none => pure none
+  if holdsOpt.getNumArgs == 1 then
+    let h := holdsOpt.getArg 0
+    let view : Ident := ⟨h.getArg 1⟩
+    let assumeE? := if (h.getArg 2).getNumArgs == 2 then some ((h.getArg 2).getArg 1) else none
+    elabInvariantViewCmd doc? isPrivate name view rawPreds assumeE? pf?
+  else
+    let fullName := (← getCurrNamespace) ++ name.getId.eraseMacroScopes
+    Qed.Verify.Core.elabStaticMetaInv "" fullName #[] #[] name rawPreds pf? doc? isPrivate
 end InvariantViewElab
 end Qed

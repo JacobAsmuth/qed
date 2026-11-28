@@ -45,6 +45,7 @@ fullstack NotesApp:
   server NotesApi
   client NotesShell
   title "Notes App"
+/-- Documented Cloud Run deployment specification. -/
 deploy NotesDeploy:
   app     NotesApp
   regions [us_central1, europe_west1]
@@ -60,6 +61,9 @@ deploy NotesDeploy:
   invariant hasProdDomain:   domain.isSome and preview.subdomain.isSome
   invariant includesCentral: us_central1 in regions
   invariant perfTier:        compute == performance
+  invariant ttlAtMostWeek:   preview.ttl_sec <= 7 * 86400
+    prove:
+      decide
 deploy MinimalDeploy:
   app     NotesApp
   regions [europe_west1, europe_west4]
@@ -91,7 +95,7 @@ def multiEnvManifest : Qed.Deploy.DeployManifest := {
 bad_deploy "`deploy BadStatefulMultiRegion`: server `StatefulApi` uses in-memory `state`, which can only run in a single region" BadStatefulMultiRegion StatefulApi : regions [us_central1, europe_west1]
 bad_deploy "`deploy BadTimeout`: `timeout` (7201s) must be between 1s and 3600s" BadTimeout NotesApp : timeout 7201s
 bad_deploy "`deploy BadDomain`: invalid RFC 1123 production `domain` `https://notes.example.com`" BadDomain NotesApp : domain "https://notes.example.com"
-bad_deploy "`deploy BadOverlap`: preview host `*.example.com` overlaps production domain `notes.example.com`" BadOverlap NotesApp : domain "notes.example.com" |
+bad_deploy "`deploy BadOverlap`: preview host `*.example.com` overlaps production domain `notes.example.com`" BadOverlap NotesApp : domain "notes.example.com" ||
   preview:
     domain "*.example.com"
 bad_deploy "`deploy BadPublicPreview`: `auth ManagedAuth` uses `managed` auth" BadPublicPreview NotesApp :
@@ -113,17 +117,17 @@ expect_err "cannot combine `managed [...]` with explicit OIDC clauses in `auth B
 auth BadMixedAuth:
   managed [google]
   issuer env("X") ?? "http://127.0.0.1:8001"
-bad_db_raw "cannot combine a default endpoint with `prod` in `database BadDefaultProdDb`" BadDefaultProdDb : postgres secret("DEFAULT_URL") | prod postgres secret("PROD_URL") |
+bad_db_raw "cannot combine a default endpoint with `prod` in `database BadDefaultProdDb`" BadDefaultProdDb : postgres secret("DEFAULT_URL") || prod postgres secret("PROD_URL") ||
   table t:
     id : Nat primary_key
 bad_db_raw "cannot override `prod` inside `managed postgres:` in `database BadManagedProdDb`" BadManagedProdDb :
   managed postgres:
     prod sqlite "/tmp/bad.db"
-  | table t:
+  || table t:
       id : Nat primary_key
-bad_deploy "deploy invariant `BadInv.wrongTier` failed to prove" BadInv NotesApp : compute standard | invariant wrongTier: compute == xlarge
-bad_deploy "use `timeout_sec` (Option Nat, in seconds) inside deploy invariants" BadInvField NotesApp : invariant badField: timeout == none
-record CloudLogBundle:
+bad_deploy "Invariant `BadInv.wrongTier` failed" BadInv NotesApp : compute standard || invariant wrongTier: compute == xlarge
+bad_deploy "Unknown identifier `timeout`" BadInvField NotesApp : invariant badField: timeout == none
+schema CloudLogBundle:
   metaJson: Json
   logs: Qed.Cloud.Protocol.RuntimeLogView[]
 example : Repr Qed.Cloud.Protocol.RuntimeLogView := inferInstance

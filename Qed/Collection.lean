@@ -413,7 +413,8 @@ class QedMemProp (α : Type) (C : Type) where memProp : α → C → Prop
 @[simp] theorem QedMem.mem_array {α : Type} [BEq α] (x : α) (xs : Array α) : QedMem.mem x xs = xs.contains x := rfl
 @[reducible] instance {α : Type} : QedMemProp α (Array α) := ⟨fun x xs => x ∈ xs⟩
 @[simp] theorem QedMemProp.memProp_array {α : Type} (x : α) (xs : Array α) : QedMemProp.memProp x xs = (x ∈ xs) := rfl
-instance {α : Type} [DecidableEq α] (x : α) (xs : Array α) : Decidable (QedMemProp.memProp x xs) := inferInstanceAs (Decidable (x ∈ xs))
+instance {α : Type} [DecidableEq α] (x : α) (xs : Array α) : Decidable (QedMemProp.memProp x xs) :=
+  decidable_of_iff (x ∈ xs.toList) Array.mem_toList_iff
 
 @[inline] instance {α : Type} [BEq α] : QedMem α (List α) := ⟨fun x xs => xs.contains x⟩
 @[simp] theorem QedMem.mem_list {α : Type} [BEq α] (x : α) (xs : List α) : QedMem.mem x xs = xs.contains x := rfl

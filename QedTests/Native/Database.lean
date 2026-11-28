@@ -439,6 +439,34 @@ private def runMultiTenantCrossTableSuite (c : TestChecker) (tmpDir : String) : 
     | .ok r => c.check "[cross-rls-ins] encrypted secret ciphertext on disk != plaintext" (match r.rows[0]?.bind (·[0]?) with | some (SqlVal.text ct) => ct != "sk_live_cross_table" && ct.length >= 40 | _ => false)
     | .error e => c.check "[cross-rls-ins] raw sqlite inspect secret" false e
 
+private def runCloudPolicySuite (c : TestChecker) (tmpDir : String) : IO Unit := do
+  let srvInst := withRedirectedDb (.sqlitePath s!"{tmpDir}/cloud_policy.db")
+  c.expectOk "[cloud-pol] schema init" (← @MonadServer.dbExecDdl IO srvInst DbChecks.CloudPolicyDb.config) fun () => do
+    let asUser (u fn : String) (req := ByteArray.empty) := @DbChecks.CloudPolicyApi.dispatchM IO _ srvInst { userId := some u } fn req
+    forList [("alice", "alice@qed.dev", 5000, false), ("bob", "bob@qed.dev", 2000, false),
+        ("charlie", "charlie@qed.dev", 0, false), ("dave", "dave@qed.dev", 0, false), ("op1", "op@qed.dev", 0, true)] fun (id, email, cap, isOp) => do
+      c.expectOk s!"[cloud-pol] seed account {id}" (← asUser id "seedAccount" (Qed.Proto.encode (id, (email, (cap, isOp))))) fun _ => pure ()
+    forList [("a1", "Alpha"), ("a2", "Beta")] fun (id, name) => do
+      c.expectOk s!"[cloud-pol] alice creates {id}" (← asUser "alice" "createApp" (Qed.Proto.encode (id, name))) fun _ => pure ()
+    forList [("m1", "a1", "charlie", "admin", "accepted"), ("m2", "a1", "dave", "viewer", "accepted")] fun (id, appId, u, role, status) => do
+      c.expectOk s!"[cloud-pol] add member {u}" (← asUser "alice" "addMember" (Qed.Proto.encode (id, (appId, (u, (role, status)))))) fun _ => pure ()
+    c.expectOk "[cloud-pol] add db1 on a1" (← asUser "charlie" "addAppDb" (Qed.Proto.encode ("db1", ("a1", ("alice", true))))) fun _ => pure ()
+    c.expectOk "[cloud-pol] add db2 on a2" (← asUser "alice" "addAppDb" (Qed.Proto.encode ("db2", ("a2", ("alice", true))))) fun _ => pure ()
+    c.expectOk "[cloud-pol] add secret on a1" (← asUser "charlie" "addSecret" (Qed.Proto.encode ("s1", ("a1", ("alice", ("STRIPE_KEY", "sk_live_123")))))) fun _ => pure ()
+    c.checkProtoBy (α := Option (String × String)) "[cloud-pol] lookupUserIdByEmail resolves bob" (← asUser "dave" "lookupUserIdByEmail" (Qed.Proto.encode "bob@qed.dev")) id (some ("bob", "bob@qed.dev"))
+    c.checkProtoBy (α := Option (String × Nat)) "[cloud-pol] collaborator dave reads alice spendCap" (← asUser "dave" "getOwnerSpendCap" (Qed.Proto.encode "alice")) id (some ("alice", 5000))
+    c.checkProtoBy (α := Option (String × Nat)) "[cloud-pol] outsider bob gets none for alice spendCap" (← asUser "bob" "getOwnerSpendCap" (Qed.Proto.encode "alice")) id none
+    c.checkProtoBy (α := Nat) "[cloud-pol] collaborator dave counts all 2 of alice managed dbs" (← asUser "dave" "countOwnerManagedDbs" (Qed.Proto.encode "alice")) id 2
+    c.checkProtoBy (α := Nat) "[cloud-pol] outsider bob counts 0 of alice managed dbs" (← asUser "bob" "countOwnerManagedDbs" (Qed.Proto.encode "alice")) id 0
+    c.checkProtoBy (α := Array DbChecks.CloudPolicyDb.app_secrets.Meta) "[cloud-pol] viewer dave reads secret metadata" (← asUser "dave" "listSecretMeta" (Qed.Proto.encode "a1")) (·.map (·.label)) #["STRIPE_KEY"]
+    c.checkProtoBy (α := Option DbChecks.CloudPolicyDb.apps) "[cloud-pol] admin charlie renames a1" (← asUser "charlie" "renameApp" (Qed.Proto.encode ("a1", "Alpha Renamed"))) (·.map (·.name)) (some "Alpha Renamed")
+    c.checkProtoBy (α := Option DbChecks.CloudPolicyDb.apps) "[cloud-pol] alice transfers a1 to bob" (← asUser "alice" "transferApp" (Qed.Proto.encode ("a1", "bob"))) (·.map (·.ownerId)) (some "bob")
+    c.checkProtoBy (α := Option DbChecks.CloudPolicyDb.apps) "[cloud-pol] operator suspends a2" (← asUser "op1" "operatorSuspendApp" (Qed.Proto.encode ("a2", true))) (·.map (·.suspended)) (some true)
+    c.checkProtoBy (α := Option DbChecks.CloudPolicyDb.apps) "[cloud-pol] non-operator dave cannot suspend a2" (← asUser "dave" "operatorSuspendApp" (Qed.Proto.encode ("a2", false))) (·.map (·.suspended)) none
+    c.checkProtoBy (α := Array DbChecks.CloudPolicyDb.accounts) "[cloud-pol] operator lists all 5 accounts" (← asUser "op1" "listAllAccountsAsOp") (·.size) 5
+    c.checkProtoBy (α := Array DbChecks.CloudPolicyDb.accounts) "[cloud-pol] non-operator lists 0 accounts" (← asUser "dave" "listAllAccountsAsOp") (·.size) 0
+    c.check "[cloud-pol] rlsDdl expands database fn into SQL EXISTS" (DbChecks.CloudPolicyDb.rlsDdl.contains "EXISTS (SELECT 1 FROM \"app_members\" AS \"m_f")
+
 def run : IO Bool := do
   let c ← mkChecker "database"
   withDevApp c "QedTests.DbChecks" fun dir => do
@@ -467,6 +495,7 @@ def run : IO Bool := do
         runEncryptedColumnSuite c (withRedirectedDb (.sqlitePath s!"{tmpDir}/enc_vault.db")),
         runKeyRotationAndMetaSuite c tmpDir,
         runMultiTenantCrossTableSuite c tmpDir,
+        runCloudPolicySuite c tmpDir,
         runMigrationSuite c tmpDir,
         runRoadmapSuite c tmpDir,
         withMockServer c "[pg-shop] start mock" (startPgWireMock s!"{tmpDir}/shop_pg_mock.db" "shopuser" "shoppass" "shopdb") (fun m => do Db.PgWire.clearPool; m.stop) fun shopPgMock => do

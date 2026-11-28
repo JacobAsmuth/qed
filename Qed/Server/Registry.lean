@@ -133,7 +133,9 @@ deriving Inhabited
 initialize externalRegistry : Lean.SimplePersistentEnvExtension ExternalServiceInfo (Lean.NameMap ExternalServiceInfo) ← Qed.Diag.mkNameMapExt (·.serviceName)
 
 def exprCallsOld (stx : Lean.Syntax) : Bool :=
-  Qed.Lang.stxAny (fun s => s.getKind == ``Qed.Lang.qedCall && (s.getArg 0).getKind == ``Qed.Lang.qedIdent && ((s.getArg 0).getArg 0).getId.eraseMacroScopes == `old) stx
+  Qed.Lang.stxAny (fun s =>
+    (s.getKind == ``Qed.Lang.qedCall && (s.getArg 0).getKind == ``Qed.Lang.qedIdent && ((s.getArg 0).getArg 0).getId.eraseMacroScopes == `old) ||
+    match Qed.Lang.extractDottedChain? s with | some ("old" :: _ :: _) => true | _ => false) stx
 
 def exprMentionsAnyIdent (names : Array String) (stx : Lean.Syntax) : Bool :=
   Qed.Lang.stxAny (fun s => s.getKind == ``Qed.Lang.qedIdent && match ((s.getArg 0).getId.eraseMacroScopes).components with
@@ -148,17 +150,29 @@ structure DbColumnInfo where
   (refs? : Option (String × String) := none) (encKey? : Option DbEncKeyInfo := none)
 deriving Inhabited
 
+structure DbFnInfo where
+  (name : String) (params : Array String) (bodyStx : Lean.Syntax) (isCross : Bool := false)
+deriving Inhabited
+
+structure DbColReadPolicyInfo where
+  (policyConst : Lean.Name) (cols : Array String) (byCols : Array String := #[])
+  (hasCross : Bool := false) (label : String := "")
+deriving Inhabited
+
 structure DbTableInfo where
   (tableName : String) (rowTypeConst : Lean.Name) (columns : Array DbColumnInfo)
   (hasMeta hasReadPolicy hasInsertPolicy hasUpdatePolicy hasDeletePolicy : Bool := false)
   (hasCrossReadPolicy hasCrossInsertPolicy hasCrossUpdatePolicy hasCrossDeletePolicy hasTransInv : Bool := false)
-  (readPolicyLabel insertPolicyLabel updatePolicyLabel deletePolicyLabel : String := "")
+  (hasTwoStateUpdatePolicy hasCountPolicy hasCrossCountPolicy hasReadMetaPolicy hasCrossReadMetaPolicy : Bool := false)
+  (readPolicyLabel insertPolicyLabel updatePolicyLabel deletePolicyLabel countPolicyLabel readMetaPolicyLabel : String := "")
+  (colReadPolicies : Array DbColReadPolicyInfo := #[])
 deriving Inhabited
 
 structure DatabaseInfo where
   (dbName : Lean.Name) (shortName : String) (configConst ensureSchemaConst : Lean.Name) (snapTypeConst? : Option Lean.Name := none)
   (secrets : Array String) (hasDevFallback isManaged : Bool := false)
-  (envSpecs : Qed.Cloud.EnvMap Qed.Cloud.DbEnvSpec := Qed.Cloud.EnvMap.ofDefault (.byoSqlite "")) (tables : Array DbTableInfo)
+  (envSpecs : Qed.Cloud.EnvMap Qed.Cloud.DbEnvSpec := Qed.Cloud.EnvMap.ofDefault (.byoSqlite ""))
+  (tables : Array DbTableInfo) (fns : Array DbFnInfo := #[])
 deriving Inhabited
 initialize databaseRegistry : Lean.SimplePersistentEnvExtension DatabaseInfo (Lean.NameMap DatabaseInfo) ← Qed.Diag.mkNameMapExt (·.dbName)
 abbrev lookupDatabase? (env : Lean.Environment) (currNs : Lean.Name) (openDecls : List Lean.OpenDecl) (dbRef : Lean.Name) : Option DatabaseInfo :=

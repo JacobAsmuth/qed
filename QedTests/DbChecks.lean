@@ -505,14 +505,14 @@ database MultiTenantDb:
       some(row.ownerId) == ctx.userId or
       (any m in app_members: m.appId == row.appId and some(m.userId) == ctx.userId and m.status == "accepted" and m.role in ["owner", "admin"])
     example dep1: id = "d1", appId = "app1", ownerId = "alice", label = "v1", active = true
-    example policy insert ownerCanInsertDep:
+    example insert ownerCanInsertDep:
       user = "alice"
       row = dep1
-    example policy insert adminCanInsertDep:
+    example insert adminCanInsertDep:
       user = "charlie"
       row = dep1
       snap app_members = [MultiTenantDb.app_members.mk("m1", "app1", "charlie", "admin", "accepted")]
-    rejects policy insert viewerCannotInsertDep:
+    rejects insert viewerCannotInsertDep:
       user = "dave"
       row = dep1
       snap app_members = [MultiTenantDb.app_members.mk("m2", "app1", "dave", "viewer", "accepted")]
@@ -675,21 +675,21 @@ database VerifiedExamplesDb:
     example transition draftToCancelled: draftOrder -> status = "cancelled"
     rejects transition paidBackToDraft: paidOrder -> status = "draft"
     rejects transition draftSkipToShipped: draftOrder -> status = "shipped"
-    example policy read ownerCanRead:
+    example read ownerCanRead:
       user = "u1"
       row = draftOrder
-    example policy read adminCanRead:
+    example read adminCanRead:
       user = "u2"
       role = "admin"
       row = draftOrder
-    example policy read sharedCanRead:
+    example read sharedCanRead:
       user = "u3"
       row = draftOrder
       snap shares = [VerifiedExamplesDb.shares.mk("s1", "ord-1", "u3")]
-    rejects policy read strangerDenied:
+    rejects read strangerDenied:
       user = "u9"
       row = draftOrder
-    rejects policy write nonOwnerDenied:
+    rejects write nonOwnerDenied:
       user = "u2"
       role = "admin"
       row = draftOrder
@@ -705,14 +705,14 @@ bad_db_tbl "Database `example transition badStep`" BadDbTransEx jobs :
   id : String primary_key where 1 <= id.length <= 16 || status : String where status in ["queued", "done"] || invariant flow: transition status: "queued" -> "done" || example doneJob: id = "j1", status = "done" || example transition badStep: doneJob -> status = "queued"
 bad_db_tbl "Database `rejects transition badRejStep`" BadDbTransRej jobs :
   id : String primary_key where 1 <= id.length <= 16 || status : String where status in ["queued", "done"] || invariant flow: transition status: "queued" -> "done" || example queuedJob: id = "j1", status = "queued" || rejects transition badRejStep: queuedJob -> status = "done"
-bad_db_tbl "Database `example policy read badAllow`" BadDbPolAllow docs :
+bad_db_tbl "Database `example read badAllow`" BadDbPolAllow docs :
   id : String primary_key where 1 <= id.length <= 16 || ownerId : String where 1 <= ownerId.length <= 16 || policy read requires some(ownerId) == ctx.userId || example d1: id = "d1", ownerId = "alice" ||
-  example policy read badAllow:
+  example read badAllow:
     user = "bob"
     row = d1
-bad_db_tbl "Database `rejects policy read badDeny`" BadDbPolDeny docs :
+bad_db_tbl "Database `rejects read badDeny`" BadDbPolDeny docs :
   id : String primary_key where 1 <= id.length <= 16 || ownerId : String where 1 <= ownerId.length <= 16 || policy read requires some(ownerId) == ctx.userId || example d1: id = "d1", ownerId = "alice" ||
-  rejects policy read badDeny:
+  rejects read badDeny:
     user = "alice"
     row = d1
 
@@ -728,13 +728,13 @@ database TxLeaseDb:
     invariant leaseFlow: transition row.status: "open" -> "claimed" -> "done"
     invariant retriesMono: row.retries >= old(row.retries)
     example openLease: id = "l1", ownerId = "alice", status = "open", retries = 0
-    example policy read ownerCanRead:
+    example read ownerCanRead:
       user = "alice"
       row = openLease
-    rejects policy read otherCannotRead:
+    rejects read otherCannotRead:
       user = "bob"
       row = openLease
-    rejects policy write anonCannotWrite:
+    rejects write anonCannotWrite:
       row = openLease
 
 server stateless TxLeaseSrv:
@@ -912,4 +912,207 @@ expect_err "Server.Db.isSafeSqlIdent \"users; DROP TABLE users\" = true" in
 expect_err "Tactic `decide` proved that the proposition" in
   def badPgWriteQuery : Qed.Server.ThreadProg Unit (Except Qed.Server.ApiError Qed.Server.Db.DbResult) :=
     (Qed.Server.Db.postgres "postgres://localhost/app").queryReadOnly (.delete sql!"users" .litTrue [])
+
+/-! ## Phase 1 Policy Expressiveness: `database fn`, Two-State `policy update`, `policy count`, `policy read_meta`, `policy read(cols) [by ...]` -/
+database CloudPolicyDb:
+  sqlite ".qed/cloud_policy_checks.db"
+  fn isOperator() -> Bool:
+    any acc in accounts: some(acc.id) == ctx.userId and acc.isOperator
+  fn canReadApp(appId: String, ownerId: String) -> Bool:
+    some(ownerId) == ctx.userId or
+    (any m in app_members: m.appId == appId and some(m.userId) == ctx.userId and m.status == "accepted")
+  fn canAdminApp(appId: String, ownerId: String) -> Bool:
+    some(ownerId) == ctx.userId or
+    (any m in app_members: m.appId == appId and some(m.userId) == ctx.userId and m.status == "accepted" and m.role == "admin")
+  fn canReadOrOp(appId: String, ownerId: String) -> Bool:
+    return canReadApp(appId, ownerId) or isOperator()
+
+  table accounts:
+    id         : String primary_key immutable where 1 <= id.length <= 64
+    email      : String unique where 3 <= email.length <= 128
+    spendCap   : Nat
+    isOperator : Bool
+    policy read requires some(row.id) == ctx.userId or isOperator()
+    policy read(id, email) by email requires ctx.userId != none
+    policy read(id, spendCap) requires
+      some(row.id) == ctx.userId or
+      (any a in apps: a.ownerId == row.id and canReadApp(a.id, a.ownerId))
+    policy insert, update, delete requires some(row.id) == ctx.userId or isOperator()
+  table apps:
+    id        : String primary_key immutable where 1 <= id.length <= 64
+    ownerId   : String where 1 <= ownerId.length <= 64
+    name      : String where 1 <= name.length <= 120
+    suspended : Bool
+    policy read requires canReadOrOp(row.id, row.ownerId)
+    policy insert requires some(row.ownerId) == ctx.userId
+    policy update requires
+      (canAdminApp(old.id, old.ownerId) and row.ownerId == old.ownerId) or
+      (some(old(row.ownerId)) == ctx.userId and (any a in accounts: a.id == row.ownerId)) or
+      isOperator()
+    policy delete requires some(row.ownerId) == ctx.userId or isOperator()
+    example app1: id = "a1", ownerId = "alice", name = "Alpha", suspended = false
+    example app1ForBob from app1: ownerId = "bob"
+    example app1ForCharlie from app1: ownerId = "charlie"
+    example update ownerCanTransfer:
+      user = "alice"
+      old = app1
+      row = app1ForBob
+      snap accounts = [CloudPolicyDb.accounts.mk("bob", "bob@qed.dev", 5000, false)]
+    rejects update adminCannotHijackOwner:
+      user = "charlie"
+      old = app1
+      row = app1ForCharlie
+      snap app_members = [CloudPolicyDb.app_members.mk("m1", "a1", "charlie", "admin", "accepted")]
+      snap accounts = [CloudPolicyDb.accounts.mk("charlie", "c@qed.dev", 0, false)]
+    example update operatorCanSuspend:
+      user = "op1"
+      old = app1
+      row = app1
+      snap accounts = [CloudPolicyDb.accounts.mk("op1", "op@qed.dev", 0, true)]
+  table app_members:
+    id     : String primary_key immutable where 1 <= id.length <= 64
+    appId  : String immutable references apps(id) on_delete cascade
+    userId : String immutable where 1 <= userId.length <= 64
+    role   : String where role in ["admin", "viewer"]
+    status : String where status in ["accepted", "pending"]
+    policy read, write requires ctx.userId != none
+  table app_dbs:
+    id      : String primary_key immutable where 1 <= id.length <= 64
+    appId   : String immutable references apps(id) on_delete cascade
+    ownerId : String where 1 <= ownerId.length <= 64
+    managed : Bool
+    policy read requires canReadApp(row.appId, row.ownerId)
+    policy count requires
+      canReadApp(row.appId, row.ownerId) or
+      (any a in apps: a.ownerId == row.ownerId and canReadApp(a.id, a.ownerId))
+    policy insert, update, delete requires canAdminApp(row.appId, row.ownerId)
+    example db2: id = "db2", appId = "a2", ownerId = "alice", managed = true
+    example count collabCanCountOwnersOtherAppDb:
+      user = "dave"
+      row = db2
+      snap apps = [CloudPolicyDb.apps.mk("a1", "alice", "Alpha", false)]
+      snap app_members = [CloudPolicyDb.app_members.mk("m2", "a1", "dave", "viewer", "accepted")]
+    rejects read collabCannotReadOwnersOtherAppDb:
+      user = "dave"
+      row = db2
+      snap apps = [CloudPolicyDb.apps.mk("a1", "alice", "Alpha", false)]
+      snap app_members = [CloudPolicyDb.app_members.mk("m2", "a1", "dave", "viewer", "accepted")]
+  table app_secrets:
+    id      : String primary_key immutable where 1 <= id.length <= 64
+    appId   : String immutable references apps(id) on_delete cascade
+    ownerId : String where 1 <= ownerId.length <= 64
+    label   : String where 1 <= label.length <= 64
+    secret  : encrypted(String, key = secret("CP_SEC_KEY") ?? "cp-dev-secret-key-32") where 1 <= secret.length <= 200
+    policy read requires canAdminApp(row.appId, row.ownerId)
+    policy read_meta requires canReadApp(row.appId, row.ownerId)
+    policy insert, update, delete requires canAdminApp(row.appId, row.ownerId)
+    example sec1: id = "s1", appId = "a1", ownerId = "alice", label = "API_KEY", secret = "shh"
+    example read_meta viewerCanReadSecretMeta:
+      user = "dave"
+      row = sec1
+      snap app_members = [CloudPolicyDb.app_members.mk("m2", "a1", "dave", "viewer", "accepted")]
+    rejects read viewerCannotReadSecretValue:
+      user = "dave"
+      row = sec1
+      snap app_members = [CloudPolicyDb.app_members.mk("m2", "a1", "dave", "viewer", "accepted")]
+
+server stateless CloudPolicyApi:
+  use db : CloudPolicyDb
+  rpc seedAccount(id: String, email: String, spendCap: Nat, isOp: Bool) -> CloudPolicyDb.accounts!:
+    requires auth, 1 <= id.length <= 64, 3 <= email.length <= 128
+    return await db.accounts.insert(
+      where = r => some(r.id) == ctx.userId or db.isOperator(),
+      id = id, email = email, spendCap = spendCap, isOperator = isOp)?
+  rpc createApp(id: String, name: String) -> CloudPolicyDb.apps!:
+    requires auth, 1 <= id.length <= 64, 1 <= name.length <= 120, 1 <= uid.length <= 64
+    return await db.apps.insert(id = id, ownerId = uid, name = name, suspended = false)?
+  rpc addMember(id: String, appId: String, userId: String, role: String, status: String) -> CloudPolicyDb.app_members!:
+    requires auth, 1 <= id.length <= 64, 1 <= userId.length <= 64, role in ["admin", "viewer"], status in ["accepted", "pending"]
+    return await db.app_members.insert(id = id, appId = appId, userId = userId, role = role, status = status)?
+  rpc addAppDb(id: String, appId: String, ownerId: String, managed: Bool) -> CloudPolicyDb.app_dbs!:
+    requires auth, 1 <= id.length <= 64, 1 <= ownerId.length <= 64
+    return await db.app_dbs.insert(where = r => db.canAdminApp(r.appId, r.ownerId), id = id, appId = appId, ownerId = ownerId, managed = managed)?
+  rpc addSecret(id: String, appId: String, ownerId: String, label: String, secretVal: String) -> CloudPolicyDb.app_secrets!:
+    requires auth, 1 <= id.length <= 64, 1 <= ownerId.length <= 64, 1 <= label.length <= 64, 1 <= secretVal.length <= 200
+    return await db.app_secrets.insert(where = r => db.canAdminApp(r.appId, r.ownerId), id = id, appId = appId, ownerId = ownerId, label = label, secret = secretVal)?
+  -- Uses `fn` inside `where` + two-state `policy update` keeping `ownerId` unchanged
+  rpc renameApp(appId: String, newName: String) -> CloudPolicyDb.apps?!:
+    requires auth, 1 <= newName.length <= 120
+    return await db.apps.updateOne(where = r => r.id == appId and db.canAdminApp(r.id, r.ownerId), set = { name = newName })?
+  -- Two-state `policy update` transferring ownership to a verified existing account
+  rpc transferApp(appId: String, nextOwnerId: String) -> CloudPolicyDb.apps?!:
+    requires auth, 1 <= nextOwnerId.length <= 64
+    return await db.apps.updateOne(
+      where = r => r.id == appId and some(r.ownerId) == ctx.userId and (any a in accounts: a.id == nextOwnerId),
+      set = { ownerId = nextOwnerId })?
+  -- Operator suspension via `database fn isOperator()`
+  rpc operatorSuspendApp(appId: String, suspended: Bool) -> CloudPolicyDb.apps?!:
+    requires auth
+    return await db.apps.updateOne(where = r => r.id == appId and db.isOperator(), set = { suspended = suspended })?
+  -- Exact-key email lookup via `policy read(id, email) by email`
+  read_only rpc lookupUserIdByEmail(email: String) -> (String, String)?!:
+    requires auth
+    return await db.accounts.findOne(columns = ["id", "email"], where = r => r.email == email)?
+  -- Collaborator reads owner's spendCap via `policy read(id, spendCap)` (nested `db.canReadApp` inside `any a in apps:`)
+  read_only rpc getOwnerSpendCap(ownerId: String) -> (String, Nat)?!:
+    requires auth
+    return await db.accounts.findOne(columns = ["id", "spendCap"],
+      where = r => r.id == ownerId and (any a in apps: a.ownerId == r.id and db.canReadApp(a.id, a.ownerId)))?
+  -- Full-row read disjunct still works when selecting a column subset
+  read_only rpc getSelfAccountId() -> String?!:
+    requires auth
+    return await db.accounts.findOne(columns = ["id"], where = r => r.id == uid)?
+  -- Operator reads all accounts via `db.isOperator()`
+  read_only rpc listAllAccountsAsOp() -> CloudPolicyDb.accounts[]!:
+    requires auth
+    return await db.accounts.select(where = r => db.isOperator(), orderBy = "id")?
+  -- Collaborator counts ALL of owner's managed DBs via `policy count`
+  read_only rpc countOwnerManagedDbs(ownerId: String) -> Nat!:
+    requires auth
+    return await db.app_dbs.count(where = r => r.ownerId == ownerId and r.managed == true and (any a in apps: a.ownerId == r.ownerId and db.canReadApp(a.id, a.ownerId)))?
+  -- Viewer reads secret metadata via `policy read_meta`
+  read_only rpc listSecretMeta(appId: String) -> CloudPolicyDb.app_secrets.Meta[]!:
+    requires auth
+    return await db.app_secrets.selectMeta(where = r => r.appId == appId and db.canReadApp(r.appId, r.ownerId), orderBy = "id")?
+  example ownerTransfersAppToExistingAccount:
+    with user "alice"
+    with db db.accounts = [{ id = "alice", email = "a@qed.dev", spendCap = 1000, isOperator = false }, { id = "bob", email = "b@qed.dev", spendCap = 2000, isOperator = false }]
+    with db db.apps = [{ id = "a1", ownerId = "alice", name = "Alpha", suspended = false }]
+    call transferApp("a1", "bob")
+    expect ok
+    expect result.map(o => o.map(a => a.ownerId)) == .ok(some("bob"))
+  example transferToNonexistentAccountNoOps:
+    with user "alice"
+    with db db.accounts = [{ id = "alice", email = "a@qed.dev", spendCap = 1000, isOperator = false }]
+    with db db.apps = [{ id = "a1", ownerId = "alice", name = "Alpha", suspended = false }]
+    call transferApp("a1", "ghost")
+    expect ok(none)
+  example lookupEmailAndCollabSpendCapAndCount:
+    with user "dave"
+    with db db.accounts = [{ id = "alice", email = "alice@qed.dev", spendCap = 9900, isOperator = false }, { id = "dave", email = "dave@qed.dev", spendCap = 0, isOperator = false }]
+    with db db.apps = [{ id = "a1", ownerId = "alice", name = "Alpha", suspended = false }, { id = "a2", ownerId = "alice", name = "Beta", suspended = false }]
+    with db db.app_members = [{ id = "m1", appId = "a1", userId = "dave", role = "viewer", status = "accepted" }]
+    with db db.app_dbs = [{ id = "db1", appId = "a1", ownerId = "alice", managed = true }, { id = "db2", appId = "a2", ownerId = "alice", managed = true }]
+    call countOwnerManagedDbs("alice")
+    expect ok(2)
+
+-- Negative compile-time tests for Phase 1 policy expressiveness
+bad_db_auth "update policy `CloudPolicyDb.apps.update`" CloudPolicyDb adminHijackOwner(appId: String) -> CloudPolicyDb.apps?! || 1 <= uid.length <= 64 : return await db.apps.updateOne(where = r => r.id == appId and db.canAdminApp(r.id, r.ownerId), set = { ownerId = uid })?
+bad_db_auth "update policy `CloudPolicyDb.apps.update`" CloudPolicyDb transferWithoutTargetCheck(appId: String, nextOwnerId: String) -> CloudPolicyDb.apps?! || 1 <= nextOwnerId.length <= 64 : return await db.apps.updateOne(where = r => r.id == appId and some(r.ownerId) == ctx.userId, set = { ownerId = nextOwnerId })?
+bad_db_auth "requires `findOne` with an exact top-level `r.<col> == <val>` filter" CloudPolicyDb enumerateEmailsSelect(email: String) -> (String, String)[]! : return await db.accounts.select(columns = ["id", "email"], where = r => r.email == email)?
+bad_db_auth "requires `findOne` with an exact top-level `r.<col> == <val>` filter" CloudPolicyDb enumerateEmailsOr(email: String) -> (String, String)?! : return await db.accounts.findOne(columns = ["id", "email"], where = r => r.email == email or r.id != "")?
+bad_db_auth "read policy `CloudPolicyDb.accounts.read`" CloudPolicyDb leakSpendCapByEmail(email: String) -> (String, String, Nat)?! : return await db.accounts.findOne(columns = ["id", "email", "spendCap"], where = r => r.email == email)?
+bad_db_auth "read policy `CloudPolicyDb.accounts.read`" CloudPolicyDb leakFullAccountByEmail(email: String) -> CloudPolicyDb.accounts?! : return await db.accounts.findOne(where = r => r.email == email)?
+bad_db_auth "read policy `CloudPolicyDb.app_dbs.read`" CloudPolicyDb collabSelectOtherAppDbs(ownerId: String) -> CloudPolicyDb.app_dbs[]! : return await db.app_dbs.select(where = r => r.ownerId == ownerId and (any a in apps: a.ownerId == r.ownerId and db.canReadApp(a.id, a.ownerId)))?
+bad_db_auth "read policy `CloudPolicyDb.app_secrets.read`" CloudPolicyDb viewerSelectSecrets(appId: String) -> CloudPolicyDb.app_secrets[]! : return await db.app_secrets.select(where = r => r.appId == appId and db.canReadApp(r.appId, r.ownerId))?
+bad_db_def "expansion limit exceeded" BadRecDbFn :
+  fn loopA(x: String) -> Bool: loopB(x)
+  || fn loopB(x: String) -> Bool: loopA(x)
+  || table t: id : String primary_key
+bad_db_tbl "`policy read_meta` on `table plain` requires both encrypted and non-encrypted columns" BadReadMetaDb plain : id : String primary_key || policy read_meta requires ctx.userId != none
+bad_db_tbl "unknown column `bogus` in `policy read(...)`" BadColReadDb items : id : String primary_key || policy read(bogus) requires ctx.userId != none
+bad_db_tbl "cannot use encrypted column `vault.sec` in `policy read(...) by ...`" BadByEncDb vault : id : String primary_key || sec : encrypted(String, key = secret("K")) || policy read(id) by sec requires ctx.userId != none
+bad_db_def "`row` is not in scope inside `database` `fn`" BadRowInDbFn :
+  fn badFn() -> Bool: row.id == "x"
+  || table t: id : String primary_key
 end DbChecks

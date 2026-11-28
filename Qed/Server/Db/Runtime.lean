@@ -101,8 +101,8 @@ def dbEncryptQuery (encWrite : List (String × EncColSpec)) (q : SqlQuery) : m (
     match encWrite.lookup c.raw with | some spec => (·.map (c, ·)) <$> dbEncryptVal spec v | none => pure (.ok (c, v))) cols
   if encWrite.isEmpty then pure (.ok q)
   else match q with
-    | .insert tbl cols ret => (·.map fun cs => .insert tbl cs ret) <$> encCols cols
-    | .insertOrIgnore tbl cols cc ret => (·.map fun cs => .insertOrIgnore tbl cs cc ret) <$> encCols cols
+    | .insert tbl cols ret g? tys => (·.map fun cs => .insert tbl cs ret g? tys) <$> encCols cols
+    | .insertOrIgnore tbl cols cc ret g? tys => (·.map fun cs => .insertOrIgnore tbl cs cc ret g? tys) <$> encCols cols
     | .upsert tbl cols cc uc cw ret => (·.map fun cs => .upsert tbl cs cc uc cw ret) <$> encCols cols
     | .update tbl sets w ret =>
         (·.map fun ss => .update tbl ss w ret) <$> mapExceptList (fun (c, e) =>
@@ -208,7 +208,7 @@ private theorem progEffSpec_dbEncryptQuery (encWrite : List (String × EncColSpe
     have getE (hw : q.isWrite = true) : ∀ k f a p, EffOk (.aeadEncrypt k f a p) :=
       hEnc.elim (fun he => absurd (he ▸ rfl) hne) fun h => h.elim (fun hf => by rw [hw] at hf; cases hf) id
     cases q with
-    | insert _ cols _ | insertOrIgnore _ cols _ _ | upsert _ cols _ _ _ _ =>
+    | insert _ cols _ _ _ | insertOrIgnore _ cols _ _ _ _ | upsert _ cols _ _ _ _ =>
         exact progEffSpec_map _ (progEffSpec_mapExceptList _ (fun (c, v) => by
           dsimp only; cases encWrite.lookup c.raw with
           | none => exact .pure _ trivial | some spec => exact progEffSpec_map_triv _ (progEffSpec_dbEncryptVal (getE rfl) spec v)) cols)
@@ -314,7 +314,6 @@ private theorem and_inv_pred {Row : Type} {RowInv : Row → Prop} {rowInvBool pr
     (hInvSound : ∀ r, rowInvBool r = true → RowInv r) (r : Row) (h : (rowInvBool r && pred r) = true) :
     RowInv r ∧ pred r = true := by simp only [Bool.and_eq_true] at h; exact ⟨hInvSound r h.1, h.2⟩
 
-private theorem srvEnsPost_ok_pf {α : Type} {P : α → Prop} {a : α} (h : P a) : srvEnsPost (ε := ApiError) P (.ok a) := h
 private theorem srvEnsPost_err_pf {α : Type} {P : α → Prop} (e : ApiError) : srvEnsPost P (.error e) := trivial
 private theorem srvEnsPostOpt_err_pf {α : Type} {P : α → Prop} (e : ApiError) : srvEnsPostOpt P (.error e) := trivial
 
@@ -366,18 +365,37 @@ abbrev dbDelete {P : Prop} (cfg : DbConfig) (q : SqlQuery) (pf : P) (txId? : Opt
 
 @[inline] def fromSqlOfField {R α : Type} [FromSql α] (_ : R → α) (v : SqlVal) : Except String α := FromSql.fromSql v
 
-abbrev dbInsert (cfg : DbConfig) (q : SqlQuery) (newRow : Row) (RowInv : Row → Prop) (InsertPolicy : RequestCtx → Row → Prop)
-    (ctx : RequestCtx) (hInv : RowInv newRow) (hPolicy : InsertPolicy ctx newRow) (txId? : Option UInt64 := none)
-    (encWrite : List (String × EncColSpec) := []) : m (Except ApiError Row) :=
-  dbRunChecked (Q := srvEnsPost fun r => r = newRow ∧ RowInv r)
-    cfg q txId? (fun _ => .ok newRow) (fun _ => srvEnsPost_ok_pf (P := fun r => r = newRow ∧ RowInv r) ⟨rfl, hInv⟩) srvEnsPost_err_pf hPolicy encWrite []
+private def dbInsertPost {Row : Type} (newRow : Row) (requireReturning : Bool) (dbRes : DbResult) : Except ApiError Row :=
+  if requireReturning && dbRes.rows.isEmpty then .error (ApiError.forbidden "insert rejected by policy") else .ok newRow
 
-abbrev dbInsertOrIgnore (cfg : DbConfig) (q : SqlQuery) (newRow : Row) (RowInv : Row → Prop) (InsertPolicy : RequestCtx → Row → Prop)
-    (ctx : RequestCtx) (hInv : RowInv newRow) (hPolicy : InsertPolicy ctx newRow) (txId? : Option UInt64 := none)
+private theorem dbInsertPost_spec {Row : Type} {RowInv : Row → Prop} (newRow : Row) (requireReturning : Bool)
+    (hInv : RowInv newRow) (dbRes : DbResult) :
+    srvEnsPost (fun r => r = newRow ∧ RowInv r) (dbInsertPost newRow requireReturning dbRes) := by
+  unfold dbInsertPost; split
+  · exact trivial
+  · exact ⟨rfl, hInv⟩
+
+private def dbInsertOrIgnorePost {Row : Type} (newRow : Row) (dbRes : DbResult) : Except ApiError (Option Row) :=
+  .ok (if dbRes.rows.isEmpty then none else some newRow)
+
+private theorem dbInsertOrIgnorePost_spec {Row : Type} {RowInv : Row → Prop} (newRow : Row)
+    (hInv : RowInv newRow) (dbRes : DbResult) :
+    srvEnsPostOpt (fun r => r = newRow ∧ RowInv r) (dbInsertOrIgnorePost newRow dbRes) := by
+  unfold dbInsertOrIgnorePost; cases hE : dbRes.rows.isEmpty <;> simp [srvEnsPostOpt, hInv]
+
+abbrev dbInsert {P : Prop} (cfg : DbConfig) (q : SqlQuery) (newRow : Row) (RowInv : Row → Prop)
+    (hInv : RowInv newRow) (hPolicy : P) (txId? : Option UInt64 := none)
+    (encWrite : List (String × EncColSpec) := []) (requireReturning : Bool := false) : m (Except ApiError Row) :=
+  dbRunChecked (Q := srvEnsPost fun r => r = newRow ∧ RowInv r)
+    cfg q txId? (dbInsertPost newRow requireReturning) (dbInsertPost_spec newRow requireReturning hInv)
+    srvEnsPost_err_pf hPolicy encWrite []
+
+abbrev dbInsertOrIgnore {P : Prop} (cfg : DbConfig) (q : SqlQuery) (newRow : Row) (RowInv : Row → Prop)
+    (hInv : RowInv newRow) (hPolicy : P) (txId? : Option UInt64 := none)
     (encWrite : List (String × EncColSpec) := []) : m (Except ApiError (Option Row)) :=
   dbRunChecked (Q := srvEnsPostOpt fun r => r = newRow ∧ RowInv r)
-    cfg q txId? (fun dbRes => .ok (if dbRes.rows.isEmpty then none else some newRow))
-    (fun dbRes => by cases hE : dbRes.rows.isEmpty <;> simp [srvEnsPostOpt, hInv]) srvEnsPostOpt_err_pf hPolicy encWrite []
+    cfg q txId? (dbInsertOrIgnorePost newRow) (dbInsertOrIgnorePost_spec newRow hInv)
+    srvEnsPostOpt_err_pf hPolicy encWrite []
 
 abbrev dbUpsert (cfg : DbConfig) (q : SqlQuery) (newRow : Row) (decode : DbRow → Except String Row)
     (RowInv : Row → Prop) (rowInvBool : Row → Bool) (hInvSound : ∀ r, rowInvBool r = true → RowInv r)

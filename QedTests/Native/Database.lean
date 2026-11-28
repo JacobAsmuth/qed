@@ -216,6 +216,15 @@ private def runMovedDbChecks (c : TestChecker) : IO Unit := do
       DbChecks.RoadmapDb.config.backfills.length == 1 && FromSql.fromSql (α := Int) (.text "-42") == .ok (-42) && !(FromSql.fromSql (α := Int) (.text "not_int")).isOk &&
       !emptySel.1.contains "*" && emptySel.1.contains "0 = 1" && ((SqlQuery.selectAll tbl .litTrue).compile .postgres).1 == "SELECT * FROM \"projects\" WHERE TRUE" &&
       ((SqlQuery.insertOrIgnore tbl [(col, .text "a")] [] [col]).compile .postgres).1 == "INSERT INTO \"projects\" (\"owner_id\") VALUES ($1) ON CONFLICT DO NOTHING RETURNING \"owner_id\"" &&
+      (let g := SqlExpr.existsSubquery (sql!"app_members") (sql!"m") (.binOp .eq (.col (sql!"appId")) (.param (.text "app1")))
+       let gBad := SqlExpr.existsSubquery (sql!"app_members") (sql!"m") (.binOp .eq (.col (sql!"appId")) (.param (.text "'; DROP TABLE apps; --")))
+       let q1 := SqlQuery.insert (sql!"deployments") [(sql!"id", .text "d1"), (sql!"seq", .int 1), (sql!"active", .bool true), (sql!"blob", .null)] [sql!"id"] (some g) [.text, .int, .bool, .bytes]
+       let q2 := SqlQuery.insert (sql!"deployments") [(sql!"id", .text "' OR 1=1"), (sql!"seq", .int 99), (sql!"active", .bool false), (sql!"blob", .bytes ByteArray.empty)] [sql!"id"] (some gBad) [.text, .int, .bool, .bytes]
+       let qIgn := SqlQuery.insertOrIgnore (sql!"deployments") [(sql!"id", .text "d1")] [sql!"id"] [sql!"id"] (some g) [.text]
+       (q1.compile .postgres).1 == "INSERT INTO \"deployments\" (\"id\", \"seq\", \"active\", \"blob\") SELECT CAST($1 AS TEXT), CAST($2 AS BIGINT), CAST($3 AS BOOLEAN), CAST($4 AS BYTEA) WHERE EXISTS (SELECT 1 FROM \"app_members\" AS \"m\" WHERE (\"appId\" = $5)) RETURNING \"id\"" &&
+       (q1.compile .sqlite).1 == "INSERT INTO \"deployments\" (\"id\", \"seq\", \"active\", \"blob\") SELECT ?1, ?2, ?3, ?4 WHERE EXISTS (SELECT 1 FROM \"app_members\" AS \"m\" WHERE (\"appId\" = ?5)) RETURNING \"id\"" &&
+       (qIgn.compile .postgres).1 == "INSERT INTO \"deployments\" (\"id\") SELECT CAST($1 AS TEXT) WHERE EXISTS (SELECT 1 FROM \"app_members\" AS \"m\" WHERE (\"appId\" = $2)) ON CONFLICT (\"id\") DO NOTHING RETURNING \"id\"" &&
+       DbChecks.sameCompiledSql q1 q2) &&
       DbChecks.RotatingVaultDb.secrets == #["VAULT_PRIMARY_KEY"] && DbChecks.RotatingVaultDb.entries.metaColNames == ["id", "ownerId", "label"] &&
       Qed.fromJson (α := DbChecks.RotatingVaultDb.entries.Meta) (Qed.toJson m) == .ok m &&
       Qed.Proto.decode (α := DbChecks.RotatingVaultDb.entries.Meta) (Qed.Proto.encode m) == .ok m)]
@@ -403,6 +412,32 @@ private def runMultiTenantCrossTableSuite (c : TestChecker) (tmpDir : String) : 
         ("charlie (accepted admin) renames app1 via role in [owner, admin]", "charlie", "renameAppAsAdmin", "Alpha v2", some "Alpha v2"),
         ("charlie renames app1 via role == admin", "charlie", "renameAppAsSpecificAdmin", "Alpha v3", some "Alpha v3")] fun (tag, u, fn, newName, want) => do
       c.checkProtoBy (α := Option DbChecks.MultiTenantDb.apps) s!"[cross-rls] {tag}" (← asUser u fn (Qed.Proto.encode ("app1", newName))) (·.map (·.name)) want
+    -- Cross-table `policy insert` (unguarded owner, guarded admin/bare/nested/row/insertOrIgnore/encrypted)
+    c.expectOk "[cross-rls-ins] alice (owner) deploys without guard" (← asUser "alice" "deployAsOwner" (Qed.Proto.encode ("d_own", ("app1", "owner-v1")))) fun _ => pure ()
+    c.expectOk "[cross-rls-ins] charlie (admin) deploys via cross-table where" (← asUser "charlie" "deployAsAdmin" (Qed.Proto.encode ("d_adm", ("app1", ("alice", "admin-v1"))))) fun _ => pure ()
+    c.expectOk "[cross-rls-ins] charlie (admin) deploys via bare where" (← asUser "charlie" "deployAsAdminBareWhere" (Qed.Proto.encode ("d_bare", ("app1", ("alice", "bare-v1"))))) fun _ => pure ()
+    c.expectOk "[cross-rls-ins] charlie (admin) deploys via row struct" (← asUser "charlie" "deployRowAsAdmin" (Qed.Proto.encode ({ id := "d_row", appId := "app1", ownerId := "alice", label := "row-v1", active := true : DbChecks.MultiTenantDb.deployments }))) fun _ => pure ()
+    forList [("dave (viewer) rejected 403 on deployAsAdmin", "dave", "deployAsAdmin", "d_v", "app1"),
+        ("eve (pending admin) rejected 403 on deployAsAdmin", "eve", "deployAsAdmin", "d_p", "app1"),
+        ("mallory (outsider) rejected 403 on deployAsOrgMember", "mallory", "deployAsOrgMember", "d_m", "app2"),
+        ("frank (org1) rejected 403 on non-org app1", "frank", "deployAsOrgMember", "d_f1", "app1")] fun (tag, u, fn, depId, appId) => do
+      match ← asUser u fn (Qed.Proto.encode (depId, (appId, ("alice", "denied")))) with
+      | .error e => c.check s!"[cross-rls-ins] {tag}" (e.code == 403) s!"expected 403, got {e.code}: {e.message}"
+      | .ok _ => c.check s!"[cross-rls-ins] {tag}" false "expected 403 error, got ok"
+    c.expectOk "[cross-rls-ins] frank (org1) deploys on app2 via nested any" (← asUser "frank" "deployAsOrgMember" (Qed.Proto.encode ("d_org", ("app2", ("alice", "org-v1"))))) fun _ => pure ()
+    c.checkProtoBy (α := Option DbChecks.MultiTenantDb.deployments) "[cross-rls-ins] charlie insertOrIgnore inserts first time" (← asUser "charlie" "deployIdempotentAsAdmin" (Qed.Proto.encode ("d_ign", ("app1", ("alice", "ign-v1"))))) (·.map (·.id)) (some "d_ign")
+    c.checkProtoBy (α := Option DbChecks.MultiTenantDb.deployments) "[cross-rls-ins] charlie insertOrIgnore duplicate returns none" (← asUser "charlie" "deployIdempotentAsAdmin" (Qed.Proto.encode ("d_ign", ("app1", ("alice", "ign-v1"))))) (·.map (·.id)) none
+    c.checkProtoBy (α := Option DbChecks.MultiTenantDb.deployments) "[cross-rls-ins] dave (viewer) insertOrIgnore returns none without inserting" (← asUser "dave" "deployIdempotentAsAdmin" (Qed.Proto.encode ("d_ign_bad", ("app1", ("alice", "ign-bad"))))) (·.map (·.id)) none
+    c.checkProtoBy (α := Array DbChecks.MultiTenantDb.deployments) "[cross-rls-ins] app1 has exactly 5 authorized deployments" (← asUser "alice" "listDeployments" (Qed.Proto.encode "app1")) (·.map (·.id)) #["d_adm", "d_bare", "d_ign", "d_own", "d_row"]
+    c.checkProtoBy (α := Array DbChecks.MultiTenantDb.deployments) "[cross-rls-ins] app2 has exactly 1 org deployment" (← asUser "alice" "listDeployments" (Qed.Proto.encode "app2")) (·.map (·.id)) #["d_org"]
+    c.expectOk "[cross-rls-ins] charlie (admin) inserts encrypted app_secret" (← asUser "charlie" "createSecretAsAdmin" (Qed.Proto.encode ("s1", ("app1", ("alice", "sk_live_cross_table"))))) fun _ => pure ()
+    match ← asUser "dave" "createSecretAsAdmin" (Qed.Proto.encode ("s2", ("app1", ("alice", "sk_denied")))) with
+    | .error e => c.check "[cross-rls-ins] dave (viewer) rejected 403 on encrypted app_secret" (e.code == 403) s!"expected 403, got {e.code}"
+    | .ok _ => c.check "[cross-rls-ins] dave (viewer) rejected 403 on encrypted app_secret" false "expected 403"
+    c.checkProtoBy (α := Array DbChecks.MultiTenantDb.app_secrets) "[cross-rls-ins] encrypted secret roundtrips cleanly" (← asUser "charlie" "listSecrets" (Qed.Proto.encode "app1")) (·.map fun s => (s.id, s.secret)) #[("s1", "sk_live_cross_table")]
+    match ← Prim.sqliteExec s!"{tmpDir}/multi_tenant.db" "SELECT \"secret\" FROM \"app_secrets\" WHERE \"id\" = ?1" #[.text "s1"] with
+    | .ok r => c.check "[cross-rls-ins] encrypted secret ciphertext on disk != plaintext" (match r.rows[0]?.bind (·[0]?) with | some (SqlVal.text ct) => ct != "sk_live_cross_table" && ct.length >= 40 | _ => false)
+    | .error e => c.check "[cross-rls-ins] raw sqlite inspect secret" false e
 
 def run : IO Bool := do
   let c ← mkChecker "database"

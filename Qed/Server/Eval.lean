@@ -138,6 +138,8 @@ def evalSqlQuery (cfg : DbConfig) (db0 : MemDb) (q : SqlQuery) : MemDb × Except
   let runTransform (t : MemTable) (ret : List SqlIdent) (useRetLen : Bool) (step : DbRow → Option (Option DbRow × DbRow)) :=
     let (outRows, retRows, aff) := transformRows t.columns ret step t.rows
     (db.upsertTable { t with rows := outRows }, .ok { rows := retRows.toArray, affected := if useRetLen then retRows.length else aff })
+  let withInsertGuard (tn : SqlIdent) (guard? : Option SqlExpr) (f : MemTable → MemDb × Except ApiError DbResult) :=
+    withTbl tn fun t => if guard?.all (fun g => sqlValToBool (evalSqlExpr db [] 64 g)) then f t else (db, .ok { rows := #[], affected := 0 })
   match q with
   | .select tn cols w ob lim off => runSelect tn (some cols) w ob lim off
   | .selectAll tn w ob lim off => runSelect tn none w ob lim off
@@ -155,10 +157,10 @@ def evalSqlQuery (cfg : DbConfig) (db0 : MemDb) (q : SqlQuery) : MemDb × Except
           tR.rows.filterMap fun rr => if getRowCol tR.columns rr rJc.raw == lv && sqlValToBool (evalSqlExpr db [(rt.raw, tR.columns, rr), (lt.raw, tL.columns, rl)] 64 rW) then some (rl, rr) else none
       let out := sliceRows lim off (sortRowsBy (lCols.map (·.raw) ++ rCols.map (·.raw)) ob (pairs.map fun (rl, rr) => (lCols.map (getRowCol tL.columns rl ·.raw) ++ rCols.map (getRowCol tR.columns rr ·.raw)).toArray))
       (db, .ok { rows := out.toArray, affected := out.length })
-  | .insert tn pairs ret => withTbl tn fun t =>
+  | .insert tn pairs ret guard? _ => withInsertGuard tn guard? fun t =>
       let newRow := buildRowFromPairs t.columns pairs
       if hasSingleColConflict t (uniqueCols tn) newRow then (db, .error ⟨409, s!"unique constraint violation on `{tn.raw}`"⟩) else appendRow t newRow ret
-  | .insertOrIgnore tn pairs conflictCols ret => withTbl tn fun t =>
+  | .insertOrIgnore tn pairs conflictCols ret guard? _ => withInsertGuard tn guard? fun t =>
       let newRow := buildRowFromPairs t.columns pairs
       let hit := if !conflictCols.isEmpty then t.rows.any (conflictMatches t.columns conflictCols · newRow) else hasSingleColConflict t (uniqueCols tn) newRow
       if hit then (db, .ok { rows := #[], affected := 0 }) else appendRow t newRow ret

@@ -487,6 +487,43 @@ database MultiTenantDb:
     orgId  : String immutable where 1 <= orgId.length <= 64
     userId : String immutable where 1 <= userId.length <= 128
     policy read, write requires ctx.userId != none
+  table deployments:
+    id      : String primary_key immutable where 1 <= id.length <= 64
+    appId   : String immutable references apps(id) on_delete cascade
+    ownerId : String immutable where 1 <= ownerId.length <= 128
+    label   : String where 1 <= label.length <= 120
+    active  : Bool
+    policy read requires
+      some(row.ownerId) == ctx.userId or
+      (any m in app_members: m.appId == row.appId and some(m.userId) == ctx.userId and m.status == "accepted") or
+      (any a in apps: a.id == row.appId and (any om in org_members: some(om.orgId) == a.orgId and some(om.userId) == ctx.userId))
+    policy insert requires
+      some(row.ownerId) == ctx.userId or
+      (any m in app_members: m.appId == row.appId and some(m.userId) == ctx.userId and m.status == "accepted" and m.role in ["owner", "admin"]) or
+      (any a in apps: a.id == row.appId and (any om in org_members: some(om.orgId) == a.orgId and some(om.userId) == ctx.userId))
+    policy update, delete requires
+      some(row.ownerId) == ctx.userId or
+      (any m in app_members: m.appId == row.appId and some(m.userId) == ctx.userId and m.status == "accepted" and m.role in ["owner", "admin"])
+    example dep1: id = "d1", appId = "app1", ownerId = "alice", label = "v1", active = true
+    example policy insert ownerCanInsertDep:
+      user = "alice"
+      row = dep1
+    example policy insert adminCanInsertDep:
+      user = "charlie"
+      row = dep1
+      snap app_members = [MultiTenantDb.app_members.mk("m1", "app1", "charlie", "admin", "accepted")]
+    rejects policy insert viewerCannotInsertDep:
+      user = "dave"
+      row = dep1
+      snap app_members = [MultiTenantDb.app_members.mk("m2", "app1", "dave", "viewer", "accepted")]
+  table app_secrets:
+    id      : String primary_key immutable where 1 <= id.length <= 64
+    appId   : String immutable references apps(id) on_delete cascade
+    ownerId : String immutable where 1 <= ownerId.length <= 128
+    secret  : encrypted(String, key = secret("MT_SECRET_KEY") ?? "mt-dev-secret-key-32") where 1 <= secret.length <= 200
+    policy read, insert, update, delete requires
+      some(row.ownerId) == ctx.userId or
+      (any m in app_members: m.appId == row.appId and some(m.userId) == ctx.userId and m.status == "accepted" and m.role in ["owner", "admin"])
 
 server MultiTenantApi:
   use db : MultiTenantDb
@@ -521,10 +558,93 @@ server MultiTenantApi:
     return await db.apps.updateOne(
       where = r => r.id == appId and (any m in app_members: m.appId == r.id and some(m.userId) == ctx.userId and m.status == "accepted" and m.role == "admin"),
       set = r => { name = newName })?
+  rpc deployAsOwner(depId: String, appId: String, label: String) -> MultiTenantDb.deployments!:
+    requires auth, 1 <= depId.length <= 64, 1 <= label.length <= 120, 1 <= uid.length <= 128
+    return await db.deployments.insert(id = depId, appId = appId, ownerId = uid, label = label, active = true)?
+  rpc deployAsAdmin(depId: String, appId: String, appOwnerId: String, label: String) -> MultiTenantDb.deployments!:
+    requires auth, 1 <= depId.length <= 64, 1 <= appOwnerId.length <= 128, 1 <= label.length <= 120
+    return await db.deployments.insert(
+      where = r => any m in app_members: m.appId == r.appId and some(m.userId) == ctx.userId and m.status == "accepted" and m.role == "admin",
+      id = depId, appId = appId, ownerId = appOwnerId, label = label, active = true)?
+  rpc deployAsAdminBareWhere(depId: String, appId: String, appOwnerId: String, label: String) -> MultiTenantDb.deployments!:
+    requires auth, 1 <= depId.length <= 64, 1 <= appOwnerId.length <= 128, 1 <= label.length <= 120
+    return await db.deployments.insert(
+      where = any m in app_members: m.appId == appId and some(m.userId) == ctx.userId and m.status == "accepted" and m.role in ["owner", "admin"],
+      id = depId, appId = appId, ownerId = appOwnerId, label = label, active = true)?
+  rpc deployAsOrgMember(depId: String, appId: String, appOwnerId: String, label: String) -> MultiTenantDb.deployments!:
+    requires auth, 1 <= depId.length <= 64, 1 <= appOwnerId.length <= 128, 1 <= label.length <= 120
+    return await db.deployments.insert(
+      where = r => any a in apps: a.id == r.appId and (any om in org_members: some(om.orgId) == a.orgId and some(om.userId) == ctx.userId),
+      id = depId, appId = appId, ownerId = appOwnerId, label = label, active = true)?
+  rpc deployRowAsAdmin(row: MultiTenantDb.deployments) -> MultiTenantDb.deployments!:
+    requires auth, 1 <= row.id.length <= 64, 1 <= row.ownerId.length <= 128, 1 <= row.label.length <= 120
+    return await db.deployments.insert(row,
+      where = r => any m in app_members: m.appId == r.appId and some(m.userId) == ctx.userId and m.status == "accepted" and m.role == "admin")?
+  rpc deployIdempotentAsAdmin(depId: String, appId: String, appOwnerId: String, label: String) -> MultiTenantDb.deployments?!:
+    requires auth, 1 <= depId.length <= 64, 1 <= appOwnerId.length <= 128, 1 <= label.length <= 120
+    return await db.deployments.insertOrIgnore(
+      on = "id",
+      where = r => any m in app_members: m.appId == r.appId and some(m.userId) == ctx.userId and m.status == "accepted" and m.role in ["owner", "admin"],
+      id = depId, appId = appId, ownerId = appOwnerId, label = label, active = true)?
+  rpc createSecretAsAdmin(secId: String, appId: String, appOwnerId: String, secretVal: String) -> MultiTenantDb.app_secrets!:
+    requires auth, 1 <= secId.length <= 64, 1 <= appOwnerId.length <= 128, 1 <= secretVal.length <= 200
+    return await db.app_secrets.insert(
+      where = r => some(r.ownerId) == ctx.userId or (any m in app_members: m.appId == r.appId and some(m.userId) == ctx.userId and m.status == "accepted" and m.role in ["owner", "admin"]),
+      id = secId, appId = appId, ownerId = appOwnerId, secret = secretVal)?
+  rpc listDeployments(appId: String) -> MultiTenantDb.deployments[]!:
+    requires auth
+    return await db.deployments.select(where = r => r.appId == appId and (
+      some(r.ownerId) == ctx.userId or
+      (any m in app_members: m.appId == r.appId and some(m.userId) == ctx.userId and m.status == "accepted") or
+      (any a in apps: a.id == r.appId and (any om in org_members: some(om.orgId) == a.orgId and some(om.userId) == ctx.userId))), orderBy = "id")?
+  rpc listSecrets(appId: String) -> MultiTenantDb.app_secrets[]!:
+    requires auth
+    return await db.app_secrets.select(where = r => r.appId == appId and (
+      some(r.ownerId) == ctx.userId or
+      (any m in app_members: m.appId == r.appId and some(m.userId) == ctx.userId and m.status == "accepted" and m.role in ["owner", "admin"])), orderBy = "id")?
+  example adminCanDeployAndViewerRejected:
+    with user "charlie"
+    with db db.apps = [{ id = "app1", ownerId = "alice", orgId = none, name = "Alpha" }]
+    with db db.app_members = [{ id = "m1", appId = "app1", userId = "charlie", role = "admin", status = "accepted" }]
+    call deployAsAdmin("d1", "app1", "alice", "v1")
+    expect ok
+    expect db_count("deployments") == 1
+  example viewerDeployRejectedAtRuntime:
+    with user "dave"
+    with db db.apps = [{ id = "app1", ownerId = "alice", orgId = none, name = "Alpha" }]
+    with db db.app_members = [{ id = "m2", appId = "app1", userId = "dave", role = "viewer", status = "accepted" }]
+    call deployAsAdmin("d1", "app1", "alice", "v1")
+    expect error(403)
+    expect db_count("deployments") == 0
+  example orgMemberCanDeployNested:
+    with user "frank"
+    with db db.apps = [{ id = "app2", ownerId = "alice", orgId = some("org1"), name = "Beta" }]
+    with db db.org_members = [{ id = "om1", orgId = "org1", userId = "frank" }]
+    call deployAsOrgMember("d2", "app2", "alice", "org-rel")
+    expect ok
+    expect db_count("deployments") == 1
+  example outsiderOrgDeployRejected:
+    with user "mallory"
+    with db db.apps = [{ id = "app2", ownerId = "alice", orgId = some("org1"), name = "Beta" }]
+    with db db.org_members = [{ id = "om1", orgId = "org1", userId = "frank" }]
+    call deployAsOrgMember("d2", "app2", "alice", "org-rel")
+    expect error(403)
+    expect db_count("deployments") == 0
+  example unauthorizedInsertOrIgnoreReturnsNone:
+    with user "dave"
+    with db db.apps = [{ id = "app1", ownerId = "alice", orgId = none, name = "Alpha" }]
+    with db db.app_members = [{ id = "m2", appId = "app1", userId = "dave", role = "viewer", status = "accepted" }]
+    call deployIdempotentAsAdmin("d1", "app1", "alice", "v1")
+    expect ok(none)
+    expect db_count("deployments") == 0
 
 bad_db_auth "read policy `MultiTenantDb.apps.read`" MultiTenantDb leakAllApps() -> MultiTenantDb.apps[]! : return await db.apps.select()?
 bad_db_auth "read policy `MultiTenantDb.apps.read`" MultiTenantDb leakPendingApps() -> MultiTenantDb.apps[]! : return await db.apps.select(where = r => any m in app_members: m.appId == r.id and some(m.userId) == ctx.userId and m.status == "pending")?
 bad_db_auth "update policy `MultiTenantDb.apps.update`" MultiTenantDb viewerCannotRename(appId: String, newName: String) -> MultiTenantDb.apps?! || 1 <= newName.length <= 120 : return await db.apps.updateOne(where = r => r.id == appId and (any m in app_members: m.appId == r.id and some(m.userId) == ctx.userId and m.status == "accepted" and m.role == "viewer"), set = r => { name = newName })?
+bad_db_auth "For cross-table insert policies, pass `where = r => any ... in ...:`" MultiTenantDb unguardedCrossInsert(depId: String, appId: String, appOwnerId: String) -> MultiTenantDb.deployments! || 1 <= depId.length <= 64, 1 <= appOwnerId.length <= 128 : return await db.deployments.insert(id = depId, appId = appId, ownerId = appOwnerId, label = "v1", active = true)?
+bad_db_auth "insert policy `MultiTenantDb.deployments.insert`" MultiTenantDb viewerCannotDeploy(depId: String, appId: String, appOwnerId: String) -> MultiTenantDb.deployments! || 1 <= depId.length <= 64, 1 <= appOwnerId.length <= 128 : return await db.deployments.insert(where = r => any m in app_members: m.appId == r.appId and some(m.userId) == ctx.userId and m.status == "accepted" and m.role == "viewer", id = depId, appId = appId, ownerId = appOwnerId, label = "v1", active = true)?
+bad_db_auth "insert policy `MultiTenantDb.deployments.insert`" MultiTenantDb pendingCannotDeploy(depId: String, appId: String, appOwnerId: String) -> MultiTenantDb.deployments! || 1 <= depId.length <= 64, 1 <= appOwnerId.length <= 128 : return await db.deployments.insert(where = r => any m in app_members: m.appId == r.appId and some(m.userId) == ctx.userId and m.status == "pending" and m.role == "admin", id = depId, appId = appId, ownerId = appOwnerId, label = "v1", active = true)?
+bad_db_auth "shadows an outer row/table variable" MultiTenantDb shadowedAliasInsert(depId: String, appId: String, appOwnerId: String) -> MultiTenantDb.deployments! || 1 <= depId.length <= 64, 1 <= appOwnerId.length <= 128 : return await db.deployments.insert(where = r => any r in app_members: r.appId == appId and some(r.userId) == ctx.userId and r.status == "accepted" and r.role == "admin", id = depId, appId = appId, ownerId = appOwnerId, label = "v1", active = true)?
 bad_db_tbl "unknown table `ghosts` in cross-table `any m in ghosts:`" BadCrossTableRefDb apps : id : String primary_key || policy read requires any m in ghosts: m.appId == row.id
 bad_db_def "cannot reference encrypted column `secrets.val` inside cross-table `any s in secrets:`" BadCrossEncDb :
   table apps:

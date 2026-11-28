@@ -134,7 +134,8 @@ Array: sumBy_push sumBy_append sumBy_mergeSort sumBy_set sumBy_eraseIdx sumBy_fi
 Qed.ForEach: forall_append forall_pop forall_reverse forall_extract forall_eraseIdx forall_set
   forall_swap forall_modify
 Qed.Server.Db: isSafeSqlIdent_no_inject evalSelect_satisfies_policy evalInsert_preserves_inv
-  evalUpdate_preserves_inv_and_trans evalDelete_preserves_inv_and_policy diffTableSchema_self_empty
+  evalInsertGuarded_preserves_inv_and_policy evalUpdate_preserves_inv_and_trans
+  evalDelete_preserves_inv_and_policy diffTableSchema_self_empty
   verifyMigrationSafe_nullable_addColumn aeadBase64Len_mono
 Qed.Server.Db.SqlExpr: compile_sameShape
 Qed.Server.Db.SqlQuery: compile_sameShape compile_no_semicolon
@@ -191,6 +192,6 @@ open Lean in
       let bad := axs.filter (!allowed.contains ·)
       unless bad.isEmpty do
         throwError "unexpected axiom(s) in {n}: {bad.toList}"
-  unless seen.size == 429 do
-    throwError "expected 429 theorems in axioms manifest, checked {seen.size}"
+  unless seen.size == 430 do
+    throwError "expected 430 theorems in axioms manifest, checked {seen.size}"
   IO.println s!"✓ {seen.size} theorems checked: 0 unexpected axioms"

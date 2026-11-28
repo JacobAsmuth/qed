@@ -144,7 +144,7 @@ structure DbEncKeyInfo where
 deriving Inhabited
 
 structure DbColumnInfo where
-  (name : String) (isPrimaryKey isImmutable isUnique isNullable isNat isInt : Bool := false)
+  (name : String) (isPrimaryKey isImmutable isUnique isNullable isNat isInt isBool isBytes : Bool := false)
   (refs? : Option (String × String) := none) (encKey? : Option DbEncKeyInfo := none)
 deriving Inhabited
 

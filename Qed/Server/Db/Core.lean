@@ -222,6 +222,12 @@ def SqlAggOp.render : SqlAggOp → String | .sum => "SUM" | .min => "MIN" | .max
 theorem SqlBinOp.render_no_semicolon (op : SqlBinOp) : ∀ c ∈ op.render.toList, c ≠ ';' := by cases op <;> exact NoSemi.lit
 theorem SqlAggOp.render_no_semicolon (op : SqlAggOp) : ∀ c ∈ op.render.toList, c ≠ ';' := by cases op <;> exact NoSemi.lit
 
+inductive SqlColType where | text | int | bool | bytes deriving Inhabited, DecidableEq
+def SqlColType.render (d : SqlDialect) : SqlColType → String
+  | .text => "TEXT" | .int => d.pick "BIGINT" "INTEGER" | .bool => d.pick "BOOLEAN" "INTEGER" | .bytes => d.pick "BYTEA" "BLOB"
+private theorem SqlColType.render_no_semicolon (d : SqlDialect) (t : SqlColType) : NoSemi (t.render d) := by
+  cases t <;> dsimp only [SqlColType.render] <;> first | exact NoSemi.lit | exact d.pick_no_semi NoSemi.lit NoSemi.lit
+
 inductive SqlExpr where
   | litTrue | litFalse | col (name : SqlIdent) | qualCol (tableOrAlias name : SqlIdent) | param (val : SqlVal)
   | binOp (op : SqlBinOp) (lhs rhs : SqlExpr)
@@ -287,6 +293,32 @@ private theorem compileInParams_eraseVals (d : SqlDialect) :
 private theorem compileInParams_no_semicolon (d : SqlDialect) :
     ∀ (vs : List SqlVal) (p : Array SqlVal), NoSemi (compileInParams d vs p).1 :=
   compileSepList_no_semicolon (α := SqlVal) _ fun _ p => placeholder_no_semicolon d (p.size + 1)
+
+private def zipValsWithTypes : List SqlVal → List SqlColType → List (SqlVal × Option SqlColType)
+  | [], _ => [] | v :: vs, [] => (v, none) :: zipValsWithTypes vs []
+  | v :: vs, t :: ts => (v, some t) :: zipValsWithTypes vs ts
+private theorem zipValsWithTypes_map_null : ∀ (vs : List SqlVal) (ts : List SqlColType),
+    zipValsWithTypes (vs.map fun _ => .null) ts = (zipValsWithTypes vs ts).map fun (_, ty?) => (.null, ty?)
+  | [], _ => rfl
+  | _ :: vs, [] => congrArg _ (zipValsWithTypes_map_null vs [])
+  | _ :: vs, _ :: ts => congrArg _ (zipValsWithTypes_map_null vs ts)
+private def compileSelectParams (d : SqlDialect) : List (SqlVal × Option SqlColType) → Array SqlVal → String × Array SqlVal :=
+  compileSepList (α := SqlVal × Option SqlColType) fun (v, ty?) p =>
+    let ph := placeholder d (p.size + 1)
+    (match d, ty? with | .postgres, some ty => "CAST(" ++ ph ++ " AS " ++ ty.render .postgres ++ ")" | _, _ => ph, p.push v)
+private theorem compileSelectParams_eraseVals (d : SqlDialect) :
+    ∀ (vs : List (SqlVal × Option SqlColType)) (p₁ p₂ : Array SqlVal), p₁.size = p₂.size →
+      SameCompile (compileSelectParams d vs p₁) (compileSelectParams d (vs.map fun (_, ty?) => (.null, ty?)) p₂) :=
+  compileSepList_eraseVals (α := SqlVal × Option SqlColType) _ (fun (_, ty?) => (.null, ty?)) fun (_, ty?) _ _ h =>
+    ⟨by cases d <;> cases ty? <;> simp [h], by simp [h]⟩
+private theorem compileSelectParams_no_semicolon (d : SqlDialect) :
+    ∀ (vs : List (SqlVal × Option SqlColType)) (p : Array SqlVal), NoSemi (compileSelectParams d vs p).1 :=
+  compileSepList_no_semicolon (α := SqlVal × Option SqlColType) _ fun (_, ty?) p => by
+    cases d <;> cases ty?
+    · exact placeholder_no_semicolon .postgres (p.size + 1)
+    · exact NoSemi.lApp (placeholder_no_semicolon .postgres (p.size + 1)) |>.appL |>.app (SqlColType.render_no_semicolon .postgres _) |>.appL
+    · exact placeholder_no_semicolon .sqlite (p.size + 1)
+    · exact placeholder_no_semicolon .sqlite (p.size + 1)
 
 @[inline] private def wrap1 (pre suf : String) (r : String × Array SqlVal) : String × Array SqlVal := (pre ++ r.1 ++ suf, r.2)
 @[inline] private def wrap2 (pre mid suf : String) (f g : Array SqlVal → String × Array SqlVal) (p : Array SqlVal) :
@@ -404,8 +436,9 @@ inductive SqlQuery where
                (leftJoinCol rightJoinCol : SqlIdent) (leftWhere rightWhere : SqlExpr)
                (orderBy : Option (SqlIdent × SqlOrderDir) := none) (limit offset : Option Nat := none)
   | insert (table : SqlIdent) (cols : List (SqlIdent × SqlVal)) (returning : List SqlIdent)
+           (guard? : Option SqlExpr := none) (colTypes : List SqlColType := [])
   | insertOrIgnore (table : SqlIdent) (cols : List (SqlIdent × SqlVal)) (conflictCols : List SqlIdent := [])
-                   (returning : List SqlIdent := [])
+                   (returning : List SqlIdent := []) (guard? : Option SqlExpr := none) (colTypes : List SqlColType := [])
   | upsert (table : SqlIdent) (cols : List (SqlIdent × SqlVal)) (conflictCols : List SqlIdent)
            (updateCols : List SqlIdent) (conflictWhere? : Option SqlExpr) (returning : List SqlIdent)
   | update (table : SqlIdent) (sets : List (SqlIdent × SqlExpr)) (whereExpr : SqlExpr) (returning : List SqlIdent)
@@ -453,8 +486,8 @@ def SqlQuery.eraseVals : SqlQuery → SqlQuery
   | .count t w => .count t w.eraseVals | .countSchema sc t w => .countSchema sc t w.eraseVals
   | .aggregate op t c w => .aggregate op t c w.eraseVals
   | .joinSelect lt rt lc rc lj rj lw rw o l off => .joinSelect lt rt lc rc lj rj lw.eraseVals rw.eraseVals o l off
-  | .insert t cols ret => .insert t (cols.map fun (c, _) => (c, .null)) ret
-  | .insertOrIgnore t cols cc ret => .insertOrIgnore t (cols.map fun (c, _) => (c, .null)) cc ret
+  | .insert t cols ret g? tys => .insert t (cols.map fun (c, _) => (c, .null)) ret (g?.map SqlExpr.eraseVals) tys
+  | .insertOrIgnore t cols cc ret g? tys => .insertOrIgnore t (cols.map fun (c, _) => (c, .null)) cc ret (g?.map SqlExpr.eraseVals) tys
   | .upsert t cols cc uc cw ret => .upsert t (cols.map fun (c, _) => (c, .null)) cc uc (cw.map SqlExpr.eraseVals) ret
   | .update t s w ret => .update t (s.map fun (c, e) => (c, e.eraseVals)) w.eraseVals ret
   | .delete t w ret => .delete t w.eraseVals ret
@@ -495,9 +528,15 @@ private theorem renderConflictTarget_no_semicolon (cc : List SqlIdent) : NoSemi 
   · exact NoSemi.lit
   · exact NoSemi.lApp (SqlIdent.joinQuotedPrefixed_no_semicolon "" NoSemi.empty cc) |>.appL
 
-private def compileInsertHead (d : SqlDialect) (tbl : SqlIdent) (cols : List (SqlIdent × SqlVal)) : String × Array SqlVal :=
-  let (valsSql, params) := compileInParams d (cols.map Prod.snd) #[]
-  ("INSERT INTO " ++ tbl.quoteIdent ++ " (" ++ SqlIdent.joinQuoted (cols.map Prod.fst) ++ ") VALUES (" ++ valsSql ++ ")", params)
+private def compileInsertHead (d : SqlDialect) (tbl : SqlIdent) (cols : List (SqlIdent × SqlVal))
+    (guard? : Option SqlExpr := none) (colTypes : List SqlColType := []) : String × Array SqlVal :=
+  let head := "INSERT INTO " ++ tbl.quoteIdent ++ " (" ++ SqlIdent.joinQuoted (cols.map Prod.fst) ++ ") "
+  match guard? with
+  | none => let (valsSql, params) := compileInParams d (cols.map Prod.snd) #[]; (head ++ "VALUES (" ++ valsSql ++ ")", params)
+  | some g =>
+      let (valsSql, p1) := compileSelectParams d (zipValsWithTypes (cols.map Prod.snd) colTypes) #[]
+      let (gSql, p2) := g.compile d p1
+      (head ++ "SELECT " ++ valsSql ++ " WHERE " ++ gSql, p2)
 
 def SqlQuery.compile (d : SqlDialect) : SqlQuery → String × Array SqlVal
   | .select tbl cols whereExpr orderBy? limit? offset? =>
@@ -532,10 +571,10 @@ def SqlQuery.compile (d : SqlDialect) : SqlQuery → String × Array SqlVal
       ("SELECT " ++ selCols ++ " FROM " ++ lt.quoteIdent ++ " AS \"_l\" INNER JOIN " ++
        rt.quoteIdent ++ " AS \"_r\" ON \"_l\"." ++ lJoin.quoteIdent ++ " = \"_r\"." ++ rJoin.quoteIdent ++
        " WHERE (" ++ lwSql ++ " AND " ++ rwSql ++ ")" ++ renderOrderBy "\"_l\"." orderBy? ++ renderLimitOffset d limit? offset?, p2)
-  | .insert tbl cols ret =>
-      let (hd, params) := compileInsertHead d tbl cols; (hd ++ renderReturning ret, params)
-  | .insertOrIgnore tbl cols conflictCols ret =>
-      let (hd, params) := compileInsertHead d tbl cols
+  | .insert tbl cols ret g? tys =>
+      let (hd, params) := compileInsertHead d tbl cols g? tys; (hd ++ renderReturning ret, params)
+  | .insertOrIgnore tbl cols conflictCols ret g? tys =>
+      let (hd, params) := compileInsertHead d tbl cols g? tys
       (hd ++ renderConflictTarget conflictCols ++ "DO NOTHING" ++ renderReturning ret, params)
   | .upsert tbl cols conflictCols updateCols conflictWhere? ret =>
       let (hd, p1) := compileInsertHead d tbl cols
@@ -553,15 +592,34 @@ def SqlQuery.compile (d : SqlDialect) : SqlQuery → String × Array SqlVal
       let (wSql, params) := whereExpr.compile d #[]
       ("DELETE FROM " ++ tbl.quoteIdent ++ " WHERE " ++ wSql ++ renderReturning ret, params)
 
-private theorem compileInsertHead_eraseVals (d : SqlDialect) (tbl : SqlIdent) (cols : List (SqlIdent × SqlVal)) :
-    SameCompile (compileInsertHead d tbl cols) (compileInsertHead d tbl (cols.map fun (c, _) => (c, .null))) := by
-  have ⟨h1, h2⟩ := compileInParams_eraseVals d (cols.map Prod.snd) #[] #[] rfl
-  refine ⟨?_, ?_⟩ <;> simp only [compileInsertHead, List.map_map, Function.comp_def, h1, h2]
+private theorem compileInsertHead_eraseVals (d : SqlDialect) (tbl : SqlIdent) (cols : List (SqlIdent × SqlVal))
+    (guard? : Option SqlExpr := none) (colTypes : List SqlColType := []) :
+    SameCompile (compileInsertHead d tbl cols guard? colTypes)
+      (compileInsertHead d tbl (cols.map fun (c, _) => (c, .null)) (guard?.map SqlExpr.eraseVals) colTypes) := by
+  cases guard? with
+  | none =>
+      have ⟨h1, h2⟩ := compileInParams_eraseVals d (cols.map Prod.snd) #[] #[] rfl
+      refine ⟨?_, ?_⟩ <;> simp only [compileInsertHead, Option.map, List.map_map, Function.comp_def, h1, h2]
+  | some g =>
+      have ⟨h1, h2⟩ := compileSelectParams_eraseVals d (zipValsWithTypes (cols.map Prod.snd) colTypes) #[] #[] rfl
+      have ⟨h3, h4⟩ := g.compileQual_eraseVals d "" _ _ h2
+      have hzip : zipValsWithTypes ((cols.map fun (c, _) => (c, SqlVal.null)).map Prod.snd) colTypes =
+          (zipValsWithTypes (cols.map Prod.snd) colTypes).map fun (_, ty?) => (.null, ty?) := by
+        rw [← zipValsWithTypes_map_null]; simp [List.map_map, Function.comp_def]
+      have hfst : (cols.map fun (c, _) => (c, SqlVal.null)).map Prod.fst = cols.map Prod.fst := by
+        simp [List.map_map, Function.comp_def]
+      refine ⟨?_, ?_⟩
+      · dsimp only [compileInsertHead, Option.map, SqlExpr.compile]; rw [hfst, hzip, h1, h3]
+      · dsimp only [compileInsertHead, Option.map, SqlExpr.compile]; rw [hzip, h4]
 
-private theorem compileInsertHead_no_semicolon (d : SqlDialect) (tbl : SqlIdent) (cols : List (SqlIdent × SqlVal)) :
-    NoSemi (compileInsertHead d tbl cols).1 :=
-  NoSemi.lApp tbl.quoteIdent_no_semicolon |>.appL |>.app (SqlIdent.joinQuotedPrefixed_no_semicolon "" NoSemi.empty (cols.map Prod.fst))
-    |>.appL |>.app (compileInParams_no_semicolon d _ _) |>.appL
+private theorem compileInsertHead_no_semicolon (d : SqlDialect) (tbl : SqlIdent) (cols : List (SqlIdent × SqlVal))
+    (guard? : Option SqlExpr := none) (colTypes : List SqlColType := []) :
+    NoSemi (compileInsertHead d tbl cols guard? colTypes).1 := by
+  have hHead : NoSemi ("INSERT INTO " ++ tbl.quoteIdent ++ " (" ++ SqlIdent.joinQuoted (cols.map Prod.fst) ++ ") ") :=
+    NoSemi.lApp tbl.quoteIdent_no_semicolon |>.appL |>.app (SqlIdent.joinQuotedPrefixed_no_semicolon "" NoSemi.empty (cols.map Prod.fst)) |>.appL
+  cases guard? with
+  | none => exact hHead.appL.app (compileInParams_no_semicolon d _ _) |>.appL
+  | some g => exact hHead.appL.app (compileSelectParams_no_semicolon d _ _) |>.appL |>.app (g.compile_no_semicolon d _)
 
 private theorem SqlQuery.compile_eraseVals (d : SqlDialect) (q : SqlQuery) : (q.compile d).1 = (q.eraseVals.compile d).1 := by
   cases q with
@@ -575,10 +633,11 @@ private theorem SqlQuery.compile_eraseVals (d : SqlDialect) (q : SqlQuery) : (q.
       have ⟨hL, hszL⟩ := lw.compileQual_eraseVals d "\"_l\"." #[] #[] rfl
       have ⟨hR, _⟩ := rw.compileQual_eraseVals d "\"_r\"." _ _ hszL
       dsimp only [SqlQuery.eraseVals, SqlQuery.compile]; rw [hL, hR]
-  | insert tbl cols _ | insertOrIgnore tbl cols _ _ =>
-      dsimp only [SqlQuery.eraseVals, SqlQuery.compile]; rw [(compileInsertHead_eraseVals d tbl cols).1]
+  | insert tbl cols _ g? tys | insertOrIgnore tbl cols _ _ g? tys =>
+      dsimp only [SqlQuery.eraseVals, SqlQuery.compile]; rw [(compileInsertHead_eraseVals d tbl cols g? tys).1]
   | upsert tbl cols _ _ cw _ =>
-      have ⟨h, hsz⟩ := compileInsertHead_eraseVals d tbl cols
+      have ⟨h, hsz⟩ := compileInsertHead_eraseVals d tbl cols none []
+      dsimp only [Option.map] at h hsz
       cases cw with
       | none => dsimp only [SqlQuery.eraseVals, SqlQuery.compile, Option.map]; rw [h]
       | some e =>
@@ -627,9 +686,9 @@ theorem SqlQuery.compile_no_semicolon (d : SqlDialect) (q : SqlQuery) : ∀ c �
         |>.app lj.quoteIdent_no_semicolon |>.appL |>.app rj.quoteIdent_no_semicolon |>.appL
         |>.app (lw.compileQual_no_semicolon d "\"_l\"." hL #[]) |>.appL |>.app (rw.compileQual_no_semicolon d "\"_r\"." hR _) |>.appL
         |>.app (renderOrderBy_no_semicolon "\"_l\"." hL ob) |>.app (renderLimitOffset_no_semicolon d lim off)
-  | insert tbl cols ret => exact (compileInsertHead_no_semicolon d tbl cols).app (renderReturning_no_semicolon ret)
-  | insertOrIgnore tbl cols cc ret =>
-      exact (compileInsertHead_no_semicolon d tbl cols).app (renderConflictTarget_no_semicolon cc) |>.appL |>.app (renderReturning_no_semicolon ret)
+  | insert tbl cols ret g? tys => exact (compileInsertHead_no_semicolon d tbl cols g? tys).app (renderReturning_no_semicolon ret)
+  | insertOrIgnore tbl cols cc ret g? tys =>
+      exact (compileInsertHead_no_semicolon d tbl cols g? tys).app (renderConflictTarget_no_semicolon cc) |>.appL |>.app (renderReturning_no_semicolon ret)
   | upsert tbl cols cc uc cw ret =>
       have hConf : NoSemi (renderConflictTarget cc ++ if uc.isEmpty then "DO NOTHING" else "DO UPDATE SET " ++ renderUpsertSets uc) := by
         refine (renderConflictTarget_no_semicolon cc).app ?_
@@ -652,6 +711,7 @@ section RelModel
 variable {Row : Type}
 def evalSelect (tbl : List Row) (wherePred : Row → Bool) : List Row := tbl.filter wherePred
 def evalInsert (tbl : List Row) (newRow : Row) : List Row := newRow :: tbl
+def evalInsertGuarded (tbl : List Row) (guard : Bool) (newRow : Row) : List Row := if guard then newRow :: tbl else tbl
 def evalUpdate (tbl : List Row) (wherePred : Row → Bool) (setFn : Row → Row) : List Row := tbl.map fun r => if wherePred r then setFn r else r
 def evalDelete (tbl : List Row) (wherePred : Row → Bool) : List Row := tbl.filter fun r => !wherePred r
 
@@ -663,6 +723,15 @@ theorem evalSelect_satisfies_policy (RowInv ReadPolicy : Row → Prop) (tbl : Li
 theorem evalInsert_preserves_inv (RowInv InsertPolicy : Row → Prop) (tbl : List Row) (newRow : Row)
     (htbl : ∀ r ∈ tbl, RowInv r) (hinv : RowInv newRow) (_hpol : InsertPolicy newRow) :
     ∀ r ∈ evalInsert tbl newRow, RowInv r := fun r hr => (List.mem_cons.1 hr).elim (· ▸ hinv) (htbl r)
+
+theorem evalInsertGuarded_preserves_inv_and_policy (RowInv InsertPolicy : Row → Prop) (tbl : List Row)
+    (guard : Bool) (newRow : Row) (htbl : ∀ r ∈ tbl, RowInv r) (hinv : RowInv newRow)
+    (hpol : guard = true → InsertPolicy newRow) :
+    (∀ r ∈ evalInsertGuarded tbl guard newRow, RowInv r) ∧ (guard = true → InsertPolicy newRow) :=
+  ⟨fun r hr => by
+    cases guard
+    · exact htbl r hr
+    · exact (List.mem_cons.1 hr).elim (· ▸ hinv) (htbl r), hpol⟩
 
 theorem evalUpdate_preserves_inv_and_trans (RowInv UpdatePolicy : Row → Prop) (TransInv : Row → Row → Prop)
     (tbl : List Row) (wherePred : Row → Bool) (setFn : Row → Row) (htbl : ∀ r ∈ tbl, RowInv r)
@@ -696,10 +765,6 @@ abbrev aeadOverhead : Nat := 28
 abbrev aeadBase64Len (plainBytes : Nat) : Nat := 4 * ((plainBytes + aeadOverhead + 2) / 3)
 theorem aeadBase64Len_mono {a b : Nat} (h : a ≤ b) : aeadBase64Len a ≤ aeadBase64Len b := by
   simp only [aeadBase64Len, aeadOverhead]; omega
-
-inductive SqlColType where | text | int | bool | bytes deriving Inhabited, DecidableEq
-def SqlColType.render (d : SqlDialect) : SqlColType → String
-  | .text => "TEXT" | .int => d.pick "BIGINT" "INTEGER" | .bool => d.pick "BOOLEAN" "INTEGER" | .bytes => d.pick "BYTEA" "BLOB"
 
 inductive OnDeleteAction where | noAction | cascade | setNull | restrict deriving Inhabited, DecidableEq
 def OnDeleteAction.render : OnDeleteAction → String
@@ -957,7 +1022,7 @@ def decodeD1Response (raw : String) (expectedCols : List String) : Except String
   return { rows := ← decodeJsonRows first "results" rowDec "D1 results is not an array", affected := (first.get? "meta" |>.bind (·.natAt? "changes")).getD 0 }
 
 def queryExpectedCols : SqlQuery → List String
-  | .select _ cols _ _ _ _ | .selectSchema _ _ cols _ _ _ _ | .insert _ _ cols | .insertOrIgnore _ _ _ cols | .upsert _ _ _ _ _ cols | .update _ _ _ cols | .delete _ _ cols => cols.map (·.raw)
+  | .select _ cols _ _ _ _ | .selectSchema _ _ cols _ _ _ _ | .insert _ _ cols _ _ | .insertOrIgnore _ _ _ cols _ _ | .upsert _ _ _ _ _ cols | .update _ _ _ cols | .delete _ _ cols => cols.map (·.raw)
   | .joinSelect _ _ lc rc _ _ _ _ _ _ _ => lc.map (·.raw) ++ rc.map (·.raw) | .selectAll _ _ _ _ _ | .count _ _ | .countSchema _ _ _ | .aggregate _ _ _ _ => []
 end HttpSql
 

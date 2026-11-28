@@ -590,6 +590,7 @@ private def tablePolicyNames (t : ParsedTable) : Array String :=
   let colInfos : Array DbColumnInfo := t.cols.map fun c => {
     name := c.colName, isPrimaryKey := c.isPrimaryKey, isImmutable := c.isImmutable, isUnique := c.isUnique,
     isNullable := c.isNullable, isNat := c.isNat, isInt := c.sqlColType == .int && !c.isNat,
+    isBool := c.sqlColType == .bool, isBytes := c.sqlColType == .bytes,
     refs? := c.refs?.map fun (rt, rc) => (rt.getId.eraseMacroScopes.toString, rc.getId.eraseMacroScopes.toString), encKey? := c.encKey? }
   return ({
     tableName := t.tableName, rowTypeConst := fullDbName ++ t.ident.getId, columns := colInfos, hasMeta,

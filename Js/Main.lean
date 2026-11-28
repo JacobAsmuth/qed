@@ -256,6 +256,18 @@ def main (args : List String) : IO Unit := do
           IO.println s!"FAIL\t{decl}\tallowed in client bundle (not blocked by client bundle leak gate)"
           failed := failed + 1
     if failed > 0 then fail s!"leak gate check failed for {failed}/{decls.length} declaration(s) in `{mod}`"
+  | "--verify-decl-each" :: rest =>
+    let (mod, decls) ← match rest with
+      | m :: "--" :: ds => pure (m, ds)
+      | m :: ds => pure (m, ds)
+      | [] => fail "usage: qedjs --verify-decl-each <module> [--] <decl1> [<decl2> ...]"
+    if decls.isEmpty then fail "usage: qedjs --verify-decl-each <module> [--] <decl1> [<decl2> ...]"
+    let env ← loadEnv [mod]
+    let results ← orThrow (Js.verifyDeclsInModule env mod.toName (decls.map String.toName))
+    for (decl, res) in results do
+      match res with
+      | .error err => IO.println s!"REJECT\t{decl}\t{err.replace "\n" " "}"
+      | .ok ()     => IO.println s!"ALLOW\t{decl}\tok"
   | _ =>
     let (flags, cleanArgs) ← orThrow (parseJsFlags args {})
     match splitDashes cleanArgs with

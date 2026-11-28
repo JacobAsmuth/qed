@@ -1601,4 +1601,23 @@ def verifyProjectEnv (env : Environment) (skipFramework : Bool := false) : Excep
   let tasks := buckets.map fun b => Task.spawn fun _ => verifyModuleIndices env b 16384
   tasks.foldlM (init := 0) fun acc t => return acc + (← t.get)
 
+def verifyDeclsInModule (env : Environment) (modName : Name) (declNames : List Name) :
+    Except String (List (Name × Except String Unit)) := do
+  let some modIdx := env.header.moduleNames.idxOf? modName
+    | throw s!"module `{modName}` not loaded in environment"
+  let isNonFw := !isFrameworkModule modName
+  let csimpThms := (Lean.Compiler.CSimp.ext.getState env).thmNames
+  let irEntries := Lean.IR.declMapExt.getModuleEntries env modIdx
+  let modIrMap := if !isNonFw then {} else irEntries.foldl (init := ({} : Std.HashMap Name Lean.IR.FnBody)) fun m d =>
+    match d with | .fdecl (f := irName) (body := b) .. => m.insert irName b | _ => m
+  return declNames.map fun declName => (declName, do
+    let some ci := env.find? declName | throw s!"declaration `{declName}` not found in `{modName}`"
+    let c0 : VerifyCache := { axioms := {}, partials := {}, mutRefs := {}, irNodes := {} }
+    let c1 ← verifyConstEntry env modName isNonFw csimpThms c0 ci
+    discard <| irEntries.foldlM (init := c1) fun c d =>
+      match d with
+      | .fdecl (f := irName) .. =>
+          if resolveIrTarget env irName == declName then verifyIrDeclEntry env modIrMap modName isNonFw c d else pure c
+      | _ => pure c)
+
 end Js

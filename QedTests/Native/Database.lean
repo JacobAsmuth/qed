@@ -583,84 +583,89 @@ private def runRlsGateNegativeSuite (c : TestChecker) (tmpDir : String) : IO Uni
   if fc != 0 then c.check "[rls-gate] compile base fixture" false ferr; return
   let (pc, pout, perr) ← runCmd qedjs #["--verify-env", "--skip-qed", "RlsGateFixture"] (env := env)
   c.check "[rls-gate] positive control passes --verify-env" (pc == 0) (pout ++ perr)
-  let hdr := "import RlsGateFixture\nopen Qed Qed.Server Qed.Server.Db\n"
   let attacks : List (String × String × String) := [
     ("direct_dbExec",
-      hdr ++ "def atk {m} [Monad m] [MonadServer m] : m (Except ApiError DbResult) := MonadServer.dbExec GateDb.config (SqlQuery.count (sql!\"notes\") .litTrue)\n",
+      "def atk_direct_dbExec {m} [Monad m] [MonadServer m] : m (Except ApiError DbResult) := MonadServer.dbExec GateDb.config (SqlQuery.count (sql!\"notes\") .litTrue)\n",
       "rls gate: forbidden server/DB/auth primitive"),
     ("direct_prim_sqlite",
-      "import Qed.Server.Prim\nopen Qed.Server Qed.Server.Db\ndef atk : IO (Except String DbResult) := Prim.sqliteExec \"a.db\" \"SELECT 1\" #[]\n",
+      "def atk_direct_prim_sqlite : IO (Except String DbResult) := Prim.sqliteExec \"a.db\" \"SELECT 1\" #[]\n",
       "rls gate: forbidden server/DB/auth primitive"),
     ("direct_pgwire",
-      "import Qed.Server.Db.PgWire\nopen Qed.Server.Db\ndef atk : IO (Except String DbResult) := PgWire.execParameterized \"postgres://u:p@h/d\" \"SELECT 1\" #[]\n",
+      "def atk_direct_pgwire : IO (Except String DbResult) := PgWire.execParameterized \"postgres://u:p@h/d\" \"SELECT 1\" #[]\n",
       "rls gate: forbidden server/DB/auth primitive"),
     ("direct_dbRunChecked",
-      hdr ++ "def atk {m} [Monad m] [MonadServer m] (ctx : RequestCtx) : m (Except ApiError DbResult) :=\n  dbRunChecked (Q := fun _ => True) GateDb.config (SqlQuery.count (sql!\"notes\") .litTrue) none .ok (fun _ => trivial) (fun _ => trivial) trivial [] [] ctx.auth\n",
+      "def atk_direct_dbRunChecked {m} [Monad m] [MonadServer m] (ctx : RequestCtx) : m (Except ApiError DbResult) :=\n  dbRunChecked (Q := fun _ => True) GateDb.config (SqlQuery.count (sql!\"notes\") .litTrue) none .ok (fun _ => trivial) (fun _ => trivial) trivial [] [] ctx.auth\n",
       "rls gate: direct call to `Qed.Server.Db.dbRunChecked`"),
     ("spoofed_dbRunRows_True",
-      hdr ++ "def atk {m} [Monad m] [MonadServer m] (ctx : RequestCtx) : m (Except ApiError (Array GateDb.notes)) :=\n  dbRunRows (P := True) GateDb.config (SqlQuery.select (sql!\"notes\") [sql!\"id\", sql!\"ownerId\", sql!\"body\"] .litTrue)\n    GateDb.notes.decodeRow GateDb.notes.RowInv GateDb.notes.rowInvBool GateDb.notes.rowInvBool_sound trivial (fun _ => true) \"err\" none [] [] ctx.auth\n",
+      "def atk_spoofed_dbRunRows_True {m} [Monad m] [MonadServer m] (ctx : RequestCtx) : m (Except ApiError (Array GateDb.notes)) :=\n  dbRunRows (P := True) GateDb.config (SqlQuery.select (sql!\"notes\") [sql!\"id\", sql!\"ownerId\", sql!\"body\"] .litTrue)\n    GateDb.notes.decodeRow GateDb.notes.RowInv GateDb.notes.rowInvBool GateDb.notes.rowInvBool_sound trivial (fun _ => true) \"err\" none [] [] ctx.auth\n",
       "does not match verified `RowInv"),
     ("vacuous_dbCount_false_pred",
-      hdr ++ "def atk {m} [Monad m] [MonadServer m] (ctx : RequestCtx) : m (Except ApiError Nat) :=\n  dbCount (P := ∀ r : GateDb.notes, GateDb.notes.RowInv r → false = true → GateDb.notes.ReadPolicy ctx r)\n    GateDb.config (SqlQuery.count (sql!\"notes\") .litTrue) (fun _ _ h => absurd h (by decide)) none ctx.auth\n",
+      "def atk_vacuous_dbCount_false_pred {m} [Monad m] [MonadServer m] (ctx : RequestCtx) : m (Except ApiError Nat) :=\n  dbCount (P := ∀ r : GateDb.notes, GateDb.notes.RowInv r → false = true → GateDb.notes.ReadPolicy ctx r)\n    GateDb.config (SqlQuery.count (sql!\"notes\") .litTrue) (fun _ _ h => absurd h (by decide)) none ctx.auth\n",
       "SQL `WHERE` predicate on `notes` does not match"),
     ("mismatched_dbInsert_pairs",
-      hdr ++ "def atk {m} [Monad m] [MonadServer m] (ctx : RequestCtx) (uid : String) (hu : ctx.userId = some uid) (hl : 1 ≤ uid.length ∧ uid.length ≤ 64) : m (Except ApiError GateDb.notes) :=\n  let r : GateDb.notes := { id := \"1\", ownerId := uid, body := \"hi\" }\n  dbInsert (P := GateDb.notes.InsertPolicy ctx r) GateDb.config\n    (SqlQuery.insert (sql!\"notes\") [(sql!\"id\", ToSql.toSql r.id), (sql!\"ownerId\", .text \"victim\"), (sql!\"body\", ToSql.toSql r.body)] [])\n    r GateDb.notes.RowInv (by simp [r, GateDb.notes.RowInv, hl]; decide) (by simp [r, GateDb.notes.InsertPolicy, hu]) none [] false ctx.auth\n",
+      "def atk_mismatched_dbInsert_pairs {m} [Monad m] [MonadServer m] (ctx : RequestCtx) (uid : String) (hu : ctx.userId = some uid) (hl : 1 ≤ uid.length ∧ uid.length ≤ 64) : m (Except ApiError GateDb.notes) :=\n  let r : GateDb.notes := { id := \"1\", ownerId := uid, body := \"hi\" }\n  dbInsert (P := GateDb.notes.InsertPolicy ctx r) GateDb.config\n    (SqlQuery.insert (sql!\"notes\") [(sql!\"id\", ToSql.toSql r.id), (sql!\"ownerId\", .text \"victim\"), (sql!\"body\", ToSql.toSql r.body)] [])\n    r GateDb.notes.RowInv (by simp [r, GateDb.notes.RowInv, hl]; decide) (by simp [r, GateDb.notes.InsertPolicy, hu]) none [] false ctx.auth\n",
       "SQL insert column pairs on `notes` do not match verified `newRow`"),
     ("guarded_dbInsert_no_returning",
-      hdr ++ "def atk {m} [Monad m] [MonadServer m] (ctx : RequestCtx) (uid : String) (hu : ctx.userId = some uid) (hl : 1 ≤ uid.length ∧ uid.length ≤ 64) : m (Except ApiError GateDb.notes) :=\n  let r : GateDb.notes := { id := \"1\", ownerId := uid, body := \"hi\" }\n  dbInsert (P := GateDb.notes.RowInv r → (r.ownerId == uid) = true → GateDb.notes.InsertPolicy ctx r) GateDb.config\n    (SqlQuery.insert (sql!\"notes\") [(sql!\"id\", ToSql.toSql r.id), (sql!\"ownerId\", ToSql.toSql r.ownerId), (sql!\"body\", ToSql.toSql r.body)] [] (some (.binOp .eq (.param (.text uid)) (.param (.text uid)))))\n    r GateDb.notes.RowInv (by simp [r, GateDb.notes.RowInv, hl]; decide) (fun _ _ => by simp [r, GateDb.notes.InsertPolicy, hu]) none [] false ctx.auth\n",
+      "def atk_guarded_dbInsert_no_returning {m} [Monad m] [MonadServer m] (ctx : RequestCtx) (uid : String) (hu : ctx.userId = some uid) (hl : 1 ≤ uid.length ∧ uid.length ≤ 64) : m (Except ApiError GateDb.notes) :=\n  let r : GateDb.notes := { id := \"1\", ownerId := uid, body := \"hi\" }\n  dbInsert (P := GateDb.notes.RowInv r → (r.ownerId == uid) = true → GateDb.notes.InsertPolicy ctx r) GateDb.config\n    (SqlQuery.insert (sql!\"notes\") [(sql!\"id\", ToSql.toSql r.id), (sql!\"ownerId\", ToSql.toSql r.ownerId), (sql!\"body\", ToSql.toSql r.body)] [] (some (.binOp .eq (.param (.text uid)) (.param (.text uid)))))\n    r GateDb.notes.RowInv (by simp [r, GateDb.notes.RowInv, hl]; decide) (fun _ _ => by simp [r, GateDb.notes.InsertPolicy, hu]) none [] false ctx.auth\n",
       "must set `requireReturning := true`"),
     ("unauthorized_col_proj",
-      hdr ++ "def atk {m} [Monad m] [MonadServer m] (ctx : RequestCtx) (h : ctx.userId ≠ none) : m (Except ApiError (Option String)) :=\n  dbFindOneProj (P := ∀ r : GateDb.notes, GateDb.notes.RowInv r → (r.id == \"1\") = true → GateDb.notes.ColReadPolicy_0 ctx r)\n    GateDb.config (SqlQuery.select (sql!\"notes\") [sql!\"body\"] (.binOp .eq (.col (sql!\"id\")) (.param (.text \"1\"))) none (some 1))\n    (fun _ => .ok \"\") (fun _ _ _ => h) none [] ctx.auth\n",
+      "def atk_unauthorized_col_proj {m} [Monad m] [MonadServer m] (ctx : RequestCtx) (h : ctx.userId ≠ none) : m (Except ApiError (Option String)) :=\n  dbFindOneProj (P := ∀ r : GateDb.notes, GateDb.notes.RowInv r → (r.id == \"1\") = true → GateDb.notes.ColReadPolicy_0 ctx r)\n    GateDb.config (SqlQuery.select (sql!\"notes\") [sql!\"body\"] (.binOp .eq (.col (sql!\"id\")) (.param (.text \"1\"))) none (some 1))\n    (fun _ => .ok \"\") (fun _ _ _ => h) none [] ctx.auth\n",
       "column `body` is not authorized by `GateDb.notes.ColReadPolicy_0`"),
     ("multirow_by_col_proj",
-      hdr ++ "def atk {m} [Monad m] [MonadServer m] (ctx : RequestCtx) (h : ctx.userId ≠ none) : m (Except ApiError (Array String)) :=\n  dbSelectProj (P := ∀ r : GateDb.notes, GateDb.notes.RowInv r → (r.id == \"1\") = true → GateDb.notes.ColReadPolicy_0 ctx r)\n    GateDb.config (SqlQuery.select (sql!\"notes\") [sql!\"id\"] (.binOp .eq (.col (sql!\"id\")) (.param (.text \"1\"))))\n    (fun _ => .ok \"\") (fun _ _ _ => h) none [] ctx.auth\n",
+      "def atk_multirow_by_col_proj {m} [Monad m] [MonadServer m] (ctx : RequestCtx) (h : ctx.userId ≠ none) : m (Except ApiError (Array String)) :=\n  dbSelectProj (P := ∀ r : GateDb.notes, GateDb.notes.RowInv r → (r.id == \"1\") = true → GateDb.notes.ColReadPolicy_0 ctx r)\n    GateDb.config (SqlQuery.select (sql!\"notes\") [sql!\"id\"] (.binOp .eq (.col (sql!\"id\")) (.param (.text \"1\"))))\n    (fun _ => .ok \"\") (fun _ _ _ => h) none [] ctx.auth\n",
       "with `by` columns requires `findOne`"),
     ("anonymous_auth_on_dbCount",
-      hdr ++ "def atk {m} [Monad m] [MonadServer m] (ctx : RequestCtx) (uid : String) (hu : ctx.userId = some uid) : m (Except ApiError Nat) :=\n  dbCount (P := ∀ r : GateDb.notes, GateDb.notes.RowInv r → (r.ownerId == uid) = true → GateDb.notes.ReadPolicy ctx r)\n    GateDb.config (SqlQuery.count (sql!\"notes\") (.binOp .eq (.col (sql!\"ownerId\")) (.param (.text uid))))\n    (fun r _ heq => by simp [GateDb.notes.ReadPolicy, hu, beq_iff_eq.mp heq]) none AuthToken.anonymous\n",
+      "def atk_anonymous_auth_on_dbCount {m} [Monad m] [MonadServer m] (ctx : RequestCtx) (uid : String) (hu : ctx.userId = some uid) : m (Except ApiError Nat) :=\n  dbCount (P := ∀ r : GateDb.notes, GateDb.notes.RowInv r → (r.ownerId == uid) = true → GateDb.notes.ReadPolicy ctx r)\n    GateDb.config (SqlQuery.count (sql!\"notes\") (.binOp .eq (.col (sql!\"ownerId\")) (.param (.text uid))))\n    (fun r _ heq => by simp [GateDb.notes.ReadPolicy, hu, beq_iff_eq.mp heq]) none AuthToken.anonymous\n",
       "`auth` must be `ctx.auth`"),
     ("forged_forUser",
-      hdr ++ "def atk : RequestCtx := RequestCtx.forUser \"victim\"\n",
+      "def atk_forged_forUser : RequestCtx := RequestCtx.forUser \"victim\"\n",
       "rls gate: forbidden server/DB/auth primitive"),
     ("forged_ofPrincipal",
-      hdr ++ "def atk : AuthToken := AuthToken.ofPrincipal (.system \"stripe\")\n",
+      "def atk_forged_ofPrincipal : AuthToken := AuthToken.ofPrincipal (.system \"stripe\")\n",
       "rls gate: forbidden server/DB/auth primitive"),
     ("forged_verifyRouteAuth",
-      hdr ++ "def atk {m} [Monad m] [MonadServer m] (ctx : RequestCtx) : m (Except ApiError { c : RequestCtx // c.principal = .system \"stripe\" }) :=\n  verifyRouteAuth (.system \"stripe\") (.bearerSecret \"hardcoded\") ctx\n",
+      "def atk_forged_verifyRouteAuth {m} [Monad m] [MonadServer m] (ctx : RequestCtx) : m (Except ApiError { c : RequestCtx // c.principal = .system \"stripe\" }) :=\n  verifyRouteAuth (.system \"stripe\") (.bearerSecret \"hardcoded\") ctx\n",
       "is forbidden outside `<Server>.httpDispatchM`"),
     ("forged_mkSystem_job",
-      hdr ++ "def atk : ServerJob Unit := ServerJob.mkSystem \"OtherSrv\" \"poll\" 1000 (by decide) (fun _ _ => pure (.ok ()))\n",
+      "def atk_forged_mkSystem_job : ServerJob Unit := ServerJob.mkSystem \"OtherSrv\" \"poll\" 1000 (by decide) (fun _ _ => pure (.ok ()))\n",
       "is forbidden outside `<Server>.jobs`"),
     ("forged_DbConfig_mk",
-      hdr ++ "def atk : DbConfig := { name := \"Fake\", endpoint := .sqlitePath \"x.db\" }\n",
+      "def atk_forged_DbConfig_mk : DbConfig := { name := \"Fake\", endpoint := .sqlitePath \"x.db\" }\n",
       "`DbConfig.mk` is forbidden outside `<Db>.config`"),
     ("custom_MonadServer_inst",
-      hdr ++ "set_option warn.classDefReducibility false in\ndef atk (x : MonadServer Id) : MonadServer Id := x\n",
+      "set_option warn.classDefReducibility false in\ndef atk_custom_MonadServer_inst (x : MonadServer Id) : MonadServer Id := x\n",
       "custom `Qed.Server.MonadServer` instance"),
     ("direct_ServerJob_runM",
-      hdr ++ "def atk {m} [Monad m] [MonadServer m] [MonadAtomic Unit m] (j : ServerJob Unit) : m (Except ApiError Unit) := j.runM\n",
+      "def atk_direct_ServerJob_runM {m} [Monad m] [MonadServer m] [MonadAtomic Unit m] (j : ServerJob Unit) : m (Except ApiError Unit) := j.runM\n",
       "rls gate: forbidden server/DB/auth primitive"),
     ("dbGroupAgg_count_policy",
-      hdr ++ "def atk {m} [Monad m] [MonadServer m] (ctx : RequestCtx) (h : ctx.userId ≠ none) : m (Except ApiError (Array (String × Nat))) :=\n  dbGroupAgg (P := ∀ r : GateDb.notes, GateDb.notes.RowInv r → true = true → GateDb.notes.CountPolicy ctx r)\n    GateDb.config (SqlQuery.groupAggregate .count (sql!\"notes\") [sql!\"ownerId\"] none .litTrue)\n    (fun _ => .ok (\"\", 0)) (fun _ _ _ => h) none ctx.auth\n",
+      "def atk_dbGroupAgg_count_policy {m} [Monad m] [MonadServer m] (ctx : RequestCtx) (h : ctx.userId ≠ none) : m (Except ApiError (Array (String × Nat))) :=\n  dbGroupAgg (P := ∀ r : GateDb.notes, GateDb.notes.RowInv r → true = true → GateDb.notes.CountPolicy ctx r)\n    GateDb.config (SqlQuery.groupAggregate .count (sql!\"notes\") [sql!\"ownerId\"] none .litTrue)\n    (fun _ => .ok (\"\", 0)) (fun _ _ _ => h) none ctx.auth\n",
       "must prove `ReadPolicy` or a multi-row `ColReadPolicy`"),
     ("dbGroupAgg_by_col_policy",
-      hdr ++ "def atk {m} [Monad m] [MonadServer m] (ctx : RequestCtx) (h : ctx.userId ≠ none) : m (Except ApiError (Array (String × Nat))) :=\n  dbGroupAgg (P := ∀ r : GateDb.notes, GateDb.notes.RowInv r → (r.id == \"1\") = true → GateDb.notes.ColReadPolicy_0 ctx r)\n    GateDb.config (SqlQuery.groupAggregate .count (sql!\"notes\") [sql!\"id\"] none (.binOp .eq (.col (sql!\"id\")) (.param (.text \"1\"))))\n    (fun _ => .ok (\"\", 0)) (fun _ _ _ => h) none ctx.auth\n",
+      "def atk_dbGroupAgg_by_col_policy {m} [Monad m] [MonadServer m] (ctx : RequestCtx) (h : ctx.userId ≠ none) : m (Except ApiError (Array (String × Nat))) :=\n  dbGroupAgg (P := ∀ r : GateDb.notes, GateDb.notes.RowInv r → (r.id == \"1\") = true → GateDb.notes.ColReadPolicy_0 ctx r)\n    GateDb.config (SqlQuery.groupAggregate .count (sql!\"notes\") [sql!\"id\"] none (.binOp .eq (.col (sql!\"id\")) (.param (.text \"1\"))))\n    (fun _ => .ok (\"\", 0)) (fun _ _ _ => h) none ctx.auth\n",
       "cannot authorize multi-row `groupBy`"),
     ("dbGroupAgg_unauth_col",
-      hdr ++ "def atk {m} [Monad m] [MonadServer m] (ctx : RequestCtx) (h : ctx.userId ≠ none) : m (Except ApiError (Array (String × Nat))) :=\n  dbGroupAgg (P := ∀ r : GateDb.notes, GateDb.notes.RowInv r → true = true → GateDb.notes.ColReadPolicy_1 ctx r)\n    GateDb.config (SqlQuery.groupAggregate .count (sql!\"notes\") [sql!\"body\"] none .litTrue)\n    (fun _ => .ok (\"\", 0)) (fun _ _ _ => h) none ctx.auth\n",
+      "def atk_dbGroupAgg_unauth_col {m} [Monad m] [MonadServer m] (ctx : RequestCtx) (h : ctx.userId ≠ none) : m (Except ApiError (Array (String × Nat))) :=\n  dbGroupAgg (P := ∀ r : GateDb.notes, GateDb.notes.RowInv r → true = true → GateDb.notes.ColReadPolicy_1 ctx r)\n    GateDb.config (SqlQuery.groupAggregate .count (sql!\"notes\") [sql!\"body\"] none .litTrue)\n    (fun _ => .ok (\"\", 0)) (fun _ _ _ => h) none ctx.auth\n",
       "column `body` in `groupBy` is not authorized"),
     ("dbGroupAgg_mismatched_where",
-      hdr ++ "def atk {m} [Monad m] [MonadServer m] (ctx : RequestCtx) : m (Except ApiError (Array (String × Nat))) :=\n  dbGroupAgg (P := ∀ r : GateDb.notes, GateDb.notes.RowInv r → false = true → GateDb.notes.ReadPolicy ctx r)\n    GateDb.config (SqlQuery.groupAggregate .count (sql!\"notes\") [sql!\"ownerId\"] none .litTrue)\n    (fun _ => .ok (\"\", 0)) (fun _ _ h => absurd h (by decide)) none ctx.auth\n",
+      "def atk_dbGroupAgg_mismatched_where {m} [Monad m] [MonadServer m] (ctx : RequestCtx) : m (Except ApiError (Array (String × Nat))) :=\n  dbGroupAgg (P := ∀ r : GateDb.notes, GateDb.notes.RowInv r → false = true → GateDb.notes.ReadPolicy ctx r)\n    GateDb.config (SqlQuery.groupAggregate .count (sql!\"notes\") [sql!\"ownerId\"] none .litTrue)\n    (fun _ => .ok (\"\", 0)) (fun _ _ h => absurd h (by decide)) none ctx.auth\n",
       "SQL `WHERE` predicate on `groupBy notes` does not match")
   ]
-  runTasks <| attacks.zipIdx.map fun ((tag, src, wantErr), idx) => do
-    let modName := s!"RlsGateAtk{idx}"
-    let (cc, cerr) ← compileMod modName src
-    if cc != 0 then
-      c.check s!"[rls-gate] compile attack `{tag}`" false cerr
-    else
-      let (vc, vout, verr) ← runCmd qedjs #["--verify-env", "--skip-qed", modName] (env := env)
-      let combined := vout ++ verr
-      c.check s!"[rls-gate] rejects `{tag}`" (vc != 0 && combined.contains wantErr) s!"exit={vc}, out={combined.take 240}"
+  let atkSrc := "import RlsGateFixture\nimport Qed.Server.Prim\nimport Qed.Server.Db.PgWire\nopen Qed Qed.Server Qed.Server.Db\n" ++
+    String.intercalate "\n" (attacks.map fun (_, src, _) => src)
+  let (ac, aerr) ← compileMod "RlsGateAttacks" atkSrc
+  if ac != 0 then c.check "[rls-gate] compile batched attack module" false aerr; return
+  let (ec, eout, eerr) ← runCmd qedjs #["--verify-env", "--skip-qed", "RlsGateAttacks"] (env := env)
+  c.check "[rls-gate] --verify-env rejects RlsGateAttacks end-to-end" (ec != 0) (eout ++ eerr)
+  let declArgs := attacks.toArray.map fun (tag, _, _) => s!"atk_{tag}"
+  let (vc, vout, verr) ← runCmd qedjs (#["--verify-decl-each", "RlsGateAttacks", "--"] ++ declArgs) (env := env)
+  let rows := (vout.splitOn "\n").filterMap fun l =>
+    match l.splitOn "\t" with | st :: d :: rest => some (d, st, "\t".intercalate rest) | _ => none
+  forList attacks fun (tag, _, wantErr) => do
+    let dn := s!"atk_{tag}"
+    match rows.find? (·.1 == dn) with
+    | some (_, st, msg) => c.check s!"[rls-gate] rejects `{tag}`" (vc == 0 && st == "REJECT" && msg.contains wantErr) s!"exit={vc}, status={st}, out={msg.take 240}"
+    | none => c.check s!"[rls-gate] rejects `{tag}`" false s!"exit={vc}, missing result line: {(vout ++ verr).take 240}"
 
 rollback_env qedServerMain DbChecks.BuildJobSrv
 rollback_env qedServerMain DbChecks.PrincipalApi

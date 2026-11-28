@@ -904,7 +904,8 @@ private def rejectSrvAssignPredict (stmt : Syntax) : LowerM Unit := do
   let bodyTerm := wrapTxVar (← recAsync innerCtx txStmts)
   let restTerm? ← if aCtx.loopMuts?.isSome || !(rest.isEmpty || blockAlwaysReturns txStmts) then some <$> recAsync aCtx rest else pure none
   return qctx.runPure do
-    let txRun ← Db.mkAppC `Qed.Server.dbRunTx #[mkIdentFrom aliasRef dbInfo.configConst, ← `(fun ($txId:ident : UInt64) => $bodyTerm)]
+    let ctxT : Term := aCtx.ctxTerm?.getD ⟨(mkIdent `ctx).raw⟩
+    let txRun ← Db.mkAppC `Qed.Server.dbRunTx #[mkIdentFrom aliasRef dbInfo.configConst, ← `(fun ($txId:ident : UInt64) => $bodyTerm), ← `(($ctxT).auth)]
     match aCtx.loopMuts?, restTerm? with
     | some lm, some rt => let txRetId := mkIdent `_txRet; `($txRun >>= fun | Option.some $txRetId:ident => $(← wrapLoopStep false lm ``Qed.QedLoopStep.ret (some txRetId)) | Option.none => $rt)
     | none, some rt => Db.mkAppC `Qed.Server.srvSeqM #[txRun, ← `(fun _ => $rt)]

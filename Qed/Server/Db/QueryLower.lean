@@ -133,7 +133,10 @@ open Lean Elab Command
 private def parseStrLitArg? (stx : Syntax) : Option String :=
   let u := unwrapParens1 stx; if u.getKind == ``qedLitStr then some (⟨u.getArg 0⟩ : TSyntax `str).getString else none
 
-private def mkPolHint (label fallback pfx : String) : String := if label.isEmpty then fallback else s!"{pfx} `{label}`."
+private def mkPolHint (qualName opLabel label pfx : String) : String :=
+  if label.isEmpty then
+    s!"Table `{qualName}` has no `policy {opLabel}` (omitted policies default to deny). Add `policy {opLabel} requires ...` (or `policy read, write requires true` for an unrestricted table)."
+  else s!"{pfx} `{label}`."
 
 @[noinline] private def parseColNameList (tbl : DbTableInfo) (stx : Syntax) (label : String)
     (allowSingleStr : Bool) (forbidDup : Bool := false) (forbidEnc : Bool := false)
@@ -499,8 +502,8 @@ private def DbCallCtx.lowerVal (c : DbCallCtx) (s : Syntax) : CommandElabM Term 
 private def DbCallCtx.findNamed (c : DbCallCtx) (k : String) : Option Syntax := findNamedArg? c.namedArgs k
 private def DbCallCtx.qualName (c : DbCallCtx) : String := s!"{c.dbInfo.shortName}.{c.tbl.tableName}"
 private def DbCallCtx.readPolKind (c : DbCallCtx) : String := s!"read policy `{c.qualName}.read`"
-private def DbCallCtx.readPolHint (c : DbCallCtx) (t : DbTableInfo := c.tbl) (clause := "`where = r => ...`") (desc := "the table's") : String :=
-  mkPolHint t.readPolicyLabel s!"Check {clause} against {desc} `policy read`." s!"Ensure {clause} (together with `requires` / `if` guards) implies"
+private def DbCallCtx.readPolHint (c : DbCallCtx) (t : DbTableInfo := c.tbl) (clause := "`where = r => ...`") : String :=
+  mkPolHint s!"{c.dbInfo.shortName}.{t.tableName}" "read" t.readPolicyLabel s!"Ensure {clause} (together with `requires` / `if` guards) implies"
 private def DbCallCtx.parseWhere (c : DbCallCtx) (whereStx? : Option Syntax := c.whereArg?) (needCross := false)
     (tbl : DbTableInfo := c.tbl) (rowTyId : Ident := c.rowTyId) : CommandElabM (Term × Term × Option (String × Syntax) × Bool) :=
   parseWhereArg c.qctx c.lowerValWithLocals c.dbInfo c.dbAlias tbl rowTyId whereStx? needCross
@@ -517,34 +520,36 @@ private def DbCallCtx.parseWhere (c : DbCallCtx) (whereStx? : Option Syntax := c
   mkRowProof c isCross predT #[c.rowInvId, polId] kind hint fun r =>
     mkAppTermsPure polId (if isCross && hasCrossPol then #[mkIdent `_dbSnap, c.ctxId, r] else #[c.ctxId, r])
 
+private def DbCallCtx.authTerm (c : DbCallCtx) : PureQuotM Term := `(($(c.ctxId)).auth)
+
 @[noinline] private def mkRowRunCallPure (c : DbCallCtx) (isOne : Bool) (qT proofT runPredT errLit encWriteT : Term) : PureQuotM Term := do
   mkAppC (if isOne then `Qed.Server.Db.dbRunOneRow else `Qed.Server.Db.dbRunRows)
     #[c.cfgId, qT, c.tid c.tbl `decodeRow, c.rowInvId, c.tid c.tbl `rowInvBool, c.tid c.tbl `rowInvBool_sound,
-      proofT, runPredT, errLit, c.txOptT, encWriteT, ← mkListTerm (← mkTblEncReadPure c.tbl)]
+      proofT, runPredT, errLit, c.txOptT, encWriteT, ← mkListTerm (← mkTblEncReadPure c.tbl), ← c.authTerm]
 
 @[noinline] private def lowerDbSelect (c : DbCallCtx) : CommandElabM (Term × Bool) := do
   if c.opName == "count" then
     let (polId, hasCrossPol, polKind, polHint) :=
       if c.tbl.hasCountPolicy then
         (c.tid c.tbl `CountPolicy, c.tbl.hasCrossCountPolicy, s!"count policy `{c.qualName}.count`",
-          mkPolHint c.tbl.countPolicyLabel "Check `where = r => ...` against the table's `policy count`." "Ensure `where = r => ...` (together with `requires` / `if` guards) implies")
+          mkPolHint c.qualName "count" c.tbl.countPolicyLabel "Ensure `where = r => ...` (together with `requires` / `if` guards) implies")
       else (c.readPolId, c.tbl.hasCrossReadPolicy, c.readPolKind, c.readPolHint)
     let (predT, sqlW, _, isCross) ← c.parseWhere (needCross := hasCrossPol)
     let pf ← mkPolProof c isCross hasCrossPol predT polId polKind polHint
-    return (c.q do mkAppC `Qed.Server.Db.dbCount #[c.cfgId, ← mkAppC `Qed.Server.Db.SqlQuery.count #[c.tblSqlId, sqlW], pf, c.txOptT], false)
+    return (c.q do mkAppC `Qed.Server.Db.dbCount #[c.cfgId, ← mkAppC `Qed.Server.Db.SqlQuery.count #[c.tblSqlId, sqlW], pf, c.txOptT, ← c.authTerm], false)
   let isOne := c.opName == "findOne" || c.opName == "findOneMeta"
   let (ordT, limT, offT) ← if !isOne then parseQueryWindow c.qctx c.tbl c.lowerVal c.findNamed
     else pure (← parseOrderByArg c.qctx c.tbl (c.findNamed "orderBy"), c.q (mkOptTerm (some (Syntax.mkNumLit "1"))), mkCIdent `Option.none)
   let mkProjCall (sqlW pf colsT decT encT : Term) : Term := c.q do
     let qT ← mkAppC `Qed.Server.Db.SqlQuery.select #[c.tblSqlId, colsT, sqlW, ordT, limT, offT]
-    mkAppC (if isOne then `Qed.Server.Db.dbFindOneProj else `Qed.Server.Db.dbSelectProj) #[c.cfgId, qT, decT, pf, c.txOptT, encT]
+    mkAppC (if isOne then `Qed.Server.Db.dbFindOneProj else `Qed.Server.Db.dbSelectProj) #[c.cfgId, qT, decT, pf, c.txOptT, encT, ← c.authTerm]
   if c.opName == "selectMeta" || c.opName == "findOneMeta" then
     unless c.tbl.hasMeta do
       mkDbErr c.stx s!"`{c.opName}` is only available on tables with both encrypted and non-encrypted columns (`{c.qualName}` can use `{if isOne then "findOne" else "select"}` directly)"
     let (polId, hasCrossPol, polKind, polHint) :=
       if c.tbl.hasReadMetaPolicy then
         (c.tid c.tbl `ReadMetaPolicy, c.tbl.hasCrossReadMetaPolicy, s!"read_meta policy `{c.qualName}.read_meta`",
-          mkPolHint c.tbl.readMetaPolicyLabel "Check `where = r => ...` against the table's `policy read_meta`." "Ensure `where = r => ...` (together with `requires` / `if` guards) implies")
+          mkPolHint c.qualName "read_meta" c.tbl.readMetaPolicyLabel "Ensure `where = r => ...` (together with `requires` / `if` guards) implies")
       else (c.readPolId, c.tbl.hasCrossReadPolicy, c.readPolKind, c.readPolHint)
     let (predT, sqlW, _, isCross) ← c.parseWhere (needCross := hasCrossPol)
     let pf ← mkPolProof c isCross hasCrossPol predT polId polKind polHint
@@ -598,8 +603,8 @@ private def DbCallCtx.parseWhere (c : DbCallCtx) (whereStx? : Option Syntax := c
   return (c.q do
     let aggOp := mkCIdent <| match c.opName with | "sum" => `Qed.Server.Db.SqlAggOp.sum | "min" => `Qed.Server.Db.SqlAggOp.min | _ => `Qed.Server.Db.SqlAggOp.max
     let qT ← mkAppC `Qed.Server.Db.SqlQuery.aggregate #[aggOp, c.tblSqlId, ← mkSqlIdentTermPure colInfo.name, sqlW]
-    if c.opName == "sum" then mkAppC (if colInfo.isNat then `Qed.Server.Db.dbSumNat else `Qed.Server.Db.dbSumInt) #[c.cfgId, qT, pf, c.txOptT]
-    else mkAppC `Qed.Server.Db.dbAggOpt #[c.cfgId, qT, ← mkFieldProjLam c.rowTyId (mkIdentFrom colStx (Name.mkSimple colInfo.name)), pf, c.txOptT], false)
+    if c.opName == "sum" then mkAppC (if colInfo.isNat then `Qed.Server.Db.dbSumNat else `Qed.Server.Db.dbSumInt) #[c.cfgId, qT, pf, c.txOptT, ← c.authTerm]
+    else mkAppC `Qed.Server.Db.dbAggOpt #[c.cfgId, qT, ← mkFieldProjLam c.rowTyId (mkIdentFrom colStx (Name.mkSimple colInfo.name)), pf, c.txOptT, ← c.authTerm], false)
 
 @[noinline] private def lowerDbJoin (c : DbCallCtx) : CommandElabM (Term × Bool) := do
   let some rStx := (c.findNamed "table").orElse fun _ => (c.findNamed "with").orElse fun _ => c.posArgs[0]?
@@ -625,7 +630,7 @@ private def DbCallCtx.parseWhere (c : DbCallCtx) (whereStx? : Option Syntax := c
     let (rTblSqlId, rAllColsT) ← mkTblSqlPartsPure rightTbl
     let qT ← mkAppC `Qed.Server.Db.SqlQuery.joinSelect #[c.tblSqlId, rTblSqlId, c.allColsT, rAllColsT, ← mkSqlIdentTermPure lCol, ← mkSqlIdentTermPure rCol, lSqlW, rSqlW, ordT, limT, offT]
     let lPf ← mkDbProveTac #[c.rowInvId, c.readPolId] c.readPolKind c.opQual c.readPolHint
-    let rPf ← mkDbProveTac #[c.tid rightTbl `RowInv, c.tid rightTbl `ReadPolicy] s!"read policy `{c.dbInfo.shortName}.{rightTbl.tableName}.read` (joined table)" c.opQual (c.readPolHint rightTbl "`rightWhere = r => ...`" "the joined table's")
+    let rPf ← mkDbProveTac #[c.tid rightTbl `RowInv, c.tid rightTbl `ReadPolicy] s!"read policy `{c.dbInfo.shortName}.{rightTbl.tableName}.read` (joined table)" c.opQual (c.readPolHint rightTbl "`rightWhere = r => ...`")
     let joinEncT ← mkListTerm ((← mkTblEncReadPure c.tbl) ++ (← mkTblEncReadPure rightTbl c.tbl.columns.size))
     mkAppC `Qed.Server.Db.dbJoinSelect #[c.cfgId, qT, Syntax.mkNumLit (toString c.tbl.columns.size),
       c.tid c.tbl `decodeRow, c.tid rightTbl `decodeRow, c.rowInvId, c.tid c.tbl `rowInvBool, c.tid c.tbl `rowInvBool_sound,
@@ -686,7 +691,7 @@ private def DbCallCtx.parseWhere (c : DbCallCtx) (whereStx? : Option Syntax := c
     mkPairTerm (← mkSqlIdentTermPure col.name) (← mkAppC `Qed.Server.Db.ToSql.toSql #[← `(($rowVar).$(mkIdentFrom c.stx (Name.mkSimple col.name)))]))
   let conflictColTs ← mkListTerm (← Lang.mapPQ conflictCols fun cc => mkSqlIdentTermPure cc.name)
   let invPf ← mkDbProveTac #[c.rowInvId] s!"table constraint `{c.qualName}.RowInv`" c.opQual "Guard input parameters with `requires` or `if` so every column `where` constraint and table `invariant` holds."
-  let insPolHintBase := mkPolHint c.tbl.insertPolicyLabel "Ensure inserted row satisfies the table's `policy insert` / `policy write`."
+  let insPolHintBase := mkPolHint c.qualName "insert" c.tbl.insertPolicyLabel
     (if insertGuard?.isSome then "Ensure `where = r => ...` implies" else "Ensure inserted row satisfies")
   let insPolHint := if insertGuard?.isNone && c.tbl.hasCrossInsertPolicy then
       insPolHintBase ++ (if c.opName == "upsert" then " For cross-table insert policies, use `insertOrIgnore(where = r => ...)` + `updateOne` inside `transaction`."
@@ -722,17 +727,17 @@ private def DbCallCtx.parseWhere (c : DbCallCtx) (whereStx? : Option Syntax := c
         else pure (mkCIdent `List.nil : Term)
       if !isIgn then
         let qT ← mkAppC `Qed.Server.Db.SqlQuery.insert #[c.tblSqlId, pairTs, firstColRetTs, guardOptT, colTypeTs]
-        mkAppC `Qed.Server.Db.dbInsert #[c.cfgId, qT, rowVar, c.rowInvId, invPf, insPolPf, c.txOptT, encWriteT, quote hasGuard]
+        mkAppC `Qed.Server.Db.dbInsert #[c.cfgId, qT, rowVar, c.rowInvId, invPf, insPolPf, c.txOptT, encWriteT, quote hasGuard, ← c.authTerm]
       else
         let qT ← mkAppC `Qed.Server.Db.SqlQuery.insertOrIgnore #[c.tblSqlId, pairTs, conflictColTs, firstColRetTs, guardOptT, colTypeTs]
-        mkAppC `Qed.Server.Db.dbInsertOrIgnore #[c.cfgId, qT, rowVar, c.rowInvId, invPf, insPolPf, c.txOptT, encWriteT]
+        mkAppC `Qed.Server.Db.dbInsertOrIgnore #[c.cfgId, qT, rowVar, c.rowInvId, invPf, insPolPf, c.txOptT, encWriteT, ← c.authTerm]
     else
       let some (conflictPredT, conflictSqlW) := conflictW? | unreachable!
       let conflictNames := conflictCols.map (·.name)
       let updColTs ← mkListTerm (← Lang.foldlPQ c.tbl.columns #[] fun acc col =>
         if !col.isPrimaryKey && !col.isImmutable && !conflictNames.contains col.name then return acc.push (← mkSqlIdentTermPure col.name) else pure acc)
       let (updPolId, transInvId) := (c.tid c.tbl `UpdatePolicy, c.tid c.tbl `TransInv)
-      let updHint := mkPolHint c.tbl.updatePolicyLabel "Ensure `where = r => ...` satisfies the table's `policy update` / `policy write`." "Ensure `where = r => ...` implies"
+      let updHint := mkPolHint c.qualName "update" c.tbl.updatePolicyLabel "Ensure `where = r => ...` implies"
       let updPolNewPf ← mkDbProveTac #[updPolId] s!"update policy `{c.qualName}.update`" c.opQual updHint
       let updPolOldPf ← mkDbProveTac #[c.rowInvId, updPolId] s!"upsert conflict update policy `{c.qualName}.update`" c.opQual updHint
       let transPf ← mkDbProveTac #[c.rowInvId, transInvId] s!"transition/monotonicity invariant `{c.qualName}.TransInv`" c.opQual "Ensure the upserted row satisfies all `old(...)` and `transition` invariants against any conflicting row."
@@ -744,9 +749,9 @@ private def DbCallCtx.parseWhere (c : DbCallCtx) (whereStx? : Option Syntax := c
 @[noinline] private def lowerDbWrite (c : DbCallCtx) : CommandElabM (Term × Bool) := do
   if c.opName == "delete" then
     let (predT, sqlW, _, isCross) ← c.parseWhere (needCross := c.tbl.hasCrossDeletePolicy)
-    let delHint := mkPolHint c.tbl.deletePolicyLabel "Check the `where = r => ...` clause against the table's `policy delete` / `policy write`." "Ensure `where = r => ...` implies"
+    let delHint := mkPolHint c.qualName "delete" c.tbl.deletePolicyLabel "Ensure `where = r => ...` implies"
     let pf ← mkPolProof c isCross c.tbl.hasCrossDeletePolicy predT (c.tid c.tbl `DeletePolicy) s!"delete policy `{c.qualName}.delete`" delHint
-    return (c.q do mkAppC `Qed.Server.Db.dbDelete #[c.cfgId, ← mkAppC `Qed.Server.Db.SqlQuery.delete #[c.tblSqlId, sqlW, mkCIdent `List.nil], pf, c.txOptT], true)
+    return (c.q do mkAppC `Qed.Server.Db.dbDelete #[c.cfgId, ← mkAppC `Qed.Server.Db.SqlQuery.delete #[c.tblSqlId, sqlW, mkCIdent `List.nil], pf, c.txOptT, ← c.authTerm], true)
   let hasCol (nm : String) := c.tbl.columns.any (·.name == nm)
   let isClauseWhere (s : Syntax) := (unwrapParens1 s).getKind == ``qedLam1 || !hasCol "where"
   let allowsConflict := c.opName == "upsert" || c.opName == "insertOrIgnore"
@@ -845,7 +850,7 @@ private structure UpdateFieldAcc where
   let (leanFIds, leanFVals, sqlPairs) := (acc.leanFIds, acc.leanFVals, acc.sqlPairs)
   let setFnT := c.q `(fun ($setRowVar:ident : $(c.rowTyId)) => { $setRowVar with $[$leanFIds:ident := $leanFVals:term],* })
   let (updPolId, transInvId) := (c.tid c.tbl `UpdatePolicy, c.tid c.tbl `TransInv)
-  let polHint := mkPolHint c.tbl.updatePolicyLabel "Ensure `where = r => ...` satisfies the table's `policy update` / `policy write`." "Ensure `where = r => ...` implies"
+  let polHint := mkPolHint c.qualName "update" c.tbl.updatePolicyLabel "Ensure `where = r => ...` implies"
   let polPf ← if c.tbl.hasTwoStateUpdatePolicy then
       mkRowProof c isCross predT #[c.rowInvId, updPolId] s!"update policy `{c.qualName}.update`" polHint fun r => do
         let sr ← mkAppTermsPure setFnT #[r]

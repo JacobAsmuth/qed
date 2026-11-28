@@ -231,9 +231,9 @@ private def stepEffect {σ : Type} (env : EvalEnv) (st : EvalState σ) (eff : Se
       match matchHttpStub req st.httpStubs with
       | some (resp, stubs') => ({ st with httpStubs := stubs', trace := tr }, resp)
       | none => ({ st with trace := tr }, .error (ApiError.internal s!"unmocked HTTP {req.method} {req.url}"))
-  | .dbExec cfg q | .dbTxExec cfg _ q => let (db', res) := evalSqlQuery cfg st.db q; ({ st with db := db', trace := { st.trace with dbQueries := st.trace.dbQueries ++ [q] } }, res)
+  | .dbExec cfg q _ | .dbTxExec cfg _ q => let (db', res) := evalSqlQuery cfg st.db q; ({ st with db := db', trace := { st.trace with dbQueries := st.trace.dbQueries ++ [q] } }, res)
   | .dbExecDdl cfg => ({ st with db := st.db.ensureTables cfg.tables }, .ok ())
-  | .dbTxBegin cfg => let db' := st.db.ensureTables cfg.tables; let tid := st.nextTxId; ({ st with db := db', txSaved := (tid, db') :: st.txSaved, nextTxId := tid + 1 }, .ok tid)
+  | .dbTxBegin cfg _ => let db' := st.db.ensureTables cfg.tables; let tid := st.nextTxId; ({ st with db := db', txSaved := (tid, db') :: st.txSaved, nextTxId := tid + 1 }, .ok tid)
   | .dbTxCommit _ tid => ({ st with txSaved := st.txSaved.filter (·.1 != tid) }, .ok ())
   | .dbTxRollback _ tid => (st.txSaved.lookup tid).elim (st, ()) fun saved => ({ st with db := saved, txSaved := st.txSaved.filter (·.1 != tid) }, ())
   | .setCookie c => withTr (fun t => { t with cookies := t.cookies ++ [c] }) ()
@@ -272,14 +272,16 @@ def evalProg {σ α : Type} (env : EvalEnv) (st : EvalState σ) : ThreadProg σ 
 
 def setNow (e : EvalEnv) (ms : UInt64) : EvalEnv := { e with nowMs := ms }
 def setEnvVar (e : EvalEnv) (k v : String) : EvalEnv := { e with envVars := (k, v) :: e.envVars }
-def setSession (c : RequestCtx) (b : Bool) : RequestCtx := { c with auth := { c.auth with authMethod := if b then .session else .bearer } }
+def setSession (c : RequestCtx) (b : Bool) : RequestCtx :=
+  c.withAuth (AuthToken.ofRaw c.auth.principal c.auth.claims (if b then .session else .bearer))
 def setQuery (c : RequestCtx) (q : String) : RequestCtx := { c with query := q }
 def setBody (c : RequestCtx) (b : String) : RequestCtx := { c with body := b }
 def setHeader (c : RequestCtx) (k v : String) : RequestCtx := { c with headers := (k, v) :: c.headers }
-def setRole (c : RequestCtx) (r : String) : RequestCtx := { c with auth := { c.auth with claims := ("role", r) :: c.auth.claims } }
+def setRole (c : RequestCtx) (r : String) : RequestCtx :=
+  c.withAuth (AuthToken.ofRaw c.auth.principal (("role", r) :: c.auth.claims) c.auth.authMethod)
 def setUser (c : RequestCtx) : Option String → RequestCtx
-  | none => { c with auth := { c.auth with principal := .anonymous, authMethod := .none } }
-  | some u => { c with auth := { c.auth with principal := .user u, authMethod := if c.auth.authMethod == .none then .bearer else c.auth.authMethod } }
+  | none => c.withAuth (AuthToken.ofRaw .anonymous c.auth.claims .none)
+  | some u => c.withAuth (AuthToken.ofRaw (.user u) c.auth.claims (if c.auth.authMethod == .none then .bearer else c.auth.authMethod))
 def setPrincipal (c : RequestCtx) (p : Principal) : RequestCtx := c.withAuth (AuthToken.ofPrincipal p)
 def setShared {σ : Type} (s : EvalState σ) (v : σ) : EvalState σ := { s with shared := v }
 def pushHttpStub {σ : Type} (s : EvalState σ) (stub : HttpStub) : EvalState σ := { s with httpStubs := s.httpStubs ++ [stub] }

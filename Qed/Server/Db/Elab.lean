@@ -515,16 +515,42 @@ private def optSqlStr (ps : Array String) : Term := quote (if ps.isEmpty then no
   mkAppC `Qed.Server.Db.ColumnSchema.mk #[← mkSqlIdentTermPure col.colName, cTyT, quote col.isNullable, quote col.isPrimaryKey,
     quote col.isUnique, quote col.isImmutable, refT, onDelT, optSqlStr chkParts]
 
+private def renderRlsOpSql (tblName : String) (colNames : Array String) (tables : Array ParsedTable)
+    (es : Array Syntax) (forceTrue : Bool := false) : String × Bool :=
+  if es.isEmpty then ("FALSE", false)
+  else if forceTrue then ("TRUE", true)
+  else
+    let ps := renderSqlPreds tblName colNames true tables es
+    if ps.isEmpty then ("TRUE", true) else (String.intercalate " AND " ps.toList, false)
+
 @[noinline] private def mkTableSchemaCmdPure (t : ParsedTable) (tables : Array ParsedTable) (rowTypeName : Name) (colNames : Array String)
-    (readPolsExp updatePolsExp : Array Syntax) :
+    (readPolsExp insertPolsExp updatePolsExp deletePolsExp countPolsExp readMetaPolsExp : Array Syntax)
+    (colReadPolsExp : Array (Array Syntax)) (updTwoState : Bool) :
     PureQuotM (TSyntax `command × Term) := do
   let colSchemaTerms ← Lang.mapPQ t.cols (mkColSchemaTermPure t.tableName colNames)
   let idxTerms ← Lang.mapPQ t.indexes fun idxs => do mkListTerm (← Lang.mapPQ idxs fun ic => mkSqlIdentTermPure ic.getId.eraseMacroScopes.toString)
   let schemaId := mkIdentFrom t.ident (rowTypeName ++ `schema)
+  let rlsOf (es : Array Syntax) (forceTrue := false) := renderRlsOpSql t.tableName colNames tables es forceTrue
+  let (rlsIns, _) := rlsOf insertPolsExp
+  let (rlsUpd, updFb) := rlsOf updatePolsExp updTwoState
+  let (rlsDel, delFb) := rlsOf deletePolsExp
+  let mut readBranches : Array String := #[]
+  for es in #[readPolsExp, countPolsExp, readMetaPolsExp] ++ colReadPolsExp do
+    if !es.isEmpty then
+      let (s, _) := rlsOf es
+      if s != "FALSE" then readBranches := pushUnique readBranches s
+  if !updatePolsExp.isEmpty && !updTwoState && !updFb && rlsUpd != "FALSE" then
+    readBranches := pushUnique readBranches rlsUpd
+  if !deletePolsExp.isEmpty && !delFb && rlsDel != "FALSE" then
+    readBranches := pushUnique readBranches rlsDel
+  let rlsRead :=
+    if readBranches.isEmpty then "FALSE"
+    else if readBranches.contains "TRUE" then "TRUE"
+    else if readBranches.size == 1 then readBranches[0]!
+    else String.intercalate " OR " (readBranches.toList.map fun b => "(" ++ b ++ ")")
   let schemaVal ← mkAppC `Qed.Server.Db.TableSchema.mk #[← mkSqlIdentTermPure t.tableName, ← mkListTerm colSchemaTerms, ← mkListTerm idxTerms,
     ← mkListTerm ((renderSqlPreds t.tableName colNames false #[] t.singleInvs).map quote),
-    optSqlStr (renderSqlPreds t.tableName colNames true tables readPolsExp),
-    optSqlStr (renderSqlPreds t.tableName colNames true tables updatePolsExp)]
+    quote (some rlsRead), quote (some rlsIns), quote (some rlsUpd), quote (some rlsDel)]
   return (← `(command| def $schemaId : Qed.Server.Db.TableSchema := $schemaVal), schemaId)
 
 @[noinline] private def checkColInstances (fTys : Array Term) (initRepr : Bool) : TermElabM (Bool × Bool) :=
@@ -594,7 +620,9 @@ private def tablePolicyNames (t : ParsedTable) : Array String :=
     (t : ParsedTable) (tables : Array ParsedTable) (colNames : Array String) (rowTypeId : Ident)
     (mkSub : Name → Ident) (snapTyId? : Option Ident) (suf : Name) (es : Array Syntax)
     (allowOld : Bool := false) : CommandElabM (TSyntax `command × String × Bool × Bool × Array Syntax) := do
-  let rawLabel := String.intercalate " and " (es.toList.map fun pe => (pe.reprint.getD "policy").trimAscii.toString)
+  let rawLabel :=
+    if es.isEmpty then ""
+    else String.intercalate " and " (es.toList.map fun pe => (pe.reprint.getD "policy").trimAscii.toString)
   let expEs ← Lang.mapCmd es fun e => Prod.fst <$> expandDbFnsInStx fns #[dbShort] e
   let (rowVar, oldVar, ctxVar, snapVar) := (mkIdent `_row, mkIdent `_old, mkIdent `_ctx, mkIdent `_dbSnap)
   let isCross := expEs.any exprHasAnyIn
@@ -603,7 +631,7 @@ private def tablePolicyNames (t : ParsedTable) : Array String :=
   let lowered ← Lang.mapCmd expEs (lowerDbExpr qctx colNames rowVar (if hasOld then some oldVar else none) (some ctxVar) true · tables (if isCross then snapTyId?.map (fun _ => snapVar) else none))
   if isCross && snapTyId?.isNone then mkDbErr t.ident "internal error: missing database `Snap` type for cross-table policy"
   let cmd := qctx.runPure do
-    let conj ← Qed.mkConjBody lowered (ascribeProp := false)
+    let conj : Term ← if es.isEmpty then pure (mkCIdent ``False : Term) else Qed.mkConjBody lowered (ascribeProp := false)
     Lang.noUnusedVarsPure <| ← match isCross, hasOld with
       | true, true =>
           `(command| @[simp] abbrev $(mkSub suf) ($snapVar:ident : $(snapTyId?.get!)) ($ctxVar:ident : Qed.Server.RequestCtx) ($oldVar:ident $rowVar:ident : $rowTypeId) : Prop := $conj)
@@ -654,12 +682,12 @@ private def tablePolicyNames (t : ParsedTable) : Array String :=
   let polRes ← Lang.mapCmd #[(`ReadPolicy, t.readPols, false), (`InsertPolicy, t.insertPols, false), (`UpdatePolicy, t.updatePols, true), (`DeletePolicy, t.deletePols, false)] fun (s, es, allowOld) =>
     elabTablePolicy qctx dbShort fns t tables colNames rowTypeId mkSub snapTyId? s es allowOld
   Lang.foldlCmd polRes () fun _ (cmd, _, _, _, _) => elabCommand cmd
-  let elabOptPol (suf : Name) (es : Array Syntax) : CommandElabM (Bool × Bool × String) :=
-    if es.isEmpty then pure (false, false, "") else do
-      let (cmd, lbl, isC, _, _) ← elabTablePolicy qctx dbShort fns t tables colNames rowTypeId mkSub snapTyId? suf es
-      elabCommand cmd; pure (true, isC, lbl)
-  let (hasCountPolicy, hasCrossCountPolicy, countPolicyLabel) ← elabOptPol `CountPolicy t.countPols
-  let (hasReadMetaPolicy, hasCrossReadMetaPolicy, readMetaPolicyLabel) ← elabOptPol `ReadMetaPolicy t.readMetaPols
+  let elabOptPol (suf : Name) (es : Array Syntax) : CommandElabM (Bool × Bool × String × Array Syntax) :=
+    if es.isEmpty then pure (false, false, "", #[]) else do
+      let (cmd, lbl, isC, _, expEs) ← elabTablePolicy qctx dbShort fns t tables colNames rowTypeId mkSub snapTyId? suf es
+      elabCommand cmd; pure (true, isC, lbl, expEs)
+  let (hasCountPolicy, hasCrossCountPolicy, countPolicyLabel, countPolsExp) ← elabOptPol `CountPolicy t.countPols
+  let (hasReadMetaPolicy, hasCrossReadMetaPolicy, readMetaPolicyLabel, readMetaPolsExp) ← elabOptPol `ReadMetaPolicy t.readMetaPols
   let checkPolCols (label : String) (forbidEnc : Bool) (ids : Array Ident) : CommandElabM (Array String) :=
     Lang.foldlCmd ids (#[] : Array String) fun seen cid => do
       let cn := cid.getId.eraseMacroScopes.toString
@@ -667,16 +695,21 @@ private def tablePolicyNames (t : ParsedTable) : Array String :=
       if forbidEnc && col.encKey?.isSome then mkDbErr cid s!"cannot use encrypted column `{t.tableName}.{cn}` in `{label}`"
       if seen.contains cn then mkDbErr cid s!"duplicate column `{cn}` in `{label}` on `table {t.tableName}`"
       return seen.push cn
-  let colReadInfos ← Lang.foldlCmd (Array.range t.colReadPols.size) (#[] : Array DbColReadPolicyInfo) fun acc idx => do
+  let (colReadInfos, colReadPolsExp) ← Lang.foldlCmd (Array.range t.colReadPols.size) ((#[] : Array DbColReadPolicyInfo), (#[] : Array (Array Syntax))) fun (acc, expAcc) idx => do
     let crp := t.colReadPols[idx]!
     let cols ← checkPolCols "policy read(...)" false crp.cols
     let byCols ← checkPolCols "policy read(...) by ..." true crp.byCols
     let suf := Name.mkSimple s!"ColReadPolicy_{idx}"
-    let (cmd, lbl, isC, _, _) ← elabTablePolicy qctx dbShort fns t tables colNames rowTypeId mkSub snapTyId? suf crp.exprs
+    let (cmd, lbl, isC, _, expEs) ← elabTablePolicy qctx dbShort fns t tables colNames rowTypeId mkSub snapTyId? suf crp.exprs
     elabCommand cmd
-    return acc.push { policyConst := tblFull ++ suf, cols, byCols, hasCross := isC, label := lbl }
+    Lang.elabPureCmds do return #[
+      ← `(command| def $(mkSub (Name.mkSimple s!"ColReadPolicy_{idx}_cols")) : List String := $(← mkListTerm (cols.map fun s => (Syntax.mkStrLit s : Term)))),
+      ← `(command| def $(mkSub (Name.mkSimple s!"ColReadPolicy_{idx}_byCols")) : List String := $(← mkListTerm (byCols.map fun s => (Syntax.mkStrLit s : Term))))]
+    return (acc.push { policyConst := tblFull ++ suf, cols, byCols, hasCross := isC, label := lbl }, expAcc.push expEs)
   let updTwoState := polRes[2]!.2.2.2.1
-  let (schemaCmd, schemaTerm) := qctx.runPure (mkTableSchemaCmdPure t tables rowTypeName colNames polRes[0]!.2.2.2.2 (if updTwoState then #[] else polRes[2]!.2.2.2.2))
+  let (schemaCmd, schemaTerm) := qctx.runPure (mkTableSchemaCmdPure t tables rowTypeName colNames
+    polRes[0]!.2.2.2.2 polRes[1]!.2.2.2.2 polRes[2]!.2.2.2.2 polRes[3]!.2.2.2.2
+    countPolsExp readMetaPolsExp colReadPolsExp updTwoState)
   elabCommand schemaCmd
   let colInfos : Array DbColumnInfo := t.cols.map fun c => {
     name := c.colName, isPrimaryKey := c.isPrimaryKey, isImmutable := c.isImmutable, isUnique := c.isUnique,
@@ -818,7 +851,7 @@ private def tablePolicyNames (t : ParsedTable) : Array String :=
                   let aT : Term ← match kvs[`session]? with
                     | some s => `(if $s then Qed.Server.AuthMethod.session else Qed.Server.AuthMethod.bearer)
                     | none => pure (mkCIdent (if userVal?.isSome then `Qed.Server.AuthMethod.bearer else `Qed.Server.AuthMethod.none))
-                  `({ auth := { principal := $pT, claims := $cT, authMethod := $aT } : Qed.Server.RequestCtx })
+                  `({ auth := Qed.Server.AuthToken.ofRaw $pT $cT $aT : Qed.Server.RequestCtx })
         let snapTerm? ← match snapTyId? with
           | none => pure none
           | some sTyId =>
@@ -870,29 +903,6 @@ private def tablePolicyNames (t : ParsedTable) : Array String :=
         unless colNames.contains cn do mkDbErr ic s!"index on `table {t.tableName}` references unknown column `{cn}`"
         if t.cols.any fun c => c.colName == cn && c.encKey?.isSome then mkDbErr ic s!"cannot index encrypted column `{t.tableName}.{cn}` (AES-256-GCM uses randomized nonces)"
 
-@[noinline] private def mkClientTableFieldPure (dbName : Name) (cfgParamId : Ident) (t : ParsedTable) : PureQuotM (Ident × Term × Term) := do
-  let rowTyId := mkIdentFrom t.ident (dbName ++ t.ident.getId); let colIdTs ← Lang.mapPQ t.cols fun c => mkSqlIdentTermPure c.colName
-  let encCols := t.cols.map fun c => (c.colName, c.encKey?)
-  let ewTs ← mkColsEncPairs t.tableName encCols fun cn _ => Syntax.mkStrLit cn
-  let erTs ← mkColsEncPairs t.tableName encCols fun _ idx => Syntax.mkNumLit (toString idx)
-  let hVal ← mkAppC `Qed.Server.Db.TableHandle.mk #[cfgParamId, ← mkSqlIdentTermPure t.tableName, ← mkListTerm colIdTs,
-    mkIdentFrom t.ident (dbName ++ t.ident.getId ++ `decodeRow), mkIdentFrom t.ident (dbName ++ t.ident.getId ++ `encodeRow),
-    mkIdentFrom t.ident (dbName ++ t.ident.getId ++ `rowInvBool), ← mkListTerm ewTs, ← mkListTerm erTs]
-  return (mkIdentFrom t.ident (Name.mkSimple t.tableName), ← mkAppC `Qed.Server.Db.TableHandle #[rowTyId], hVal)
-
-@[noinline] private def mkDbClientCmdsPure (dbIdent : Ident) (dbName : Name) (configId : Ident) (tables : Array ParsedTable) : PureQuotM (Array (TSyntax `command)) := do
-  let mkDb (s : Name) := mkIdentFrom dbIdent (dbName ++ s)
-  let (clientStructId, clientWithId, cfgParamId, mId) := (mkDb `Client, mkDb `clientWith, mkIdent `_cfg, mkIdent `m)
-  let tblFlds ← Lang.mapPQ tables (mkClientTableFieldPure dbName cfgParamId)
-  let cfIds := #[mkIdent `config] ++ tblFlds.map (·.1); let ciIds := cfIds
-  let cfTys := #[mkCIdent `Qed.Server.Db.DbConfig] ++ tblFlds.map (·.2.1); let ciVals := #[⟨cfgParamId.raw⟩] ++ tblFlds.map (·.2.2)
-  return #[
-    ← `(command| structure $clientStructId where $[$cfIds:ident : $cfTys:term]*),
-    ← `(command| def $clientWithId ($cfgParamId:ident : Qed.Server.Db.DbConfig) : $clientStructId := { $[$ciIds:ident := $ciVals:term],* }),
-    ← `(command| def $(mkDb `client) : $clientStructId := $clientWithId $configId),
-    ← `(command| def $(mkIdentFrom dbIdent (dbName ++ `Client ++ `ensureSchema)) {$mId:ident : Type → Type} [Monad $mId] [Qed.Server.MonadServer $mId] (_c : $clientStructId) : $mId (Except Qed.Server.ApiError Unit) := Qed.Server.MonadServer.dbExecDdl _c.config),
-    ← `(command| def $(mkIdentFrom dbIdent (dbName ++ `Client ++ `transaction)) {$mId:ident : Type → Type} {α : Type} [Monad $mId] [Qed.Server.MonadServer $mId] (_c : $clientStructId) (body : UInt64 → $mId (Except Qed.Server.ApiError α)) : $mId (Except Qed.Server.ApiError α) := Qed.Server.Db.withTransaction _c.config body)]
-
 @[noinline] private def mkDbTailCmdsPure (dbIdent : Ident) (dbName fullDbName : Name) (dbShort : String)
     (tables : Array ParsedTable) (resolved : Qed.Cloud.EnvMap (Term × Qed.Cloud.DbEnvSpec))
     (devEp? : Option Term) (hasExplicitEnv isManaged : Bool) (secrets : Array String)
@@ -903,22 +913,21 @@ private def tablePolicyNames (t : ParsedTable) : Array String :=
       some <$> mkAppC `Qed.Cloud.EnvMap.mk #[resolved.dev.1, resolved.preview.1, resolved.staging.1, resolved.prod.1]
     else pure none
   let cfgVal ← mkAppC `Qed.Server.Db.DbConfig.mk #[Syntax.mkStrLit dbShort, resolved.prod.1, ← mkOptTerm devEp?, envEndpointsTerm,
-    quote isManaged, ← mkListTerm tableSchemaTerms, ← mkListTerm backfillTerms]
+    quote isManaged, ← mkListTerm tableSchemaTerms, ← mkListTerm backfillTerms, quote false]
   let tblMetaTerms ← Lang.mapPQ tables fun t => do
     let sub (leaf : Name) := mkIdentFrom t.ident (dbName ++ t.ident.getId ++ leaf)
     let (hasR, hasI, hasU, hasD) := (!t.readPols.isEmpty, !t.insertPols.isEmpty, !t.updatePols.isEmpty, !t.deletePols.isEmpty)
     mkAppC `Qed.Server.Db.TableMetaInfo.mk #[Syntax.mkStrLit t.tableName, sub `metaColNames, sub `policies,
       quote hasR, quote hasI, quote hasU, quote hasD, quote (hasI && hasU && hasD)]
-  let core : Array (TSyntax `command) := #[
+  return #[
     ← `(command| abbrev $(mkDb `Tx) : Type := Qed.Server.Db.DbTx $(Syntax.mkStrLit fullDbName.toString)),
     ← Lang.mkStrArrDefPure (mkDb `secrets) secrets,
     ← `(command| def $(mkDb `tables) : Array Qed.Server.Db.TableMetaInfo := #[$[$tblMetaTerms:term],*]),
     ← `(command| def $configId : Qed.Server.Db.DbConfig := $cfgVal),
     ← `(command| def $(mkDb `ddl) (dialect : Qed.Server.Db.SqlDialect := .postgres) : String := Qed.Server.Db.renderDatabaseDdl dialect ($configId).tables),
     ← `(command| def $(mkDb `rlsDdl) : String := Qed.Server.Db.renderDatabaseRlsDdl ($configId).tables),
-    ← `(command| def $ensureId {$mId:ident : Type → Type} [Monad $mId] [Qed.Server.MonadServer $mId] : $mId (Except Qed.Server.ApiError Unit) := Qed.Server.MonadServer.dbExecDdl $configId),
+    ← `(command| @[noinline, nospecialize] def $ensureId {$mId:ident : Type → Type} [Monad $mId] [Qed.Server.MonadServer $mId] : $mId (Except Qed.Server.ApiError Unit) := Qed.Server.MonadServer.dbExecDdl $configId),
     ← `(command| instance $(mkDb `instSafeIOEnsureSchema):ident {_σ : Type} : Qed.Server.SafeIO (@$ensureId (Qed.Server.ThreadProg _σ) _ _) where noAtomic := Qed.Server.NoAtomic.io (.dbExecDdl $configId) _ .pure)]
-  return core ++ (← mkDbClientCmdsPure dbIdent dbName configId tables)
 
 private structure ParsedDbState where
   primaryEp? : Option (Term × Qed.Cloud.DbEnvSpec) := none
@@ -977,7 +986,7 @@ private structure ParsedDbState where
   | `Qed.Server.Db.dbFn =>
       let fnId : Ident := ⟨c.getArg 1⟩; let fnName := fnId.getId.eraseMacroScopes.toString
       if st.fns.any (·.name == fnName) then mkDbErr fnId s!"duplicate `fn {fnName}` in `database {dbName}`"
-      if ["config", "ensureSchema", "ddl", "rlsDdl", "secrets", "tables", "Snap", "Tx", "Client", "client", "clientWith"].contains fnName then
+      if ["config", "ensureSchema", "ddl", "rlsDdl", "secrets", "tables", "Snap", "Tx"].contains fnName then
         mkDbErr fnId s!"reserved name `{fnName}` cannot be used for `database` `fn`"
       let params ← Lang.foldlCmd (c.getArg 3).getSepArgs (#[] : Array (Ident × String × Term)) fun acc ps => do
         let pId : Ident := ⟨ps.getArg 0⟩; let pName := pId.getId.eraseMacroScopes.toString

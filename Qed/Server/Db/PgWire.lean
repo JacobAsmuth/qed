@@ -274,6 +274,10 @@ def execSimpleOnConnTag (conn : PgConn) (sql : String) : IO (Except String (Stri
 def execSimpleOnConn (conn : PgConn) (sql : String) : IO (Except String PgConn × PgConn) :=
   (fun (res, c) => (res.map Prod.snd, c)) <$> execSimpleOnConnTag conn sql
 
+def setSessionRlsOnConn (conn : PgConn) (userId principalTag : String) : IO (Except String PgConn × PgConn) := do
+  let (res, conn') ← execOnConn conn "SELECT set_config('qed.user_id', $1, true), set_config('qed.principal', $2, true)" #[.text userId, .text principalTag]
+  return (res.map Prod.snd, conn')
+
 private def execParameterizedAttempt (cfg : PgConnParams) (sql : String) (params : Array SqlVal) : Nat → PgM DbResult
   | 0 => throw "postgres query failed after retry"
   | attemptsLeft + 1 => do
@@ -283,6 +287,41 @@ private def execParameterizedAttempt (cfg : PgConnParams) (sql : String) (params
       | .error e => releaseConn conn'; if !conn'.healthy && wasReused && attemptsLeft > 0 then execParameterizedAttempt cfg sql params attemptsLeft else throw e
 def execParameterized (pgUrl : String) (sql : String) (params : Array SqlVal) (ssrfGuard : Bool := false) : IO (Except String DbResult) :=
   ExceptT.run do let cfg ← liftP (parsePgUrl pgUrl); execParameterizedAttempt { cfg with ssrfGuard } sql params 2
+
+private def execParameterizedWithSessionAttempt (cfg : PgConnParams) (sql : String) (params : Array SqlVal)
+    (userId principalTag : String) : Nat → PgM DbResult
+  | 0 => throw "postgres query failed after retry"
+  | attemptsLeft + 1 => do
+      let rollbackAndThrow (c : PgConn) (msg : String) : PgM DbResult := do
+        let (_, cRb) ← execSimpleOnConn c "ROLLBACK"; releaseConn cRb; throw msg
+      let (conn, wasReused) ← liftE (acquireConn cfg)
+      let (bRes, c1) ← execSimpleOnConn conn "BEGIN"
+      match bRes with
+      | .error e =>
+          releaseConn { c1 with healthy := false }
+          if !c1.healthy && wasReused && attemptsLeft > 0 then
+            execParameterizedWithSessionAttempt cfg sql params userId principalTag attemptsLeft
+          else throw s!"postgres BEGIN failed: {e}"
+      | .ok cBegun =>
+          let (sRes, c2) ← setSessionRlsOnConn cBegun userId principalTag
+          match sRes with
+          | .error e => rollbackAndThrow c2 s!"postgres RLS session setup failed: {e}"
+          | .ok cSession =>
+              let (qRes, c3) ← execOnConn cSession sql params
+              match qRes with
+              | .error e => rollbackAndThrow c3 e
+              | .ok (dbRes, cDone) =>
+                  let (cRes, c4) ← execSimpleOnConnTag cDone "COMMIT"
+                  match cRes with
+                  | .ok (tag, cFinal) =>
+                      releaseConn cFinal
+                      if !tag.isEmpty && tag != "COMMIT" then throw s!"postgres COMMIT rolled back ({tag})"
+                      return dbRes
+                  | .error e => releaseConn { c4 with healthy := false }; throw s!"postgres COMMIT failed: {e}"
+
+def execParameterizedWithSession (pgUrl : String) (sql : String) (params : Array SqlVal)
+    (userId principalTag : String) (ssrfGuard : Bool := false) : IO (Except String DbResult) :=
+  ExceptT.run do let cfg ← liftP (parsePgUrl pgUrl); execParameterizedWithSessionAttempt { cfg with ssrfGuard } sql params userId principalTag 2
 def clearPool : IO Unit := do
   (← pgPoolBox.modifyGet fun m => (m.toList.foldl (init := []) (fun acc (_, arr) => arr.foldl (init := acc) fun a e => e.1 :: a), {})).forM (closePgHandle · true)
 def execDdl (pgUrl : String) (ddl : String) (ssrfGuard : Bool := false) : IO (Except String Unit) :=

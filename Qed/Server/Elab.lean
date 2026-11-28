@@ -380,7 +380,7 @@ private structure CallableOpts where
   return paramTypeConsts
 
 @[noinline] private def mkJobTermsPure (c : SrvElabCtx) (jobIdent : Ident) (jobStr : String) (intervalMs : Nat)
-    (returnsBool isAsyncJob : Bool) (hRes : ElabHandlerRes) (callArgs : Array Term) : PureQuotM (Term × Option Term) := do
+    (returnsBool isAsyncJob : Bool) (hJobPrinId : Ident) (hJobPrinTy : Term) (hRes : ElabHandlerRes) (callArgs : Array Term) : PureQuotM (Term × Option Term) := do
   let (runExpr, isRO, hasEmit) := (hRes.runExpr, !hRes.mutatesState, hRes.hasEmit)
   let proofExpr? : Option Term ← if !c.hasState then pure none else do
     let invThmId := c.fnSubId jobIdent "_inv"
@@ -398,11 +398,21 @@ private structure CallableOpts where
     else pure (runExpr, proofExpr?)
   let (wrappedRun, wrappedPf?) ← wrapWithEnvDeclsPure c.envDecls unitRun unitPf?
   let stTy : Term := if c.hasState then (c.stateId : Term) else mkCIdent ``Unit
-  let mkJobLam (body : Term) : PureQuotM Term := `(fun {m} [Monad m] [Qed.Server.MonadServer m] [Qed.Server.MonadAtomic $stTy m] => $body)
+  let mkJobLam (body : Term) : PureQuotM Term :=
+    `(fun {m} [Monad m] [Qed.Server.MonadServer m] [Qed.Server.MonadAtomic $stTy m] ($(c.ctxId):ident : Qed.Server.RequestCtx) ($hJobPrinId:ident : $hJobPrinTy) => $body)
+  let runLam ← mkJobLam wrappedRun
   let workOpt ← mkOptTermPure (← if returnsBool then some <$> mkJobLam (← wrapWithEnvDeclsPure c.envDecls runExpr none).1 else pure none)
-  let jobMeta ← mkAppC ``Qed.Server.JobMeta.mk #[Syntax.mkStrLit jobStr, Syntax.mkNumLit (toString intervalMs), ← mkAppC ``Nat.zero_lt_succ #[← `(_)]]
-  let jobTerm ← mkAscribePure (← mkAppC ``Qed.Server.ServerJob.mk #[jobMeta, ← mkJobLam wrappedRun, workOpt]) (← mkAppC ``Qed.Server.ServerJob #[stTy])
-  return (jobTerm, ← match wrappedPf? with | some pf => some <$> `(Qed.Server.VerifiedJob.mk (σ := $stTy) (Inv := $(c.stateInvId)) $jobTerm $pf) | none => pure none)
+  let srvLit := Syntax.mkStrLit c.srvName.toString
+  let jobLit := Syntax.mkStrLit jobStr
+  let intLit := Syntax.mkNumLit (toString intervalMs)
+  let posPf ← mkAppC ``Nat.zero_lt_succ #[← `(_)]
+  let jobTerm ← mkAscribePure (← mkAppC ``Qed.Server.ServerJob.mkSystem #[srvLit, jobLit, intLit, posPf, runLam, workOpt]) (← mkAppC ``Qed.Server.ServerJob #[stTy])
+  let vJobTerm? ← match wrappedPf? with
+    | some pf =>
+        let pfLam ← `(fun ($(c.ctxId):ident : Qed.Server.RequestCtx) ($hJobPrinId:ident : $hJobPrinTy) => $pf)
+        some <$> `(Qed.Server.VerifiedJob.mkSystem (σ := $stTy) (Inv := $(c.stateInvId)) $srvLit $jobLit $intLit $posPf $runLam $workOpt $pfLam)
+    | none => pure none
+  return (jobTerm, vJobTerm?)
 
 @[noinline] private def elabOneServerJob (existingMethods : Array ServerMethodInfo) (errTyTerm : Term)
     (acc : Array String × Std.HashMap String (Bool × Nat) × Array Term × Array Term) (jc : Syntax) :
@@ -429,15 +439,15 @@ private structure CallableOpts where
   let isAsyncJob := !c.hasState || blockHasAwait rawBodyStmts || blockHasAtomic rawBodyStmts
   let jobPrinStr := s!"{c.srvName}.{jobStr}"
   let hJobPrinId := mkIdent `_hJobPrincipal
-  let (jobCtxTerm, hJobPrinTy) ← runSrvPQ do
+  let hJobPrinTy ← runSrvPQ do
     let prinT ← mkAppC ``Qed.Server.Principal.system #[Syntax.mkStrLit jobPrinStr]
-    return (← mkAppC ``Qed.Server.RequestCtx.forPrincipal #[prinT], ← `(($(c.ctxId)).principal = $prinT))
-  let callArgs := c.envIdents.map (⟨·.raw⟩) ++ #[jobCtxTerm, mkCIdent ``rfl]
+    `(($(c.ctxId)).principal = $prinT)
+  let callArgs := c.envIdents.map (⟨·.raw⟩) ++ #[⟨c.ctxId.raw⟩, ⟨hJobPrinId.raw⟩]
   let some hRes ← elabSrvCallable jobIdent jobStr rawBodyStmts payloadTerm errTyTerm {
     missingRetLabel := s!"`-> Bool` job `{jobStr}`", isUnit := !returnsBool, forceAsync? := some isAsyncJob,
-    extraBinderIds := #[hJobPrinId], extraBinderTys := #[hJobPrinTy], extraCallArgs := #[mkCIdent ``rfl],
-    ensSpec? := mkFnEnsSpec? ensRes? #[] false contracts.topEnsTac?, contracts? := some contracts, ctxArg? := some jobCtxTerm } | return none
-  let (jt, vjt?) ← runSrvPQ (mkJobTermsPure c jobIdent jobStr intervalMs returnsBool isAsyncJob hRes callArgs)
+    extraBinderIds := #[hJobPrinId], extraBinderTys := #[hJobPrinTy], extraCallArgs := #[⟨hJobPrinId.raw⟩],
+    ensSpec? := mkFnEnsSpec? ensRes? #[] false contracts.topEnsTac?, contracts? := some contracts } | return none
+  let (jt, vjt?) ← runSrvPQ (mkJobTermsPure c jobIdent jobStr intervalMs returnsBool isAsyncJob hJobPrinId hJobPrinTy hRes callArgs)
   return some (jobNames.push jobStr, jobMap.insert jobStr (returnsBool, rtJobs.size), rtJobs.push jt, vjt?.elim vJobs vJobs.push)
 
 @[noinline] private def elabServerJobs (existingMethods : Array ServerMethodInfo) (jobClauses : Array Syntax) :

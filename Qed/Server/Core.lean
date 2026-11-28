@@ -54,23 +54,31 @@ def Principal.toSqlTag : Principal → String
   | .system name => "system:" ++ name
 
 structure AuthToken where
+  private mk ::
   principal  : Principal := .anonymous
   claims     : List (String × String) := []
   authMethod : AuthMethod := .none
 deriving Inhabited, DecidableEq, Repr
 
 namespace AuthToken
+def anonymous : AuthToken := {}
+@[reducible] def ofRaw (principal : Principal := .anonymous) (claims : List (String × String) := [])
+    (authMethod : AuthMethod := .none) : AuthToken :=
+  { principal, claims, authMethod }
 @[reducible] def ofUser (id : String) (claims : List (String × String) := []) (method : AuthMethod := .bearer) : AuthToken :=
   { principal := .user id, claims, authMethod := method }
 @[reducible] def ofPrincipal (p : Principal) : AuthToken :=
   { principal := p, claims := [], authMethod := .none }
+def rlsSessionPair (tok : AuthToken) : String × String :=
+  let uid := match tok.principal with | .user id => id | _ => ""
+  (uid, tok.principal.toSqlTag)
 end AuthToken
 
 structure RequestCtx where
   headers     : List (String × String) := []
   cookies     : List (String × String) := []
   bearerToken : Option String := none
-  auth        : AuthToken := {}
+  auth        : AuthToken := AuthToken.anonymous
   clientIp    : String := "127.0.0.1"
   connId      : String := ""
   query       : String := ""
@@ -515,8 +523,8 @@ structure RouteMeta where
 deriving Inhabited, DecidableEq, Repr
 
 inductive ServerEffect : Type where
-  | httpCall (req : OutboundReq) | dbExec (cfg : Db.DbConfig) (q : Db.SqlQuery) | dbExecDdl (cfg : Db.DbConfig)
-  | dbTxBegin (cfg : Db.DbConfig) | dbTxExec (cfg : Db.DbConfig) (txId : UInt64) (q : Db.SqlQuery)
+  | httpCall (req : OutboundReq) | dbExec (cfg : Db.DbConfig) (q : Db.SqlQuery) (auth : AuthToken := AuthToken.anonymous) | dbExecDdl (cfg : Db.DbConfig)
+  | dbTxBegin (cfg : Db.DbConfig) (auth : AuthToken := AuthToken.anonymous) | dbTxExec (cfg : Db.DbConfig) (txId : UInt64) (q : Db.SqlQuery)
   | dbTxCommit (cfg : Db.DbConfig) (txId : UInt64) | dbTxRollback (cfg : Db.DbConfig) (txId : UInt64)
   | setCookie (cookie : SetCookie) | sendSse (ev : SseEvent) | readEnv (v : String) | nowMs | sleep (ms : Nat)
   | randomHex (n : UInt32) | randomBytes (n : UInt32) | hmacSha256 (key msg : ByteArray)
@@ -528,8 +536,8 @@ inductive ServerEffect : Type where
   | fsMkdirAll (path : String) | fsRemoveAll (path : String) | fsExists (path : String) | fsMktempDir (prefixStr : String)
 
 @[reducible] def ServerEffect.Resp : ServerEffect → Type
-  | .httpCall _ => Except ApiError OutboundResp | .dbExec _ _ | .dbTxExec _ _ _ => Except ApiError Db.DbResult
-  | .dbExecDdl _ | .dbTxCommit _ _ => Except ApiError Unit | .dbTxBegin _ => Except ApiError UInt64
+  | .httpCall _ => Except ApiError OutboundResp | .dbExec _ _ _ | .dbTxExec _ _ _ => Except ApiError Db.DbResult
+  | .dbExecDdl _ | .dbTxCommit _ _ => Except ApiError Unit | .dbTxBegin _ _ => Except ApiError UInt64
   | .dbTxRollback _ _ | .setCookie _ | .sendSse _ | .wsBroadcast _ _ | .sleep _ => Unit
   | .readEnv _ => Option String | .nowMs => UInt64 | .randomHex _ => String | .randomBytes _ => ByteArray
   | .hmacSha256 _ _ | .sha256 _ => ByteArray | .constEq _ _ => Bool
@@ -545,9 +553,9 @@ namespace MonadServer
 section
 variable {m : Type → Type} [MonadServer m]
 @[reducible, inline] def httpCall (req : OutboundReq) : m (Except ApiError OutboundResp) := exec (.httpCall req)
-@[reducible, inline] def dbExec (cfg : Db.DbConfig) (q : Db.SqlQuery) : m (Except ApiError Db.DbResult) := exec (.dbExec cfg q)
+@[reducible, inline] def dbExec (cfg : Db.DbConfig) (q : Db.SqlQuery) (auth : AuthToken := AuthToken.anonymous) : m (Except ApiError Db.DbResult) := exec (.dbExec cfg q auth)
 @[reducible, inline] def dbExecDdl (cfg : Db.DbConfig) : m (Except ApiError Unit) := exec (.dbExecDdl cfg)
-@[reducible, inline] def dbTxBegin (cfg : Db.DbConfig) : m (Except ApiError UInt64) := exec (.dbTxBegin cfg)
+@[reducible, inline] def dbTxBegin (cfg : Db.DbConfig) (auth : AuthToken := AuthToken.anonymous) : m (Except ApiError UInt64) := exec (.dbTxBegin cfg auth)
 @[reducible, inline] def dbTxExec (cfg : Db.DbConfig) (txId : UInt64) (q : Db.SqlQuery) : m (Except ApiError Db.DbResult) := exec (.dbTxExec cfg txId q)
 @[reducible, inline] def dbTxCommit (cfg : Db.DbConfig) (txId : UInt64) : m (Except ApiError Unit) := exec (.dbTxCommit cfg txId)
 @[reducible, inline] def dbTxRollback (cfg : Db.DbConfig) (txId : UInt64) : m Unit := exec (.dbTxRollback cfg txId)
@@ -640,7 +648,7 @@ variable {σ α β γ : Type} {Inv Inv₁ Inv₂ : σ → Prop} {A A₁ A₂ : P
   | .hmacSha256 _ _ | .sha256 _ | .constEq _ _ | .aeadEncrypt _ _ _ _ | .aeadDecrypt _ _ _ _ => true | _ => false
 
 @[reducible] def ServerEffect.isDbWrite : ServerEffect → Bool
-  | .dbExec _ q | .dbTxExec _ _ q => q.isWrite
+  | .dbExec _ q _ | .dbTxExec _ _ q => q.isWrite
   | .dbExecDdl _ => true
   | _ => false
 
@@ -907,6 +915,28 @@ structure IoJob extends JobMeta where
   runOnce     : IO (Except ApiError Unit)
   runWorkOnce : IO (Except ApiError Bool) := runOnce.map fun | .ok () => .ok false | .error e => .error e
 
+@[noinline] def ServerJob.mkSystem {σ : Type} (srvName jobName : String) (intervalMs : Nat) (intervalPos : 0 < intervalMs)
+    (run : {m : Type → Type} → [Monad m] → [MonadServer m] → [MonadAtomic σ m] →
+      (ctx : RequestCtx) → ctx.principal = .system (srvName ++ "." ++ jobName) → m (Except ApiError Unit))
+    (runWork? : Option ({m : Type → Type} → [Monad m] → [MonadServer m] → [MonadAtomic σ m] →
+      (ctx : RequestCtx) → ctx.principal = .system (srvName ++ "." ++ jobName) → m (Except ApiError Bool)) := none) :
+    ServerJob σ :=
+  let ctx := RequestCtx.forPrincipal (.system (srvName ++ "." ++ jobName))
+  { name := jobName, intervalMs, intervalPos,
+    runM := fun {_m} _ _ _ => run ctx rfl,
+    runWorkM? := runWork?.map fun rw => fun {_m} _ _ _ => rw ctx rfl }
+
+@[noinline] def VerifiedJob.mkSystem {σ : Type} {Inv : σ → Prop} (srvName jobName : String) (intervalMs : Nat) (intervalPos : 0 < intervalMs)
+    (run : {m : Type → Type} → [Monad m] → [MonadServer m] → [MonadAtomic σ m] →
+      (ctx : RequestCtx) → ctx.principal = .system (srvName ++ "." ++ jobName) → m (Except ApiError Unit))
+    (runWork? : Option ({m : Type → Type} → [Monad m] → [MonadServer m] → [MonadAtomic σ m] →
+      (ctx : RequestCtx) → ctx.principal = .system (srvName ++ "." ++ jobName) → m (Except ApiError Bool)) := none)
+    (preserves : ∀ (ctx : RequestCtx) (h : ctx.principal = .system (srvName ++ "." ++ jobName)),
+      ProgPreservesInv Inv (run (m := ThreadProg σ) ctx h)) :
+    VerifiedJob σ Inv :=
+  { toServerJob := ServerJob.mkSystem srvName jobName intervalMs intervalPos run runWork?,
+    preserves := preserves (RequestCtx.forPrincipal (.system (srvName ++ "." ++ jobName))) rfl }
+
 def ServerJob.toIoJob {σ : Type} (srvInst : MonadServer IO) (atomicInst : MonadAtomic σ IO) (j : ServerJob σ) : IoJob :=
   { j.toJobMeta with
     runOnce := @j.runM IO _ srvInst atomicInst
@@ -1106,8 +1136,8 @@ theorem noAtomic_srvForRangeM (r : Qed.QedRange) (st : σS) (body : σS → Nat 
 instance (r : Qed.QedRange) (st : σS) (body : σS → Nat → ThreadProg σ (Qed.QedLoopStep σS ρ)) [hb : ∀ s i, SafeIO (body s i)] : SafeIO (srvForRangeM r st body) :=
   ⟨noAtomic_srvForRangeM r st body (fun s i => (hb s i).noAtomic)⟩
 
-@[inline, specialize] def dbRunTx [SrvErr E] {m : Type → Type} [Monad m] [MonadServer m] (cfg : Db.DbConfig) (body : UInt64 → m (Option (Except E α))) : m (Option (Except E α)) := do
-  match ← MonadServer.dbTxBegin cfg with
+@[noinline, nospecialize] def dbRunTx [SrvErr E] {m : Type → Type} [Monad m] [MonadServer m] (cfg : Db.DbConfig) (body : UInt64 → m (Option (Except E α))) (auth : AuthToken := AuthToken.anonymous) : m (Option (Except E α)) := do
+  match ← MonadServer.dbTxBegin cfg auth with
   | .error e => return some (.error (SrvErr.ofApi e))
   | .ok txId =>
       match ← body txId with
@@ -1116,26 +1146,28 @@ instance (r : Qed.QedRange) (st : σS) (body : σS → Nat → ThreadProg σ (Qe
           | .ok () => return res | .error e => MonadServer.dbTxRollback cfg txId; return some (.error (SrvErr.ofApi e))
 
 theorem progEffSpec_dbRunTx [SrvErr E] {Post : Option (Except E α) → Prop} (cfg : Db.DbConfig) (body : UInt64 → ThreadProg σ (Option (Except E α)))
-    (hBegin : EffOk (.dbTxBegin cfg)) (hCommit : ∀ tid, EffOk (.dbTxCommit cfg tid)) (hRollback : ∀ tid, EffOk (.dbTxRollback cfg tid))
+    (auth : AuthToken)
+    (hBegin : EffOk (.dbTxBegin cfg auth)) (hCommit : ∀ tid, EffOk (.dbTxCommit cfg tid)) (hRollback : ∀ tid, EffOk (.dbTxRollback cfg tid))
     (hErr : ∀ e : ApiError, Post (some (.error (SrvErr.ofApi e)))) (hBody : ∀ txId, ProgEffSpec Inv A Step EffOk Post (body txId)) :
-    ProgEffSpec Inv A Step EffOk Post (dbRunTx (E := E) (m := ThreadProg σ) cfg body) :=
-  .io (.dbTxBegin cfg) _ hBegin fun
+    ProgEffSpec Inv A Step EffOk Post (dbRunTx (E := E) (m := ThreadProg σ) cfg body auth) :=
+  .io (.dbTxBegin cfg auth) _ hBegin fun
     | .error e => .pure _ (hErr e)
     | .ok tid => (hBody tid).bind fun
         | some (.error _), he => .io (.dbTxRollback cfg tid) _ (hRollback tid) fun _ => .pure _ he
         | some (.ok _), hr | none, hr => .io (.dbTxCommit cfg tid) _ (hCommit tid) fun
             | .ok () => .pure _ hr | .error e => .io (.dbTxRollback cfg tid) _ (hRollback tid) fun _ => .pure _ (hErr e)
 
-theorem noAtomic_dbRunTx [SrvErr E] (cfg : Db.DbConfig) (body : UInt64 → ThreadProg σ (Option (Except E α))) (hBody : ∀ txId, NoAtomic (body txId)) :
-    NoAtomic (dbRunTx (E := E) (m := ThreadProg σ) cfg body) :=
-  progEffSpec_dbRunTx cfg body trivial (fun _ => trivial) (fun _ => trivial) (fun _ => trivial) hBody
+theorem noAtomic_dbRunTx [SrvErr E] (cfg : Db.DbConfig) (body : UInt64 → ThreadProg σ (Option (Except E α))) (auth : AuthToken) (hBody : ∀ txId, NoAtomic (body txId)) :
+    NoAtomic (dbRunTx (E := E) (m := ThreadProg σ) cfg body auth) :=
+  progEffSpec_dbRunTx cfg body auth trivial (fun _ => trivial) (fun _ => trivial) (fun _ => trivial) hBody
 
 theorem progEffSpec_dbRunTx_bind [SrvErr E] {Post : β → Prop} (cfg : Db.DbConfig) (body : UInt64 → ThreadProg σ (Option (Except E α)))
-    {k : Option (Except E α) → ThreadProg σ β} (hBegin : EffOk (.dbTxBegin cfg)) (hCommit : ∀ tid, EffOk (.dbTxCommit cfg tid))
+    (auth : AuthToken)
+    {k : Option (Except E α) → ThreadProg σ β} (hBegin : EffOk (.dbTxBegin cfg auth)) (hCommit : ∀ tid, EffOk (.dbTxCommit cfg tid))
     (hRollback : ∀ tid, EffOk (.dbTxRollback cfg tid)) (hErr : ∀ e : ApiError, ProgEffSpec Inv A Step EffOk Post (k (some (.error (SrvErr.ofApi e)))))
     (hNone : ProgEffSpec Inv A Step EffOk Post (k none)) (hBody : ∀ txId, ProgEffSpec Inv A Step EffOk (fun o => match o with | some r => ProgEffSpec Inv A Step EffOk Post (k (some r)) | none => True) (body txId)) :
-    ProgEffSpec Inv A Step EffOk Post (dbRunTx (E := E) (m := ThreadProg σ) cfg body >>= k) :=
-  (progEffSpec_dbRunTx cfg body hBegin hCommit hRollback hErr fun tid =>
+    ProgEffSpec Inv A Step EffOk Post (dbRunTx (E := E) (m := ThreadProg σ) cfg body auth >>= k) :=
+  (progEffSpec_dbRunTx cfg body auth hBegin hCommit hRollback hErr fun tid =>
     (hBody tid).mono id (fun _ h => h) (fun _ _ _ _ h => h) (fun _ h => h) fun | some _, hr => hr | none, _ => hNone).bind fun _ h => h
 
 end StructuralProgLemmas
@@ -1404,7 +1436,7 @@ private def RouteAuthSpec.rawSecret : RouteAuthSpec → String
 /-- Constant-time fail-closed cryptographic verifier for HTTP webhook and cron routes.
     Returns `500` when the configured secret is empty/whitespace, `401` on missing/invalid/expired
     credentials, and only mints a verified `RequestCtx` carrying `principal = p` on success. -/
-def verifyRouteAuth {m : Type → Type} [Monad m] [MonadServer m]
+@[noinline, nospecialize] def verifyRouteAuth {m : Type → Type} [Monad m] [MonadServer m]
     (p : Principal) (spec : RouteAuthSpec) (ctx : RequestCtx) :
     m (Except ApiError { c : RequestCtx // c.principal = p }) :=
   let key := Qed.Str.trim spec.rawSecret
@@ -1461,8 +1493,8 @@ instance {σ : Type} (p : Principal) (spec : RouteAuthSpec) (ctx : RequestCtx) :
     SafeIO (verifyRouteAuth (m := ThreadProg σ) p spec ctx) := by
   refine ⟨?_⟩
   by_cases hEmpty : (Qed.Str.trim spec.rawSecret).isEmpty = true
-  · simp only [verifyRouteAuth, if_pos hEmpty]; exact .pure _
-  · simp only [verifyRouteAuth, if_neg hEmpty]
+  · simp only [verifyRouteAuth, ite_eq_left hEmpty]; exact .pure _
+  · simp only [verifyRouteAuth, ite_eq_right hEmpty]
     cases spec with
     | headerSecret hdrName _ | bearerSecret _ =>
         dsimp only; split

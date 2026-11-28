@@ -10,6 +10,7 @@ database VaultDb:
     id    : String primary_key where 1 <= id.length <= 64
     title : String             where 1 <= title.length <= 200
     stock : Nat                where stock <= 10000
+    policy read requires true
     policy write requires ctx.userId != none
   table notes:
     id      : Nat    primary_key
@@ -109,6 +110,8 @@ database ShopDb:
   table authors:
     id   : String primary_key where 1 <= id.length <= 64
     name : String             where 1 <= name.length <= 120
+    policy read requires true
+    policy write requires ctx.userId != none
   table items:
     id       : String primary_key where 1 <= id.length <= 64
     authorId : String references authors(id)
@@ -174,6 +177,19 @@ server ShopApi:
       if price == 99999: return fail(.aborted)
       let created = await db.items.insert(id = iid, authorId = aid, ownerId = uid, title = title, price = price)?
       return created
+  rpc insertAuthorOrIgnore(aid: String, aname: String) -> ShopDb.authors?!:
+    requires auth, 1 <= aid.length <= 64, 1 <= aname.length <= 120
+    return await db.authors.insertOrIgnore(id = aid, name = aname)?
+  rpc abortedDupAuthorTx(aid: String) -> Bool!:
+    requires auth, 1 <= aid.length <= 64
+    db.transaction:
+      let _ = await db.authors.insert(id = aid, name = "dup-pk-error")
+        catch _e: ShopDb.authors.mk(aid, "fallback")
+      return true
+  rpc txInsertAuthorOrIgnore(aid: String, aname: String) -> ShopDb.authors?!:
+    requires auth, 1 <= aid.length <= 64, 1 <= aname.length <= 120
+    db.transaction:
+      return await db.authors.insertOrIgnore(id = aid, name = aname)?
 bad_db "Database read policy `ShopDb.items.read` failed in `leakSum → ShopDb.items.sum`:\n  • must prove: some ownerId = ctx.userId" ShopDb : rpc leakSum() -> Nat!: return await db.items.sum(col = "price")?
 bad_db_auth "Database read policy `ShopDb.privateProfiles.read` (joined table) failed in `leakProfileJoin → ShopDb.secretLogs.join`:\n  • must prove: some ownerId = ctx.userId" ShopDb leakProfileJoin() -> (ShopDb.secretLogs, ShopDb.privateProfiles)[]! : return await db.secretLogs.join(table = privateProfiles, where = r => r.ownerId == uid)?
 bad_db_auth "Database insert policy `ShopDb.items.insert` failed in `badTxInsert → ShopDb.items.insert`:\n  • must prove: some \"victim\" = ctx.userId" ShopDb badTxInsert(aid: String, iid: String) -> ShopDb.items! || 1 <= aid.length <= 64, 1 <= iid.length <= 64 : db.transaction: return await db.items.insert(id = iid, authorId = aid, ownerId = "victim", title = "oops", price = 10)?
@@ -343,6 +359,7 @@ database RoadmapDb:
   table orgs:
     id   : String primary_key where 1 <= id.length <= 64
     name : String where 1 <= name.length <= 120
+    policy read, write requires true
   table projects:
     id      : String primary_key where 1 <= id.length <= 64
     orgId   : String references orgs(id) on_delete cascade
@@ -356,15 +373,18 @@ database RoadmapDb:
     projectId : String? references projects(id) on_delete set_null
     orgId     : String references orgs(id) on_delete restrict
     day       : Date?
+    policy read, write requires true
   table services:
     slug    : ServiceSlug primary_key
     port    : ServicePort
     altPort : ServicePort?
+    policy read, write requires true
   table scaling:
     id           : String primary_key where 1 <= id.length <= 64
     plan         : String
     minInstances : Nat
     maxInstances : Nat
+    policy read, write requires true
     invariant freeScaling:
       minInstances <= maxInstances,
       (plan == "pro" or plan == "enterprise") or (minInstances == 0 and maxInstances <= 1)
@@ -398,6 +418,41 @@ server RoadmapApi:
   rpc idempotentOrg(orgId: String, name: String) -> RoadmapDb.orgs?!:
     requires 1 <= orgId.length <= 64, 1 <= name.length <= 64
     return await db.orgs.insertOrIgnore(id = orgId, name = name)?
+  rpc insertOrg(orgId: String, name: String) -> RoadmapDb.orgs!:
+    requires 1 <= orgId.length <= 64, 1 <= name.length <= 120
+    return await db.orgs.insert(id = orgId, name = name)?
+  rpc getOrg(orgId: String) -> RoadmapDb.orgs?!:
+    return await db.orgs.findOne(where = r => r.id == orgId)?
+  rpc abortTxInsertOrg(orgId: String, name: String) -> Bool!:
+    requires 1 <= orgId.length <= 64, 1 <= name.length <= 120
+    db.transaction:
+      let _ = await db.orgs.insert(id = orgId, name = name)?
+      return fail(.aborted)
+  rpc insertProject(projId: String, orgId: String) -> RoadmapDb.projects!:
+    requires auth, 1 <= projId.length <= 64, 1 <= orgId.length <= 64, 1 <= uid.length <= 128
+    return await db.projects.insert(id = projId, orgId = orgId, ownerId = uid, stage = .queued, note = none)?
+  rpc getProject(projId: String) -> RoadmapDb.projects?!:
+    requires auth
+    return await db.projects.findOne(where = r => r.id == projId and r.ownerId == uid)?
+  rpc upsertBuilding(projId: String, orgId: String, note: String?) -> RoadmapDb.projects!:
+    requires auth, 1 <= projId.length <= 64, 1 <= orgId.length <= 64, 1 <= uid.length <= 128
+    return await db.projects.upsert(on = ["id"], where = r => r.ownerId == uid and r.stage == .queued, id = projId, orgId = orgId, ownerId = uid, stage = .building, note = note)?
+  rpc promoteToLive(projId: String) -> RoadmapDb.projects?!:
+    requires auth
+    return await db.projects.updateOne(where = r => r.id == projId and r.ownerId == uid and r.stage == .building, set = { stage = .live })?
+  rpc countLive() -> Nat!:
+    requires auth
+    return await db.projects.count(where = r => r.ownerId == uid and r.stage == .live)?
+  rpc deleteProject(projId: String) -> Nat!:
+    requires auth
+    return await db.projects.delete(where = r => r.id == projId and r.ownerId == uid)?
+  rpc insertScaling(id: String, minI: Nat, maxI: Nat) -> RoadmapDb.scaling!:
+    requires 1 <= id.length <= 64, minI <= maxI
+    return await db.scaling.insert(id = id, plan = "pro", minInstances = minI, maxInstances = maxI)?
+  rpc bumpScalingMax(id: String, delta: Nat) -> RoadmapDb.scaling?!:
+    return await db.scaling.updateOne(where = r => r.id == id and r.plan == "pro", set = { maxInstances += delta })?
+  rpc decScalingMax(id: String, delta: Nat) -> RoadmapDb.scaling?!:
+    return await db.scaling.updateOne(where = r => r.id == id and r.plan == "pro" and r.maxInstances >= r.minInstances + delta, set = { maxInstances -= delta })?
   rpc findByTrimmedOwner(rawOwner: String) -> RoadmapDb.projects[]!:
     let clean = Qed.Str.truncate(Qed.Str.toLower(Qed.Str.trim(rawOwner)), 64)
     if some(clean) != ctx.userId: return fail(.forbidden)
@@ -409,7 +464,6 @@ server RoadmapApi:
     requires auth, 1 <= rawLabel.length
     return await db.slots.updateOne(where = r => r.id == slotId and r.ownerId == uid, set = { label = Qed.Str.truncate(rawLabel, 64), tag = Qed.Str.take(rawTag, 16) })?
 
-example : RoadmapDb.Client := RoadmapDb.client
 bad_db "Database table constraint `RoadmapDb.scaling.RowInv` failed in `badFreeWarm → RoadmapDb.scaling.insert`" RoadmapDb :
   rpc badFreeWarm(appId: String) -> RoadmapDb.scaling!:
     requires 1 <= appId.length <= 64
@@ -1342,5 +1396,39 @@ bad_db_tbl "cannot combine `principal = ...` with `user`/`role`/`session`" BadMi
     user = "alice"
     principal = .system("stripe")
     row = d1
+
+/-! ## Phase 3: Default-Deny Omitted Table Policies -/
+database DefaultDenyDb:
+  sqlite ".qed/default_deny_checks.db"
+  table locked:
+    id     : String primary_key where 1 <= id.length <= 64
+    secret : String where 1 <= secret.length <= 128
+  table narrow:
+    id      : String primary_key where 1 <= id.length <= 64
+    ownerId : String immutable where 1 <= ownerId.length <= 64
+    secret  : encrypted(String, key = secret("DD_KEY") ?? "dd-dev-key-material-32bytes!") where 1 <= secret.length <= 128
+    policy count requires some(row.ownerId) == ctx.userId
+    policy read_meta requires some(row.ownerId) == ctx.userId
+    policy read(id) by id requires ctx.userId != none
+
+server stateless DefaultDenyPartialApi:
+  use db : DefaultDenyDb
+  rpc countOwn() -> Nat!:
+    requires auth
+    return await db.narrow.count(where = r => r.ownerId == uid)?
+  rpc listMeta() -> DefaultDenyDb.narrow.Meta[]!:
+    requires auth
+    return await db.narrow.selectMeta(where = r => r.ownerId == uid)?
+  rpc lookupId(targetId: String) -> String?!:
+    requires auth
+    return await db.narrow.findOne(columns = ["id"], where = r => r.id == targetId)?
+
+bad_db_auth "omitted policies default to deny" DefaultDenyDb denyLockedRead() -> DefaultDenyDb.locked[]! : return await db.locked.select()?
+bad_db_auth "omitted policies default to deny" DefaultDenyDb denyLockedInsert(id: String) -> DefaultDenyDb.locked! || 1 <= id.length <= 64 : return await db.locked.insert(id = id, secret = "x")?
+bad_db_auth "omitted policies default to deny" DefaultDenyDb denyLockedUpdate(id: String) -> DefaultDenyDb.locked?! : return await db.locked.updateOne(where = r => r.id == id, set = { secret = "y" })?
+bad_db_auth "omitted policies default to deny" DefaultDenyDb denyLockedDelete(id: String) -> Nat! : return await db.locked.delete(where = r => r.id == id)?
+bad_db_auth "omitted policies default to deny" DefaultDenyDb denyNarrowFullRead() -> DefaultDenyDb.narrow[]! : return await db.narrow.select(where = r => r.ownerId == uid)?
+bad_db_auth "omitted policies default to deny" DefaultDenyDb denyNarrowUnlistedCol(targetId: String) -> (String, String)?! : return await db.narrow.findOne(columns = ["id", "ownerId"], where = r => r.id == targetId)?
+bad_db_auth "omitted policies default to deny" DefaultDenyDb denyNarrowMultiRowBy(targetId: String) -> String[]! : return await db.narrow.select(columns = ["id"], where = r => r.id == targetId)?
 
 end DbChecks

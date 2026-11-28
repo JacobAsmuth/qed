@@ -297,8 +297,34 @@ private def isExplicitEnvEndpointSet : Db.DbEndpoint → IO Bool
   | .cloudflareD1 aE _ dE _ tS => [aE, dE, tS].allM fun k => (·.isSome) <$> loadNonEmptyEnv k
   | .managedPostgres dbName _ => (·.isSome) <$> loadNonEmptyEnv (Qed.Cloud.managedPostgresSecretVar dbName)
   | .postgresUrl _ _ | .sqlitePath _ => pure false
+private def canonicalPgHost (h : String) : String :=
+  let lo := h.toLower
+  if lo == "localhost" || lo == "::1" || lo == "[::1]" then "127.0.0.1" else lo
+
+private def canonicalTransportKey : ResolvedDbTransport → Option String
+  | .postgres url _ =>
+      match Db.PgWire.parsePgUrl url with
+      | .ok p => some s!"pg:{canonicalPgHost p.host}:{p.port}/{p.database}"
+      | .error _ => some s!"pgraw:{trimWs url}"
+  | .sqlite path => some s!"sqlite:{trimWs path}"
+  | _ => none
+
+initialize appDbRegistry : IO.Ref (Std.HashSet String) ← IO.mkRef {}
+
+private def checkOrRegisterAppDb (isDynamicExternal : Bool) (tr : ResolvedDbTransport) : IO (Except ApiError ResolvedDbTransport) := do
+  if let some k := canonicalTransportKey tr then
+    if isDynamicExternal then
+      if (← appDbRegistry.get).contains k then
+        return .error (ApiError.forbidden "dynamic read-only database handle cannot target an application-owned database")
+    else
+      appDbRegistry.modify (·.insert k)
+  return .ok tr
+
 def resolveDbConfigCore (rawDeployEnv? : Option String) (onCloudRun : Bool) (cfg : Db.DbConfig) : IO (Except ApiError ResolvedDbTransport) := do
-  let run (ep : Db.DbEndpoint) (fmt : String → String) := (·.mapError fun e => ApiError.internal (fmt e)) <$> resolveDbEndpoint ep
+  let run (ep : Db.DbEndpoint) (fmt : String → String) : IO (Except ApiError ResolvedDbTransport) := do
+    match ← resolveDbEndpoint ep with
+    | .error e => return .error (ApiError.internal (fmt e))
+    | .ok tr => checkOrRegisterAppDb cfg.isDynamicExternal tr
   match rawDeployEnv? with
   | some rawEnv => match Qed.Cloud.DeployEnv.parse? (trimWs rawEnv).toLower with
       | none => return .error (ApiError.internal s!"invalid QED_DEPLOY_ENV `{rawEnv}` (expected dev, preview, staging, or prod)")
@@ -307,7 +333,7 @@ def resolveDbConfigCore (rawDeployEnv? : Option String) (onCloudRun : Bool) (cfg
           let ep ← if env == .dev && epEnv != cfg.endpoint then do if ← isExplicitEnvEndpointSet cfg.endpoint then pure cfg.endpoint else pure epEnv else pure epEnv
           run ep fun e => s!"database `{cfg.name}` unavailable for env `{env}`: {e}"
   | none => match ← resolveDbEndpoint cfg.endpoint with
-      | .ok tr => return .ok tr
+      | .ok tr => checkOrRegisterAppDb cfg.isDynamicExternal tr
       | .error primaryErr =>
           if onCloudRun then return .error (ApiError.internal s!"database `{cfg.name}` unavailable on Cloud Run (fail-closed, no dev fallback): {primaryErr}")
           match cfg.devFallback? with
@@ -328,6 +354,9 @@ private def mkDbResolveCache (primaryDb? : Option Db.DbConfig) : IO DbResolveCac
   let primary? ← primaryDb?.bindM fun cfg => do match ← resolveDbConfigCore rawDeployEnv? onCloudRun cfg with | .ok tr => pure (some (cfg.name, dbCfgKey cfg, tr)) | .error _ => pure none
   return { rawDeployEnv?, onCloudRun, primary?, byName := ← Prim.mkStateBox (∅ : Std.HashMap String (DbCfgKey × ResolvedDbTransport)) }
 private def resolveDbConfig (cfg : Db.DbConfig) (cache? : Option DbResolveCache := none) : IO (Except ApiError ResolvedDbTransport) := do
+  if cfg.isDynamicExternal then
+    let (r, c) ← loadDeployEnvFlags
+    return ← resolveDbConfigCore r c cfg
   match cache? with
   | none => let (r, c) ← loadDeployEnvFlags; resolveDbConfigCore r c cfg
   | some cache =>
@@ -409,6 +438,8 @@ private def applyMigrationSteps (dialect : Db.SqlDialect) (steps : List Db.Migra
     if let .postgres url ssrfGuard := tr then
       let chkDdl := Db.renderDatabaseCheckDdl cfg.tables
       if !chkDdl.isEmpty then if let .error e ← mapApi (Db.PgWire.execDdl url chkDdl ssrfGuard) then return .error e
+      let rlsDdl := Db.renderDatabaseRlsDdl cfg.tables
+      if !rlsDdl.isEmpty then if let .error e ← mapApi (Db.PgWire.execDdl url rlsDdl ssrfGuard) then return .error e
     return .ok steps
 
 initialize pgTxBox : IO.Ref (UInt64 × Std.HashMap UInt64 Db.PgWire.PgConn) ← IO.mkRef (1, {})
@@ -445,13 +476,21 @@ private def runAead (op : ByteArray → ByteArray → ByteArray → IO (Except S
       return .error (ApiError.internal s!"external HTTP transport error ({req.serviceName}): {e}{hint}")
   | .ok (st, respBody, respHdrs) => return .ok { status := st.toUInt32, body := respBody, headers := respHdrs.toList }
 
-@[noinline] private def execPgTxBegin (url : String) (ssrfGuard : Bool) : IO (Except ApiError UInt64) := mapApi do
+@[noinline] private def execPgTxBegin (url : String) (ssrfGuard : Bool) (auth : AuthToken) : IO (Except ApiError UInt64) := mapApi do
   let pgCfg ← match Db.PgWire.parsePgUrl url with | .ok c => pure c | .error e => return .error e
   let (conn, _) ← match ← Db.PgWire.acquireConn { pgCfg with ssrfGuard } with | .ok c => pure c | .error e => return .error e
   let (res, conn') ← Db.PgWire.execSimpleOnConn conn "BEGIN"
   match res with
   | .error e => Db.PgWire.releaseConn { conn' with healthy := false }; return .error s!"postgres BEGIN failed: {e}"
-  | .ok cReady => return .ok (← pgTxBox.modifyGet fun (n, m) => (n, (n + 1, m.insert n cReady)))
+  | .ok cBegun =>
+      let (uid, ptag) := auth.rlsSessionPair
+      let (sRes, c2) ← Db.PgWire.setSessionRlsOnConn cBegun uid ptag
+      match sRes with
+      | .error e =>
+          let (_, cRb) ← Db.PgWire.execSimpleOnConn c2 "ROLLBACK"
+          Db.PgWire.releaseConn cRb
+          return .error s!"postgres RLS session setup failed: {e}"
+      | .ok cReady => return .ok (← pgTxBox.modifyGet fun (n, m) => (n, (n + 1, m.insert n cReady)))
 
 private def sanitizeTmpPrefix (pfx : String) : String :=
   let clean := String.ofList (pfx.toList.filter fun c => c.isAlphanum || c == '-' || c == '_')
@@ -465,11 +504,17 @@ private def runNativeIo {α : Type} (act : IO α) : IO (Except ApiError α) :=
     (dbCache? : Option DbResolveCache := none) (ssrfGuard : Bool := true) : MonadServer IO where
   exec
     | .httpCall req => execNativeHttp gcpCache? ssrfGuard req
-    | .dbExec cfg q => withResolvedDb cfg dbCache? fun
-        | tr@(.postgres _ _) => let (sqlPg, pPg) := q.compile .postgres; execRawOnTransport tr "" sqlPg pPg []
+    | .dbExec cfg q auth => withResolvedDb cfg dbCache? fun
+        | .postgres url pgSsrf =>
+            let (sqlPg, pPg) := q.compile .postgres
+            if cfg.isDynamicExternal then
+              mapApi (Db.PgWire.execParameterized url sqlPg pPg pgSsrf)
+            else
+              let (uid, ptag) := auth.rlsSessionPair
+              mapApi (Db.PgWire.execParameterizedWithSession url sqlPg pPg uid ptag pgSsrf)
         | tr => let (sqlSq, pSq) := q.compile .sqlite; execRawOnTransport tr sqlSq "" pSq (Db.HttpSql.queryExpectedCols q)
     | .dbExecDdl cfg => (·.map fun _ => ()) <$> migrateDatabase cfg
-    | .dbTxBegin cfg => withTxTransport dbCache? cfg (mapApi ∘ Prim.sqliteTxBegin) execPgTxBegin
+    | .dbTxBegin cfg auth => withTxTransport dbCache? cfg (mapApi ∘ Prim.sqliteTxBegin) (fun u g => execPgTxBegin u g auth)
     | .dbTxExec cfg tid q => withTxTransport dbCache? cfg
         (fun _ => let (s, p) := q.compile .sqlite; mapApi (Prim.sqliteTxExec tid s p))
         (fun _ _ => withPgTx tid fun conn => do
@@ -618,7 +663,7 @@ private def buildRequestCtxReq (cfg : ServerConfig) (req : ParsedReqHead) (clien
   let cookies := if !req.hasCookie then [] else hdrList.foldl (fun acc (k, v) => if eqCI k "cookie" then acc ++ parseCookiePairs v else acc) []
   let bearer? := req.auth?.bind extractBearer; let (userId?, claims, authMethod) ← resolveAuthPrincipal cfg oidcRt? bearer? cookies
   let query := (findByte req.target 0 63).elim "" fun q => if q + 1 >= req.target.utf8ByteSize then "" else String.Pos.Raw.extract req.target ⟨q + 1⟩ ⟨req.target.utf8ByteSize⟩
-  let auth : AuthToken := match userId? with | some uid => AuthToken.ofUser uid claims authMethod | none => { principal := .anonymous, claims, authMethod }
+  let auth : AuthToken := match userId? with | some uid => AuthToken.ofUser uid claims authMethod | none => AuthToken.ofRaw .anonymous claims authMethod
   return { headers := hdrList, cookies, bearerToken := bearer?, auth, clientIp, query, body := if body.isEmpty then "" else (String.fromUTF8? body).getD "" }
 
 private structure WireVariants where (headKA headClose fullKA fullClose : ByteArray)

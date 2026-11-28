@@ -783,12 +783,14 @@ structure ColumnSchema where
 deriving Inhabited
 
 structure TableSchema where
-  name      : SqlIdent
-  columns   : List ColumnSchema
-  indexes   : List (List SqlIdent) := []
-  checks    : List String := []
-  rlsRead?  : Option String := none
-  rlsWrite? : Option String := none
+  name       : SqlIdent
+  columns    : List ColumnSchema
+  indexes    : List (List SqlIdent) := []
+  checks     : List String := []
+  rlsRead?   : Option String := none
+  rlsInsert? : Option String := none
+  rlsUpdate? : Option String := none
+  rlsDelete? : Option String := none
 deriving Inhabited
 
 private def optClause (opt : Option α) (f : α → String) : String := opt.map f |>.getD ""
@@ -818,10 +820,22 @@ def TableSchema.renderPostgresChecks (t : TableSchema) : List String :=
     let cn := t.chkName i
     s!"DO $qed_chk$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = '{cn}' AND conrelid = '{t.name.quoteIdent}'::regclass) THEN ALTER TABLE {t.name.quoteIdent} ADD CONSTRAINT \"{cn}\" CHECK ({chk}) NOT VALID; END IF; END $qed_chk$"
 def TableSchema.renderPostgresRls (t : TableSchema) : List String :=
+  let mkPol (opTag sqlOp clause : String) (expr? : Option String) : List String :=
+    match expr? with
+    | none => []
+    | some e =>
+        let pName := s!"qed_{opTag}_{t.name.raw}"
+        let body := if clause == "USING_CHECK" then s!"USING ({e}) WITH CHECK ({e})" else s!"{clause} ({e})"
+        [s!"DROP POLICY IF EXISTS \"{pName}\" ON {t.name.quoteIdent}",
+         s!"CREATE POLICY \"{pName}\" ON {t.name.quoteIdent} FOR {sqlOp} {body}"]
   let pols :=
-    (t.rlsRead?.map fun e => s!"CREATE POLICY \"qed_read_{t.name.raw}\" ON {t.name.quoteIdent} FOR SELECT USING ({e})").toList ++
-    (t.rlsWrite?.map fun e => s!"CREATE POLICY \"qed_write_{t.name.raw}\" ON {t.name.quoteIdent} FOR ALL USING ({e}) WITH CHECK ({e})").toList
-  if pols.isEmpty then [] else ("ALTER TABLE " ++ t.name.quoteIdent ++ " ENABLE ROW LEVEL SECURITY") :: pols
+    mkPol "read" "SELECT" "USING" t.rlsRead? ++
+    mkPol "insert" "INSERT" "WITH CHECK" t.rlsInsert? ++
+    mkPol "update" "UPDATE" "USING_CHECK" t.rlsUpdate? ++
+    mkPol "delete" "DELETE" "USING" t.rlsDelete?
+  if pols.isEmpty then []
+  else ("ALTER TABLE " ++ t.name.quoteIdent ++ " ENABLE ROW LEVEL SECURITY") ::
+       ("ALTER TABLE " ++ t.name.quoteIdent ++ " FORCE ROW LEVEL SECURITY") :: pols
 def renderDatabaseDdl (d : SqlDialect) (tables : List TableSchema) : String := joinSqlStmts (tables.flatMap (·.renderDdlStatements d))
 def renderDatabaseCheckDdl (tables : List TableSchema) : String := joinSqlStmts (tables.flatMap (·.renderPostgresChecks))
 def renderDatabaseRlsDdl (tables : List TableSchema) : String := joinSqlStmts (tables.flatMap (·.renderPostgresRls))
@@ -901,13 +915,14 @@ inductive DbEndpoint where
 deriving Inhabited, DecidableEq
 
 structure DbConfig where
-  name          : String
-  endpoint      : DbEndpoint
-  devFallback?  : Option DbEndpoint := none
-  envEndpoints? : Option (Qed.Cloud.EnvMap DbEndpoint) := none
-  isManaged     : Bool := false
-  tables        : List TableSchema := []
-  backfills     : List SqlQuery := []
+  name              : String
+  endpoint          : DbEndpoint
+  devFallback?      : Option DbEndpoint := none
+  envEndpoints?     : Option (Qed.Cloud.EnvMap DbEndpoint) := none
+  isManaged         : Bool := false
+  tables            : List TableSchema := []
+  backfills         : List SqlQuery := []
+  isDynamicExternal : Bool := false
 deriving Inhabited
 
 def DbConfig.endpointForEnv (cfg : DbConfig) (env : Qed.Cloud.DeployEnv) : DbEndpoint :=
@@ -929,7 +944,7 @@ deriving Inhabited, DecidableEq, Repr
 
 /-- Construct a `DbConfig` targeting a dynamic runtime PostgreSQL URL (SSRF-guarded by default). -/
 @[inline] def DbConfig.forPostgresUrl (url : String) (ssrfGuard : Bool := true) (name : String := "dynamic_pg") : DbConfig :=
-  { name, endpoint := .postgresUrl url ssrfGuard }
+  { name, endpoint := .postgresUrl url ssrfGuard, isDynamicExternal := true }
 
 abbrev DbRow := Array SqlVal
 structure DbResult where

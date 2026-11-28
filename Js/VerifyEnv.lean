@@ -249,9 +249,9 @@ private def isServerRlsForbiddenBase (env : Environment) (ownerDecl : Name) (tra
 
 private def dbVerifiedOpNames : Std.HashSet Name := mkNameSet "
   Qed.Server.Db.dbRunRows Qed.Server.Db.dbRunOneRow Qed.Server.Db.dbSelectProj Qed.Server.Db.dbFindOneProj
-  Qed.Server.Db.dbCount Qed.Server.Db.dbSumNat Qed.Server.Db.dbSumInt Qed.Server.Db.dbAggOpt
+  Qed.Server.Db.dbCount Qed.Server.Db.dbSumNat Qed.Server.Db.dbSumInt Qed.Server.Db.dbAggOpt Qed.Server.Db.dbGroupAgg
   Qed.Server.Db.dbDelete Qed.Server.Db.dbInsert Qed.Server.Db.dbInsertOrIgnore
-  Qed.Server.Db.dbUpsert Qed.Server.Db.dbJoinSelect"
+  Qed.Server.Db.dbUpsert Qed.Server.Db.dbJoinSelect Qed.Server.Db.dbJoinFindOne"
 
 private def restrictedServerExact : Std.HashSet Name := mkNameSet "
   Qed.Server.Db.dbRunChecked Qed.Server.Db.dbRun Qed.Server.Db.DbConfig.mk Qed.Server.dbRunTx
@@ -925,6 +925,16 @@ private def verifyDbVerifiedCall (env : Environment) (declName modName fnName : 
     unless qFn.isConstOf qCtor && qArgs.size == qArity do err s!"expected `{qCtor}`"
     let some tblName := extractSqlIdent? qArgs[tblIdx]! | err "expected static table identifier"
     checkSimpleSelectPolicy dbOwner tblName qArgs[whereIdx]! args[pIdx]! ctxE allowedPols
+  let verifyColPols (tblPrefix : Name) (polLeaves colNames : Array String) (byCheck : String → Array String → Except String Unit) (colCtx : String := "") : Except String Unit := do
+    for leaf in polLeaves do
+      if leaf != "ReadPolicy" then
+        let some allowedCols := extractStrListFromConst? env (tblPrefix ++ Name.mkSimple s!"{leaf}_cols")
+          | err s!"missing column metadata for `{tblPrefix}.{leaf}`"
+        let byCols := (extractStrListFromConst? env (tblPrefix ++ Name.mkSimple s!"{leaf}_byCols")).getD #[]
+        if !byCols.isEmpty then byCheck leaf byCols
+        for cn in colNames do
+          unless allowedCols.contains cn do
+            err s!"column `{cn}`{colCtx} is not authorized by `{tblPrefix}.{leaf}`"
   match fnName with
   | `Qed.Server.Db.dbRunRows | `Qed.Server.Db.dbRunOneRow =>
       if args.size != 18 then err s!"expected 18 arguments, got {args.size}"
@@ -1004,27 +1014,47 @@ private def verifyDbVerifiedCall (env : Environment) (declName modName fnName : 
           | err s!"projected select on `{tblName}` must prove `ReadPolicy`, `ReadMetaPolicy`, or a verified `ColReadPolicy`"
         let some colExprs := extractListElems? qArgs[1]! | err "expected static column list in projected select"
         let some colNames := colExprs.mapM extractSqlIdent? | err "expected static column identifiers in projected select"
-        for leaf in polLeaves do
-          if leaf != "ReadPolicy" then
-            let some allowedCols := extractStrListFromConst? env (tblPrefix ++ Name.mkSimple s!"{leaf}_cols")
-              | err s!"missing column metadata for `{tblPrefix}.{leaf}`"
-            for cn in colNames do
-              unless allowedCols.contains cn do
-                err s!"column `{cn}` is not authorized by `{tblPrefix}.{leaf}`"
-            let byCols := (extractStrListFromConst? env (tblPrefix ++ Name.mkSimple s!"{leaf}_byCols")).getD #[]
-            if !byCols.isEmpty then
-              unless fnName == `Qed.Server.Db.dbFindOneProj &&
-                     (extractOpt? qArgs[4]!).any (fun lim? => lim?.any (fun l => extractNatLit? l == some 1)) do
-                err s!"`{tblPrefix}.{leaf}` with `by` columns requires `findOne` (`limit = some 1`)"
-              for bc in byCols do
-                unless sqlWhereHasTopEqCol bc qArgs[2]! 64 do
-                  err s!"`{tblPrefix}.{leaf}` requires top-level equality filter on `{bc}`"
+        verifyColPols tblPrefix polLeaves colNames fun leaf byCols => do
+          unless fnName == `Qed.Server.Db.dbFindOneProj &&
+                 (extractOpt? qArgs[4]!).any (fun lim? => lim?.any (fun l => extractNatLit? l == some 1)) do
+            err s!"`{tblPrefix}.{leaf}` with `by` columns requires `findOne` (`limit = some 1`)"
+          for bc in byCols do
+            unless sqlWhereHasTopEqCol bc qArgs[2]! 64 do
+              err s!"`{tblPrefix}.{leaf}` requires top-level equality filter on `{bc}`"
   | `Qed.Server.Db.dbCount =>
       checkSimpleQueryOp 9 3 4 5 8 `Qed.Server.Db.SqlQuery.count 2 0 1 #["CountPolicy", "ReadPolicy"]
   | `Qed.Server.Db.dbSumNat | `Qed.Server.Db.dbSumInt =>
       checkSimpleQueryOp 9 3 4 5 8 `Qed.Server.Db.SqlQuery.aggregate 4 1 3 #["ReadPolicy"]
   | `Qed.Server.Db.dbAggOpt =>
       checkSimpleQueryOp 13 6 7 8 12 `Qed.Server.Db.SqlQuery.aggregate 4 1 3 #["ReadPolicy"]
+  | `Qed.Server.Db.dbGroupAgg =>
+      if args.size != 11 then err s!"expected 11 arguments, got {args.size}"
+      let dbOwner ← requireCfg args[5]!
+      let ctxE ← requireAuthCtx args[10]!
+      let q := args[6]!.consumeMData; let qFn := q.getAppFn.consumeMData; let qArgs := q.getAppArgs
+      unless qFn.isConstOf `Qed.Server.Db.SqlQuery.groupAggregate && qArgs.size == 8 do err "expected `SqlQuery.groupAggregate`"
+      let some tblName := extractSqlIdent? qArgs[1]! | err "expected static table identifier in `SqlQuery.groupAggregate`"
+      let some gColExprs := extractListElems? qArgs[2]! | err "expected static group column list in `SqlQuery.groupAggregate`"
+      let some gColNames := gColExprs.mapM extractSqlIdent? | err "expected static group column identifiers"
+      if gColNames.isEmpty then err "expected at least one group column in `SqlQuery.groupAggregate`"
+      let some aggColOpt := extractOpt? qArgs[3]! | err "expected static `Option` aggregate column in `SqlQuery.groupAggregate`"
+      let aggCols ← match aggColOpt with
+        | none => pure #[]
+        | some ac => match extractSqlIdent? ac with | some n => pure #[n] | none => err "expected static aggregate column identifier"
+      let allReadCols := gColNames ++ aggCols
+      let tblPrefix := dbOwner ++ Name.mkSimple tblName
+      let some (isCross, predBody, concl, conclDepth) := extractRowPredGoal? dbOwner tblName args[4]!
+        | err s!"groupBy policy obligation on `{tblName}` malformed"
+      unless sqlExprMatchesLean (mkWhereMatchCtx env tblName isCross) qArgs[4]! predBody 512 do
+        err s!"SQL `WHERE` predicate on `groupBy {tblName}` does not match Lean proof predicate"
+      let rowBvar := Expr.bvar (conclDepth - (if isCross then 2 else 1))
+      if (checkPolicyApp tblPrefix #["ReadPolicy"] isCross ctxE conclDepth rowBvar concl).isSome then
+        pure ()
+      else
+        let some polLeaves := collectColReadOrChain tblPrefix isCross ctxE conclDepth rowBvar concl 32
+          | err s!"`groupBy` on `{tblName}` must prove `ReadPolicy` or a multi-row `ColReadPolicy` covering grouped/aggregated columns"
+        verifyColPols tblPrefix polLeaves allReadCols (colCtx := " in `groupBy`") fun leaf _ =>
+          err s!"`{tblPrefix}.{leaf}` with `by` columns cannot authorize multi-row `groupBy`"
   | `Qed.Server.Db.dbDelete =>
       checkSimpleQueryOp 9 3 4 5 8 `Qed.Server.Db.SqlQuery.delete 3 0 1 #["DeletePolicy"]
   | `Qed.Server.Db.dbInsert | `Qed.Server.Db.dbInsertOrIgnore =>
@@ -1115,7 +1145,7 @@ private def verifyDbVerifiedCall (env : Environment) (declName modName fnName : 
           unless sqlExprMatchesLean mCtx cwSql predBody 512 do
             err s!"upsert SQL `conflictWhere` on `{tblName}` does not match Lean `conflictPred`"
       | _ => err s!"upsert `conflictPred` on `{tblName}` must be a row lambda"
-  | `Qed.Server.Db.dbJoinSelect =>
+  | `Qed.Server.Db.dbJoinSelect | `Qed.Server.Db.dbJoinFindOne =>
       if args.size != 29 then err s!"expected 29 arguments, got {args.size}"
       let dbOwner ← requireCfg args[7]!
       let q := args[8]!.consumeMData; let qFn := q.getAppFn.consumeMData; let qArgs := q.getAppArgs

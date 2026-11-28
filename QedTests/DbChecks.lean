@@ -26,19 +26,19 @@ database VaultDb:
 def sameCompiledSql (q1 q2 : Qed.Server.Db.SqlQuery) : Bool := (q1.compile .postgres).1 == (q2.compile .postgres).1 && (q1.compile .sqlite).1 == (q2.compile .sqlite).1
 server VaultApi:
   use db : VaultDb
-  rpc listBooks() -> VaultDb.books[]!: return await db.books.select(orderBy = "id")?
+  rpc listBooks() -> VaultDb.books[]!: return await db.books.orderBy("id").select()?
   rpc listMyNotes() -> VaultDb.notes[]!:
     requires auth
-    return await db.notes.select(where = r => r.ownerId == uid, orderBy = "-version", limit = 50)?
+    return await db.notes.where(r => r.ownerId == uid).orderBy("-version").limit(50).select()?
   -- Keep one explicit legacy `ctx.userId != none` RPC to verify backwards compatibility.
   rpc getNote(noteId: Nat) -> VaultDb.notes?!:
     requires ctx.userId != none
     ensures result.id == noteId
-    if let some(uid) = ctx.userId: return await db.notes.findOne(where = r => r.id == noteId and r.ownerId == uid)?
+    if let some(uid) = ctx.userId: return await db.notes.where(r => r.id == noteId).where(r => r.ownerId == uid).findOne()?
     return none
   rpc countMyNotes() -> Nat!:
     requires auth
-    return await db.notes.count(where = r => r.ownerId == uid)?
+    return await db.notes.where(r => r.ownerId == uid).count()?
   rpc createNote(noteId: Nat, body: String) -> VaultDb.notes!:
     requires auth, 1 <= body.length <= 2000
     ensures result.id == noteId, result.body == body, 1 <= result.body.length <= 2000
@@ -47,27 +47,30 @@ server VaultApi:
   rpc editNote(noteId: Nat, body: String) -> VaultDb.notes?!:
     requires auth, 1 <= body.length <= 2000
     ensures result.id == noteId, result.body == body
-    return await db.notes.updateOne(where = r => r.id == noteId and r.ownerId == uid, set = r => { body = body, version = r.version + 1 })?
+    return await db.notes.where(r => r.id == noteId and r.ownerId == uid).updateOne(r => { body = body, version = r.version + 1 })?
   rpc publishNote(noteId: Nat) -> VaultDb.notes?!:
     requires auth
     ensures result.id == noteId, result.status == "published"
-    return await db.notes.updateOne(where = r => r.id == noteId and r.ownerId == uid and r.status == "draft", set = r => { status = "published", version = r.version + 1 })?
+    return await db.notes
+      .where(r => r.id == noteId and r.ownerId == uid)
+      .where(r => r.status == "draft")
+      .updateOne(r => { status = "published", version = r.version + 1 })?
   rpc deleteNote(noteId: Nat) -> Nat!:
     requires auth
-    return await db.notes.delete(where = r => r.id == noteId and r.ownerId == uid)?
+    return await db.notes.where(r => r.id == noteId and r.ownerId == uid).delete()?
   rpc seedBook(bookId: String, title: String, stock: Nat) -> VaultDb.books!:
     requires auth, 1 <= bookId.length <= 64, 1 <= title.length <= 200, stock <= 10000
     return await db.books.insert(id = bookId, title = title, stock = stock)?
   rpc orderBook(bookId: String, qty: Nat) -> VaultDb.books?!:
     requires auth, 1 <= qty <= 50
     ensures result.id == bookId, result.stock <= 10000
-    return await db.books.updateOne(where = r => r.id == bookId and r.stock >= qty, set = r => { stock = r.stock - qty })?
+    return await db.books.where(r => r.id == bookId and r.stock >= qty).updateOne(r => { stock = r.stock - qty })?
   rpc restockBook(bookId: String, qty: Nat) -> VaultDb.books?!:
     requires auth, 1 <= qty <= 50
-    return await db.books.updateOne(where = r => r.id == bookId and r.stock + qty <= 10000, set = { stock += qty })?
+    return await db.books.where(r => r.id == bookId and r.stock + qty <= 10000).updateOne({ stock += qty })?
   rpc atomicOrderBook(bookId: String, qty: Nat) -> VaultDb.books?!:
     requires auth, 1 <= qty <= 50
-    return await db.books.updateOne(where = r => r.id == bookId and r.stock >= qty, set = { stock -= qty })?
+    return await db.books.where(r => r.id == bookId and r.stock >= qty).updateOne({ stock -= qty })?
 component VaultClient:
   session user
   query myNotes = VaultApi.listMyNotes() if user.isSome
@@ -90,16 +93,16 @@ fullstack VaultApp:
   title "Vault"
 
 /-! ## Negative Compile-Time Verification Tests -/
-bad_db1 "Database read policy `VaultDb.notes.read` failed in `leakNote → VaultDb.notes.findOne`:\n  • must prove: some ownerId = ctx.userId" VaultDb leakNote(noteId: Nat) -> VaultDb.notes?! : return await db.notes.findOne(where = r => r.id == noteId)?
+bad_db1 "Database read policy `VaultDb.notes.read` failed in `leakNote → VaultDb.notes.findOne`:\n  • must prove: some ownerId = ctx.userId" VaultDb leakNote(noteId: Nat) -> VaultDb.notes?! : return await db.notes.where(r => r.id == noteId).findOne()?
 bad_db "Database read policy `VaultDb.notes.read` failed in `dumpAll → VaultDb.notes.select`:\n  • must prove: some ownerId = ctx.userId" VaultDb : rpc dumpAll() -> VaultDb.notes[]!: return await db.notes.select()?
-bad_db1 "Database delete policy `VaultDb.notes.delete` failed in `nukeNote → VaultDb.notes.delete`:\n  • must prove: some ownerId = ctx.userId" VaultDb nukeNote(noteId: Nat) -> Nat! : return await db.notes.delete(where = r => r.id == noteId)?
-bad_db_auth "Database update policy `VaultDb.notes.update` failed in `hijackEdit → VaultDb.notes.updateOne`:\n  • must prove: some ownerId = ctx.userId\n\nHint: Ensure `where = r => ...` implies `some(row.ownerId) == ctx.userId`.\n---\nerror: Database post-update policy `VaultDb.notes.update` (anti-hijack) failed in `hijackEdit → VaultDb.notes.updateOne`:\n  • must prove: some ownerId = ctx.userId" VaultDb hijackEdit(noteId: Nat, body: String) -> VaultDb.notes?! || 1 <= body.length <= 2000 : return await db.notes.updateOne(where = r => r.id == noteId, set = r => { body = body, version = r.version + 1 })?
+bad_db1 "Database delete policy `VaultDb.notes.delete` failed in `nukeNote → VaultDb.notes.delete`:\n  • must prove: some ownerId = ctx.userId" VaultDb nukeNote(noteId: Nat) -> Nat! : return await db.notes.where(r => r.id == noteId).delete()?
+bad_db_auth "Database update policy `VaultDb.notes.update` failed in `hijackEdit → VaultDb.notes.updateOne`:\n  • must prove: some ownerId = ctx.userId\n\nHint: Ensure `.where(r => ...)` implies `some(row.ownerId) == ctx.userId`.\n---\nerror: Database post-update policy `VaultDb.notes.update` (anti-hijack) failed in `hijackEdit → VaultDb.notes.updateOne`:\n  • must prove: some ownerId = ctx.userId" VaultDb hijackEdit(noteId: Nat, body: String) -> VaultDb.notes?! || 1 <= body.length <= 2000 : return await db.notes.where(r => r.id == noteId).updateOne(r => { body = body, version = r.version + 1 })?
 bad_db_auth "Database insert policy `VaultDb.notes.insert` failed in `spoofInsert → VaultDb.notes.insert`:\n  • must prove: some \"victim\" = ctx.userId" VaultDb spoofInsert(noteId: Nat, body: String) -> VaultDb.notes! || 1 <= body.length <= 2000 : return await db.notes.insert(id = noteId, ownerId = "victim", body = body, version = 0, status = "draft")?
-bad_db1 "cannot update `immutable` column `VaultDb.notes.ownerId` in `stealOwner`" VaultDb stealOwner(noteId: Nat) -> VaultDb.notes?! : return await db.notes.updateOne(where = r => r.id == noteId and r.ownerId == ctx.userId.getD(""), set = r => { ownerId = "attacker" })?
+bad_db1 "cannot update `immutable` column `VaultDb.notes.ownerId` in `stealOwner`" VaultDb stealOwner(noteId: Nat) -> VaultDb.notes?! : return await db.notes.where(r => r.id == noteId and r.ownerId == ctx.userId.getD("")).updateOne(r => { ownerId = "attacker" })?
 bad_db_auth "Database table constraint `VaultDb.notes.RowInv` failed in `emptyNote → VaultDb.notes.insert`" VaultDb emptyNote(noteId: Nat) -> VaultDb.notes! : if not (1 <= uid.length <= 64): return fail(.badUser) || return await db.notes.insert(id = noteId, ownerId = uid, body = "", version = 0, status = "draft")?
-bad_db1 "Database transition/monotonicity invariant `VaultDb.notes.TransInv` failed in `downgradeVersion → VaultDb.notes.updateOne`:\n  • must prove: version - 1 >= version" VaultDb downgradeVersion(noteId: Nat) -> VaultDb.notes?! : return await db.notes.updateOne(where = r => r.id == noteId and r.ownerId == ctx.userId.getD("") and r.version >= 1, set = r => { version = r.version - 1 })?
-bad_db1 "Database transition/monotonicity invariant `VaultDb.notes.TransInv` failed in `skipPublish → VaultDb.notes.updateOne`:\n  • must prove: version >= version and ((\"archived\" = \"draft\" or \"archived\" = \"published\") or \"draft\" = \"published\")" VaultDb skipPublish(noteId: Nat) -> VaultDb.notes?! : return await db.notes.updateOne(where = r => r.id == noteId and r.ownerId == ctx.userId.getD("") and r.status == "draft", set = r => { status = "archived" })?
-bad_db1 "Database table constraint `VaultDb.books.RowInv` failed in `restockOverflow → VaultDb.books.updateOne`:\n  • must prove: stock + 5 <= 10000" VaultDb restockOverflow(bookId: String) -> VaultDb.books?! : return await db.books.updateOne(where = r => r.id == bookId, set = r => { stock = r.stock + 5 })?
+bad_db1 "Database transition/monotonicity invariant `VaultDb.notes.TransInv` failed in `downgradeVersion → VaultDb.notes.updateOne`:\n  • must prove: version - 1 >= version" VaultDb downgradeVersion(noteId: Nat) -> VaultDb.notes?! : return await db.notes.where(r => r.id == noteId and r.ownerId == ctx.userId.getD("") and r.version >= 1).updateOne(r => { version = r.version - 1 })?
+bad_db1 "Database transition/monotonicity invariant `VaultDb.notes.TransInv` failed in `skipPublish → VaultDb.notes.updateOne`:\n  • must prove: version >= version and ((\"archived\" = \"draft\" or \"archived\" = \"published\") or \"draft\" = \"published\")" VaultDb skipPublish(noteId: Nat) -> VaultDb.notes?! : return await db.notes.where(r => r.id == noteId and r.ownerId == ctx.userId.getD("") and r.status == "draft").updateOne(r => { status = "archived" })?
+bad_db1 "Database table constraint `VaultDb.books.RowInv` failed in `restockOverflow → VaultDb.books.updateOne`:\n  • must prove: stock + 5 <= 10000" VaultDb restockOverflow(bookId: String) -> VaultDb.books?! : return await db.books.where(r => r.id == bookId).updateOne(r => { stock = r.stock + 5 })?
 bad_comp_sess "RPC `VaultApi.createNote` precondition `1 <= body.length <= 2000` could not be proved here:\n  • must satisfy:  1 <= \"\".length and \"\".length <= 2000" BadClientParam : if user.isSome: let _ = await VaultApi.createNote(1, "") catch: case _: pass
 bad_comp_query "reactive `query bad` cannot call mutating server RPC `VaultApi.deleteNote`" BadClientQueryMut bad = VaultApi.deleteNote(1) if user.isSome
 
@@ -144,25 +147,50 @@ server ShopApi:
   invariant txOpsNonNeg: txOps >= 0
   rpc searchItems(pfx: String, sub: String, pageOffset: Nat) -> ShopDb.items[]!:
     requires auth
-    return await db.items.select(where = r => r.ownerId == uid and r.title.startsWith(pfx) and r.title.contains(sub), orderBy = "-price", limit = 20, offset = pageOffset)?
+    return await db.items
+      .where(r => r.ownerId == uid and r.title.startsWith(pfx) and r.title.contains(sub))
+      .orderBy("-price").limit(20).offset(pageOffset)
+      .select()?
   rpc filterByIds(ids: String[]) -> ShopDb.items[]!:
     requires auth
-    return await db.items.select(where = r => r.ownerId == uid and ids.contains(r.id), orderBy = "id", limit = 50, offset = 0)?
+    return await db.items.where(r => r.ownerId == uid and ids.contains(r.id)).orderBy("id").limit(50).offset(0).select()?
   rpc totalInventoryValue() -> Nat!:
     requires auth
-    return await db.items.sum(col = "price", where = r => r.ownerId == uid)?
+    return await db.items.where(r => r.ownerId == uid).sum("price")?
   rpc cheapestPrice() -> Nat?!:
     requires auth
-    return await db.items.min(col = "price", where = r => r.ownerId == uid)?
+    return await db.items.where(r => r.ownerId == uid).min("price")?
   rpc highestPrice() -> Nat?!:
     requires auth
-    return await db.items.max(col = "price", where = r => r.ownerId == uid)?
+    return await db.items.where(r => r.ownerId == uid).max("price")?
   rpc itemsWithAuthors() -> (ShopDb.items, ShopDb.authors)[]!:
     requires auth
-    return await db.items.join(table = authors, where = r => r.ownerId == uid, orderBy = "-price", limit = 25, offset = 0)?
+    return await db.items.where(r => r.ownerId == uid).join(authors).orderBy("-price").limit(25).offset(0).select()?
+  rpc topItemWithAuthor() -> (ShopDb.items, ShopDb.authors)?!:
+    requires auth
+    return await db.items.where(r => r.ownerId == uid).join(authors).orderBy("-price").findOne()?
+  rpc countItemsByAuthor() -> (String, Nat)[]!:
+    requires auth
+    return await db.items.where(r => r.ownerId == uid).groupBy("authorId").orderBy("-count").limit(10).count()?
+  rpc sumPriceByAuthor() -> (String, Nat)[]!:
+    requires auth
+    return await db.items.where(r => r.ownerId == uid).groupBy("authorId").orderBy("-sum").sum("price")?
+  rpc minPriceByAuthor() -> (String, Nat)[]!:
+    requires auth
+    return await db.items.where(r => r.ownerId == uid).groupBy("authorId").orderBy("authorId").min("price")?
+  rpc maxPriceByAuthor() -> (String, Nat)[]!:
+    requires auth
+    return await db.items.where(r => r.ownerId == uid).groupBy("authorId").orderBy("authorId").max("price")?
+  rpc countByOwnerAndAuthor() -> (String, String, Nat)[]!:
+    requires auth
+    return await db.items.where(r => r.ownerId == uid).groupBy(["ownerId", "authorId"]).orderBy("authorId").count()?
   rpc logsWithProfiles() -> (ShopDb.secretLogs, ShopDb.privateProfiles)[]!:
     requires auth
-    return await db.secretLogs.join(table = privateProfiles, where = r => r.ownerId == uid, rightWhere = p => p.ownerId == uid)?
+    return await db.secretLogs.where(r => r.ownerId == uid).join(privateProfiles, p => p.ownerId == uid).select()?
+  rpc addItem(iid: String, aid: String, title: String, price: Nat) -> ShopDb.items!:
+    requires auth, 1 <= iid.length <= 64, 1 <= aid.length <= 64, 1 <= title.length <= 200, price <= 100000
+    if not (1 <= uid.length <= 64): return fail(.badUser)
+    return await db.items.insert(id = iid, authorId = aid, ownerId = uid, title = title, price = price)?
   rpc createAuthorAndItem(aid: String, aname: String, iid: String, title: String, price: Nat) -> ShopDb.items!:
     requires auth, 1 <= aid.length <= 64, 1 <= aname.length <= 120, 1 <= iid.length <= 64, 1 <= title.length <= 200, price <= 100000
     ensures result.id == iid, result.price == price
@@ -190,8 +218,8 @@ server ShopApi:
     requires auth, 1 <= aid.length <= 64, 1 <= aname.length <= 120
     db.transaction:
       return await db.authors.insertOrIgnore(id = aid, name = aname)?
-bad_db "Database read policy `ShopDb.items.read` failed in `leakSum → ShopDb.items.sum`:\n  • must prove: some ownerId = ctx.userId" ShopDb : rpc leakSum() -> Nat!: return await db.items.sum(col = "price")?
-bad_db_auth "Database read policy `ShopDb.privateProfiles.read` (joined table) failed in `leakProfileJoin → ShopDb.secretLogs.join`:\n  • must prove: some ownerId = ctx.userId" ShopDb leakProfileJoin() -> (ShopDb.secretLogs, ShopDb.privateProfiles)[]! : return await db.secretLogs.join(table = privateProfiles, where = r => r.ownerId == uid)?
+bad_db "Database read policy `ShopDb.items.read` failed in `leakSum → ShopDb.items.sum`:\n  • must prove: some ownerId = ctx.userId" ShopDb : rpc leakSum() -> Nat!: return await db.items.sum("price")?
+bad_db_auth "Database read policy `ShopDb.privateProfiles.read` (joined table) failed in `leakProfileJoin → ShopDb.secretLogs.select`:\n  • must prove: some ownerId = ctx.userId" ShopDb leakProfileJoin() -> (ShopDb.secretLogs, ShopDb.privateProfiles)[]! : return await db.secretLogs.where(r => r.ownerId == uid).join(privateProfiles).select()?
 bad_db_auth "Database insert policy `ShopDb.items.insert` failed in `badTxInsert → ShopDb.items.insert`:\n  • must prove: some \"victim\" = ctx.userId" ShopDb badTxInsert(aid: String, iid: String) -> ShopDb.items! || 1 <= aid.length <= 64, 1 <= iid.length <= 64 : db.transaction: return await db.items.insert(id = iid, authorId = aid, ownerId = "victim", title = "oops", price = 10)?
 
 /-! ## Verified Bidirectional Mappings & `Field`/`Ensured` DB Fact Harvesting -/
@@ -257,7 +285,7 @@ server CipherApi:
     return await db.sealedNotes.insert(id = noteId, ownerId = uid, ciphertext = sealedNoteMap.encode(input))?
   rpc editSealed(noteId: Nat, input: SecretNoteInput) -> CipherDb.sealedNotes?!:
     requires auth
-    return await db.sealedNotes.updateOne(where = r => r.id == noteId and r.ownerId == uid, set = r => { ciphertext = sealedNoteMap.encode(input) })?
+    return await db.sealedNotes.where(r => r.id == noteId and r.ownerId == uid).updateOne(r => { ciphertext = sealedNoteMap.encode(input) })?
   rpc savePlainFromSchema(noteId: Nat, input: PlainNoteInput) -> VaultDb.notes!:
     requires auth
     if not (1 <= uid.length <= 64): return fail(.invalidUser)
@@ -318,29 +346,29 @@ server EncVaultApi:
   rpc edit(noteId: Nat, input: SecretNoteInput) -> EncVaultDb.entries?!:
     requires auth
     ensures result.id == noteId
-    return await db.entries.updateOne(where = r => r.id == noteId and r.ownerId == uid, set = r => { body = input.body })?
+    return await db.entries.where(r => r.id == noteId and r.ownerId == uid).updateOne(r => { body = input.body })?
   rpc scaleId(noteId: Nat) -> EncVaultDb.entries?!:
     requires auth
-    return await db.entries.updateOne(where = r => r.id == noteId and r.ownerId == uid, set = { note = "scaled", })?
+    return await db.entries.where(r => r.id == noteId and r.ownerId == uid).updateOne({ note = "scaled", })?
   rpc get(noteId: Nat) -> EncVaultDb.entries?!:
     requires auth
     ensures result.id == noteId
-    return await db.entries.findOne(where = r => r.id == noteId and r.ownerId == uid)?
+    return await db.entries.where(r => r.id == noteId and r.ownerId == uid).findOne()?
   rpc list() -> EncVaultDb.entries[]!:
     requires auth
-    return await db.entries.select(where = r => r.ownerId == uid, orderBy = "id")?
+    return await db.entries.where(r => r.ownerId == uid).orderBy("id").select()?
   rpc listFiltered(exactId: Nat?, minId: Nat?) -> EncVaultDb.entries[]!:
     requires auth
-    return await db.entries.select(where = r => r.ownerId == uid and (if let some(id) = exactId: r.id == id elif let some(lo) = minId: r.id >= lo else: true), orderBy = "id")?
+    return await db.entries.where(r => r.ownerId == uid and (if let some(id) = exactId: r.id == id elif let some(lo) = minId: r.id >= lo else: true)).orderBy("id").select()?
 
 component FieldRenderCheck:
   state items : SecretNoteInput[] = []
   view: <ul>{for item in items: <li key={item.body}><span>{item.body}</span></li>}</ul>
 
-bad_db1 "cannot reference encrypted column `entries.body` inside SQL `where`" EncVaultDb badWhere(q: String) -> EncVaultDb.entries[]! : return await db.entries.select(where = r => r.ownerId == ctx.userId.getD("") and r.body == q)?
-bad_db1 "cannot `orderBy` encrypted column `entries.body`" EncVaultDb badOrder(x: Nat) -> EncVaultDb.entries[]! : return await db.entries.select(where = r => r.ownerId == ctx.userId.getD(""), orderBy = "body")?
-bad_db1 "cannot compute SQL aggregate on encrypted column `entries.body`" EncVaultDb badAgg(x: Nat) -> String?! : return await db.entries.min(col = "body", where = r => r.ownerId == ctx.userId.getD(""))?
-bad_db1 "cannot update encrypted column `EncVaultDb.entries.body` using a row-dependent SQL expression" EncVaultDb badSet(x: Nat) -> EncVaultDb.entries?! : return await db.entries.updateOne(where = r => r.id == x and r.ownerId == ctx.userId.getD(""), set = r => { body = r.body })?
+bad_db1 "cannot reference encrypted column `entries.body` inside SQL `where`" EncVaultDb badWhere(q: String) -> EncVaultDb.entries[]! : return await db.entries.where(r => r.ownerId == ctx.userId.getD("") and r.body == q).select()?
+bad_db1 "cannot `orderBy` encrypted column `entries.body`" EncVaultDb badOrder(x: Nat) -> EncVaultDb.entries[]! : return await db.entries.where(r => r.ownerId == ctx.userId.getD("")).orderBy("body").select()?
+bad_db1 "cannot compute SQL aggregate on encrypted column `entries.body`" EncVaultDb badAgg(x: Nat) -> String?! : return await db.entries.where(r => r.ownerId == ctx.userId.getD("")).min("body")?
+bad_db1 "cannot update encrypted column `EncVaultDb.entries.body` using a row-dependent SQL expression" EncVaultDb badSet(x: Nat) -> EncVaultDb.entries?! : return await db.entries.where(r => r.id == x and r.ownerId == ctx.userId.getD("")).updateOne(r => { body = r.body })?
 bad_db_tbl "cannot index encrypted column `bad.body`" BadEncIndexDb bad : id : Nat primary_key || body : encrypted(String, key = secret("K")) || index (body)
 bad_db_tbl "encrypted column `bad.body` cannot be `unique`" BadEncUniqueDb bad : id : Nat primary_key || body : encrypted(String, key = secret("K")) unique
 
@@ -402,13 +430,13 @@ server RoadmapApi:
   rpc createAndUpsert(orgId: String, projId: String, stg: DeployStage) -> RoadmapDb.projects!:
     requires auth, 1 <= orgId.length <= 64, 1 <= projId.length <= 64, stg == .queued
     let _o = await db.orgs.upsert(on = "id", id = orgId, name = "Acme")?
-    return await db.projects.upsert(on = ["id"], where = r => r.ownerId == uid and r.stage == .queued, id = projId, orgId = orgId, ownerId = uid, stage = .queued, note = some("ok"))?
+    return await db.projects.where(r => r.ownerId == uid and r.stage == .queued).upsert(on = ["id"], id = projId, orgId = orgId, ownerId = uid, stage = .queued, note = some("ok"))?
   rpc listLive() -> RoadmapDb.projects[]!:
     requires auth
-    return await db.projects.select(where = r => r.ownerId == uid and r.stage == .live)?
+    return await db.projects.where(r => r.ownerId == uid and r.stage == .live).select()?
   rpc advanceToBuilding(projId: String) -> RoadmapDb.projects?!:
     requires auth
-    return await db.projects.updateOne(where = r => r.id == projId and r.ownerId == uid and r.stage == .queued, set = { stage = .building })?
+    return await db.projects.where(r => r.id == projId and r.ownerId == uid and r.stage == .queued).updateOne({ stage = .building })?
   rpc registerService(rawSlug: String, rawPort: Nat) -> RoadmapDb.services!:
     let s = ServiceSlug.parse(rawSlug)?
     let p = ServicePort.parse(rawPort)?
@@ -422,7 +450,7 @@ server RoadmapApi:
     requires 1 <= orgId.length <= 64, 1 <= name.length <= 120
     return await db.orgs.insert(id = orgId, name = name)?
   rpc getOrg(orgId: String) -> RoadmapDb.orgs?!:
-    return await db.orgs.findOne(where = r => r.id == orgId)?
+    return await db.orgs.where(r => r.id == orgId).findOne()?
   rpc abortTxInsertOrg(orgId: String, name: String) -> Bool!:
     requires 1 <= orgId.length <= 64, 1 <= name.length <= 120
     db.transaction:
@@ -433,42 +461,42 @@ server RoadmapApi:
     return await db.projects.insert(id = projId, orgId = orgId, ownerId = uid, stage = .queued, note = none)?
   rpc getProject(projId: String) -> RoadmapDb.projects?!:
     requires auth
-    return await db.projects.findOne(where = r => r.id == projId and r.ownerId == uid)?
+    return await db.projects.where(r => r.id == projId and r.ownerId == uid).findOne()?
   rpc upsertBuilding(projId: String, orgId: String, note: String?) -> RoadmapDb.projects!:
     requires auth, 1 <= projId.length <= 64, 1 <= orgId.length <= 64, 1 <= uid.length <= 128
-    return await db.projects.upsert(on = ["id"], where = r => r.ownerId == uid and r.stage == .queued, id = projId, orgId = orgId, ownerId = uid, stage = .building, note = note)?
+    return await db.projects.where(r => r.ownerId == uid and r.stage == .queued).upsert(on = ["id"], id = projId, orgId = orgId, ownerId = uid, stage = .building, note = note)?
   rpc promoteToLive(projId: String) -> RoadmapDb.projects?!:
     requires auth
-    return await db.projects.updateOne(where = r => r.id == projId and r.ownerId == uid and r.stage == .building, set = { stage = .live })?
+    return await db.projects.where(r => r.id == projId and r.ownerId == uid and r.stage == .building).updateOne({ stage = .live })?
   rpc countLive() -> Nat!:
     requires auth
-    return await db.projects.count(where = r => r.ownerId == uid and r.stage == .live)?
+    return await db.projects.where(r => r.ownerId == uid and r.stage == .live).count()?
   rpc deleteProject(projId: String) -> Nat!:
     requires auth
-    return await db.projects.delete(where = r => r.id == projId and r.ownerId == uid)?
+    return await db.projects.where(r => r.id == projId and r.ownerId == uid).delete()?
   rpc insertScaling(id: String, minI: Nat, maxI: Nat) -> RoadmapDb.scaling!:
     requires 1 <= id.length <= 64, minI <= maxI
     return await db.scaling.insert(id = id, plan = "pro", minInstances = minI, maxInstances = maxI)?
   rpc bumpScalingMax(id: String, delta: Nat) -> RoadmapDb.scaling?!:
-    return await db.scaling.updateOne(where = r => r.id == id and r.plan == "pro", set = { maxInstances += delta })?
+    return await db.scaling.where(r => r.id == id and r.plan == "pro").updateOne({ maxInstances += delta })?
   rpc decScalingMax(id: String, delta: Nat) -> RoadmapDb.scaling?!:
-    return await db.scaling.updateOne(where = r => r.id == id and r.plan == "pro" and r.maxInstances >= r.minInstances + delta, set = { maxInstances -= delta })?
+    return await db.scaling.where(r => r.id == id and r.plan == "pro" and r.maxInstances >= r.minInstances + delta).updateOne({ maxInstances -= delta })?
   rpc findByTrimmedOwner(rawOwner: String) -> RoadmapDb.projects[]!:
     let clean = Qed.Str.truncate(Qed.Str.toLower(Qed.Str.trim(rawOwner)), 64)
     if some(clean) != ctx.userId: return fail(.forbidden)
-    return await db.projects.select(where = r => r.ownerId == clean)?
+    return await db.projects.where(r => r.ownerId == clean).select()?
   fn allocSlot(rawId: String, rawLabel: String, rawTag: String, rawCode: String) -> RoadmapDb.slots!:
     requires auth, 1 <= uid.length <= 64, 1 <= rawId.length, 1 <= rawLabel.length, rawCode.length <= 32
     return await db.slots.insert(id = Qed.Str.truncate(rawId, 64), ownerId = uid, label = Qed.Str.truncate(rawLabel, 64), tag = Qed.Str.take(rawTag, 16), code = Qed.Str.toLower(Qed.Str.trim(rawCode)))?
   fn relabelSlot(slotId: String, rawLabel: String, rawTag: String) -> RoadmapDb.slots?!:
     requires auth, 1 <= rawLabel.length
-    return await db.slots.updateOne(where = r => r.id == slotId and r.ownerId == uid, set = { label = Qed.Str.truncate(rawLabel, 64), tag = Qed.Str.take(rawTag, 16) })?
+    return await db.slots.where(r => r.id == slotId and r.ownerId == uid).updateOne({ label = Qed.Str.truncate(rawLabel, 64), tag = Qed.Str.take(rawTag, 16) })?
 
 bad_db "Database table constraint `RoadmapDb.scaling.RowInv` failed in `badFreeWarm → RoadmapDb.scaling.insert`" RoadmapDb :
   rpc badFreeWarm(appId: String) -> RoadmapDb.scaling!:
     requires 1 <= appId.length <= 64
     return await db.scaling.insert(id = appId, plan = "free", minInstances = 1, maxInstances = 1)?
-bad_db_auth "Nat non-underflow for `books.stock -= ...`" VaultDb badAtomicDec(bookId: String, qty: Nat) -> VaultDb.books?! || 1 <= qty <= 50 : return await db.books.updateOne(where = r => r.id == bookId, set = { stock -= qty })?
+bad_db_auth "Nat non-underflow for `books.stock -= ...`" VaultDb badAtomicDec(bookId: String, qty: Nat) -> VaultDb.books?! || 1 <= qty <= 50 : return await db.books.where(r => r.id == bookId).updateOne({ stock -= qty })?
 bad_db_auth "Database upsert conflict update policy `RoadmapDb.projects.update` failed in `badUpsert → RoadmapDb.projects.upsert`" RoadmapDb badUpsert(orgId: String, projId: String) -> RoadmapDb.projects! || 1 <= orgId.length <= 64, 1 <= projId.length <= 64 : return await db.projects.upsert(on = "id", id = projId, orgId = orgId, ownerId = uid, stage = .queued, note = none)?
 bad_db_def "`on_delete set_null` on `bad.orgId` requires a nullable column (`T?`)" BadSetNullDb :
   table orgs:
@@ -477,7 +505,7 @@ bad_db_def "`on_delete set_null` on `bad.orgId` requires a nullable column (`T?`
       id    : String primary_key
       orgId : String references orgs(id) on_delete set_null
 
-/-! ## Item 6: Encrypted Column Projections (`Meta`, `selectMeta`, `columns = [...]`) & `prevKeys` Rotation -/
+/-! ## Item 6: Encrypted Column Projections (`Meta`, `selectMeta`, `.columns(...)`) & `prevKeys` Rotation -/
 database RotatingVaultDb:
   sqlite ".qed/rotating_vault_checks.db"
   table entries:
@@ -493,24 +521,24 @@ server RotatingVaultApi:
     return await db.entries.insert(id = id, ownerId = uid, label = label, secret = secret)?
   rpc get(id: Nat) -> RotatingVaultDb.entries?!:
     requires auth
-    return await db.entries.findOne(where = r => r.id == id and r.ownerId == uid)?
+    return await db.entries.where(r => r.id == id and r.ownerId == uid).findOne()?
   rpc rotateValue(id: Nat, secret: String) -> RotatingVaultDb.entries?!:
     requires auth, 1 <= secret.length <= 512
-    return await db.entries.updateOne(where = r => r.id == id and r.ownerId == uid, set = { secret = secret })?
+    return await db.entries.where(r => r.id == id and r.ownerId == uid).updateOne({ secret = secret })?
   rpc listMeta() -> RotatingVaultDb.entries.Meta[]!:
     requires auth
-    return await db.entries.selectMeta(where = r => r.ownerId == uid, orderBy = "id")?
+    return await db.entries.where(r => r.ownerId == uid).orderBy("id").selectMeta()?
   rpc getMeta(id: Nat) -> RotatingVaultDb.entries.Meta?!:
     requires auth
-    return await db.entries.findOneMeta(where = r => r.id == id and r.ownerId == uid)?
+    return await db.entries.where(r => r.id == id and r.ownerId == uid).findOneMeta()?
   rpc listLabels() -> (Nat, String)[]!:
     requires auth
-    return await db.entries.select(columns = ["id", "label"], where = r => r.ownerId == uid, orderBy = "id")?
+    return await db.entries.where(r => r.ownerId == uid).orderBy("id").columns(["id", "label"]).select()?
   rpc getLabel(id: Nat) -> String?!:
     requires auth
-    return await db.entries.findOne(columns = ["label"], where = r => r.id == id and r.ownerId == uid)?
+    return await db.entries.where(r => r.id == id and r.ownerId == uid).columns("label").findOne()?
 bad_db_auth "read policy `RotatingVaultDb.entries.read`" RotatingVaultDb leakMeta() -> RotatingVaultDb.entries.Meta[]! : return await db.entries.selectMeta()?
-bad_db_auth "unknown column `nope` on table `entries`" RotatingVaultDb badProjCol() -> String[]! : return await db.entries.select(columns = ["nope"], where = r => r.ownerId == uid)?
+bad_db_auth "unknown column `nope` on table `entries`" RotatingVaultDb badProjCol() -> String[]! : return await db.entries.where(r => r.ownerId == uid).columns(["nope"]).select()?
 
 /-! ## Item 4: Cross-Table `any m in tbl:` RLS Policies & Queries -/
 database MultiTenantDb:
@@ -592,70 +620,76 @@ server MultiTenantApi:
     return await db.org_members.insert(id = id, orgId = orgId, userId = userId)?
   rpc listOwnedApps() -> MultiTenantDb.apps[]!:
     requires auth
-    return await db.apps.select(where = r => r.ownerId == uid, orderBy = "id")?
+    return await db.apps.where(r => r.ownerId == uid).orderBy("id").select()?
   rpc listAccessibleApps() -> MultiTenantDb.apps[]!:
     requires auth
-    return await db.apps.select(where = r =>
-      some(r.ownerId) == ctx.userId or
-      (any m in app_members: m.appId == r.id and some(m.userId) == ctx.userId and m.status == "accepted") or
-      (any om in org_members: some(om.orgId) == r.orgId and some(om.userId) == ctx.userId), orderBy = "id")?
+    return await db.apps
+      .where(r =>
+        some(r.ownerId) == ctx.userId or
+        (any m in app_members: m.appId == r.id and some(m.userId) == ctx.userId and m.status == "accepted") or
+        (any om in org_members: some(om.orgId) == r.orgId and some(om.userId) == ctx.userId))
+      .orderBy("id").select()?
   rpc listSharedApps() -> MultiTenantDb.apps[]!:
     requires auth
-    return await db.apps.select(where = r => any m in app_members: m.appId == r.id and some(m.userId) == ctx.userId and m.status == "accepted", orderBy = "id")?
+    return await db.apps.where(r => any m in app_members: m.appId == r.id and some(m.userId) == ctx.userId and m.status == "accepted").orderBy("id").select()?
   rpc renameAppAsAdmin(appId: String, newName: String) -> MultiTenantDb.apps?!:
     requires auth, 1 <= newName.length <= 120
-    return await db.apps.updateOne(
-      where = r => r.id == appId and (any m in app_members: m.appId == r.id and some(m.userId) == ctx.userId and m.status == "accepted" and m.role in ["owner", "admin"]),
-      set = r => { name = newName })?
+    return await db.apps
+      .where(r => r.id == appId and (any m in app_members: m.appId == r.id and some(m.userId) == ctx.userId and m.status == "accepted" and m.role in ["owner", "admin"]))
+      .updateOne(r => { name = newName })?
   rpc renameAppAsSpecificAdmin(appId: String, newName: String) -> MultiTenantDb.apps?!:
     requires auth, 1 <= newName.length <= 120
-    return await db.apps.updateOne(
-      where = r => r.id == appId and (any m in app_members: m.appId == r.id and some(m.userId) == ctx.userId and m.status == "accepted" and m.role == "admin"),
-      set = r => { name = newName })?
+    return await db.apps
+      .where(r => r.id == appId and (any m in app_members: m.appId == r.id and some(m.userId) == ctx.userId and m.status == "accepted" and m.role == "admin"))
+      .updateOne(r => { name = newName })?
   rpc deployAsOwner(depId: String, appId: String, label: String) -> MultiTenantDb.deployments!:
     requires auth, 1 <= depId.length <= 64, 1 <= label.length <= 120, 1 <= uid.length <= 128
     return await db.deployments.insert(id = depId, appId = appId, ownerId = uid, label = label, active = true)?
   rpc deployAsAdmin(depId: String, appId: String, appOwnerId: String, label: String) -> MultiTenantDb.deployments!:
     requires auth, 1 <= depId.length <= 64, 1 <= appOwnerId.length <= 128, 1 <= label.length <= 120
-    return await db.deployments.insert(
-      where = r => any m in app_members: m.appId == r.appId and some(m.userId) == ctx.userId and m.status == "accepted" and m.role == "admin",
-      id = depId, appId = appId, ownerId = appOwnerId, label = label, active = true)?
+    return await db.deployments
+      .where(r => any m in app_members: m.appId == r.appId and some(m.userId) == ctx.userId and m.status == "accepted" and m.role == "admin")
+      .insert(id = depId, appId = appId, ownerId = appOwnerId, label = label, active = true)?
   rpc deployAsAdminBareWhere(depId: String, appId: String, appOwnerId: String, label: String) -> MultiTenantDb.deployments!:
     requires auth, 1 <= depId.length <= 64, 1 <= appOwnerId.length <= 128, 1 <= label.length <= 120
-    return await db.deployments.insert(
-      where = any m in app_members: m.appId == appId and some(m.userId) == ctx.userId and m.status == "accepted" and m.role in ["owner", "admin"],
-      id = depId, appId = appId, ownerId = appOwnerId, label = label, active = true)?
+    return await db.deployments
+      .where(_ => any m in app_members: m.appId == appId and some(m.userId) == ctx.userId and m.status == "accepted" and m.role in ["owner", "admin"])
+      .insert(id = depId, appId = appId, ownerId = appOwnerId, label = label, active = true)?
   rpc deployAsOrgMember(depId: String, appId: String, appOwnerId: String, label: String) -> MultiTenantDb.deployments!:
     requires auth, 1 <= depId.length <= 64, 1 <= appOwnerId.length <= 128, 1 <= label.length <= 120
-    return await db.deployments.insert(
-      where = r => any a in apps: a.id == r.appId and (any om in org_members: some(om.orgId) == a.orgId and some(om.userId) == ctx.userId),
-      id = depId, appId = appId, ownerId = appOwnerId, label = label, active = true)?
+    return await db.deployments
+      .where(r => any a in apps: a.id == r.appId and (any om in org_members: some(om.orgId) == a.orgId and some(om.userId) == ctx.userId))
+      .insert(id = depId, appId = appId, ownerId = appOwnerId, label = label, active = true)?
   rpc deployRowAsAdmin(row: MultiTenantDb.deployments) -> MultiTenantDb.deployments!:
     requires auth, 1 <= row.id.length <= 64, 1 <= row.ownerId.length <= 128, 1 <= row.label.length <= 120
-    return await db.deployments.insert(row,
-      where = r => any m in app_members: m.appId == r.appId and some(m.userId) == ctx.userId and m.status == "accepted" and m.role == "admin")?
+    return await db.deployments
+      .where(r => any m in app_members: m.appId == r.appId and some(m.userId) == ctx.userId and m.status == "accepted" and m.role == "admin")
+      .insert(row)?
   rpc deployIdempotentAsAdmin(depId: String, appId: String, appOwnerId: String, label: String) -> MultiTenantDb.deployments?!:
     requires auth, 1 <= depId.length <= 64, 1 <= appOwnerId.length <= 128, 1 <= label.length <= 120
-    return await db.deployments.insertOrIgnore(
-      on = "id",
-      where = r => any m in app_members: m.appId == r.appId and some(m.userId) == ctx.userId and m.status == "accepted" and m.role in ["owner", "admin"],
-      id = depId, appId = appId, ownerId = appOwnerId, label = label, active = true)?
+    return await db.deployments
+      .where(r => any m in app_members: m.appId == r.appId and some(m.userId) == ctx.userId and m.status == "accepted" and m.role in ["owner", "admin"])
+      .insertOrIgnore(on = "id", id = depId, appId = appId, ownerId = appOwnerId, label = label, active = true)?
   rpc createSecretAsAdmin(secId: String, appId: String, appOwnerId: String, secretVal: String) -> MultiTenantDb.app_secrets!:
     requires auth, 1 <= secId.length <= 64, 1 <= appOwnerId.length <= 128, 1 <= secretVal.length <= 200
-    return await db.app_secrets.insert(
-      where = r => some(r.ownerId) == ctx.userId or (any m in app_members: m.appId == r.appId and some(m.userId) == ctx.userId and m.status == "accepted" and m.role in ["owner", "admin"]),
-      id = secId, appId = appId, ownerId = appOwnerId, secret = secretVal)?
+    return await db.app_secrets
+      .where(r => some(r.ownerId) == ctx.userId or (any m in app_members: m.appId == r.appId and some(m.userId) == ctx.userId and m.status == "accepted" and m.role in ["owner", "admin"]))
+      .insert(id = secId, appId = appId, ownerId = appOwnerId, secret = secretVal)?
   rpc listDeployments(appId: String) -> MultiTenantDb.deployments[]!:
     requires auth
-    return await db.deployments.select(where = r => r.appId == appId and (
-      some(r.ownerId) == ctx.userId or
-      (any m in app_members: m.appId == r.appId and some(m.userId) == ctx.userId and m.status == "accepted") or
-      (any a in apps: a.id == r.appId and (any om in org_members: some(om.orgId) == a.orgId and some(om.userId) == ctx.userId))), orderBy = "id")?
+    return await db.deployments
+      .where(r => r.appId == appId and (
+        some(r.ownerId) == ctx.userId or
+        (any m in app_members: m.appId == r.appId and some(m.userId) == ctx.userId and m.status == "accepted") or
+        (any a in apps: a.id == r.appId and (any om in org_members: some(om.orgId) == a.orgId and some(om.userId) == ctx.userId))))
+      .orderBy("id").select()?
   rpc listSecrets(appId: String) -> MultiTenantDb.app_secrets[]!:
     requires auth
-    return await db.app_secrets.select(where = r => r.appId == appId and (
-      some(r.ownerId) == ctx.userId or
-      (any m in app_members: m.appId == r.appId and some(m.userId) == ctx.userId and m.status == "accepted" and m.role in ["owner", "admin"])), orderBy = "id")?
+    return await db.app_secrets
+      .where(r => r.appId == appId and (
+        some(r.ownerId) == ctx.userId or
+        (any m in app_members: m.appId == r.appId and some(m.userId) == ctx.userId and m.status == "accepted" and m.role in ["owner", "admin"])))
+      .orderBy("id").select()?
   example adminCanDeployAndViewerRejected:
     with user "charlie"
     with db db.apps = [{ id = "app1", ownerId = "alice", orgId = none, name = "Alpha" }]
@@ -693,12 +727,12 @@ server MultiTenantApi:
     expect db_count("deployments") == 0
 
 bad_db_auth "read policy `MultiTenantDb.apps.read`" MultiTenantDb leakAllApps() -> MultiTenantDb.apps[]! : return await db.apps.select()?
-bad_db_auth "read policy `MultiTenantDb.apps.read`" MultiTenantDb leakPendingApps() -> MultiTenantDb.apps[]! : return await db.apps.select(where = r => any m in app_members: m.appId == r.id and some(m.userId) == ctx.userId and m.status == "pending")?
-bad_db_auth "update policy `MultiTenantDb.apps.update`" MultiTenantDb viewerCannotRename(appId: String, newName: String) -> MultiTenantDb.apps?! || 1 <= newName.length <= 120 : return await db.apps.updateOne(where = r => r.id == appId and (any m in app_members: m.appId == r.id and some(m.userId) == ctx.userId and m.status == "accepted" and m.role == "viewer"), set = r => { name = newName })?
-bad_db_auth "For cross-table insert policies, pass `where = r => any ... in ...:`" MultiTenantDb unguardedCrossInsert(depId: String, appId: String, appOwnerId: String) -> MultiTenantDb.deployments! || 1 <= depId.length <= 64, 1 <= appOwnerId.length <= 128 : return await db.deployments.insert(id = depId, appId = appId, ownerId = appOwnerId, label = "v1", active = true)?
-bad_db_auth "insert policy `MultiTenantDb.deployments.insert`" MultiTenantDb viewerCannotDeploy(depId: String, appId: String, appOwnerId: String) -> MultiTenantDb.deployments! || 1 <= depId.length <= 64, 1 <= appOwnerId.length <= 128 : return await db.deployments.insert(where = r => any m in app_members: m.appId == r.appId and some(m.userId) == ctx.userId and m.status == "accepted" and m.role == "viewer", id = depId, appId = appId, ownerId = appOwnerId, label = "v1", active = true)?
-bad_db_auth "insert policy `MultiTenantDb.deployments.insert`" MultiTenantDb pendingCannotDeploy(depId: String, appId: String, appOwnerId: String) -> MultiTenantDb.deployments! || 1 <= depId.length <= 64, 1 <= appOwnerId.length <= 128 : return await db.deployments.insert(where = r => any m in app_members: m.appId == r.appId and some(m.userId) == ctx.userId and m.status == "pending" and m.role == "admin", id = depId, appId = appId, ownerId = appOwnerId, label = "v1", active = true)?
-bad_db_auth "shadows an outer row/table variable" MultiTenantDb shadowedAliasInsert(depId: String, appId: String, appOwnerId: String) -> MultiTenantDb.deployments! || 1 <= depId.length <= 64, 1 <= appOwnerId.length <= 128 : return await db.deployments.insert(where = r => any r in app_members: r.appId == appId and some(r.userId) == ctx.userId and r.status == "accepted" and r.role == "admin", id = depId, appId = appId, ownerId = appOwnerId, label = "v1", active = true)?
+bad_db_auth "read policy `MultiTenantDb.apps.read`" MultiTenantDb leakPendingApps() -> MultiTenantDb.apps[]! : return await db.apps.where(r => any m in app_members: m.appId == r.id and some(m.userId) == ctx.userId and m.status == "pending").select()?
+bad_db_auth "update policy `MultiTenantDb.apps.update`" MultiTenantDb viewerCannotRename(appId: String, newName: String) -> MultiTenantDb.apps?! || 1 <= newName.length <= 120 : return await db.apps.where(r => r.id == appId and (any m in app_members: m.appId == r.id and some(m.userId) == ctx.userId and m.status == "accepted" and m.role == "viewer")).updateOne(r => { name = newName })?
+bad_db_auth "For cross-table insert policies, chain `.where(r => any ... in ...:)`" MultiTenantDb unguardedCrossInsert(depId: String, appId: String, appOwnerId: String) -> MultiTenantDb.deployments! || 1 <= depId.length <= 64, 1 <= appOwnerId.length <= 128 : return await db.deployments.insert(id = depId, appId = appId, ownerId = appOwnerId, label = "v1", active = true)?
+bad_db_auth "insert policy `MultiTenantDb.deployments.insert`" MultiTenantDb viewerCannotDeploy(depId: String, appId: String, appOwnerId: String) -> MultiTenantDb.deployments! || 1 <= depId.length <= 64, 1 <= appOwnerId.length <= 128 : return await db.deployments.where(r => any m in app_members: m.appId == r.appId and some(m.userId) == ctx.userId and m.status == "accepted" and m.role == "viewer").insert(id = depId, appId = appId, ownerId = appOwnerId, label = "v1", active = true)?
+bad_db_auth "insert policy `MultiTenantDb.deployments.insert`" MultiTenantDb pendingCannotDeploy(depId: String, appId: String, appOwnerId: String) -> MultiTenantDb.deployments! || 1 <= depId.length <= 64, 1 <= appOwnerId.length <= 128 : return await db.deployments.where(r => any m in app_members: m.appId == r.appId and some(m.userId) == ctx.userId and m.status == "pending" and m.role == "admin").insert(id = depId, appId = appId, ownerId = appOwnerId, label = "v1", active = true)?
+bad_db_auth "shadows an outer row/table variable" MultiTenantDb shadowedAliasInsert(depId: String, appId: String, appOwnerId: String) -> MultiTenantDb.deployments! || 1 <= depId.length <= 64, 1 <= appOwnerId.length <= 128 : return await db.deployments.where(r => any r in app_members: r.appId == appId and some(r.userId) == ctx.userId and r.status == "accepted" and r.role == "admin").insert(id = depId, appId = appId, ownerId = appOwnerId, label = "v1", active = true)?
 bad_db_tbl "unknown table `ghosts` in cross-table `any m in ghosts:`" BadCrossTableRefDb apps : id : String primary_key || policy read requires any m in ghosts: m.appId == row.id
 bad_db_def "cannot reference encrypted column `secrets.val` inside cross-table `any s in secrets:`" BadCrossEncDb :
   table apps:
@@ -795,27 +829,40 @@ server stateless TxLeaseSrv:
   use db : TxLeaseDb
   fn claimInsideTx(tx: db.Tx, leaseId: String, uid: String) -> TxLeaseDb.leases?!:
     requires some(uid) == ctx.userId
-    return await tx.leases.updateOne(where = r => r.id == leaseId and r.ownerId == uid and r.status == "open" and r.retries < 10, set = r => { status = "claimed", retries = r.retries + 1 })?
+    return await tx.leases.where(r => r.id == leaseId and r.ownerId == uid and r.status == "open" and r.retries < 10).updateOne(r => { status = "claimed", retries = r.retries + 1 })?
   rpc claimMyLease(leaseId: String) -> TxLeaseDb.leases?!:
     requires auth
     db.transaction as tx:
       return await claimInsideTx(tx, leaseId, uid)?
   rpc bulkClaimMyOpen(onlyId: String?) -> TxLeaseDb.leases[]!:
     requires auth
-    return await db.leases.update(
-      where = r => if let some(lid) = onlyId: r.id == lid and r.ownerId == uid and r.status == "open" and r.retries < 10 else: r.ownerId == uid and r.status == "open" and r.retries < 10,
-      set = r => { status = "claimed", retries = r.retries + 1 })?
+    return await db.leases
+      .where(r => if let some(lid) = onlyId: r.id == lid and r.ownerId == uid and r.status == "open" and r.retries < 10 else: r.ownerId == uid and r.status == "open" and r.retries < 10)
+      .update(r => { status = "claimed", retries = r.retries + 1 })?
   read_only rpc listMyLeases(onlyOpen: Bool, filterId: String?) -> TxLeaseDb.leases[]!:
     requires auth
-    return await db.leases.select(where = r => if onlyOpen: (r.id == filterId.getD("") if filterId != none else true) and r.ownerId == uid and r.status == "open" else: r.ownerId == uid)?
+    return await db.leases.where(r => if onlyOpen: (r.id == filterId.getD("") if filterId != none else true) and r.ownerId == uid and r.status == "open" else: r.ownerId == uid).select()?
   read_only fn countMyLeases(onlyOpen: Bool) -> Nat!:
     requires auth
-    return await db.leases.count(where = r => r.ownerId == uid and (r.status == "open" if onlyOpen else true))?
+    return await db.leases.where(r => r.ownerId == uid and (r.status == "open" if onlyOpen else true)).count()?
+  read_only fn countLeasesByStatus() -> (String, Nat)[]!:
+    requires auth
+    return await db.leases.where(r => r.ownerId == uid).groupBy("status").orderBy("-count").count()?
+  read_only fn maxRetriesByStatus() -> (String, Nat)[]!:
+    requires auth
+    return await db.leases.where(r => r.ownerId == uid).groupBy("status").orderBy("status").max("retries")?
   example ownerCanCount:
     with user "alice"
     with db db.leases = [{ id = "l1", ownerId = "alice", status = "open", retries = 0 }, { id = "l2", ownerId = "alice", status = "done", retries = 1 }, { id = "l3", ownerId = "bob", status = "open", retries = 0 }]
     call countMyLeases(true)
     expect ok(1)
+  example ownerCanGroupByInEval:
+    with user "alice"
+    with db db.leases = [{ id = "l1", ownerId = "alice", status = "open", retries = 2 }, { id = "l2", ownerId = "alice", status = "open", retries = 5 }, { id = "l3", ownerId = "alice", status = "done", retries = 1 }, { id = "l4", ownerId = "bob", status = "open", retries = 9 }]
+    call countLeasesByStatus()
+    expect ok([("open", 2), ("done", 1)])
+    call maxRetriesByStatus()
+    expect ok([("done", 1), ("open", 5)])
   example ownerConditionalSelect:
     with user "alice"
     with db db.leases = [{ id = "l1", ownerId = "alice", status = "open", retries = 0 }, { id = "l2", ownerId = "alice", status = "done", retries = 1 }]
@@ -823,12 +870,12 @@ server stateless TxLeaseSrv:
     expect ok([{ id = "l1", ownerId = "alice", status = "open", retries = 0 }])
 
 bad_db "Database read policy `TxLeaseDb.leases.read` failed in `sneakyReadAll → TxLeaseDb.leases.select`" TxLeaseDb : rpc sneakyReadAll() -> TxLeaseDb.leases[]!: return await db.leases.select()?
-bad_db_auth "Database read policy `TxLeaseDb.leases.read` failed in `leakySelect → TxLeaseDb.leases.select`" TxLeaseDb [ro] leakySelect(onlyOpen: Bool) -> TxLeaseDb.leases[]! : return await db.leases.select(where = r => if onlyOpen: r.ownerId == uid and r.status == "open" else: r.status == "done")?
-bad_svc "Database update policy `TxLeaseDb.leases.update` failed in `badTxUpdate → TxLeaseDb.leases.updateOne`" BadTxPolicyHelper : use db : TxLeaseDb || fn badTxUpdate(tx: db.Tx, leaseId: String) -> TxLeaseDb.leases?!: return await tx.leases.updateOne(where = r => r.id == leaseId and r.status == "open" and r.retries < 10, set = r => { status = "claimed" })?
+bad_db_auth "Database read policy `TxLeaseDb.leases.read` failed in `leakySelect → TxLeaseDb.leases.select`" TxLeaseDb [ro] leakySelect(onlyOpen: Bool) -> TxLeaseDb.leases[]! : return await db.leases.where(r => if onlyOpen: r.ownerId == uid and r.status == "open" else: r.status == "done").select()?
+bad_svc "Database update policy `TxLeaseDb.leases.update` failed in `badTxUpdate → TxLeaseDb.leases.updateOne`" BadTxPolicyHelper : use db : TxLeaseDb || fn badTxUpdate(tx: db.Tx, leaseId: String) -> TxLeaseDb.leases?!: return await tx.leases.where(r => r.id == leaseId and r.status == "open" and r.retries < 10).updateOne(r => { status = "claimed" })?
 bad_svc "Database transition/monotonicity invariant `TxLeaseDb.leases.TransInv` failed in `invalidReopen → TxLeaseDb.leases.updateOne`" BadTxTransInv : use db : TxLeaseDb ||
   fn invalidReopen(leaseId: String) -> TxLeaseDb.leases?!:
     requires auth
-    return await db.leases.updateOne(where = r => r.id == leaseId and r.ownerId == uid and r.status == "done", set = r => { status = "open" })?
+    return await db.leases.where(r => r.id == leaseId and r.ownerId == uid and r.status == "done").updateOne(r => { status = "open" })?
 
 /-! ## Issue #22 Item 2: `SqlIdent.ofString?`, `sql!"..."`, Dynamic Read-Only `Db.postgres`, & `pg_catalog` Introspection -/
 
@@ -1074,9 +1121,9 @@ server stateless CloudPolicyApi:
   use db : CloudPolicyDb
   rpc seedAccount(id: String, email: String, spendCap: Nat, isOp: Bool) -> CloudPolicyDb.accounts!:
     requires auth, 1 <= id.length <= 64, 3 <= email.length <= 128
-    return await db.accounts.insert(
-      where = r => some(r.id) == ctx.userId or db.isOperator(),
-      id = id, email = email, spendCap = spendCap, isOperator = isOp)?
+    return await db.accounts
+      .where(r => some(r.id) == ctx.userId or db.isOperator())
+      .insert(id = id, email = email, spendCap = spendCap, isOperator = isOp)?
   rpc createApp(id: String, name: String) -> CloudPolicyDb.apps!:
     requires auth, 1 <= id.length <= 64, 1 <= name.length <= 120, 1 <= uid.length <= 64
     return await db.apps.insert(id = id, ownerId = uid, name = name, suspended = false)?
@@ -1085,49 +1132,56 @@ server stateless CloudPolicyApi:
     return await db.app_members.insert(id = id, appId = appId, userId = userId, role = role, status = status)?
   rpc addAppDb(id: String, appId: String, ownerId: String, managed: Bool) -> CloudPolicyDb.app_dbs!:
     requires auth, 1 <= id.length <= 64, 1 <= ownerId.length <= 64
-    return await db.app_dbs.insert(where = r => db.canAdminApp(r.appId, r.ownerId), id = id, appId = appId, ownerId = ownerId, managed = managed)?
+    return await db.app_dbs.where(r => db.canAdminApp(r.appId, r.ownerId)).insert(id = id, appId = appId, ownerId = ownerId, managed = managed)?
   rpc addSecret(id: String, appId: String, ownerId: String, label: String, secretVal: String) -> CloudPolicyDb.app_secrets!:
     requires auth, 1 <= id.length <= 64, 1 <= ownerId.length <= 64, 1 <= label.length <= 64, 1 <= secretVal.length <= 200
-    return await db.app_secrets.insert(where = r => db.canAdminApp(r.appId, r.ownerId), id = id, appId = appId, ownerId = ownerId, label = label, secret = secretVal)?
-  -- Uses `fn` inside `where` + two-state `policy update` keeping `ownerId` unchanged
+    return await db.app_secrets.where(r => db.canAdminApp(r.appId, r.ownerId)).insert(id = id, appId = appId, ownerId = ownerId, label = label, secret = secretVal)?
+  -- Uses `fn` inside `.where` + two-state `policy update` keeping `ownerId` unchanged
   rpc renameApp(appId: String, newName: String) -> CloudPolicyDb.apps?!:
     requires auth, 1 <= newName.length <= 120
-    return await db.apps.updateOne(where = r => r.id == appId and db.canAdminApp(r.id, r.ownerId), set = { name = newName })?
+    return await db.apps.where(r => r.id == appId and db.canAdminApp(r.id, r.ownerId)).updateOne({ name = newName })?
   -- Two-state `policy update` transferring ownership to a verified existing account
   rpc transferApp(appId: String, nextOwnerId: String) -> CloudPolicyDb.apps?!:
     requires auth, 1 <= nextOwnerId.length <= 64
-    return await db.apps.updateOne(
-      where = r => r.id == appId and some(r.ownerId) == ctx.userId and (any a in accounts: a.id == nextOwnerId),
-      set = { ownerId = nextOwnerId })?
+    return await db.apps
+      .where(r => r.id == appId and some(r.ownerId) == ctx.userId and (any a in accounts: a.id == nextOwnerId))
+      .updateOne({ ownerId = nextOwnerId })?
   -- Operator suspension via `database fn isOperator()`
   rpc operatorSuspendApp(appId: String, suspended: Bool) -> CloudPolicyDb.apps?!:
     requires auth
-    return await db.apps.updateOne(where = r => r.id == appId and db.isOperator(), set = { suspended = suspended })?
+    return await db.apps.where(r => r.id == appId and db.isOperator()).updateOne({ suspended = suspended })?
   -- Exact-key email lookup via `policy read(id, email) by email`
   read_only rpc lookupUserIdByEmail(email: String) -> (String, String)?!:
     requires auth
-    return await db.accounts.findOne(columns = ["id", "email"], where = r => r.email == email)?
+    return await db.accounts.where(r => r.email == email).columns(["id", "email"]).findOne()?
   -- Collaborator reads owner's spendCap via `policy read(id, spendCap)` (nested `db.canReadApp` inside `any a in apps:`)
   read_only rpc getOwnerSpendCap(ownerId: String) -> (String, Nat)?!:
     requires auth
-    return await db.accounts.findOne(columns = ["id", "spendCap"],
-      where = r => r.id == ownerId and (any a in apps: a.ownerId == r.id and db.canReadApp(a.id, a.ownerId)))?
+    return await db.accounts
+      .where(r => r.id == ownerId and (any a in apps: a.ownerId == r.id and db.canReadApp(a.id, a.ownerId)))
+      .columns(["id", "spendCap"]).findOne()?
   -- Full-row read disjunct still works when selecting a column subset
   read_only rpc getSelfAccountId() -> String?!:
     requires auth
-    return await db.accounts.findOne(columns = ["id"], where = r => r.id == uid)?
+    return await db.accounts.where(r => r.id == uid).columns("id").findOne()?
   -- Operator reads all accounts via `db.isOperator()`
   read_only rpc listAllAccountsAsOp() -> CloudPolicyDb.accounts[]!:
     requires auth
-    return await db.accounts.select(where = r => db.isOperator(), orderBy = "id")?
+    return await db.accounts.where(r => db.isOperator()).orderBy("id").select()?
   -- Collaborator counts ALL of owner's managed DBs via `policy count`
   read_only rpc countOwnerManagedDbs(ownerId: String) -> Nat!:
     requires auth
-    return await db.app_dbs.count(where = r => r.ownerId == ownerId and r.managed == true and (any a in apps: a.ownerId == r.ownerId and db.canReadApp(a.id, a.ownerId)))?
+    return await db.app_dbs.where(r => r.ownerId == ownerId and r.managed == true and (any a in apps: a.ownerId == r.ownerId and db.canReadApp(a.id, a.ownerId))).count()?
   -- Viewer reads secret metadata via `policy read_meta`
   read_only rpc listSecretMeta(appId: String) -> CloudPolicyDb.app_secrets.Meta[]!:
     requires auth
-    return await db.app_secrets.selectMeta(where = r => r.appId == appId and db.canReadApp(r.appId, r.ownerId), orderBy = "id")?
+    return await db.app_secrets.where(r => r.appId == appId and db.canReadApp(r.appId, r.ownerId)).orderBy("id").selectMeta()?
+  -- Multi-row `ColReadPolicy` (`policy read(id, spendCap)`) authorizes `groupBy("id").sum("spendCap")`
+  read_only rpc sumSpendCapByOwner(ownerId: String) -> (String, Nat)[]!:
+    requires auth
+    return await db.accounts
+      .where(r => r.id == ownerId and (any a in apps: a.ownerId == r.id and db.canReadApp(a.id, a.ownerId)))
+      .groupBy("id").sum("spendCap")?
   example ownerTransfersAppToExistingAccount:
     with user "alice"
     with db db.accounts = [{ id = "alice", email = "a@qed.dev", spendCap = 1000, isOperator = false }, { id = "bob", email = "b@qed.dev", spendCap = 2000, isOperator = false }]
@@ -1150,15 +1204,21 @@ server stateless CloudPolicyApi:
     call countOwnerManagedDbs("alice")
     expect ok(2)
 
--- Negative compile-time tests for Phase 1 policy expressiveness
-bad_db_auth "update policy `CloudPolicyDb.apps.update`" CloudPolicyDb adminHijackOwner(appId: String) -> CloudPolicyDb.apps?! || 1 <= uid.length <= 64 : return await db.apps.updateOne(where = r => r.id == appId and db.canAdminApp(r.id, r.ownerId), set = { ownerId = uid })?
-bad_db_auth "update policy `CloudPolicyDb.apps.update`" CloudPolicyDb transferWithoutTargetCheck(appId: String, nextOwnerId: String) -> CloudPolicyDb.apps?! || 1 <= nextOwnerId.length <= 64 : return await db.apps.updateOne(where = r => r.id == appId and some(r.ownerId) == ctx.userId, set = { ownerId = nextOwnerId })?
-bad_db_auth "requires `findOne` with an exact top-level `r.<col> == <val>` filter" CloudPolicyDb enumerateEmailsSelect(email: String) -> (String, String)[]! : return await db.accounts.select(columns = ["id", "email"], where = r => r.email == email)?
-bad_db_auth "requires `findOne` with an exact top-level `r.<col> == <val>` filter" CloudPolicyDb enumerateEmailsOr(email: String) -> (String, String)?! : return await db.accounts.findOne(columns = ["id", "email"], where = r => r.email == email or r.id != "")?
-bad_db_auth "read policy `CloudPolicyDb.accounts.read`" CloudPolicyDb leakSpendCapByEmail(email: String) -> (String, String, Nat)?! : return await db.accounts.findOne(columns = ["id", "email", "spendCap"], where = r => r.email == email)?
-bad_db_auth "read policy `CloudPolicyDb.accounts.read`" CloudPolicyDb leakFullAccountByEmail(email: String) -> CloudPolicyDb.accounts?! : return await db.accounts.findOne(where = r => r.email == email)?
-bad_db_auth "read policy `CloudPolicyDb.app_dbs.read`" CloudPolicyDb collabSelectOtherAppDbs(ownerId: String) -> CloudPolicyDb.app_dbs[]! : return await db.app_dbs.select(where = r => r.ownerId == ownerId and (any a in apps: a.ownerId == r.ownerId and db.canReadApp(a.id, a.ownerId)))?
-bad_db_auth "read policy `CloudPolicyDb.app_secrets.read`" CloudPolicyDb viewerSelectSecrets(appId: String) -> CloudPolicyDb.app_secrets[]! : return await db.app_secrets.select(where = r => r.appId == appId and db.canReadApp(r.appId, r.ownerId))?
+-- Negative compile-time tests for Phase 1 policy expressiveness & groupBy RLS
+bad_db_auth "update policy `CloudPolicyDb.apps.update`" CloudPolicyDb adminHijackOwner(appId: String) -> CloudPolicyDb.apps?! || 1 <= uid.length <= 64 : return await db.apps.where(r => r.id == appId and db.canAdminApp(r.id, r.ownerId)).updateOne({ ownerId = uid })?
+bad_db_auth "update policy `CloudPolicyDb.apps.update`" CloudPolicyDb transferWithoutTargetCheck(appId: String, nextOwnerId: String) -> CloudPolicyDb.apps?! || 1 <= nextOwnerId.length <= 64 : return await db.apps.where(r => r.id == appId and some(r.ownerId) == ctx.userId).updateOne({ ownerId = nextOwnerId })?
+bad_db_auth "requires `.findOne()` with an exact top-level `r.<col> == <val>` filter" CloudPolicyDb enumerateEmailsSelect(email: String) -> (String, String)[]! : return await db.accounts.where(r => r.email == email).columns(["id", "email"]).select()?
+bad_db_auth "requires `.findOne()` with an exact top-level `r.<col> == <val>` filter" CloudPolicyDb enumerateEmailsOr(email: String) -> (String, String)?! : return await db.accounts.where(r => r.email == email or r.id != "").columns(["id", "email"]).findOne()?
+bad_db_auth "read policy `CloudPolicyDb.accounts.read`" CloudPolicyDb leakSpendCapByEmail(email: String) -> (String, String, Nat)?! : return await db.accounts.where(r => r.email == email).columns(["id", "email", "spendCap"]).findOne()?
+bad_db_auth "read policy `CloudPolicyDb.accounts.read`" CloudPolicyDb leakFullAccountByEmail(email: String) -> CloudPolicyDb.accounts?! : return await db.accounts.where(r => r.email == email).findOne()?
+bad_db_auth "read policy `CloudPolicyDb.app_dbs.read`" CloudPolicyDb collabSelectOtherAppDbs(ownerId: String) -> CloudPolicyDb.app_dbs[]! : return await db.app_dbs.where(r => r.ownerId == ownerId and (any a in apps: a.ownerId == r.ownerId and db.canReadApp(a.id, a.ownerId))).select()?
+bad_db_auth "read policy `CloudPolicyDb.app_dbs.read`" CloudPolicyDb collabGroupByCountOnlyPolicy(ownerId: String) -> (String, Nat)[]! : return await db.app_dbs.where(r => r.ownerId == ownerId and (any a in apps: a.ownerId == r.ownerId and db.canReadApp(a.id, a.ownerId))).groupBy("appId").count()?
+bad_db_auth "read policy `CloudPolicyDb.accounts.read`" CloudPolicyDb groupByByColPolicy(email: String) -> (String, Nat)[]! : return await db.accounts.where(r => r.email == email).groupBy("email").count()?
+bad_db_auth "read policy `CloudPolicyDb.app_secrets.read`" CloudPolicyDb viewerSelectSecrets(appId: String) -> CloudPolicyDb.app_secrets[]! : return await db.app_secrets.where(r => r.appId == appId and db.canReadApp(r.appId, r.ownerId)).select()?
+bad_db_auth "cannot use encrypted column `app_secrets.secret` in `.groupBy(...)`" CloudPolicyDb groupByEncrypted() -> (String, Nat)[]! : return await db.app_secrets.where(r => db.canAdminApp(r.appId, r.ownerId)).groupBy("secret").count()?
+bad_db_auth "must reference a grouped column" CloudPolicyDb groupByBadOrderBy() -> (String, Nat)[]! : return await db.apps.where(r => db.canReadOrOp(r.id, r.ownerId)).groupBy("ownerId").orderBy("name").count()?
+bad_db_auth "takes no arguments; chain `.where(r => ...)`" CloudPolicyDb rejectOldWhereKw() -> CloudPolicyDb.apps[]! : return await db.apps.select(where = r => db.canReadOrOp(r.id, r.ownerId))?
+bad_db_auth "`.join(...)` is a chain modifier; follow it with `.select()` or `.findOne()`" ShopDb rejectTerminalJoin() -> (ShopDb.items, ShopDb.authors)[]! : return await db.items.where(r => r.ownerId == uid).join(authors)?
 bad_db_def "expansion limit exceeded" BadRecDbFn :
   fn loopA(x: String) -> Bool: loopB(x)
   || fn loopB(x: String) -> Bool: loopA(x)
@@ -1224,7 +1284,7 @@ service PrincipalOps:
     return await db.billing_events.insert(id = id, status = status)?
   fn listStripeEvents() -> PrincipalDb.billing_events[]!:
     requires ctx.principal == .system("stripe")
-    return await db.billing_events.select(orderBy = "id")?
+    return await db.billing_events.orderBy("id").select()?
   example stripeCanRecord:
     with principal = .system("stripe")
     call recordStripeEvent("evt_1", "paid")
@@ -1263,12 +1323,12 @@ server stateless PrincipalApi:
 
   post "/cron/reap":
     requires system("reap-and-sweep", bearer = bearerSecret)
-    let upd = await db.deployments.updateOne(where = r => r.status == "building", set = { status = "stale" })?
+    let upd = await db.deployments.where(r => r.status == "building").updateOne({ status = "stale" })?
     return json({ reaped = upd != none })
 
   post "/cron/cleanup":
     requires system("cleanup", secret = cronSecret, header = "x-qed-cron-secret")
-    let n = await db.deployments.delete(where = r => r.status == "stale")?
+    let n = await db.deployments.where(r => r.status == "stale").delete()?
     return json({ deleted = n })
 
   example stripeMissingSecret500:
@@ -1340,7 +1400,7 @@ server stateless PrincipalApi:
 server stateless BuildJobSrv:
   use db : PrincipalDb
   every 1s poll -> Bool!:
-    let claimed = await db.deployments.updateOne(where = r => r.status == "queued", set = { status = "building" })?
+    let claimed = await db.deployments.where(r => r.status == "queued").updateOne({ status = "building" })?
     return claimed != none
   example pollClaimsQueuedDeployment:
     with db db.deployments = [{ id = "d1", ownerId = "alice", status = "queued" }]
@@ -1383,12 +1443,12 @@ bad_srv "Database insert policy `PrincipalDb.billing_events.insert` failed" [sta
 bad_srv "Database update policy `PrincipalDb.deployments.update` failed" [stateless] WrongJobSrv :
   use db : PrincipalDb ||
   every 1s poll -> Bool!:
-    let upd = await db.deployments.updateOne(where = r => r.status == "queued", set = { status = "building" })?
+    let upd = await db.deployments.where(r => r.status == "queued").updateOne({ status = "building" })?
     return upd != none
 bad_srv "Database delete policy `PrincipalDb.deployments.delete` failed" [stateless] BadJobDeletesDeployments :
   use db : PrincipalDb ||
   every 1s poll -> Bool!:
-    let _ = await db.deployments.delete(where = r => r.status == "stale")?
+    let _ = await db.deployments.where(r => r.status == "stale").delete()?
     return true
 bad_db_tbl "cannot combine `principal = ...` with `user`/`role`/`session`" BadMixedPrincipalEx docs :
   id : String primary_key || policy read requires ctx.principal == .system("stripe") || example d1: id = "d1" ||
@@ -1415,20 +1475,20 @@ server stateless DefaultDenyPartialApi:
   use db : DefaultDenyDb
   rpc countOwn() -> Nat!:
     requires auth
-    return await db.narrow.count(where = r => r.ownerId == uid)?
+    return await db.narrow.where(r => r.ownerId == uid).count()?
   rpc listMeta() -> DefaultDenyDb.narrow.Meta[]!:
     requires auth
-    return await db.narrow.selectMeta(where = r => r.ownerId == uid)?
+    return await db.narrow.where(r => r.ownerId == uid).selectMeta()?
   rpc lookupId(targetId: String) -> String?!:
     requires auth
-    return await db.narrow.findOne(columns = ["id"], where = r => r.id == targetId)?
+    return await db.narrow.where(r => r.id == targetId).columns("id").findOne()?
 
 bad_db_auth "omitted policies default to deny" DefaultDenyDb denyLockedRead() -> DefaultDenyDb.locked[]! : return await db.locked.select()?
 bad_db_auth "omitted policies default to deny" DefaultDenyDb denyLockedInsert(id: String) -> DefaultDenyDb.locked! || 1 <= id.length <= 64 : return await db.locked.insert(id = id, secret = "x")?
-bad_db_auth "omitted policies default to deny" DefaultDenyDb denyLockedUpdate(id: String) -> DefaultDenyDb.locked?! : return await db.locked.updateOne(where = r => r.id == id, set = { secret = "y" })?
-bad_db_auth "omitted policies default to deny" DefaultDenyDb denyLockedDelete(id: String) -> Nat! : return await db.locked.delete(where = r => r.id == id)?
-bad_db_auth "omitted policies default to deny" DefaultDenyDb denyNarrowFullRead() -> DefaultDenyDb.narrow[]! : return await db.narrow.select(where = r => r.ownerId == uid)?
-bad_db_auth "omitted policies default to deny" DefaultDenyDb denyNarrowUnlistedCol(targetId: String) -> (String, String)?! : return await db.narrow.findOne(columns = ["id", "ownerId"], where = r => r.id == targetId)?
-bad_db_auth "omitted policies default to deny" DefaultDenyDb denyNarrowMultiRowBy(targetId: String) -> String[]! : return await db.narrow.select(columns = ["id"], where = r => r.id == targetId)?
+bad_db_auth "omitted policies default to deny" DefaultDenyDb denyLockedUpdate(id: String) -> DefaultDenyDb.locked?! : return await db.locked.where(r => r.id == id).updateOne({ secret = "y" })?
+bad_db_auth "omitted policies default to deny" DefaultDenyDb denyLockedDelete(id: String) -> Nat! : return await db.locked.where(r => r.id == id).delete()?
+bad_db_auth "omitted policies default to deny" DefaultDenyDb denyNarrowFullRead() -> DefaultDenyDb.narrow[]! : return await db.narrow.where(r => r.ownerId == uid).select()?
+bad_db_auth "omitted policies default to deny" DefaultDenyDb denyNarrowUnlistedCol(targetId: String) -> (String, String)?! : return await db.narrow.where(r => r.id == targetId).columns(["id", "ownerId"]).findOne()?
+bad_db_auth "omitted policies default to deny" DefaultDenyDb denyNarrowMultiRowBy(targetId: String) -> String[]! : return await db.narrow.where(r => r.id == targetId).columns("id").select()?
 
 end DbChecks

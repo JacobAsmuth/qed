@@ -590,7 +590,7 @@ private def effWrapperUnfoldNames : Array Name :=
   splitNms `Qed.Http "requestOidcRaw getOidc getOidcString getOidcJson postOidcJson" ++
   splitNms `Qed.Proc "exec execOk" ++
   splitNms `Qed.Fs "readBytes readText writeBytes writeText mkdirAll removeAll pathExists mktempDir" ++
-  splitNms `Qed.Server.Db "dbRunRows dbRunOneRow dbSelectProj dbFindOneProj dbCount dbSumNat dbSumInt dbAggOpt dbDelete dbInsert dbInsertOrIgnore dbUpsert dbJoinSelect dbRun pgSchemasQuery pgTablesQuery pgColumnsQuery pgIndexesQuery pgKeyColumnsQuery pgTableStatsQuery" ++
+  splitNms `Qed.Server.Db "dbRunRows dbRunOneRow dbSelectProj dbFindOneProj dbCount dbSumNat dbSumInt dbAggOpt dbGroupAgg dbDelete dbInsert dbInsertOrIgnore dbUpsert dbJoinSelect dbJoinFindOne dbRun pgSchemasQuery pgTablesQuery pgColumnsQuery pgIndexesQuery pgKeyColumnsQuery pgTableStatsQuery" ++
   splitNms `Qed.Server.Db.PgHandle "runReadOnly queryReadOnly listSchemas listTables listColumns listIndexes listKeyColumns listTableStats countRows countRowsInSchema selectRows selectCols selectSchema"
 
 private def effHypContraSimpNames : Array Name :=

@@ -374,7 +374,7 @@ server VaultExApi:
   read_only rpc listMeta() -> ExVaultDb.vault_items.Meta[]!:
     requires auth
     no_http, no_decrypt, no_db_write
-    return await db.vault_items.selectMeta(where = r => r.ownerId == uid, orderBy = "id")?
+    return await db.vault_items.where(r => r.ownerId == uid).orderBy("id").selectMeta()?
   rpc saveItem(id: String, label: String, payload: String) -> ExVaultDb.vault_items!:
     requires auth, 1 <= id.length <= 64, 1 <= label.length <= 120, 1 <= uid.length <= 64
     no_http
@@ -443,7 +443,7 @@ bad_db "Server invariant `no_decrypt` failed in `readSecret`" ExVaultDb :
   read_only rpc readSecret() -> ExVaultDb.vault_items[]!:
     requires auth
     no_decrypt
-    return await db.vault_items.select(where = r => r.ownerId == uid)?
+    return await db.vault_items.where(r => r.ownerId == uid).select()?
 bad_db "Server invariant `no_db_write` failed in `sneakyInsert`" ExVaultDb :
   rpc sneakyInsert(id: String, label: String, payload: String) -> ExVaultDb.vault_items!:
     requires auth, 1 <= id.length <= 64, 1 <= label.length <= 120, 1 <= uid.length <= 64

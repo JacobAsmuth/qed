@@ -9,12 +9,16 @@ namespace Qed.Server.Db
 private def decodeRowErr {Row : Type} (decode : DbRow → Except String Row) (r : DbRow) : Except ApiError Row :=
   (decode r).mapError fun e => ApiError.internal s!"database row decode failed: {e}"
 
+private def decodeJoinRow {RowL RowR : Type} (leftColCount : Nat)
+    (decodeL : DbRow → Except String RowL) (decodeR : DbRow → Except String RowR) (r : DbRow) : Except String (RowL × RowR) :=
+  match decodeL (r.extract 0 leftColCount), decodeR (r.extract leftColCount r.size) with
+  | .error e, _ => .error s!"join left-row: {e}"
+  | _, .error e => .error s!"join right-row: {e}"
+  | .ok l, .ok r => .ok (l, r)
+
 private def decodeJoinRowErr {RowL RowR : Type} (leftColCount : Nat)
     (decodeL : DbRow → Except String RowL) (decodeR : DbRow → Except String RowR) (r : DbRow) : Except ApiError (RowL × RowR) :=
-  match decodeL (r.extract 0 leftColCount), decodeR (r.extract leftColCount r.size) with
-  | .error e, _ => .error (ApiError.internal s!"database join left-row decode failed: {e}")
-  | _, .error e => .error (ApiError.internal s!"database join right-row decode failed: {e}")
-  | .ok l, .ok r => .ok (l, r)
+  decodeRowErr (decodeJoinRow leftColCount decodeL decodeR) r
 
 private def decodeCheckedList {Row : Type} (decode : DbRow → Except ApiError Row) (check : Row → Bool) (errMsg : String) :
     List DbRow → Except ApiError (List Row)
@@ -377,6 +381,8 @@ abbrev dbDelete {P : Prop} (cfg : DbConfig) (q : SqlQuery) (pf : P) (txId? : Opt
   dbRun cfg q txId? (fun dbRes => .ok dbRes.affected) pf auth
 
 @[inline] def fromSqlOfField {R α : Type} [FromSql α] (_ : R → α) (v : SqlVal) : Except String α := FromSql.fromSql v
+@[inline] def fromSqlGroupSumNat : SqlVal → Except String Nat | .null => .ok 0 | v => FromSql.fromSql v
+@[inline] def fromSqlGroupSumInt : SqlVal → Except String Int | .null => .ok 0 | v => FromSql.fromSql v
 
 private def dbInsertPost {Row : Type} (newRow : Row) (requireReturning : Bool) (dbRes : DbResult) : Except ApiError Row :=
   if requireReturning && dbRes.rows.isEmpty then .error (ApiError.forbidden "insert rejected by policy") else .ok newRow
@@ -437,6 +443,14 @@ abbrev dbUpsert (cfg : DbConfig) (q : SqlQuery) (newRow : Row) (decode : DbRow �
 
 end DbOps
 
+abbrev dbGroupAgg {RowOut : Type} {m : Type → Type} [Monad m] [MonadServer m] {P : Prop}
+    (cfg : DbConfig) (q : SqlQuery) (decode : DbRow → Except String RowOut)
+    (pf : P) (txId? : Option UInt64 := none) (auth : AuthToken := AuthToken.anonymous) :
+    m (Except ApiError (Array RowOut)) :=
+  dbRunChecked (Q := fun _ => True) cfg q txId?
+    (fun dbRes => (dbRes.rows.toList.mapM (decodeRowErr decode)).map List.toArray)
+    (fun _ => trivial) (fun _ => trivial) pf [] [] auth
+
 abbrev dbJoinSelect {RowL RowR Key : Type} [BEq Key] {m : Type → Type} [Monad m] [MonadServer m]
     (cfg : DbConfig) (q : SqlQuery) (leftColCount : Nat)
     (decodeL : DbRow → Except String RowL) (decodeR : DbRow → Except String RowR)
@@ -454,6 +468,24 @@ abbrev dbJoinSelect {RowL RowR Key : Type} [BEq Key] {m : Type → Type} [Monad 
     (decodeCheckedArr_post _ _ _ fun p h => by
       simp only [Bool.and_eq_true] at h; exact ⟨hInvSoundL p.1 h.1.1.1.1, h.1.1.1.2, hInvSoundR p.2 h.1.1.2, h.1.2⟩)
     (fun _ => trivial) (And.intro hPolicyL hPolicyR) [] encRead ctx.auth
+
+abbrev dbJoinFindOne {RowL RowR Key : Type} [BEq Key] {m : Type → Type} [Monad m] [MonadServer m]
+    (cfg : DbConfig) (q : SqlQuery) (leftColCount : Nat)
+    (decodeL : DbRow → Except String RowL) (decodeR : DbRow → Except String RowR)
+    (RowInvL : RowL → Prop) (rowInvBoolL : RowL → Bool) (hInvSoundL : ∀ r, rowInvBoolL r = true → RowInvL r)
+    (RowInvR : RowR → Prop) (rowInvBoolR : RowR → Bool) (hInvSoundR : ∀ r, rowInvBoolR r = true → RowInvR r)
+    (wherePredL : RowL → Bool) (wherePredR : RowR → Bool) (keyL : RowL → Key) (keyR : RowR → Key)
+    (ReadPolicyL : RequestCtx → RowL → Prop) (ReadPolicyR : RequestCtx → RowR → Prop) (ctx : RequestCtx)
+    (hPolicyL : ∀ r, RowInvL r → wherePredL r = true → ReadPolicyL ctx r)
+    (hPolicyR : ∀ r, RowInvR r → wherePredR r = true → ReadPolicyR ctx r)
+    (txId? : Option UInt64 := none) (encRead : List (Nat × EncColSpec) := []) : m (Except ApiError (Option (RowL × RowR))) :=
+  dbRunChecked (Q := srvEnsPostOpt fun p => RowInvL p.1 ∧ wherePredL p.1 = true ∧ RowInvR p.2 ∧ wherePredR p.2 = true) cfg q txId?
+    (decodeCheckedOne (decodeJoinRow leftColCount decodeL decodeR)
+      (fun p => rowInvBoolL p.1 && wherePredL p.1 && rowInvBoolR p.2 && wherePredR p.2 && (keyL p.1 == keyR p.2))
+      "database joined row violated verified table invariant or query predicate")
+    (decodeCheckedOne_post _ _ _ fun p h => by
+      simp only [Bool.and_eq_true] at h; exact ⟨hInvSoundL p.1 h.1.1.1.1, h.1.1.1.2, hInvSoundR p.2 h.1.1.2, h.1.2⟩)
+    srvEnsPostOpt_err_pf (And.intro hPolicyL hPolicyR) [] encRead ctx.auth
 
 theorem some_getD_eq_self_iff {α : Type} (o : Option α) (d : α) : some (o.getD d) = o ↔ o ≠ none := by cases o <;> simp
 

@@ -320,8 +320,19 @@ private def runShopDirectSuite (c : TestChecker) (label : String) (srvInst : Mon
     c.checkProtoBy (α := Array (DbChecks.ShopDb.items × DbChecks.ShopDb.authors)) (lbl "FK join returns [(i2, Alan Turing), (i1, Ada Lovelace), (i3, Grace Hopper)]")
       (← alice "itemsWithAuthors") (·.map fun (it, au) => (it.id, au.name)) #[("i2", "Alan Turing"), ("i1", "Ada Lovelace"), ("i3", "Grace Hopper")]
     c.checkProtoBy (α := Array (DbChecks.ShopDb.items × DbChecks.ShopDb.authors)) (lbl "bob FK join returns 0 (RLS)") (← bob "itemsWithAuthors") (·.size) 0
+    c.checkProtoBy (α := Option (DbChecks.ShopDb.items × DbChecks.ShopDb.authors)) (lbl "FK join findOne returns some (i2, Alan Turing)")
+      (← alice "topItemWithAuthor") (·.map fun (it, au) => (it.id, au.name)) (some ("i2", "Alan Turing"))
+    c.checkProtoBy (α := Option (DbChecks.ShopDb.items × DbChecks.ShopDb.authors)) (lbl "bob FK join findOne returns none (RLS)") (← bob "topItemWithAuthor") Option.isNone true
     if testConcurrentReaders then
       c.check (lbl "8 concurrent SQLite reader-pool queries succeeded") (← runParallelAll 8 do return match ← alice "totalInventoryValue" with | .ok bs => Qed.Proto.decode (α := Nat) bs == .ok 400 | .error _ => false)
+    forList [("i4", "a1", "Lean 4 Tactics", 200), ("i5", "a1", "Lean 4 Metaprogramming", 300), ("i6", "a2", "Compiler Design", 100)] fun (iid, aid, title, price) => do
+      c.expectOk (lbl s!"addItem({iid})") (← alice "addItem" (Qed.Proto.encode (iid, (aid, (title, price))))) fun _ => pure ()
+    c.checkProto (lbl "groupBy(authorId).orderBy(-count).count() == [(a1,3),(a2,2),(a3,1)]") (← alice "countItemsByAuthor") (#[("a1", 3), ("a2", 2), ("a3", 1)] : Array (String × Nat))
+    c.checkProto (lbl "bob groupBy(authorId).count() == [] (RLS)") (← bob "countItemsByAuthor") (#[] : Array (String × Nat))
+    c.checkProto (lbl "groupBy(authorId).orderBy(-sum).sum(price) == [(a1,600),(a2,350),(a3,50)]") (← alice "sumPriceByAuthor") (#[("a1", 600), ("a2", 350), ("a3", 50)] : Array (String × Nat))
+    c.checkProto (lbl "groupBy(authorId).orderBy(authorId).min(price) == [(a1,100),(a2,100),(a3,50)]") (← alice "minPriceByAuthor") (#[("a1", 100), ("a2", 100), ("a3", 50)] : Array (String × Nat))
+    c.checkProto (lbl "groupBy(authorId).orderBy(authorId).max(price) == [(a1,300),(a2,250),(a3,50)]") (← alice "maxPriceByAuthor") (#[("a1", 300), ("a2", 250), ("a3", 50)] : Array (String × Nat))
+    c.checkProto (lbl "groupBy([ownerId,authorId]).count() == [(alice,a1,3),(alice,a2,2),(alice,a3,1)]") (← alice "countByOwnerAndAuthor") (#[("alice", "a1", 3), ("alice", "a2", 2), ("alice", "a3", 1)] : Array (String × String × Nat))
 
 private def runMigrationSuite (c : TestChecker) (tmpDir : String) : IO Unit := do
   let migDb := s!"{tmpDir}/migrate.db"
@@ -407,8 +418,8 @@ private def runKeyRotationAndMetaSuite (c : TestChecker) (tmpDir : String) : IO 
     envRef.set []; decCountRef.set 0
     c.checkProtoBy (α := Array DbChecks.RotatingVaultDb.entries.Meta) "[enc-meta] selectMeta succeeds without encryption key" (← alice "listMeta") (·.map fun m => (m.id, m.label)) #[(1, "stripe-live"), (2, "github-pat")]
     c.checkProtoBy (α := Option DbChecks.RotatingVaultDb.entries.Meta) "[enc-meta] findOneMeta succeeds without encryption key" (← alice "getMeta" (Qed.Proto.encode (2 : Nat))) (·.map (·.label)) (some "github-pat")
-    c.checkProto (α := Array (Nat × String)) "[enc-meta] select(columns = [id, label]) succeeds without key" (← alice "listLabels") #[(1, "stripe-live"), (2, "github-pat")]
-    c.checkProto (α := Option String) "[enc-meta] findOne(columns = [label]) succeeds without key" (← alice "getLabel" (Qed.Proto.encode (1 : Nat))) (some "stripe-live")
+    c.checkProto (α := Array (Nat × String)) "[enc-meta] .columns([id, label]).select() succeeds without key" (← alice "listLabels") #[(1, "stripe-live"), (2, "github-pat")]
+    c.checkProto (α := Option String) "[enc-meta] .columns(label).findOne() succeeds without key" (← alice "getLabel" (Qed.Proto.encode (1 : Nat))) (some "stripe-live")
     c.checkEq "[enc-meta] ZERO aeadDecrypt calls across all metadata projections" (← decCountRef.get) 0
     envRef.set [("VAULT_PREV_KEY", "key-v1-initial-material-32bytes!")]
     c.check "[enc-rot] missing primary key fails closed even when prevKey is set" (!(← alice "get" (Qed.Proto.encode (1 : Nat))).isOk)
@@ -482,6 +493,8 @@ private def runCloudPolicySuite (c : TestChecker) (tmpDir : String) : IO Unit :=
     c.checkProtoBy (α := Option (String × String)) "[cloud-pol] lookupUserIdByEmail resolves bob" (← asUser "dave" "lookupUserIdByEmail" (Qed.Proto.encode "bob@qed.dev")) id (some ("bob", "bob@qed.dev"))
     c.checkProtoBy (α := Option (String × Nat)) "[cloud-pol] collaborator dave reads alice spendCap" (← asUser "dave" "getOwnerSpendCap" (Qed.Proto.encode "alice")) id (some ("alice", 5000))
     c.checkProtoBy (α := Option (String × Nat)) "[cloud-pol] outsider bob gets none for alice spendCap" (← asUser "bob" "getOwnerSpendCap" (Qed.Proto.encode "alice")) id none
+    c.checkProto (α := Array (String × Nat)) "[cloud-pol] collaborator dave groupBy(id).sum(spendCap) for alice" (← asUser "dave" "sumSpendCapByOwner" (Qed.Proto.encode "alice")) #[("alice", 5000)]
+    c.checkProto (α := Array (String × Nat)) "[cloud-pol] outsider bob groupBy(id).sum(spendCap) returns []" (← asUser "bob" "sumSpendCapByOwner" (Qed.Proto.encode "alice")) #[]
     c.checkProtoBy (α := Nat) "[cloud-pol] collaborator dave counts all 2 of alice managed dbs" (← asUser "dave" "countOwnerManagedDbs" (Qed.Proto.encode "alice")) id 2
     c.checkProtoBy (α := Nat) "[cloud-pol] outsider bob counts 0 of alice managed dbs" (← asUser "bob" "countOwnerManagedDbs" (Qed.Proto.encode "alice")) id 0
     c.checkProtoBy (α := Array DbChecks.CloudPolicyDb.app_secrets.Meta) "[cloud-pol] viewer dave reads secret metadata" (← asUser "dave" "listSecretMeta" (Qed.Proto.encode "a1")) (·.map (·.label)) #["STRIPE_KEY"]
@@ -562,8 +575,10 @@ private def runRlsGateNegativeSuite (c : TestChecker) (tmpDir : String) : IO Uni
     "    body : String where 1 <= body.length <= 200\n" ++
     "    policy read, write requires some(row.ownerId) == ctx.userId\n" ++
     "    policy read(id) by id requires ctx.userId != none\n" ++
+    "    policy read(id, ownerId) requires ctx.userId != none\n" ++
+    "    policy count requires ctx.userId != none\n" ++
     "server stateless GateSrv:\n  use db : GateDb\n  rpc okCount() -> Nat!:\n" ++
-    "    requires auth\n    return await db.notes.count(where = r => r.ownerId == uid)?\n"
+    "    requires auth\n    return await db.notes.where(r => r.ownerId == uid).count()?\n"
   let (fc, ferr) ← compileMod "RlsGateFixture" fixtureSrc
   if fc != 0 then c.check "[rls-gate] compile base fixture" false ferr; return
   let (pc, pout, perr) ← runCmd qedjs #["--verify-env", "--skip-qed", "RlsGateFixture"] (env := env)
@@ -623,7 +638,19 @@ private def runRlsGateNegativeSuite (c : TestChecker) (tmpDir : String) : IO Uni
       "custom `Qed.Server.MonadServer` instance"),
     ("direct_ServerJob_runM",
       hdr ++ "def atk {m} [Monad m] [MonadServer m] [MonadAtomic Unit m] (j : ServerJob Unit) : m (Except ApiError Unit) := j.runM\n",
-      "rls gate: forbidden server/DB/auth primitive")
+      "rls gate: forbidden server/DB/auth primitive"),
+    ("dbGroupAgg_count_policy",
+      hdr ++ "def atk {m} [Monad m] [MonadServer m] (ctx : RequestCtx) (h : ctx.userId ≠ none) : m (Except ApiError (Array (String × Nat))) :=\n  dbGroupAgg (P := ∀ r : GateDb.notes, GateDb.notes.RowInv r → true = true → GateDb.notes.CountPolicy ctx r)\n    GateDb.config (SqlQuery.groupAggregate .count (sql!\"notes\") [sql!\"ownerId\"] none .litTrue)\n    (fun _ => .ok (\"\", 0)) (fun _ _ _ => h) none ctx.auth\n",
+      "must prove `ReadPolicy` or a multi-row `ColReadPolicy`"),
+    ("dbGroupAgg_by_col_policy",
+      hdr ++ "def atk {m} [Monad m] [MonadServer m] (ctx : RequestCtx) (h : ctx.userId ≠ none) : m (Except ApiError (Array (String × Nat))) :=\n  dbGroupAgg (P := ∀ r : GateDb.notes, GateDb.notes.RowInv r → (r.id == \"1\") = true → GateDb.notes.ColReadPolicy_0 ctx r)\n    GateDb.config (SqlQuery.groupAggregate .count (sql!\"notes\") [sql!\"id\"] none (.binOp .eq (.col (sql!\"id\")) (.param (.text \"1\"))))\n    (fun _ => .ok (\"\", 0)) (fun _ _ _ => h) none ctx.auth\n",
+      "cannot authorize multi-row `groupBy`"),
+    ("dbGroupAgg_unauth_col",
+      hdr ++ "def atk {m} [Monad m] [MonadServer m] (ctx : RequestCtx) (h : ctx.userId ≠ none) : m (Except ApiError (Array (String × Nat))) :=\n  dbGroupAgg (P := ∀ r : GateDb.notes, GateDb.notes.RowInv r → true = true → GateDb.notes.ColReadPolicy_1 ctx r)\n    GateDb.config (SqlQuery.groupAggregate .count (sql!\"notes\") [sql!\"body\"] none .litTrue)\n    (fun _ => .ok (\"\", 0)) (fun _ _ _ => h) none ctx.auth\n",
+      "column `body` in `groupBy` is not authorized"),
+    ("dbGroupAgg_mismatched_where",
+      hdr ++ "def atk {m} [Monad m] [MonadServer m] (ctx : RequestCtx) : m (Except ApiError (Array (String × Nat))) :=\n  dbGroupAgg (P := ∀ r : GateDb.notes, GateDb.notes.RowInv r → false = true → GateDb.notes.ReadPolicy ctx r)\n    GateDb.config (SqlQuery.groupAggregate .count (sql!\"notes\") [sql!\"ownerId\"] none .litTrue)\n    (fun _ => .ok (\"\", 0)) (fun _ _ h => absurd h (by decide)) none ctx.auth\n",
+      "SQL `WHERE` predicate on `groupBy notes` does not match")
   ]
   runTasks <| attacks.zipIdx.map fun ((tag, src, wantErr), idx) => do
     let modName := s!"RlsGateAtk{idx}"

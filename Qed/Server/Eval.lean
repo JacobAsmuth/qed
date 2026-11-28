@@ -151,6 +151,24 @@ def evalSqlQuery (cfg : DbConfig) (db0 : MemDb) (q : SqlQuery) : MemDb × Except
       let aggVal : SqlVal := match op, vals with
         | .sum, vs => .int (vs.foldl (· + ·) 0) | .min, [] | .max, [] => .null | .min, v :: vs => .int (vs.foldl min v) | .max, v :: vs => .int (vs.foldl max v)
       (db, .ok { rows := #[#[aggVal]], affected := 1 })
+  | .groupAggregate op tn gCols aggCol? w ob lim off => withTbl tn fun t =>
+      let insertGrp (acc : List (List SqlVal × List DbRow)) (k : List SqlVal) (r : DbRow) : List (List SqlVal × List DbRow) :=
+        if acc.any (·.1 == k) then acc.map fun (k', rs) => if k' == k then (k', rs ++ [r]) else (k', rs)
+        else acc ++ [(k, [r])]
+      let groups := (filterRows t tn w).foldl (init := []) fun acc r =>
+        insertGrp acc (gCols.map (getRowCol t.columns r ·.raw)) r
+      let aggOf (grp : List DbRow) : SqlVal := match op with
+        | .count => .int (Int.ofNat grp.length)
+        | .sum => .int ((grp.filterMap fun r => aggCol?.bind fun c => sqlValToInt? (getRowCol t.columns r c.raw)).foldl (· + ·) 0)
+        | .min | .max =>
+            let pick (a b : SqlVal) := match sqlValCmp a b, op with | some .lt, .min | some .gt, .max => a | _, _ => b
+            let nonNull := grp.filterMap fun r => aggCol?.bind fun c => match getRowCol t.columns r c.raw with | .null => none | v => some v
+            match nonNull with | [] => .null | v :: vs => vs.foldl pick v
+      let aggIdent : SqlIdent := ⟨"__qed_agg", by decide⟩
+      let resCols := gCols.map (·.raw) ++ [aggIdent.raw]
+      let ob' := ob.map fun | .col c d => (c, d) | .agg d => (aggIdent, d)
+      let out := sliceRows lim off (sortRowsBy resCols ob' (groups.map fun (k, grp) => (k ++ [aggOf grp]).toArray))
+      (db, .ok { rows := out.toArray, affected := out.length })
   | .joinSelect lt rt lCols rCols lJc rJc lW rW ob lim off => withTbl lt fun tL => withTbl rt fun tR =>
       let pairs := tL.rows.flatMap fun rl =>
         if !evalWhere tL lt lW rl then [] else let lv := getRowCol tL.columns rl lJc.raw

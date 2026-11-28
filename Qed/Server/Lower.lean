@@ -366,17 +366,18 @@ private def httpRespSpecs : Array (String × Name × Nat) := #[
 
 @[noinline] private def lowerSrvCallHook (stx calleeStx : Syntax) (rawArgs : Array Syntax) (mode : ExprMode) (go : ExprMode → Syntax → SrvExprM Term) : SrvExprM (Option Term) := do
   let (ctx, qctx) ← read
-  if let some chain := extractDottedChain? calleeStx then if let some aliasName := chain.head? then
+  if let some (aliasName, tblPath, steps) := Db.extractDbQueryChain? calleeStx rawArgs then
     let dbHit? : Option (DatabaseInfo × Option Term) := match ctx.txDbAliases.find? (·.1 == aliasName) with
       | some (_, dbi, txT) => some (dbi, some txT)
       | none => (ctx.dbs.find? (·.1 == aliasName)).map fun (_, dbi) => (dbi, ctx.activeDbTx?.bind fun (a, tid) => if a == aliasName then some ⟨tid.raw⟩ else none)
     if let some (dbInfo, txIdTerm?) := dbHit? then
       let stRef ← liftM (show LowerM (IO.Ref LowerState) from fun ref => pure ref)
-      let (dbTerm, isWrite) ← liftM <| Db.lowerDbCall
+      let (dbTerm, isWrite) ← liftM <| Db.lowerDbCallChain
         (fun locs e => ((go .val e).run ({ ctx with locals := ctx.locals ++ locs }, qctx)) stRef)
-        ctx.fnName dbInfo stx chain rawArgs txIdTerm? (fun t => `(srvAutoField($t))) ctx.ctxTerm?
+        ctx.fnName dbInfo stx aliasName tblPath steps txIdTerm? (fun t => `(srvAutoField($t))) ctx.ctxTerm?
       if isWrite then modify fun s => { s with dbWrite := true }
       return some dbTerm
+  if let some chain := extractDottedChain? calleeStx then if let some aliasName := chain.head? then
     if chain.length == 2 && !ctxHasIdent ctx aliasName then
       let methName := chain[1]!
       if aliasName == "Db" && methName == "postgres" then

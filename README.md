@@ -130,18 +130,14 @@ server NotesApi:
   use db : NotesDb
 
   rpc getNote(noteId: Nat) -> NotesDb.notes?!:
-    requires ctx.userId != none
-    if let some(uid) = ctx.userId:
-      return await db.notes.findOne(where = r => r.id == noteId and r.ownerId == uid)?
-    return none
+    requires auth
+    return await db.notes.where(r => r.id == noteId and r.ownerId == uid).findOne()?
 
   rpc publishNote(noteId: Nat) -> NotesDb.notes?!:
-    requires ctx.userId != none
-    let uid = ctx.userId.getD("")
-    return await db.notes.updateOne(
-      where = r => r.id == noteId and r.ownerId == uid and r.status == "draft",
-      set   = r => { status = "published", version = r.version + 1 }
-    )?
+    requires auth
+    return await db.notes
+      .where(r => r.id == noteId and r.ownerId == uid and r.status == "draft")
+      .updateOne(r => { status = "published", version = r.version + 1 })?
 ```
 
 If an endpoint reads, updates, or deletes a row without proving the table's `policy` (for example, forgetting `r.ownerId == uid` in `getNote`), compilation fails:
@@ -150,7 +146,7 @@ If an endpoint reads, updates, or deletes a row without proving the table's `pol
 Database read policy `NotesDb.notes.read` failed in `getNote → NotesDb.notes.findOne`:
   • must prove: some ownerId = ctx.userId
 
-Hint: Ensure `where = r => ...` (together with `requires` / `if` guards) implies `some(row.ownerId) == ctx.userId`.
+Hint: Ensure `.where(r => ...)` (together with `requires` / `if` guards) implies `some(row.ownerId) == ctx.userId`.
 ```
 
 - **Row-level policies:** `policy read` / `write` / `insert` / `update` / `delete` are checked on every query against `ctx` and `row`.

@@ -41,18 +41,18 @@ server AuthApi:
   invariant nonNegCalls: adminCalls >= 0
   invariant adminOnly: mutating adminCalls requires ctx.userId != none and ctx.hasClaim("role", "admin")
   onCreateAccount(user): if 1 <= user.id.length <= 128 and user.email.length <= 254: await db.profiles.insert(id = user.id, email = user.email, logins = 0)?
-  onSignIn(user): if user.email.length <= 254: await db.profiles.updateOne(where = r => r.id == user.id, set = r => { email = user.email, logins = r.logins + 1 })?
+  onSignIn(user): if user.email.length <= 254: await db.profiles.where(r => r.id == user.id).updateOne(r => { email = user.email, logins = r.logins + 1 })?
   rpc whoami() -> CloudAuth.User!:
     requires ctx.userId != none
     if let some(u) = CloudAuth.fromCtx(ctx): return u
     return fail(.unauthorized)
   rpc getProfile() -> AuthNotesDb.profiles?!:
     requires ctx.userId != none
-    if let some(uid) = ctx.userId: return await db.profiles.findOne(where = r => r.id == uid)?
+    if let some(uid) = ctx.userId: return await db.profiles.where(r => r.id == uid).findOne()?
     return none
   rpc doubleLogins() -> AuthNotesDb.profiles?!:
     requires ctx.userId != none
-    if let some(uid) = ctx.userId: return await db.profiles.updateOne(where = r => r.id == uid, set = { logins *= 2, })?
+    if let some(uid) = ctx.userId: return await db.profiles.where(r => r.id == uid).updateOne({ logins *= 2, })?
     return none
   rpc adminAction() -> Nat!:
     requires ctx.userId != none, ctx.hasClaim("role", "admin")

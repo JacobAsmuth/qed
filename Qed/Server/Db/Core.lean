@@ -422,6 +422,34 @@ theorem SqlExpr.compile_no_semicolon (d : SqlDialect) (e : SqlExpr) :
     ∀ (params : Array SqlVal), ∀ c ∈ (e.compile d params).1.toList, c ≠ ';' :=
   SqlExpr.compileQual_no_semicolon d "" (fun _ h => nomatch h) e
 
+inductive SqlGroupAggOp where | count | sum | min | max deriving Inhabited, DecidableEq
+def SqlGroupAggOp.render : SqlGroupAggOp → Option SqlIdent → String
+  | .count, _ => "COUNT(*)"
+  | .sum, some c => "SUM(" ++ c.quoteIdent ++ ")"
+  | .min, some c => "MIN(" ++ c.quoteIdent ++ ")"
+  | .max, some c => "MAX(" ++ c.quoteIdent ++ ")"
+  | _, none => "COUNT(*)"
+private theorem SqlGroupAggOp.render_no_semicolon (op : SqlGroupAggOp) (col? : Option SqlIdent) : NoSemi (op.render col?) := by
+  cases op <;> cases col? with
+  | none => exact NoSemi.lit
+  | some c => dsimp only [SqlGroupAggOp.render]; first | exact NoSemi.lit | exact (NoSemi.lApp c.quoteIdent_no_semicolon).appL
+
+inductive SqlGroupOrderBy where
+  | col (name : SqlIdent) (dir : SqlOrderDir)
+  | agg (dir : SqlOrderDir)
+deriving Inhabited, DecidableEq
+
+private def renderGroupOrderBy (aggSql : String) : Option SqlGroupOrderBy → String
+  | none => ""
+  | some (.col c dir) => " ORDER BY " ++ c.quoteIdent ++ (match dir with | .asc => " ASC" | .desc => " DESC")
+  | some (.agg dir) => " ORDER BY " ++ aggSql ++ (match dir with | .asc => " ASC" | .desc => " DESC")
+private theorem renderGroupOrderBy_no_semicolon (aggSql : String) (hAgg : NoSemi aggSql) (ob : Option SqlGroupOrderBy) :
+    NoSemi (renderGroupOrderBy aggSql ob) := by
+  rcases ob with _ | ⟨c, dir⟩ | ⟨dir⟩
+  · exact NoSemi.empty
+  · exact (NoSemi.lApp c.quoteIdent_no_semicolon).app (by cases dir <;> exact NoSemi.lit)
+  · exact (NoSemi.lApp hAgg).app (by cases dir <;> exact NoSemi.lit)
+
 inductive SqlQuery where
   | select (table : SqlIdent) (cols : List SqlIdent) (whereExpr : SqlExpr)
            (orderBy : Option (SqlIdent × SqlOrderDir) := none) (limit offset : Option Nat := none)
@@ -432,6 +460,9 @@ inductive SqlQuery where
   | count  (table : SqlIdent) (whereExpr : SqlExpr)
   | countSchema (schema table : SqlIdent) (whereExpr : SqlExpr)
   | aggregate (op : SqlAggOp) (table col : SqlIdent) (whereExpr : SqlExpr)
+  | groupAggregate (op : SqlGroupAggOp) (table : SqlIdent) (groupCols : List SqlIdent)
+                   (aggCol? : Option SqlIdent) (whereExpr : SqlExpr)
+                   (orderBy : Option SqlGroupOrderBy := none) (limit offset : Option Nat := none)
   | joinSelect (leftTable rightTable : SqlIdent) (leftCols rightCols : List SqlIdent)
                (leftJoinCol rightJoinCol : SqlIdent) (leftWhere rightWhere : SqlExpr)
                (orderBy : Option (SqlIdent × SqlOrderDir) := none) (limit offset : Option Nat := none)
@@ -485,6 +516,7 @@ def SqlQuery.eraseVals : SqlQuery → SqlQuery
   | .selectSchema sc t c w o l off => .selectSchema sc t c w.eraseVals o l off
   | .count t w => .count t w.eraseVals | .countSchema sc t w => .countSchema sc t w.eraseVals
   | .aggregate op t c w => .aggregate op t c w.eraseVals
+  | .groupAggregate op t gc ac w o l off => .groupAggregate op t gc ac w.eraseVals o l off
   | .joinSelect lt rt lc rc lj rj lw rw o l off => .joinSelect lt rt lc rc lj rj lw.eraseVals rw.eraseVals o l off
   | .insert t cols ret g? tys => .insert t (cols.map fun (c, _) => (c, .null)) ret (g?.map SqlExpr.eraseVals) tys
   | .insertOrIgnore t cols cc ret g? tys => .insertOrIgnore t (cols.map fun (c, _) => (c, .null)) cc ret (g?.map SqlExpr.eraseVals) tys
@@ -564,6 +596,13 @@ def SqlQuery.compile (d : SqlDialect) : SqlQuery → String × Array SqlVal
   | .aggregate op tbl col whereExpr =>
       let (wSql, params) := whereExpr.compile d #[]
       ("SELECT " ++ op.render ++ "(" ++ col.quoteIdent ++ ") FROM " ++ tbl.quoteIdent ++ " WHERE " ++ wSql, params)
+  | .groupAggregate op tbl gCols aggCol? whereExpr orderBy? limit? offset? =>
+      let aggSql := op.render aggCol?
+      let selCols := if gCols.isEmpty then aggSql else SqlIdent.joinQuoted gCols ++ ", " ++ aggSql
+      let (wSql, params) := whereExpr.compile d #[]
+      let grpSql := if gCols.isEmpty then "" else " GROUP BY " ++ SqlIdent.joinQuoted gCols
+      ("SELECT " ++ selCols ++ " FROM " ++ tbl.quoteIdent ++ " WHERE " ++ wSql ++ grpSql ++
+       renderGroupOrderBy aggSql orderBy? ++ renderLimitOffset d limit? offset?, params)
   | .joinSelect lt rt lCols rCols lJoin rJoin lWhere rWhere orderBy? limit? offset? =>
       let (lwSql, p1) := lWhere.compileQual d "\"_l\"." #[]
       let (rwSql, p2) := rWhere.compileQual d "\"_r\"." p1
@@ -626,7 +665,7 @@ private theorem SqlQuery.compile_eraseVals (d : SqlDialect) (q : SqlQuery) : (q.
   | select _ cols w _ _ _ =>
       dsimp only [SqlQuery.eraseVals, SqlQuery.compile, SqlExpr.compile]
       split <;> (dsimp only; rw [(w.compileQual_eraseVals d "" #[] #[] rfl).1])
-  | selectAll _ w _ _ _ | selectSchema _ _ _ w _ _ _ | count _ w | countSchema _ _ w | aggregate _ _ _ w | delete _ w _ =>
+  | selectAll _ w _ _ _ | selectSchema _ _ _ w _ _ _ | count _ w | countSchema _ _ w | aggregate _ _ _ w | groupAggregate _ _ _ _ w _ _ _ | delete _ w _ =>
       dsimp only [SqlQuery.eraseVals, SqlQuery.compile, SqlExpr.compile]
       rw [(w.compileQual_eraseVals d "" #[] #[] rfl).1]
   | joinSelect _ _ _ _ _ _ lw rw _ _ _ =>
@@ -678,6 +717,18 @@ theorem SqlQuery.compile_no_semicolon (d : SqlDialect) (q : SqlQuery) : ∀ c �
       exact NoSemi.lApp sc.quoteIdent_no_semicolon |>.appL |>.app tbl.quoteIdent_no_semicolon |>.appL |>.app (w.compile_no_semicolon d #[])
   | aggregate op tbl col w =>
       exact NoSemi.lApp op.render_no_semicolon |>.appL |>.app col.quoteIdent_no_semicolon |>.appL |>.app tbl.quoteIdent_no_semicolon |>.appL |>.app (w.compile_no_semicolon d #[])
+  | groupAggregate op tbl gCols aggCol? w ob lim off =>
+      have hAgg := op.render_no_semicolon aggCol?
+      have hSel : NoSemi (if gCols.isEmpty then op.render aggCol? else SqlIdent.joinQuoted gCols ++ ", " ++ op.render aggCol?) := by
+        split
+        · exact hAgg
+        · exact (NoSemi.appL (s := ", ") (jq gCols)).app hAgg
+      have hGrp : NoSemi (if gCols.isEmpty then "" else " GROUP BY " ++ SqlIdent.joinQuoted gCols) := by
+        split
+        · exact NoSemi.empty
+        · exact NoSemi.lApp (jq gCols)
+      exact NoSemi.lApp hSel |>.appL |>.app tbl.quoteIdent_no_semicolon |>.appL |>.app (w.compile_no_semicolon d #[])
+        |>.app hGrp |>.app (renderGroupOrderBy_no_semicolon _ hAgg ob) |>.app (renderLimitOffset_no_semicolon d lim off)
   | joinSelect lt rt lc rc lj rj lw rw ob lim off =>
       have hL : NoSemi "\"_l\"." := NoSemi.lit
       have hR : NoSemi "\"_r\"." := NoSemi.lit
@@ -1038,7 +1089,8 @@ def decodeD1Response (raw : String) (expectedCols : List String) : Except String
 
 def queryExpectedCols : SqlQuery → List String
   | .select _ cols _ _ _ _ | .selectSchema _ _ cols _ _ _ _ | .insert _ _ cols _ _ | .insertOrIgnore _ _ _ cols _ _ | .upsert _ _ _ _ _ cols | .update _ _ _ cols | .delete _ _ cols => cols.map (·.raw)
-  | .joinSelect _ _ lc rc _ _ _ _ _ _ _ => lc.map (·.raw) ++ rc.map (·.raw) | .selectAll _ _ _ _ _ | .count _ _ | .countSchema _ _ _ | .aggregate _ _ _ _ => []
+  | .joinSelect _ _ lc rc _ _ _ _ _ _ _ => lc.map (·.raw) ++ rc.map (·.raw)
+  | .selectAll _ _ _ _ _ | .count _ _ | .countSchema _ _ _ | .aggregate _ _ _ _ | .groupAggregate _ _ _ _ _ _ _ _ => []
 end HttpSql
 
 /-- Branded transaction handle carrying a live transaction ID for a specific `database`. -/

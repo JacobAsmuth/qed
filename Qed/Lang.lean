@@ -133,8 +133,7 @@ def qedPatIdent : Parser := leadP `Qed.Lang.qedPatIdent (ident >> pPatArgsOpt)
 
 def qedCallArgNamed : Parser := node `Qed.Lang.qedCallArgNamed (atomic (rawIdent >> "=" >> notFollowedBy (symbol "=") "=") >> pExpr)
 def qedCallArgPos   : Parser := node `Qed.Lang.qedCallArgPos pExpr
-@[qedCallArg_parser] def qedCallArgP : Parser := opaqueP (
-  node `Qed.Lang.qedCallArgWhere (atomic (symbol "where" >> "=" >> notFollowedBy (symbol "=") "=") >> pExpr) <|> qedCallArgNamed <|> qedCallArgPos)
+@[qedCallArg_parser] def qedCallArgP : Parser := opaqueP (qedCallArgNamed <|> qedCallArgPos)
 
 def qedCasePats : Parser := sepBy1 (node `Qed.Lang.qedPatAlt (sepBy1 pPat ",")) "|"
 @[combinator_parenthesizer qedCasePats] def qedCasePats.parenthesizer : Parenthesizer := pure ()
@@ -163,7 +162,13 @@ def qedIdent       : Parser := leadP `Qed.Lang.qedIdent       (notReservedExprKw
 
 @[qedExpr_parser 90] def qedCall   : TrailingParser := opaqueP (trailP `Qed.Lang.qedCall   90 (checkNoWsBefore "" >> "(" >> commaSep (categoryParser `qedCallArg 0) >> ")"))
 @[qedExpr_parser 90] def qedIndex  : TrailingParser := opaqueP (trailP `Qed.Lang.qedIndex  90 (checkNoWsBefore "" >> "[" >> pExpr >> "]" >> optional (atomic (checkNoWsBefore "" >> symbol "?"))))
-@[qedExpr_parser 90] def qedProj   : TrailingParser := opaqueP (trailP `Qed.Lang.qedProj   90 (checkNoWsBefore "" >> "." >> checkNoWsBefore "" >> (ident <|> fieldIdx)))
+private def checkTailHasNewline : Parser := { fn := fun _ s =>
+  let prev := if s.stxStack.size > 0 then s.stxStack.back else .missing
+  match prev.getTailInfo with
+  | .original _ _ trailing _ => if trailing.contains '\n' then s else s.mkError "expected newline"
+  | _ => s.mkError "expected newline" }
+@[qedExpr_parser 90] def qedProj   : TrailingParser := opaqueP (trailP `Qed.Lang.qedProj   90 (
+  (checkNoWsBefore "" <|> (checkTailHasNewline >> checkColGt)) >> "." >> checkNoWsBefore "" >> (rawIdent <|> fieldIdx)))
 @[qedExpr_parser 90] def qedUnwrap : TrailingParser := opaqueP (trailP `Qed.Lang.qedUnwrap 90 (checkNoWsBefore "" >> symbol "?"))
 
 @[qedExpr_parser 85] def qedPow    : TrailingParser := opaqueP (binOpP `Qed.Lang.qedPow 85 80 "**")
@@ -360,11 +365,10 @@ def pushUnique {α : Type} [BEq α] (xs : Array α) (x : α) : Array α := if xs
 partial def stxAny (p : Syntax → Bool) (stx : Syntax) : Bool := p stx || stx.getArgs.any (stxAny p)
 
 def splitCallArgsPure (callName : String) (rawArgs : Array Syntax) (validKeys : Option (List String) := none)
-    (allowWhere : Bool := false) (errRef : Syntax := Syntax.missing) : Except (Syntax × String) (Array Syntax × Array (String × Syntax)) :=
+    (errRef : Syntax := Syntax.missing) : Except (Syntax × String) (Array Syntax × Array (String × Syntax)) :=
   foldlIdxExcept rawArgs (#[], #[]) fun (posArgs, namedArgs) a _ =>
     let k := a.getKind
     if k == ``qedCallArgPos then .ok (posArgs.push (a.getArg 0), namedArgs)
-    else if allowWhere && k == `Qed.Lang.qedCallArgWhere then .ok (posArgs, namedArgs.push ("where", a.getArg 2))
     else if k == ``qedCallArgNamed then
       let key := (a.getArg 0).getId.eraseMacroScopes.toString
       match validKeys with
@@ -375,8 +379,8 @@ def splitCallArgsPure (callName : String) (rawArgs : Array Syntax) (validKeys : 
     else .error (a, s!"unexpected argument in `{callName}(...)`")
 
 @[noinline, nospecialize] def splitCallArgs {m : Type → Type} [Monad m] [MonadError m] (callName : String) (rawArgs : Array Syntax)
-    (validKeys : Option (List String) := none) (allowWhere : Bool := false) (errRef : Syntax := Syntax.missing) : m (Array Syntax × Array (String × Syntax)) :=
-  liftPureErr (splitCallArgsPure callName rawArgs validKeys allowWhere errRef)
+    (validKeys : Option (List String) := none) (errRef : Syntax := Syntax.missing) : m (Array Syntax × Array (String × Syntax)) :=
+  liftPureErr (splitCallArgsPure callName rawArgs validKeys errRef)
 
 structure ParsedEnvRef where mk :: (isSecret : Bool) (envKey : String) (default? : Option String) deriving Inhabited, Repr
 
@@ -1046,7 +1050,7 @@ private def builtinQualCall? : Name → Option (Name × Nat)
       let hasCompound := ops.any (· != "=")
       if hasCompound && !hasBase then
         let badIdx := (ops.findIdx? (· != "=")).getD 0
-        return ← hooks.throwErr fields[badIdx]! s!"`{ops[badIdx]!}` in record literal requires a base record (`\{ base with field {ops[badIdx]!} val }`) or database `update(..., set = \{ ... })`"
+        return ← hooks.throwErr fields[badIdx]! s!"`{ops[badIdx]!}` in record literal requires a base record (`\{ base with field {ops[badIdx]!} val }`) or database `.update(\{ ... })` / `.updateOne(\{ ... })`"
       let base? ← if hasBase then some <$> go .val ((stx.getArg 1).getArg 0) else pure none
       if hasCompound then
         let baseId ← hooks.freshIdent "_qedRec"

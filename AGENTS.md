@@ -29,3 +29,10 @@ Once tests pass and before replying to the user, run a dedicated self-review on 
 - **No em/en dashes**: Never use U+2014 or U+2013 in repository files; use colons, commas, or periods.
 - **Do not weaken gates**: Keep benchmarks, `scripts/axioms.lean` (zero `sorry`, zero unexpected axioms), and all test assertions intact.
 - **Verification commands**: Run `./scripts/qed check`, `lake env lean scripts/axioms.lean`, `cargo test --manifest-path rust/qed_server/Cargo.toml`, and `./scripts/qed test` after substantive changes.
+
+## 4. Language & Syntax Design
+Keep Qed's surface language simple, flexible, and readable whenever adding or modifying grammar, parsers, or DSL clauses:
+- **Avoid new keywords**: Exhaust existing Qed keywords and constructs before minting a new one. Reuse the same keyword in a new block/context (for example `fn` inside `database` instead of `policy_fn`) when the concept is the same.
+- **Keep keywords consistent across contexts**: Before designing any new clause, inspect existing parsers (`Qed/Lang.lean`, `Qed/Schema.lean`, `Qed/Component/Syntax.lean`, `Qed/Server/Syntax.lean`, `Qed/Server/Db/Elab.lean`) so shared concepts (`fn`, `example`, `rejects`, `invariant`, `requires`, `with`, etc.) follow a uniform shape everywhere.
+- **Avoid keyword chains at all costs**: Never stack multi-word keyword prefixes (like `example policy read ...`) just to simplify parsing or disambiguation. Use flat, concise syntax (like `example read ...:`) and let the parser handle disambiguation cleanly.
+- **Prefer simple, composable primitives**: Favor orthogonal, readable forms over special-case grammar. If a syntax feels noisy or redundant when read aloud, simplify it and align with the user before implementing.

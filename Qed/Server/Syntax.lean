@@ -108,7 +108,7 @@ def srvJobClause : Parser := withP `Qed.Server.srvJobClause
   (atomic (identEq `every) >> numLit >> ident >> ident >> optional (" -> " >> qType) >> ":" >> srvContractSuite "expected indented `every` job body" srvContractLine)
 def srvExMethod : Parser := extHttpMethod <|> identEq `GET <|> identEq `POST <|> identEq `PUT <|> identEq `PATCH <|> identEq `DELETE
 private def srvExItemP : Parser :=
-  withP `Qed.Server.srvExWithEq    (atomic (symbol "with" >> (identEq `now <|> identEq `session <|> identEq `query <|> identEq `body <|> identEq `ctx <|> identEq `state) >> "=") >> qExpr) <|>
+  withP `Qed.Server.srvExWithEq    (atomic (symbol "with" >> (identEq `now <|> identEq `session <|> identEq `query <|> identEq `body <|> identEq `principal <|> identEq `ctx <|> identEq `state) >> "=") >> qExpr) <|>
   withP `Qed.Server.srvExWithStrEq (atomic (symbol "with" >> (identEq `env <|> identEq `header <|> identEq `file)) >> strLit >> "=" >> qExpr) <|>
   withP `Qed.Server.srvExWithExpr  (atomic (symbol "with" >> (identEq `user <|> identEq `role)) >> qExpr) <|>
   withP `Qed.Server.srvExWithHttp  (atomic (symbol "with" >> (identEq `http <|> identEq `http_error)) >> srvExMethod >> strLit >> "=>" >> numLit >> optional (checkLineEq >> qExpr)) <|>

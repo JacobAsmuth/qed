@@ -272,8 +272,8 @@ private def runShopDirectSuite (c : TestChecker) (label : String) (srvInst : Mon
   let lbl (s : String) := s!"[{label}] {s}"; let stBox ← Prim.mkStateBox DbChecks.ShopApi.initState; let atomicInst : MonadAtomic DbChecks.ShopApi.State IO := Native.withStateBox stBox
   c.expectOk (lbl "ShopDb schema init") (← @MonadServer.dbExecDdl IO srvInst DbChecks.ShopDb.config) fun () => do
     c.check (lbl "ShopDb schema initialized") true
-    let alice (fn : String) (req := ByteArray.empty) := @DbChecks.ShopApi.dispatchM IO _ srvInst atomicInst { userId := some "alice" } fn req
-    let bob   (fn : String) (req := ByteArray.empty) := @DbChecks.ShopApi.dispatchM IO _ srvInst atomicInst { userId := some "bob" } fn req
+    let alice (fn : String) (req := ByteArray.empty) := @DbChecks.ShopApi.dispatchM IO _ srvInst atomicInst (RequestCtx.forUser "alice") fn req
+    let bob   (fn : String) (req := ByteArray.empty) := @DbChecks.ShopApi.dispatchM IO _ srvInst atomicInst (RequestCtx.forUser "bob") fn req
     let mkTxReq (aid aname iid title : String) (price : Nat) := Qed.Proto.encode (aid, (aname, (iid, (title, price))))
     c.checkProto (lbl "empty sum == 0") (← alice "totalInventoryValue") (0 : Nat)
     c.checkProto (lbl "empty min == none") (← alice "cheapestPrice") (none : Option Nat)
@@ -316,7 +316,7 @@ private def runMigrationSuite (c : TestChecker) (tmpDir : String) : IO Unit := d
 private def runEncryptedColumnSuite (c : TestChecker) (srvInst : MonadServer IO) : IO Unit := do
   let cfg := DbChecks.EncVaultDb.config
   c.expectOk "[enc-db] schema init" (← @MonadServer.dbExecDdl IO srvInst cfg) fun () => do
-    let alice (fn : String) (req := ByteArray.empty) := @DbChecks.EncVaultApi.dispatchM IO _ srvInst { userId := some "alice" } fn req
+    let alice (fn : String) (req := ByteArray.empty) := @DbChecks.EncVaultApi.dispatchM IO _ srvInst (RequestCtx.forUser "alice") fn req
     let some inp1 := DbChecks.SecretNoteInput.parse { body := "top-secret payload 🔐" } | c.check "[enc-db] parse inp1" false; return
     let some inp2 := DbChecks.SecretNoteInput.parse { body := "updated secret 🔑" } | c.check "[enc-db] parse inp2" false; return
     let blob := ByteArray.mk #[1, 2, 3, 255]
@@ -372,7 +372,7 @@ private def runKeyRotationAndMetaSuite (c : TestChecker) (tmpDir : String) : IO 
   let srvInst := withMockEnvInst (withRedirectedDb (.sqlitePath dbPath)) (fun v => return (← envRef.get).lookup v) (onDecrypt? := some (decCountRef.modify (· + 1)))
   let cfg := DbChecks.RotatingVaultDb.config
   c.expectOk "[enc-rot] schema init" (← @MonadServer.dbExecDdl IO srvInst cfg) fun () => do
-    let alice (fn : String) (req := ByteArray.empty) := @DbChecks.RotatingVaultApi.dispatchM IO _ srvInst { userId := some "alice" } fn req
+    let alice (fn : String) (req := ByteArray.empty) := @DbChecks.RotatingVaultApi.dispatchM IO _ srvInst (RequestCtx.forUser "alice") fn req
     forList [((1 : Nat), "stripe-live", "sk_live_alpha"), (2, "github-pat", "ghp_beta")] fun (id, label, sec) => do
       c.expectOk s!"[enc-rot] save row {id} under K1" (← alice "save" (Qed.Proto.encode (id, (label, sec)))) fun _ => pure ()
     envRef.set []; decCountRef.set 0
@@ -396,7 +396,7 @@ private def runKeyRotationAndMetaSuite (c : TestChecker) (tmpDir : String) : IO 
 private def runMultiTenantCrossTableSuite (c : TestChecker) (tmpDir : String) : IO Unit := do
   let srvInst := withRedirectedDb (.sqlitePath s!"{tmpDir}/multi_tenant.db")
   c.expectOk "[cross-rls] schema init" (← @MonadServer.dbExecDdl IO srvInst DbChecks.MultiTenantDb.config) fun () => do
-    let asUser (u fn : String) (req := ByteArray.empty) := @DbChecks.MultiTenantApi.dispatchM IO _ srvInst { userId := some u } fn req
+    let asUser (u fn : String) (req := ByteArray.empty) := @DbChecks.MultiTenantApi.dispatchM IO _ srvInst (RequestCtx.forUser u) fn req
     forList [("alice", "app1", "Alpha", none), ("alice", "app2", "Beta Org", some "org1"), ("bob", "app3", "Bob Private", none)] fun (u, id, name, orgId) => do
       c.expectOk s!"[cross-rls] {u} creates {id}" (← asUser u "createApp" (Qed.Proto.encode (id, (name, orgId)))) fun _ => pure ()
     forList [("m1", "app1", "charlie", "admin", "accepted"), ("m2", "app1", "dave", "viewer", "accepted"), ("m3", "app1", "eve", "admin", "pending")] fun (id, appId, u, role, status) => do
@@ -442,7 +442,7 @@ private def runMultiTenantCrossTableSuite (c : TestChecker) (tmpDir : String) : 
 private def runCloudPolicySuite (c : TestChecker) (tmpDir : String) : IO Unit := do
   let srvInst := withRedirectedDb (.sqlitePath s!"{tmpDir}/cloud_policy.db")
   c.expectOk "[cloud-pol] schema init" (← @MonadServer.dbExecDdl IO srvInst DbChecks.CloudPolicyDb.config) fun () => do
-    let asUser (u fn : String) (req := ByteArray.empty) := @DbChecks.CloudPolicyApi.dispatchM IO _ srvInst { userId := some u } fn req
+    let asUser (u fn : String) (req := ByteArray.empty) := @DbChecks.CloudPolicyApi.dispatchM IO _ srvInst (RequestCtx.forUser u) fn req
     forList [("alice", "alice@qed.dev", 5000, false), ("bob", "bob@qed.dev", 2000, false),
         ("charlie", "charlie@qed.dev", 0, false), ("dave", "dave@qed.dev", 0, false), ("op1", "op@qed.dev", 0, true)] fun (id, email, cap, isOp) => do
       c.expectOk s!"[cloud-pol] seed account {id}" (← asUser id "seedAccount" (Qed.Proto.encode (id, (email, (cap, isOp))))) fun _ => pure ()
@@ -466,6 +466,58 @@ private def runCloudPolicySuite (c : TestChecker) (tmpDir : String) : IO Unit :=
     c.checkProtoBy (α := Array DbChecks.CloudPolicyDb.accounts) "[cloud-pol] operator lists all 5 accounts" (← asUser "op1" "listAllAccountsAsOp") (·.size) 5
     c.checkProtoBy (α := Array DbChecks.CloudPolicyDb.accounts) "[cloud-pol] non-operator lists 0 accounts" (← asUser "dave" "listAllAccountsAsOp") (·.size) 0
     c.check "[cloud-pol] rlsDdl expands database fn into SQL EXISTS" (DbChecks.CloudPolicyDb.rlsDdl.contains "EXISTS (SELECT 1 FROM \"app_members\" AS \"m_f")
+
+private def runPrincipalSuite (c : TestChecker) (tmpDir : String) : IO Unit := do
+  let dbPath := s!"{tmpDir}/principal.db"
+  let envRef ← IO.mkRef ([] : List (String × String))
+  let srvInst := withMockEnvInst (withRedirectedDb (.sqlitePath dbPath)) (fun v => return (← envRef.get).lookup v)
+  let atomicInst : MonadAtomic Unit IO := Native.withStateBox (← Prim.mkStateBox ())
+  let postRoute (path body : String) (hdrs : List (String × String) := []) :=
+    @DbChecks.PrincipalApi.httpDispatchM IO _ srvInst { headers := hdrs, body } "POST" path
+  let hmacHex (key msg : String) : IO String := return Qed.Proto.encodeHex (← Prim.hmacSha256 key.toUTF8 msg.toUTF8)
+  c.expectOk "[principal] schema init" (← @MonadServer.dbExecDdl IO srvInst DbChecks.PrincipalDb.config) fun () => do
+    c.checkErrCode "[principal] Stripe webhook 500 when secret unset" (← postRoute "/webhooks/stripe" "{}") 500
+    let (stripeSec, ghSec, cronSec, bearerSec) := ("whsec_live_test", "ghsec_live_test", "cron_live_secret", "bearer_live_secret")
+    envRef.set [("TEST_STRIPE_WH_SECRET", stripeSec), ("TEST_GITHUB_WH_SECRET", ghSec), ("TEST_CRON_SECRET", cronSec), ("TEST_BEARER_SECRET", bearerSec)]
+    let nowS := (← Prim.nowMs).toNat / 1000
+    let stripeBody := "{\"type\":\"invoice.paid\"}"
+    let goodStripeSig ← hmacHex stripeSec s!"{nowS}.{stripeBody}"
+    let oldTs := if nowS > 600 then nowS - 600 else 0
+    let expiredStripeSig ← hmacHex stripeSec s!"{oldTs}.{stripeBody}"
+    c.checkErrCode "[principal] Stripe webhook 401 on bad sig" (← postRoute "/webhooks/stripe" stripeBody [("stripe-signature", s!"t={nowS},v1=0000")]) 401
+    c.checkErrCode "[principal] Stripe webhook 401 on expired timestamp" (← postRoute "/webhooks/stripe" stripeBody [("stripe-signature", s!"t={oldTs},v1={expiredStripeSig}")]) 401
+    c.expectOk "[principal] Stripe webhook 200 with real ring HMAC-SHA256" (← postRoute "/webhooks/stripe" stripeBody [("stripe-signature", s!"t={nowS},v1=deadbeef,v1={goodStripeSig},v2=abc==")]) fun resp? =>
+      c.check "[principal] Stripe webhook returned 200" (resp?.any (·.status == 200))
+    let ghBody := "{\"ref\":\"refs/heads/main\"}"
+    let goodGhSig ← hmacHex ghSec ghBody
+    c.checkErrCode "[principal] GitHub webhook 401 on wrong sig" (← postRoute "/webhooks/github" ghBody [("x-hub-signature-256", "sha256=" ++ String.ofList (List.replicate 64 '0'))]) 401
+    c.expectOk "[principal] GitHub webhook 200 with real ring HMAC-SHA256" (← postRoute "/webhooks/github" ghBody [("x-hub-signature-256", s!"sha256={goodGhSig}")]) fun resp? =>
+      c.check "[principal] GitHub webhook returned 200" (resp?.any (·.status == 200))
+    let some pollJob := DbChecks.BuildJobSrv.jobs[0]? | c.check "[principal] BuildJobSrv has poll job" false; return
+    let ioPoll := pollJob.toIoJob srvInst atomicInst
+    c.checkOkBy "[principal] BuildJobSrv.poll claims queued deployment" (← ioPoll.runWorkOnce) id true
+    c.checkOkBy "[principal] BuildJobSrv.poll returns false when queue empty" (← ioPoll.runWorkOnce) id false
+    c.checkErrCode "[principal] cron/reap 401 on wrong bearer" (← postRoute "/cron/reap" "" [("authorization", "Bearer wrong")]) 401
+    c.expectOk "[principal] cron/reap 200 marks building -> stale" (← postRoute "/cron/reap" "" [("authorization", s!"Bearer {bearerSec}")]) fun resp? =>
+      c.check "[principal] cron/reap returned reaped:true" (resp?.any fun r => r.status == 200 && ((String.fromUTF8? r.body).getD "").contains "true")
+    c.checkErrCode "[principal] cron/cleanup 401 on wrong header secret" (← postRoute "/cron/cleanup" "" [("x-qed-cron-secret", "wrong")]) 401
+    c.expectOk "[principal] cron/cleanup 200 deletes stale deployment" (← postRoute "/cron/cleanup" "" [("x-qed-cron-secret", cronSec)]) fun resp? =>
+      c.check "[principal] cron/cleanup returned deleted:1" (resp?.any fun r => r.status == 200 && ((String.fromUTF8? r.body).getD "").contains "\"deleted\":1")
+    let rls := DbChecks.PrincipalDb.rlsDdl
+    let onceRc ← try
+        if !(← Native.initDatabases #[DbChecks.PrincipalDb.config]) then pure (1 : UInt32)
+        else Native.runServerJobsOnly "BuildJobSrv" (some DbChecks.PrincipalDb.config) () DbChecks.BuildJobSrv.jobs ["--once"]
+      finally
+        for suf in ["", "-wal", "-shm"] do
+          try IO.FS.removeFile s!".qed/principal_checks.db{suf}" catch _ => pure ()
+    c.checkAll [
+      ("[principal] runServerJobsOnly --once exits 0", onceRc == 0),
+      ("[principal] Principal.toSqlTag matches RLS format", Principal.anonymous.toSqlTag == "" && (Principal.system "stripe").toSqlTag == "system:stripe" && (Principal.system "BuildJobSrv.poll").toSqlTag == "system:BuildJobSrv.poll"),
+      ("[principal] rlsDdl renders ctx.principal == .system(\"stripe\")", rls.contains "(current_setting('qed.principal', true) = 'system:stripe')"),
+      ("[principal] rlsDdl renders ctx.principal in [.system(...), ...]", rls.contains "(current_setting('qed.principal', true) IN ('system:BuildJobSrv.poll', 'system:reap-and-sweep'))")]
+
+rollback_env qedServerMain DbChecks.BuildJobSrv
+rollback_env qedServerMain DbChecks.PrincipalApi
 
 def run : IO Bool := do
   let c ← mkChecker "database"
@@ -496,6 +548,7 @@ def run : IO Bool := do
         runKeyRotationAndMetaSuite c tmpDir,
         runMultiTenantCrossTableSuite c tmpDir,
         runCloudPolicySuite c tmpDir,
+        runPrincipalSuite c tmpDir,
         runMigrationSuite c tmpDir,
         runRoadmapSuite c tmpDir,
         withMockServer c "[pg-shop] start mock" (startPgWireMock s!"{tmpDir}/shop_pg_mock.db" "shopuser" "shoppass" "shopdb") (fun m => do Db.PgWire.clearPool; m.stop) fun shopPgMock => do

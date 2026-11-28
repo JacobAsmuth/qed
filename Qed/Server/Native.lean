@@ -618,7 +618,8 @@ private def buildRequestCtxReq (cfg : ServerConfig) (req : ParsedReqHead) (clien
   let cookies := if !req.hasCookie then [] else hdrList.foldl (fun acc (k, v) => if eqCI k "cookie" then acc ++ parseCookiePairs v else acc) []
   let bearer? := req.auth?.bind extractBearer; let (userId?, claims, authMethod) ← resolveAuthPrincipal cfg oidcRt? bearer? cookies
   let query := (findByte req.target 0 63).elim "" fun q => if q + 1 >= req.target.utf8ByteSize then "" else String.Pos.Raw.extract req.target ⟨q + 1⟩ ⟨req.target.utf8ByteSize⟩
-  return { headers := hdrList, cookies, bearerToken := bearer?, userId := userId?, claims, authMethod, clientIp, query, body := if body.isEmpty then "" else (String.fromUTF8? body).getD "" }
+  let auth : AuthToken := match userId? with | some uid => AuthToken.ofUser uid claims authMethod | none => { principal := .anonymous, claims, authMethod }
+  return { headers := hdrList, cookies, bearerToken := bearer?, auth, clientIp, query, body := if body.isEmpty then "" else (String.fromUTF8? body).getD "" }
 
 private structure WireVariants where (headKA headClose fullKA fullClose : ByteArray)
 private def WireVariants.build (mime : String) (body : ByteArray) (etag cacheCtrl : String) (hdrs : List (String × String)) : WireVariants :=
@@ -707,7 +708,7 @@ private def apiErrWireResp (devMode : Bool) (req : ParsedReqHead) (pathOnly : St
     if let .error (code, msg) := checkOriginAndFetchSite req fs.loop.cfg.rpcAllowedOrigins? false "auth endpoint" then return some (formatTextResponse code msg isHead req.keepAlive)
   let (hasOnCreate, hasOnSignIn) := fs.fm.authHookFlags
   let onAuthCallback? := fs.authHookFn?.map fun hookFn sub filteredClaims => ExceptT.run do
-    let hookCtx : RequestCtx := { ctx with userId := some sub, claims := filteredClaims }
+    let hookCtx : RequestCtx := ctx.withAuth (AuthToken.ofUser sub filteredClaims .session)
     let runHook (kind : UInt8) (onErr : IO Unit := pure ()) : ExceptT (Nat × String) IO (Array SetCookie) := do
       let (hRes, hCookies) ← hookFn hookCtx kind
       match hRes with | .ok () => return hCookies | .error e => onErr; throw (e.httpStatus.toNat, ← liftIO (logAndRedactApiErr fs.fm.devMode "auth hook" e))
@@ -838,7 +839,8 @@ private def runFullstackApp {Model Msg : Type} (app : Qed.App Model Msg) (fm : F
 
 private abbrev SrvHandlerM (σ : Type) (F : (Type → Type) → Type) := {m : Type → Type} → [Monad m] → [MonadServer m] → [MonadAtomic σ m] → F m
 
-@[noinline, nospecialize] def runStatefulFullstack {σ Model Msg : Type} (app : Qed.App Model Msg) (fm : FullstackMeta) (initState : σ)
+@[noinline, nospecialize] private def runStatefulCore {σ : Type} (styleCss : String) (stylesheets : List String) (ssrRender : SsrRenderFn)
+    (fm : FullstackMeta) (initState : σ)
     (dispatchM : SrvHandlerM σ fun m => RequestCtx → String → ByteArray → m (Except ApiError ByteArray))
     (wsDispatchM? : Option (SrvHandlerM σ fun m => RequestCtx → UInt8 → String → ByteArray → ByteArray → m (Except ApiError ByteArray)) := none)
     (httpDispatchM? : Option (SrvHandlerM σ fun m => RequestCtx → String → String → m (Except ApiError (Option HttpResponse))) := none)
@@ -847,7 +849,7 @@ private abbrev SrvHandlerM (σ : Type) (F : (Type → Type) → Type) := {m : Ty
   let (wsSrvInst, atomicInst) := (mkNativeServerInstWith (some gcpCache) none none (some dbCache) gcpSsrfGuard, withStateBox box)
   let withCookies {α : Type} (sseRef? : Option (IO.Ref (Array SseEvent)) := none) (f : MonadServer IO → IO α) : IO (α × Array SetCookie) := do
     let cRef ← IO.mkRef (#[] : Array SetCookie); return (← f (mkNativeServerInstWith (some gcpCache) (some cRef) sseRef? (some dbCache) gcpSsrfGuard), ← cRef.get)
-  runFullstackApp app fm
+  runFullstackCore styleCss stylesheets ssrRender fm
     (fun ctx mName reqBytes => withCookies none fun srv => @dispatchM IO _ srv atomicInst ctx mName reqBytes)
     (wsDispatchM?.map fun wsM ctx kind ch params payload => @wsM IO _ wsSrvInst atomicInst ctx kind ch params payload)
     (httpDispatchM?.map fun httpM ctx method path => do
@@ -855,6 +857,47 @@ private abbrev SrvHandlerM (σ : Type) (F : (Type → Type) → Type) := {m : Ty
       return (match res with | .ok (some resp) => .ok (some (if !sseEvs.isEmpty && startsWithCI resp.contentType "text/event-stream" then { resp with body := SseEvent.formatStream sseEvs.toList } else resp)) | other => other, cookies))
     (jobs.map (·.toIoJob wsSrvInst atomicInst))
     (authHookM?.map fun hookM ctx kind => withCookies none fun srv => @hookM IO _ srv atomicInst ctx kind)
+
+@[noinline, nospecialize] def runStatefulFullstack {σ Model Msg : Type} (app : Qed.App Model Msg) (fm : FullstackMeta) (initState : σ)
+    (dispatchM : SrvHandlerM σ fun m => RequestCtx → String → ByteArray → m (Except ApiError ByteArray))
+    (wsDispatchM? : Option (SrvHandlerM σ fun m => RequestCtx → UInt8 → String → ByteArray → ByteArray → m (Except ApiError ByteArray)) := none)
+    (httpDispatchM? : Option (SrvHandlerM σ fun m => RequestCtx → String → String → m (Except ApiError (Option HttpResponse))) := none)
+    (jobs : Array (ServerJob σ) := #[]) (authHookM? : Option (SrvHandlerM σ fun m => RequestCtx → UInt8 → m (Except ApiError Unit)) := none) : IO UInt32 :=
+  runStatefulCore (renderStyleSheet app.styles) app.stylesheets
+    (fun sh t s p d u => app.ssrRenderNativeWithStatus sh t s p d (sessionUser := u)) fm initState dispatchM wsDispatchM? httpDispatchM? jobs authHookM?
+
+@[noinline, nospecialize] def runStatefulServer {σ : Type} (fm : FullstackMeta) (initState : σ)
+    (dispatchM : SrvHandlerM σ fun m => RequestCtx → String → ByteArray → m (Except ApiError ByteArray))
+    (wsDispatchM? : Option (SrvHandlerM σ fun m => RequestCtx → UInt8 → String → ByteArray → ByteArray → m (Except ApiError ByteArray)) := none)
+    (httpDispatchM? : Option (SrvHandlerM σ fun m => RequestCtx → String → String → m (Except ApiError (Option HttpResponse))) := none)
+    (jobs : Array (ServerJob σ) := #[]) (authHookM? : Option (SrvHandlerM σ fun m => RequestCtx → UInt8 → m (Except ApiError Unit)) := none) : IO UInt32 :=
+  runStatefulCore "" [] (fun _ _ _ _ _ _ => pure (404, {}, "not found".toUTF8)) fm initState dispatchM wsDispatchM? httpDispatchM? jobs authHookM?
+
+private def drainWorkOnce (job : IoJob) : Nat → IO (Except ApiError Unit)
+  | 0 => pure (.ok ())
+  | fuel + 1 => do
+      match ← job.runWorkOnce with
+      | .ok true => drainWorkOnce job fuel
+      | .ok false => pure (.ok ())
+      | .error e => pure (.error e)
+
+@[noinline, nospecialize] def runServerJobsOnly {σ : Type} (srvName : String) (primaryDb? : Option Db.DbConfig)
+    (initState : σ) (jobs : Array (ServerJob σ)) (args : List String) : IO UInt32 := do
+  let devMode := args.contains "--dev"
+  let once := args.contains "--once"
+  let (box, gcpCache, dbCache) := (← Prim.mkStateBox initState, ← Prim.mkStateBox (#[] : Array GcpTokenCacheEntry), ← mkDbResolveCache primaryDb?)
+  let (srvInst, atomicInst) := (mkNativeServerInstWith (some gcpCache) none none (some dbCache) (!devMode), withStateBox box)
+  let ioJobs := jobs.map (·.toIoJob srvInst atomicInst)
+  if once then
+    let mut exitCode : UInt32 := 0
+    for j in ioJobs do
+      match ← drainWorkOnce j 10000 with
+      | .ok () => pure ()
+      | .error e => IO.eprintln s!"[{srvName}:{j.name}] error: {e.message}"; exitCode := 1
+    return exitCode
+  let tasks ← spawnServerJobs ioJobs
+  for t in tasks do discard <| IO.wait t
+  return 0
 
 def parseServerCliArgs (args : List String) : IO (String × UInt16 × Bool × UInt32) := do
   let portStr ← match args[1]? with | some p => pure p | none => (·.getD "8000") <$> Prim.getEnv "PORT"

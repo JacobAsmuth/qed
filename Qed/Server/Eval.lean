@@ -272,14 +272,15 @@ def evalProg {σ α : Type} (env : EvalEnv) (st : EvalState σ) : ThreadProg σ 
 
 def setNow (e : EvalEnv) (ms : UInt64) : EvalEnv := { e with nowMs := ms }
 def setEnvVar (e : EvalEnv) (k v : String) : EvalEnv := { e with envVars := (k, v) :: e.envVars }
-def setSession (c : RequestCtx) (b : Bool) : RequestCtx := { c with authMethod := if b then .session else .bearer }
+def setSession (c : RequestCtx) (b : Bool) : RequestCtx := { c with auth := { c.auth with authMethod := if b then .session else .bearer } }
 def setQuery (c : RequestCtx) (q : String) : RequestCtx := { c with query := q }
 def setBody (c : RequestCtx) (b : String) : RequestCtx := { c with body := b }
 def setHeader (c : RequestCtx) (k v : String) : RequestCtx := { c with headers := (k, v) :: c.headers }
-def setRole (c : RequestCtx) (r : String) : RequestCtx := { c with claims := ("role", r) :: c.claims }
+def setRole (c : RequestCtx) (r : String) : RequestCtx := { c with auth := { c.auth with claims := ("role", r) :: c.auth.claims } }
 def setUser (c : RequestCtx) : Option String → RequestCtx
-  | none => { c with userId := none, authMethod := .none }
-  | some u => { c with userId := some u, authMethod := if c.authMethod == .none then .bearer else c.authMethod }
+  | none => { c with auth := { c.auth with principal := .anonymous, authMethod := .none } }
+  | some u => { c with auth := { c.auth with principal := .user u, authMethod := if c.auth.authMethod == .none then .bearer else c.auth.authMethod } }
+def setPrincipal (c : RequestCtx) (p : Principal) : RequestCtx := c.withAuth (AuthToken.ofPrincipal p)
 def setShared {σ : Type} (s : EvalState σ) (v : σ) : EvalState σ := { s with shared := v }
 def pushHttpStub {σ : Type} (s : EvalState σ) (stub : HttpStub) : EvalState σ := { s with httpStubs := s.httpStubs ++ [stub] }
 def pushProcStub {σ : Type} (s : EvalState σ) (stub : ProcStub) : EvalState σ := { s with procStubs := s.procStubs ++ [stub] }

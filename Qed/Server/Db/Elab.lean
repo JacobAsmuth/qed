@@ -69,7 +69,7 @@ private def dbEncColTy : Parser := node `Qed.Server.Db.encColTy
 private def dbAssignItem : Parser := node `Qed.Server.Db.assignItem (ident >> "=" >> dbExpr)
 private def dbFnParam : Parser := node `Qed.Server.Db.dbFnParam (ident >> ":" >> categoryParser `qedType 91)
 private def dbPolicyExItem : Parser :=
-  node `Qed.Server.Db.polExKv (withPosition (atomic ((identEq `user <|> identEq `role <|> identEq `session <|> identEq `ctx <|> identEq `row <|> identEq `old) >> "=") >> dbExpr)) <|>
+  node `Qed.Server.Db.polExKv (withPosition (atomic ((identEq `user <|> identEq `role <|> identEq `session <|> identEq `principal <|> identEq `ctx <|> identEq `row <|> identEq `old) >> "=") >> dbExpr)) <|>
   node `Qed.Server.Db.polExSnap (withPosition (atomic (identEq `snap >> ident >> "=") >> dbExpr))
 
 @[dbTableClause_parser] def dbTableClauseP : Parser := opaqueP (
@@ -281,13 +281,27 @@ private partial def validateCrossTableAnyIn (tables : Array ParsedTable) (stx : 
 
 private def quoteSqlLit (s : String) : String := "'" ++ s.replace "'" "''" ++ "'"
 
+private def renderPrincipalCallLit? (s : Syntax) : Option String :=
+  let u := unwrapParens1 s
+  if u.getKind == ``qedCall && (u.getArg 0).getKind == ``qedDotIdent then
+    let tag := ((u.getArg 0).getArg 1).getId.eraseMacroScopes.toString
+    let args := (u.getArg 2).getSepArgs
+    if ["user", "system"].contains tag && args.size == 1 && args[0]!.getKind == ``qedCallArgPos then
+      let a := unwrapParens1 (args[0]!.getArg 0)
+      if a.getKind == ``qedLitStr then
+        let raw := (⟨a.getArg 0⟩ : TSyntax `str).getString
+        if raw.any (· == '\x00') then none else some (quoteSqlLit s!"{tag}:{raw}")
+      else none
+    else none
+  else none
+
 private def renderSqlLit? (s : Syntax) : Option String :=
   let u := unwrapParens1 s; let uk := u.getKind
   if uk == ``qedLitNum then some (toString (⟨u.getArg 0⟩ : TSyntax `num).getNat)
   else if uk == ``qedLitStr || uk == ``qedDotIdent then
     let raw := if uk == ``qedLitStr then (⟨u.getArg 0⟩ : TSyntax `str).getString else (u.getArg 1).getId.eraseMacroScopes.toString
     if raw.any (· == '\x00') then none else some (quoteSqlLit raw)
-  else none
+  else renderPrincipalCallLit? u
 
 private def mapOptArr {α β : Type} (xs : Array α) (f : α → Option β) : Option (Array β) :=
   let rec go : Nat → Array β → Option (Array β)
@@ -308,7 +322,7 @@ private partial def renderSqlPred? (tblName : String) (colNames : Array String) 
     let subCols := subTbl.cols.foldl (init := #[]) fun acc c => if c.encKey?.isNone then acc.push c.colName else acc
     let bodySql ← renderSqlPred? tblName colNames true tables (subAliases.push (aliasStr, subCols)) (stx.getArg 5)
     some s!"EXISTS (SELECT 1 FROM \"{subTblName}\" AS \"{aliasStr}\" WHERE {bodySql})"
-  else if forRls && k == ``qedCall then (extractSomeCall? stx).bind recR
+  else if forRls && k == ``qedCall then (extractSomeCall? stx).bind recR <|> renderPrincipalCallLit? stx
   else if k == ``qedParen then
     let args := (stx.getArg 1).getSepArgs; if args.size == 1 then (recR args[0]!).map ("(" ++ · ++ ")") else none
   else if k == ``qedIdent || k == ``qedProj then
@@ -324,6 +338,7 @@ private partial def renderSqlPred? (tblName : String) (colNames : Array String) 
     | none =>
         match extractDottedChain? stx with
         | some ["ctx", "userId"] => if forRls then some "current_setting('qed.user_id', true)" else none
+        | some ["ctx", "principal"] => if forRls then some "current_setting('qed.principal', true)" else none
         | some ["true"] => some (if forRls then "TRUE" else "1")
         | some ["false"] => some (if forRls then "FALSE" else "0")
         | _ => if !forRls && k == ``qedProj && (stx.getArg 2).isIdent && (stx.getArg 2).getId.eraseMacroScopes == `length then (recR (stx.getArg 0)).map ("LENGTH(" ++ · ++ ")") else none
@@ -337,14 +352,16 @@ private partial def renderSqlPred? (tblName : String) (colNames : Array String) 
           let i := links.size - (r + 1)
           if h : i < links.size then do
             let lk := links[i]; let opStr := cmpOpKind (lk.getArg 0); let rhs := lk.getArg 1; let l ← recR lhs
+            let isPrin := forRls && l == "current_setting('qed.principal', true)"
+            let isAnonDot (s : Syntax) := let u := unwrapParens1 s; u.getKind == ``qedDotIdent && (u.getArg 1).getId.eraseMacroScopes == `anonymous
             let part ←
               if forRls && opStr == "!=" && isNoneIdent? rhs then some s!"({l} IS NOT NULL AND {l} <> '')"
               else if opStr == "in" || opStr == "not in" then do
                 let uArr := unwrapParens1 rhs; guard (uArr.getKind == ``qedArrLit)
-                let items ← mapOptArr (uArr.getArg 1).getSepArgs renderSqlLit?
+                let items ← mapOptArr (uArr.getArg 1).getSepArgs fun s => if isPrin && isAnonDot s then some "''" else renderSqlLit? s
                 if items.isEmpty then some (if opStr == "in" then (if forRls then "FALSE" else "0") else (if forRls then "TRUE" else "1"))
                 else some s!"({l} {if opStr == "in" then "IN" else "NOT IN"} ({String.intercalate ", " items.toList}))"
-              else do let (_, op) ← matchSqlCmpOp? opStr; let r ← recR rhs; some (if forRls then s!"({l} {op} {r})" else s!"{l} {op} {r}")
+              else do let (_, op) ← matchSqlCmpOp? opStr; let r ← (if isPrin && isAnonDot rhs then some "''" else recR rhs); some (if forRls then s!"({l} {op} {r})" else s!"{l} {op} {r}")
             goLinks r rhs (parts.push part)
           else some parts
     (goLinks links.size (stx.getArg 0) #[]).map fun parts => String.intercalate " AND " parts.toList
@@ -785,16 +802,23 @@ private def tablePolicyNames (t : ParsedTable) : Array String :=
         | `write => #[(mkSub pId `InsertPolicy, tInfo.hasCrossInsertPolicy, false), (mkSub pId `UpdatePolicy, tInfo.hasCrossUpdatePolicy, tInfo.hasTwoStateUpdatePolicy), (mkSub pId `DeletePolicy, tInfo.hasCrossDeletePolicy, false)]
         | _ => #[]
       if polSpecs.any (·.2.1) && snapTyId?.isNone then mkDbErr stx "internal error: missing Snap for cross-table policy example"
+      if kvs[`principal]?.isSome && (userVal?.isSome || kvs[`role]?.isSome || kvs[`session]?.isSome) then
+        mkDbErr stx s!"`table {t.tableName}` policy example `{pId.getId}` cannot combine `principal = ...` with `user`/`role`/`session`"
       let fullGoal := qctx.runPure do
         let ctxTerm ← match kvs[`ctx]? with
           | some ct => pure ct
           | none =>
-              let uT ← mkOptTerm userVal?
-              let cT : Term ← match kvs[`role]? with | none => pure (mkCIdent `List.nil) | some r => mkListTerm #[← mkPairTerm (Syntax.mkStrLit "role") r]
-              let aT : Term ← match kvs[`session]? with
-                | some s => `(if $s then Qed.Server.AuthMethod.session else Qed.Server.AuthMethod.bearer)
-                | none => pure (mkCIdent (if userVal?.isSome then `Qed.Server.AuthMethod.bearer else `Qed.Server.AuthMethod.none))
-              `({ userId := $uT, claims := $cT, authMethod := $aT : Qed.Server.RequestCtx })
+              match kvs[`principal]? with
+              | some pT => `(Qed.Server.RequestCtx.forPrincipal ($pT : Qed.Server.Principal))
+              | none =>
+                  let pT : Term ← match userVal? with
+                    | some u => `(Qed.Server.Principal.user $u)
+                    | none => pure (mkCIdent ``Qed.Server.Principal.anonymous)
+                  let cT : Term ← match kvs[`role]? with | none => pure (mkCIdent `List.nil) | some r => mkListTerm #[← mkPairTerm (Syntax.mkStrLit "role") r]
+                  let aT : Term ← match kvs[`session]? with
+                    | some s => `(if $s then Qed.Server.AuthMethod.session else Qed.Server.AuthMethod.bearer)
+                    | none => pure (mkCIdent (if userVal?.isSome then `Qed.Server.AuthMethod.bearer else `Qed.Server.AuthMethod.none))
+                  `({ auth := { principal := $pT, claims := $cT, authMethod := $aT } : Qed.Server.RequestCtx })
         let snapTerm? ← match snapTyId? with
           | none => pure none
           | some sTyId =>

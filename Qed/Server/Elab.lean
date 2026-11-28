@@ -34,7 +34,7 @@ private structure ParsedSrvContracts where
 
 private structure SrvExCtx where
   (c : SrvElabCtx) (isService : Bool) (serviceMethods : Array ServiceMethodInfo)
-  (rpcWireMap : Std.HashMap String (Lean.Term × Lean.Term)) (stateTy : Lean.Term) (exNm : Lean.Name)
+  (rpcWireMap : Std.HashMap String (Lean.Term × Lean.Term)) (jobMap : Std.HashMap String (Bool × Nat)) (stateTy : Lean.Term) (exNm : Lean.Name)
 
 section ServerFullElab
 open Lean Elab Command
@@ -404,9 +404,10 @@ private structure CallableOpts where
   let jobTerm ← mkAscribePure (← mkAppC ``Qed.Server.ServerJob.mk #[jobMeta, ← mkJobLam wrappedRun, workOpt]) (← mkAppC ``Qed.Server.ServerJob #[stTy])
   return (jobTerm, ← match wrappedPf? with | some pf => some <$> `(Qed.Server.VerifiedJob.mk (σ := $stTy) (Inv := $(c.stateInvId)) $jobTerm $pf) | none => pure none)
 
-@[noinline] private def elabOneServerJob (existingMethods : Array ServerMethodInfo) (errTyTerm emptyCtx : Term) (callArgs : Array Term)
-    (acc : Array String × Array Term × Array Term) (jc : Syntax) : SrvElabM (Option (Array String × Array Term × Array Term)) := do
-  let (jobNames, rtJobs, vJobs) := acc; let c ← read; let jobIdent : Ident := ⟨jc.getArg 3⟩; let jobStr := jobIdent.getId.toString
+@[noinline] private def elabOneServerJob (existingMethods : Array ServerMethodInfo) (errTyTerm : Term)
+    (acc : Array String × Std.HashMap String (Bool × Nat) × Array Term × Array Term) (jc : Syntax) :
+    SrvElabM (Option (Array String × Std.HashMap String (Bool × Nat) × Array Term × Array Term)) := do
+  let (jobNames, jobMap, rtJobs, vJobs) := acc; let c ← read; let jobIdent : Ident := ⟨jc.getArg 3⟩; let jobStr := jobIdent.getId.toString
   if existingMethods.any (·.name == jobStr) || jobNames.contains jobStr then srvErrAt jobIdent s!"duplicate job or method name `{jobStr}` in `server {c.srvName}`"
   let n := (⟨jc.getArg 1⟩ : TSyntax `num).getNat; let unitStr := (jc.getArg 2).getId.eraseMacroScopes.toString
   let unit ← match unitStr with
@@ -425,22 +426,30 @@ private structure CallableOpts where
   unless contracts.blinds.isEmpty do srvErrAt jobIdent s!"`blindTo` is not supported on background job `{jobStr}`"
   let rawBodyStmts := suiteStmts (jc.getArg 7); let payloadTerm : Term := mkCIdent (if returnsBool then ``Bool else ``Unit)
   let some ensRes? ← elabEnsuresAbbrev jobIdent s!"job `{jobStr}`" `result #[] #[] #[] payloadTerm contracts.topEnsures | return none
-  let isAsyncJob := c.hasState && (blockHasAwait rawBodyStmts || blockHasAtomic rawBodyStmts)
+  let isAsyncJob := !c.hasState || blockHasAwait rawBodyStmts || blockHasAtomic rawBodyStmts
+  let jobPrinStr := s!"{c.srvName}.{jobStr}"
+  let hJobPrinId := mkIdent `_hJobPrincipal
+  let (jobCtxTerm, hJobPrinTy) ← runSrvPQ do
+    let prinT ← mkAppC ``Qed.Server.Principal.system #[Syntax.mkStrLit jobPrinStr]
+    return (← mkAppC ``Qed.Server.RequestCtx.forPrincipal #[prinT], ← `(($(c.ctxId)).principal = $prinT))
+  let callArgs := c.envIdents.map (⟨·.raw⟩) ++ #[jobCtxTerm, mkCIdent ``rfl]
   let some hRes ← elabSrvCallable jobIdent jobStr rawBodyStmts payloadTerm errTyTerm {
     missingRetLabel := s!"`-> Bool` job `{jobStr}`", isUnit := !returnsBool, forceAsync? := some isAsyncJob,
-    ensSpec? := mkFnEnsSpec? ensRes? #[] false contracts.topEnsTac?, contracts? := some contracts, ctxArg? := some emptyCtx } | return none
+    extraBinderIds := #[hJobPrinId], extraBinderTys := #[hJobPrinTy], extraCallArgs := #[mkCIdent ``rfl],
+    ensSpec? := mkFnEnsSpec? ensRes? #[] false contracts.topEnsTac?, contracts? := some contracts, ctxArg? := some jobCtxTerm } | return none
   let (jt, vjt?) ← runSrvPQ (mkJobTermsPure c jobIdent jobStr intervalMs returnsBool isAsyncJob hRes callArgs)
-  return some (jobNames.push jobStr, rtJobs.push jt, vjt?.elim vJobs vJobs.push)
+  return some (jobNames.push jobStr, jobMap.insert jobStr (returnsBool, rtJobs.size), rtJobs.push jt, vjt?.elim vJobs vJobs.push)
 
-@[noinline] private def elabServerJobs (existingMethods : Array ServerMethodInfo) (jobClauses : Array Syntax) : SrvElabM (Option (Array String)) := do
-  if jobClauses.isEmpty then return some #[]
-  let c ← read; let (errTyTerm, emptyCtx, stTy) ← runSrvPQ do return (mkCIdent ``Qed.Server.ApiError, ← `(({} : Qed.Server.RequestCtx)), if c.hasState then (c.stateId : Term) else mkCIdent ``Unit)
-  let some (jobNames, rtJobs, vJobs) ← foldOptSrv jobClauses (#[], #[], #[]) (elabOneServerJob existingMethods errTyTerm emptyCtx (c.envIdents.map (⟨·.raw⟩) ++ #[emptyCtx])) | return none
+@[noinline] private def elabServerJobs (existingMethods : Array ServerMethodInfo) (jobClauses : Array Syntax) :
+    SrvElabM (Option (Array String × Std.HashMap String (Bool × Nat))) := do
+  if jobClauses.isEmpty then return some (#[], {})
+  let c ← read; let (errTyTerm, stTy) ← runSrvPQ do return (mkCIdent ``Qed.Server.ApiError, if c.hasState then (c.stateId : Term) else mkCIdent ``Unit)
+  let some (jobNames, jobMap, rtJobs, vJobs) ← foldOptSrv jobClauses (#[], {}, #[], #[]) (elabOneServerJob existingMethods errTyTerm) | return none
   elabSrvPureCmds do return #[
     ← mkStrListDefPure (c.subId `jobNames) jobNames,
     ← mkDefValPure (c.subId `jobs) #[] (← mkAppC ``Array #[← mkAppC ``Qed.Server.ServerJob #[stTy]]) (← mkArrLitPure rtJobs)]
   if c.hasState then deferSrvPure do mkDefValPure (c.subId `verifiedJobs) #[] (← mkAppC ``Array #[← mkAppC ``Qed.Server.VerifiedJob #[c.stateId, c.stateInvId]]) (← mkArrLitPure vJobs)
-  return some jobNames
+  return some (jobNames, jobMap)
 
 /-! ## Helper & Service `fn` Elaborator -/
 
@@ -538,12 +547,12 @@ private def FnElabInfo.mkRes (i : FnElabInfo) (c : SrvElabCtx) (mon fal tAtom mu
   unless (← emitFnDefAndProofs info true outIsFallible retTy fullBody) do return none
   return some (info.mkRes c true outIsFallible false false lSt.dbWrite lSt.hasCookieOp)
 
-@[noinline] private def mkFnHeaderBindersPure (c : SrvElabCtx) (isService needsCtx hasExplicitCtx : Bool) (pp : ParsedFnParams) :
+@[noinline] private def mkFnHeaderBindersPure (c : SrvElabCtx) (isService needsCtx : Bool) (pp : ParsedFnParams) :
     PureQuotM (Term × Option Term × Array Ident × Array Term × Array (TSyntax `Lean.Parser.Term.bracketedBinder)) := do
   let (errTyTerm, ctxTy) : Term × Term := (mkCIdent ``Qed.Server.ApiError, mkCIdent ``Qed.Server.RequestCtx)
   let (preIds, preTys) : Array Ident × Array Term ← if isService then pure (if needsCtx then (#[c.ctxId], #[ctxTy]) else (#[], #[]))
     else do pure (c.envIdents.push c.ctxId, (← c.envBinderTysPure).push ctxTy)
-  let ctxT? ← if isService && !hasExplicitCtx && !needsCtx then some <$> `(({} : Qed.Server.RequestCtx)) else pure none
+  let ctxT? ← if isService && !needsCtx then some <$> `(({} : Qed.Server.RequestCtx)) else pure none
   return (errTyTerm, ctxT?, preIds ++ pp.idents, preTys ++ pp.tyTerms, (← mkTypedBindersPure preIds preTys) ++ pp.defBinders)
 
 @[noinline] private def elabStatelessOrHelperFn (isService : Bool) (rawHc : Syntax) : SrvElabM (Option (Option ServiceMethodInfo × SrvHelperSig × Array Ident)) := do
@@ -552,7 +561,7 @@ private def FnElabInfo.mkRes (i : FnElabInfo) (c : SrvElabCtx) (mon fal tAtom mu
   if c.helpers.any (·.name == fnStr) then srvErrAt fnIdent (if isService then s!"duplicate `fn {fnStr}` in `service {c.srvName}`" else s!"duplicate helper `fn {fnStr}` in `server {c.srvName}`")
   let contracts ← liftM <| collectSrvContracts (if isService then "`service` `fn`" else "server `fn`") #[] (hc.getArg 8).getArgs {}
   let pp ← parseSrvFnParams (if isService then s!"service `fn {fnStr}`" else s!"server helper `fn {fnStr}`") "parameter" (hc.getArg 4).getSepArgs
-    (reserved := if contracts.topEnsures.isEmpty then #[] else #["result"]) (allowExplicitCtx := isService)
+    (reserved := if contracts.topEnsures.isEmpty then #[] else #["result"])
   let hasExplicitRet := (hc.getArg 6).getNumArgs == 2
   let (payloadTerm, innerOpt?, isFallible, isUnitPayload) ← if hasExplicitRet then
       let rt ← liftSrvMacro (lowerSrvType ((hc.getArg 6).getArg 1) true s!"return type of {kindDesc} `fn {fnStr}`")
@@ -569,8 +578,9 @@ private def FnElabInfo.mkRes (i : FnElabInfo) (c : SrvElabCtx) (mon fal tAtom mu
   let reqs ← elabRequiresClauses fnIdent defLeaf fnStr (if isService then "_hSvcReq" else "_hFnReq") "_req" pp.names pp.names pp.idents pp.tyTerms contracts.requires (trackAuth := isService)
   let callsCtxSvc := isService && c.serviceDecls.any fun (al, si) => let alStr := al.getId.toString
     si.methods.any fun m => m.takesCtx && bodyStmts.any (stxMentionsVar alStr) && bodyStmts.any (stxAny fun s => (extractDottedChain? s).any (· == [alStr, m.name]))
-  let needsCtx := isService && !pp.hasExplicitCtx && (allStx.any (stxMentionsVar "ctx") || reqs.authBind?.isSome || c.helpers.any (fun h => h.takesCtx && bodyStmts.any (stxMentionsVar h.name)) || callsCtxSvc)
-  let (errTyTerm, ctxTerm?, thmBinderIds, thmBinderTys, allDefBinders) ← runSrvPQ (mkFnHeaderBindersPure c isService needsCtx pp.hasExplicitCtx pp)
+  let touchesDb := !pp.txParams.isEmpty || c.dbDecls.any fun (al, _) => bodyStmts.any (stxMentionsVar al.getId.toString)
+  let needsCtx := isService && (allStx.any (stxMentionsVar "ctx") || reqs.authBind?.isSome || touchesDb || c.helpers.any (fun h => h.takesCtx && bodyStmts.any (stxMentionsVar h.name)) || callsCtxSvc)
+  let (errTyTerm, ctxTerm?, thmBinderIds, thmBinderTys, allDefBinders) ← runSrvPQ (mkFnHeaderBindersPure c isService needsCtx pp)
   let (hasAwait, hasEmit) := (blockHasAwait bodyStmts, !isService && blockHasEmit bodyStmts)
   let touchesState := !isService && c.hasState && (blockHasAtomic bodyStmts || c.stateFieldNames.any (fun sf => bodyStmts.any (stxMentionsVar sf)) || c.helpers.any (fun h => h.takesAtomic && bodyStmts.any (stxMentionsVar h.name)))
   let callsMonadic := c.helpers.any fun h => h.isMonadic && bodyStmts.any (stxMentionsVar h.name)
@@ -643,7 +653,7 @@ private def FnElabInfo.mkRes (i : FnElabInfo) (c : SrvElabCtx) (mon fal tAtom mu
   let (routeLeaf, routeLabel) := (Name.mkSimple s!"_http_{routeIdx}", if isStream then s!"stream {pathStr}" else s!"{methodStr} {pathStr}")
   let routeIdent := mkIdentFrom pathStx routeLeaf
   let contracts ← liftM <| collectSrvContracts s!"HTTP route `{routeLabel}`" #[] (hc.getArg 3).getArgs {}
-  let reqs ← elabRequiresClauses routeIdent routeLeaf routeLabel "_hHttpReq" "_req" #[] #[] #[] #[] contracts.requires (trackAuth := true)
+  let reqs ← elabRequiresClauses routeIdent routeLeaf routeLabel "_hHttpReq" "_req" #[] #[] #[] #[] contracts.requires (trackAuth := true) (allowPrincipalGuard := true)
   let payloadTerm : Term := mkCIdent (if isStream then ``Unit else ``Qed.Server.HttpResponse)
   let some ensRes? ← elabEnsuresAbbrev routeIdent routeLabel `result #[] #[] #[] payloadTerm contracts.topEnsures | return none
   let some hRes ← elabSrvCallable routeIdent routeLabel (suiteStmts (hc.getArg 4)) payloadTerm (mkCIdent ``Qed.Server.ApiError) {
@@ -696,6 +706,7 @@ private inductive SrvExStep where
   | callSvc (fnId : Ident) (takesCtx isMonadic : Bool) (args : Array Term)
   | callRpc (dispId : Ident) (fnStr : String) (reqTy respTy : Term) (args : Array Term)
   | callHelper (defId : Ident) (takesEnvs takesCtx isMonadic isFallible : Bool) (args : Array Term)
+  | callJob (jobsId : Ident) (idx : Nat) (returnsBool : Bool)
   | reqHttp (dispId : Ident) (methodStr pathStr : String) | check (chk : SrvExCheck)
 
 @[noinline] private def parseOneSrvExStep (ctx : SrvExCtx) (acc : Array SrvExStep × Nat) (it : Syntax) : CommandElabM (Array SrvExStep × Nat) := do
@@ -725,7 +736,10 @@ private inductive SrvExStep where
       else if let some (reqTy, respTy) := ctx.rpcWireMap[fnStr]? then push (.callRpc (c.subId `dispatchM fnId) fnStr reqTy respTy args) 0
       else if let some hs := c.helpers.find? (·.name == fnStr) then
         push (.callHelper hs.defId hs.takesEnvs hs.takesCtx hs.isMonadic hs.isFallible args) (if hs.isMonadic || !c.envDecls.isEmpty || hs.isFallible then 0 else 2)
-      else errAt fnId s!"unknown RPC or helper `fn` `{fnStr}` in `example {ctx.exNm}`"
+      else if let some (retBool, jIdx) := ctx.jobMap[fnStr]? then
+        if !args.isEmpty then errAt fnId s!"background job `{fnStr}` takes no arguments in `example {ctx.exNm}`"
+        push (.callJob (c.subId `jobs fnId) jIdx retBool) 0
+      else errAt fnId s!"unknown RPC, helper `fn`, or `every` job `{fnStr}` in `example {ctx.exNm}`"
   | `Qed.Server.srvExReq =>
       if ctx.isService then errAt it s!"HTTP requests are only available in `server` examples, not `service {c.srvName}`"
       push (.reqHttp (c.subId `httpDispatchM ⟨it.getArg 0⟩) (it.getArg 0).getId.eraseMacroScopes.toString.toUpper (⟨it.getArg 1⟩ : TSyntax `str).getString) 1
@@ -753,7 +767,8 @@ private def srvExTraceSpecs : Array (Name × List Name) := #[
 
 private def srvExEqSpecs : Array (Name × Bool × Name × Option Name) := #[
   (`now, false, ``Qed.Server.Eval.setNow, some ``UInt64), (`session, true, ``Qed.Server.Eval.setSession, none),
-  (`query, true, ``Qed.Server.Eval.setQuery, none), (`body, true, ``Qed.Server.Eval.setBody, none)]
+  (`query, true, ``Qed.Server.Eval.setQuery, none), (`body, true, ``Qed.Server.Eval.setBody, none),
+  (`principal, true, ``Qed.Server.Eval.setPrincipal, some ``Qed.Server.Principal)]
 
 @[noinline] private def compileOneSrvExStepPure (ctx : SrvExCtx) (envId stId ctxId : Ident) (step : SrvExStep) (rest : Term) : PureQuotM Term := do
   let (resId, statusId, bodyId, evId, c) := (mkIdent `result, mkIdent `status, mkIdent `body, mkIdent `_ev, ctx.c)
@@ -801,6 +816,17 @@ private def srvExEqSpecs : Array (Name × Bool × Name × Option Name) := #[
         let monE ← if isMonadic then pure callE else if isFallible then mkAppC ``Pure.pure #[callE] else `(Pure.pure (Except.ok (α := Qed.Server.ApiError) $callE))
         mkEval (← wrapWithEnvDeclsPure c.envDecls monE none).1 ctx.stateTy
       else letR resId callE
+  | .callJob jobsId idx retBool =>
+      let idxLit := Syntax.mkNumLit (toString idx)
+      let prog ← if retBool then
+          `(match ($jobsId)[$idxLit]? with
+            | Option.some _j => match _j.runWorkM? with | Option.some _f => _f (m := Qed.Server.ThreadProg $(ctx.stateTy)) | Option.none => Pure.pure (Except.ok false)
+            | Option.none => Pure.pure (Except.error (Qed.Server.ApiError.internal "missing job")))
+        else
+          `(match ($jobsId)[$idxLit]? with
+            | Option.some _j => _j.runM (m := Qed.Server.ThreadProg $(ctx.stateTy))
+            | Option.none => Pure.pure (Except.error (Qed.Server.ApiError.internal "missing job")))
+      mkEval prog ctx.stateTy
   | .reqHttp dispId mStr pStr =>
       mkEvalStep (← mkAppTermsPure dispId #[ctxId, Syntax.mkStrLit mStr, Syntax.mkStrLit pStr]) ctx.stateTy fun evVal => do
         mkLetBindTerm resId.raw none evVal (← mkLetBindTerm statusId.raw (some (mkCIdent ``Nat)) (← mkAppC ``Qed.Server.Eval.httpStatus #[resId])
@@ -816,7 +842,8 @@ private def srvExEqSpecs : Array (Name × Bool × Name × Option Name) := #[
       wrapSrvExCheckPure stId chkT rest
 
 @[noinline] private def elabSrvExamples (isService : Bool) (exampleClauses : Array Syntax)
-    (serviceMethods : Array ServiceMethodInfo := #[]) (rpcWireMap : Std.HashMap String (Term × Term) := {}) : SrvElabM Unit := do
+    (serviceMethods : Array ServiceMethodInfo := #[]) (rpcWireMap : Std.HashMap String (Term × Term) := {})
+    (jobMap : Std.HashMap String (Bool × Nat) := {}) : SrvElabM Unit := do
   if exampleClauses.isEmpty then return
   let c ← read
   let (stateTy, initShared) ← runSrvPQ do
@@ -826,7 +853,7 @@ private def srvExEqSpecs : Array (Name × Bool × Name × Option Name) := #[
   let (_, launched) ← foldlSrv exampleClauses (({} : Std.HashSet Name), (#[] : Array (Ident × Nat × Nat × Nat × Nat × Term))) fun (seen, acc) rawExStx => do
     let (doc?, exStx) := unwrapDocClause rawExStx; let exId : Ident := ⟨exStx.getArg 1⟩; let exNm := exId.getId.eraseMacroScopes
     if seen.contains exNm then srvErrAt exId s!"duplicate `example {exNm}` in `{c.srvName}`"
-    let exCtx : SrvExCtx := { c, isService, serviceMethods, rpcWireMap, stateTy, exNm }
+    let exCtx : SrvExCtx := { c, isService, serviceMethods, rpcWireMap, jobMap, stateTy, exNm }
     let (steps, _) ← liftM <| foldlCmd (exStx.getArg 3).getArgs (#[], 0) (parseOneSrvExStep exCtx)
     let thmId := c.subId (Name.mkSimple s!"example_{exNm}") exId
     let (fullProp, cmdFast) ← runSrvPQ do
@@ -880,7 +907,7 @@ private def srvExEqSpecs : Array (Name × Bool × Name × Option Name) := #[
       let some (httpRoutes, httpDispatchArms) ← foldOptSrv b.httpClauses.zipIdx (#[], #[]) (fun (rts, arms) (hc, idx) => do
         let some (rt, arm) ← elabServerHttpRouteClause idx rts hc beforeRun? | return none
         return some (rts.push rt, arms.push arm)) | return
-      let some jobNames ← elabServerJobs methodInfos b.jobClauses | return
+      let some (jobNames, jobMap) ← elabServerJobs methodInfos b.jobClauses | return
       let elabHook? (lbl : String) (leaf : Name) (c? : Option Syntax) := match b.authDecl?, c? with | some (_, ai), some hc => Option.map some <$> elabServerAuthHook lbl leaf ai hc | _, _ => pure (some none)
       let some onCreateRun? ← elabHook? "onCreateAccount" `_onCreateAccount b.onCreateAccountClause? | return
       let some onSignInRun? ← elabHook? "onSignIn" `_onSignIn b.onSignInClause? | return
@@ -889,7 +916,7 @@ private def srvExEqSpecs : Array (Name × Bool × Name × Option Name) := #[
       let srvUnfolds : Array Name := #[c.fullSrvName ++ `secrets, c.fullSrvName ++ `rpcs, c.fullSrvName ++ `routes]
       foldlSrv b.metaInvs () fun _ (invId, exprs) =>
         liftM <| Qed.Verify.Core.elabStaticMetaInv c.srvName.toString (c.fullSrvName ++ invId.getId.eraseMacroScopes) srvAliases srvUnfolds invId exprs
-      elabSrvExamples false b.exampleClauses #[] rpcWireMap
+      elabSrvExamples false b.exampleClauses #[] rpcWireMap jobMap
 
 @[noinline] private def elabServerOrServiceCore (isService : Bool) (priorRep priorUnrep : Nat) (stx : Syntax) : CommandElabM Unit := do
   let (isStateless, srvIdent, clausesStx) := if isService then (false, (⟨stx.getArg 2⟩ : Ident), stx.getArg 4) else ((stx.getArg 2).getNumArgs == 1, (⟨stx.getArg 3⟩ : Ident), stx.getArg 5)
@@ -996,37 +1023,52 @@ private def collectReachableDefns (env : Environment) : Nat → List Name → St
     return cmds.push (← `(command| def $(mkIdentFrom fsIdent (fsName ++ `title)) : String := $(Syntax.mkStrLit pageTitle)))
   modifyEnv fun e => fullstackRegistry.addEntry e { fullstackName := currNs ++ fsName, serverName := srvInfo.serverName, title := pageTitle }
 
-@[noinline] private def mkServerMainCmdPure (fsIdent : Ident) (fsInfo : FullstackInfo) (srvInfo : ServerInfo) : PureQuotM (TSyntax `command) := do
-  let srvId (leaf : Name) : Ident := mkIdentFrom fsIdent (srvInfo.serverName ++ leaf)
-  let dbCfgIds : Array Term := srvInfo.databases.map (mkIdentFrom fsIdent ·)
+@[noinline] private def mkServerMainCmdPure (targetIdent : Ident) (fsInfo? : Option FullstackInfo) (srvInfo : ServerInfo) : PureQuotM (TSyntax `command) := do
+  let srvId (leaf : Name) : Ident := mkIdentFrom targetIdent (srvInfo.serverName ++ leaf)
+  let dbCfgIds : Array Term := srvInfo.databases.map (mkIdentFrom targetIdent ·)
+  let argsId := mkIdent `args
+  let initDbCheck ← if dbCfgIds.isEmpty then mkAppC ``Pure.pure #[mkCIdent ``Bool.true] else mkAppC `Qed.Server.Native.initDatabases #[← mkArrLitPure dbCfgIds]
+  let initStateT ← if srvInfo.hasState then pure (srvId `initState : Term) else mkAscribePure (mkCIdent ``Unit.unit) (mkCIdent ``Unit)
+  let jobsT ← if srvInfo.jobs.isEmpty then mkArrLitPure #[] else pure (srvId `jobs : Term)
+  let isJobsOnly := fsInfo?.isNone && srvInfo.methods.isEmpty && srvInfo.channels.isEmpty && !srvInfo.hasHttpRoutes && !srvInfo.hasOnCreateAccount && !srvInfo.hasOnSignIn
+  if isJobsOnly then
+    let runnerCall ← mkAppC `Qed.Server.Native.runServerJobsOnly #[quote srvInfo.shortName, ← mkOptTermPure dbCfgIds[0]?, initStateT, jobsT, argsId]
+    return ← `(command| def $(mkIdent `main):ident ($argsId:ident : List String) : IO UInt32 := do
+      if !(← $initDbCheck:term) then return 1
+      $runnerCall:term)
   let wrapHandler (id : Ident) : PureQuotM Term := `(fun {m} [Monad m] [Qed.Server.MonadServer m] [Qed.Server.MonadAtomic _ m] => $id)
   let optHandler (on : Bool) (id : Ident) : PureQuotM Term := do mkOptTermPure (← if on then some <$> wrapHandler id else pure none)
-  let (stDirId, portId, devId, wrkId, argsId) := (mkIdent `staticDir, mkIdent `port, mkIdent `devMode, mkIdent `numWorkers, mkIdent `args)
+  let (stDirId, portId, devId, wrkId) := (mkIdent `staticDir, mkIdent `port, mkIdent `devMode, mkIdent `numWorkers)
   let metaTerm ← mkAppC `Qed.Server.Native.FullstackMeta.mk #[
-    quote fsInfo.title, quote srvInfo.shortName, srvId `secrets, portId, stDirId, devId, wrkId,
+    quote (fsInfo?.map (·.title) |>.getD srvInfo.shortName), quote srvInfo.shortName, srvId `secrets, portId, stDirId, devId, wrkId,
     ← mkOptTermPure (some (← mkArrLitPure (srvInfo.methods.filterMap fun m => if m.isAsync then some (Syntax.mkStrLit m.name) else none))),
-    ← mkOptTermPure (srvInfo.authConfig?.map (mkIdentFrom fsIdent ·)), ← mkPairPure (quote srvInfo.hasOnCreateAccount) (quote srvInfo.hasOnSignIn),
+    ← mkOptTermPure (srvInfo.authConfig?.map (mkIdentFrom targetIdent ·)), ← mkPairPure (quote srvInfo.hasOnCreateAccount) (quote srvInfo.hasOnSignIn),
     ← mkOptTermPure dbCfgIds[0]?, ← mkOptTermPure (if srvInfo.hasWsProject then some (srvId `wsProject) else none)]
-  let runnerCall ← mkAppC `Qed.Server.Native.runStatefulFullstack #[
-    mkIdentFrom fsIdent (fsInfo.fullstackName ++ `clientApp), metaTerm,
-    ← if srvInfo.hasState then pure (srvId `initState : Term) else mkAscribePure (mkCIdent ``Unit.unit) (mkCIdent ``Unit),
-    ← wrapHandler (srvId `dispatchM), ← optHandler (!srvInfo.channels.isEmpty) (srvId `wsDispatchM),
-    ← optHandler srvInfo.hasHttpRoutes (srvId `httpDispatchM), ← if srvInfo.jobs.isEmpty then mkArrLitPure #[] else pure (srvId `jobs : Term),
-    ← optHandler (srvInfo.hasOnCreateAccount || srvInfo.hasOnSignIn) (srvId `authHookM)]
-  let (initDbCheck, parseCli) := (← if dbCfgIds.isEmpty then mkAppC ``Pure.pure #[mkCIdent ``Bool.true] else mkAppC `Qed.Server.Native.initDatabases #[← mkArrLitPure dbCfgIds], ← mkAppC `Qed.Server.Native.parseServerCliArgs #[argsId])
+  let commonArgs : Array Term := #[metaTerm, initStateT, ← wrapHandler (srvId `dispatchM), ← optHandler (!srvInfo.channels.isEmpty) (srvId `wsDispatchM),
+    ← optHandler srvInfo.hasHttpRoutes (srvId `httpDispatchM), jobsT, ← optHandler (srvInfo.hasOnCreateAccount || srvInfo.hasOnSignIn) (srvId `authHookM)]
+  let runnerCall ← match fsInfo? with
+    | some fsInfo => mkAppC `Qed.Server.Native.runStatefulFullstack (#[(mkIdentFrom targetIdent (fsInfo.fullstackName ++ `clientApp) : Term)] ++ commonArgs)
+    | none => mkAppC `Qed.Server.Native.runStatefulServer commonArgs
+  let parseCli ← mkAppC `Qed.Server.Native.parseServerCliArgs #[argsId]
   `(command| def $(mkIdent `main):ident ($argsId:ident : List String) : IO UInt32 := do
     let ($stDirId:ident, $portId:ident, $devId:ident, $wrkId:ident) ← $parseCli:term
     if !(← $initDbCheck:term) then return 1
     $runnerCall:term)
 
 @[noinline, command_elab qedServerMainCmd] def elabQedServerMain : CommandElab := fun stx => do
-  let fsIdent : Ident := ⟨stx[1]⟩; let (env, currNs) := (← getEnv, ← getCurrNamespace)
-  let some fsInfo := (Qed.Diag.lookupNameMapExt? fullstackRegistry env currNs (← getOpenDecls) fsIdent.getId).orElse (fun _ =>
-      (fullstackRegistry.getState env).toList.findSome? fun (k, v) => if k.getString! == fsIdent.getId.toString then some v else none)
-    | errAt fsIdent s!"unknown `fullstack` declaration `{fsIdent.getId}`"
-  let some srvInfo := (serverRegistry.getState env).find? fsInfo.serverName
-    | errAt fsIdent s!"internal error: `server` `{fsInfo.serverName}` not found in registry"
-  elabPureCmd (mkServerMainCmdPure fsIdent fsInfo srvInfo)
+  let targetIdent : Ident := ⟨stx[1]⟩; let (env, currNs, openDecls) := (← getEnv, ← getCurrNamespace, ← getOpenDecls)
+  let fsInfo? := (Qed.Diag.lookupNameMapExt? fullstackRegistry env currNs openDecls targetIdent.getId).orElse (fun _ =>
+      (fullstackRegistry.getState env).toList.findSome? fun (_, v) => if v.fullstackName.getString! == targetIdent.getId.toString then some v else none)
+  match fsInfo? with
+  | some fsInfo =>
+      let some srvInfo := (serverRegistry.getState env).find? fsInfo.serverName
+        | errAt targetIdent s!"internal error: `server` `{fsInfo.serverName}` not found in registry"
+      elabPureCmd (mkServerMainCmdPure targetIdent (some fsInfo) srvInfo)
+  | none =>
+      let some srvInfo := (Qed.Diag.lookupNameMapExt? serverRegistry env currNs openDecls targetIdent.getId).orElse (fun _ =>
+          (serverRegistry.getState env).toList.findSome? fun (_, v) => if v.shortName == targetIdent.getId.toString then some v else none)
+        | errAt targetIdent s!"unknown `fullstack` or `server` declaration `{targetIdent.getId}`"
+      elabPureCmd (mkServerMainCmdPure targetIdent none srvInfo)
 
 end ServerFullElab
 end Qed.Server

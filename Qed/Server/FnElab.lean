@@ -35,14 +35,18 @@ abbrev SrvElabM := ReaderT SrvElabCtx Lean.Elab.Command.CommandElabM
 structure ParsedFnParams where
   (idents : Array Lean.Ident := #[]) (tyTerms : Array Lean.Term := #[])
   (defBinders : Array (Lean.TSyntax `Lean.Parser.Term.bracketedBinder) := #[]) (names : Array String := #[])
-  (minParamCount : Nat := 0) (hasExplicitCtx : Bool := false)
+  (minParamCount : Nat := 0)
   (defaultExprs : Array Lean.Syntax := #[]) (txParams : Array (Lean.Ident × DatabaseInfo) := #[])
 
 structure LoweredAuthBind where
   (binderId : Lean.Ident) (binderName : String) (extraIds : Array Lean.Ident) (extraTys : Array Lean.Term) (authInfo? : Option AuthInfo)
 
+structure LoweredPrincipalGuard where
+  (hypId : Lean.Ident) (principalTerm : Lean.Term) (specTerm : Lean.Term) (hypTy : Lean.Term)
+
 structure LoweredRequires where
-  (authBind? : Option LoweredAuthBind := none) (reqPropTerms : Array Lean.Term) (reqHypIds : Array Lean.Ident)
+  (authBind? : Option LoweredAuthBind := none) (principalGuard? : Option LoweredPrincipalGuard := none)
+  (reqPropTerms : Array Lean.Term) (reqHypIds : Array Lean.Ident)
   (reqLabels : Array String) (requiresAuth : Bool) (clientReqId? : Option Lean.Ident)
   (clientReqConst? : Option Lean.Name) (clientReqLabel : String)
 
@@ -115,9 +119,9 @@ def mkBaseLowerCtx (fnName : String) (locals : Array String) (allowAwait allowUn
     | Except.error _decErr => Pure.pure (Except.error (Qed.Server.ApiError.badRequest _decErr))
     | Except.ok $tupleVar:ident => $bound)
 
-def checkSrvParamName (ctxLabel : String) (pid : Ident) (reserved seen extraShadow : Array String := #[]) (allowExplicitCtx := false) : SrvElabM String := do
+def checkSrvParamName (ctxLabel : String) (pid : Ident) (reserved seen extraShadow : Array String := #[]) : SrvElabM String := do
   let c ← read; let pstr := pid.getId.toString
-  if pstr == "ctx" && !allowExplicitCtx then srvErrAt pid s!"`ctx` is already implicitly available as `RequestCtx` in {ctxLabel}"
+  if pstr == "ctx" then srvErrAt pid s!"`ctx` is already implicitly available as `RequestCtx` in {ctxLabel}"
   if reserved.contains pstr then srvErrAt pid s!"`{pstr}` is reserved inside {ctxLabel}; rename this parameter"
   if seen.contains pstr then srvErrAt pid s!"duplicate parameter `{pstr}` in {ctxLabel}"
   if extraShadow.contains pstr then srvErrAt pid s!"parameter `{pstr}` shadows an existing binding in {ctxLabel}; rename the parameter"
@@ -130,10 +134,10 @@ def checkSrvParamName (ctxLabel : String) (pid : Ident) (reserved seen extraShad
   let tyTerm ← match txDbName? with | some dn => `(Qed.Server.Db.DbTx $(Syntax.mkStrLit dn)) | none => pure baseTy
   return (tyTerm, ← match defT? with | some dt => `(bracketedBinder| ($pid:ident : $tyTerm := srvAutoField($dt))) | none => `(bracketedBinder| ($pid:ident : $tyTerm)))
 
-@[noinline] private def parseOneFnParam (ctxLabel tyDescPrefix : String) (reserved extraShadow : Array String) (allowDefaults allowExplicitCtx : Bool)
+@[noinline] private def parseOneFnParam (ctxLabel tyDescPrefix : String) (reserved extraShadow : Array String) (allowDefaults : Bool)
     (acc : ParsedFnParams × Bool) (rp : Syntax) : SrvElabM (ParsedFnParams × Bool) := do
   let (pp, seenDefault) := acc; let c ← read; let pid : Ident := ⟨rp.getArg 0⟩
-  let pstr ← checkSrvParamName ctxLabel pid reserved pp.names extraShadow allowExplicitCtx
+  let pstr ← checkSrvParamName ctxLabel pid reserved pp.names extraShadow
   let optDef := rp.getArg 3
   if !allowDefaults && optDef.getNumArgs == 2 then srvErrAt optDef s!"default parameter values are only supported on `fn` declarations, not in {ctxLabel}"
   let pty ← liftSrvMacro (lowerSrvType (rp.getArg 2) false s!"{tyDescPrefix} `{pstr}`")
@@ -150,12 +154,12 @@ def checkSrvParamName (ctxLabel : String) (pid : Ident) (reserved seen extraShad
     else pure (false, pp.minParamCount + 1, pp.defaultExprs, none)
   let (tyTerm, binder) ← runSrvPQ (mkFnParamBinderPure pid pty.term (txDb?.map (·.dbName.toString)) defT?)
   return ({ idents := pp.idents.push pid, tyTerms := pp.tyTerms.push tyTerm, defBinders := pp.defBinders.push binder, names := pp.names.push pstr,
-            minParamCount := minPC, hasExplicitCtx := pp.hasExplicitCtx || pstr == "ctx", defaultExprs := defExprs, txParams := txDb?.elim pp.txParams (pp.txParams.push ⟨pid, ·⟩) }, seenDef')
+            minParamCount := minPC, defaultExprs := defExprs, txParams := txDb?.elim pp.txParams (pp.txParams.push ⟨pid, ·⟩) }, seenDef')
 
-@[noinline] def parseSrvFnParams (ctxLabel tyDescPrefix : String) (rawParams : Array Syntax) (reserved extraShadow : Array String := #[]) (allowExplicitCtx := false) : SrvElabM ParsedFnParams :=
-  Prod.fst <$> foldlSrv rawParams ({}, false) (parseOneFnParam ctxLabel tyDescPrefix reserved extraShadow true allowExplicitCtx)
+@[noinline] def parseSrvFnParams (ctxLabel tyDescPrefix : String) (rawParams : Array Syntax) (reserved extraShadow : Array String := #[]) : SrvElabM ParsedFnParams :=
+  Prod.fst <$> foldlSrv rawParams ({}, false) (parseOneFnParam ctxLabel tyDescPrefix reserved extraShadow true)
 @[noinline] def parseSrvParams (ctxLabel tyDescPrefix : String) (rawParams : Array Syntax) (reserved extraShadow : Array String := #[]) : SrvElabM (Array Ident × Array Term × Array String) := do
-  let pp := (← foldlSrv rawParams ({}, false) (parseOneFnParam ctxLabel tyDescPrefix reserved extraShadow false false)).1
+  let pp := (← foldlSrv rawParams ({}, false) (parseOneFnParam ctxLabel tyDescPrefix reserved extraShadow false)).1
   return (pp.idents, pp.tyTerms, pp.names)
 
 def lowerSrvExpr (ctx : LowerCtx) (mode : ExprMode) (stx : Syntax) : SrvElabM Term := return (← liftM <| (lowerExpr ctx mode stx).run {}).1
@@ -283,13 +287,15 @@ def isAuthReqLabel (s : String) : Bool := s.contains "ctx.userId" || s.contains 
 @[noinline] def wrapReqsPure (reqProps : Array Term) (reqHIds : Array Ident) (reqLbls : Array String) (inner : Term) (pureWrap : Bool := true) : PureQuotM Term :=
   foldrPQ (reqProps.zip (reqHIds.zip reqLbls)) inner fun (prop, hid, rLbl) g => do
     let ctor := if isAuthReqLabel rLbl then ``Qed.Server.ApiError.unauthorized
-      else if ["ctx.hasClaim", "ctx.claim", "ctx.isSession", "ctx.authMethod", "emailVerified"].any (rLbl.contains ·) then ``Qed.Server.ApiError.forbidden
+      else if ["ctx.hasClaim", "ctx.claim", "ctx.isSession", "ctx.authMethod", "ctx.principal", "emailVerified"].any (rLbl.contains ·) then ``Qed.Server.ApiError.forbidden
       else ``Qed.Server.ApiError.badRequest
     let errT ← mkPureErr ctor (Syntax.mkStrLit s!"precondition failed: {rLbl}") pureWrap
     `(if $hid:ident : $prop then $g else $errT)
 
-def LoweredRequires.allBinderIds (r : LoweredRequires) : Array Ident := (r.authBind?.map (·.extraIds) |>.getD #[]) ++ r.reqHypIds
-def LoweredRequires.allBinderTys (r : LoweredRequires) : Array Term := (r.authBind?.map (·.extraTys) |>.getD #[]) ++ r.reqPropTerms
+def LoweredRequires.allBinderIds (r : LoweredRequires) : Array Ident :=
+  (r.authBind?.map (·.extraIds) |>.getD #[]) ++ (r.principalGuard?.map (fun pg => #[pg.hypId]) |>.getD #[]) ++ r.reqHypIds
+def LoweredRequires.allBinderTys (r : LoweredRequires) : Array Term :=
+  (r.authBind?.map (·.extraTys) |>.getD #[]) ++ (r.principalGuard?.map (fun pg => #[pg.hypTy]) |>.getD #[]) ++ r.reqPropTerms
 def LoweredRequires.allBinderArgs (r : LoweredRequires) : Array Term := r.allBinderIds.map (⟨·.raw⟩)
 def LoweredRequires.extraLocals (r : LoweredRequires) : Array String := r.authBind?.map (fun ab => #[ab.binderName]) |>.getD #[]
 
@@ -319,6 +325,12 @@ def LoweredRequires.extraLocals (r : LoweredRequires) : Array String := r.authBi
 
 @[noinline] def wrapAuthAndReqsPure (reqs : LoweredRequires) (inner : Term) (pureWrap : Bool := true) : PureQuotM Term := do
   let body ← wrapReqsPure reqs.reqPropTerms reqs.reqHypIds reqs.reqLabels inner pureWrap
+  if let some pg := reqs.principalGuard? then
+    let (ctxId, resId, errId) := (mkIdent `ctx, mkIdent `_authPrinRes, mkIdent `_authPrinErr)
+    return ← `(Qed.Server.verifyRouteAuth $(pg.principalTerm) $(pg.specTerm) $ctxId >>= fun $resId:ident =>
+      match $resId:ident with
+      | Except.error $errId:ident => Pure.pure (Except.error $errId:ident)
+      | Except.ok ⟨$ctxId:ident, $(pg.hypId):ident⟩ => $body)
   let some ab := reqs.authBind? | return body
   wrapAuthUserPure (mkIdent `ctx) ab.binderId ab.extraIds[1]! ab.extraIds[2]! ab.authInfo? "authentication required" pureWrap body (some ab.extraIds[3]!)
 
@@ -332,6 +344,75 @@ private def matchAuthRequireExpr? (stx : Syntax) (hasAuthDecl : Bool) : CommandE
       if a.getKind == ``qedIdent && (a.getArg 0).getId.eraseMacroScopes.isAtomic then return some ⟨a.getArg 0⟩
     errAt stx "`requires auth(...)` expects a single identifier binder (e.g. `requires auth(user)`)"
   return none
+
+@[noinline] private def parsePrincipalGuardExpr? (fnLabel hypPrefix : String) (allowPrincipalGuard : Bool) (rExpr : Syntax) :
+    SrvElabM (Option LoweredPrincipalGuard) := do
+  let u := unwrapParens1 rExpr
+  if u.getKind != ``qedCall || (u.getArg 0).getKind != ``qedIdent then return none
+  if ((u.getArg 0).getArg 0).getId.eraseMacroScopes != `system then return none
+  let c ← read
+  unless allowPrincipalGuard do
+    srvErrAt rExpr s!"`requires system(...)` is only supported on HTTP routes; in `{fnLabel}`, use `requires ctx.principal == .system(\"...\")`"
+  let rawArgs := (u.getArg 2).getSepArgs
+  if rawArgs.isEmpty || rawArgs[0]!.getKind != ``qedCallArgPos then
+    srvErrAt rExpr "`requires system(...)` expects a non-empty principal name string as its first argument (e.g. `requires system(\"stripe\", stripe = stripeSecret)`)"
+  let nameStx := unwrapParens1 (rawArgs[0]!.getArg 0)
+  if nameStx.getKind != ``qedLitStr then
+    srvErrAt nameStx "`requires system(...)` expects a string literal principal name as its first argument"
+  let pName := (⟨nameStx.getArg 0⟩ : TSyntax `str).getString
+  if pName.isEmpty || pName.any (· == '\x00') then
+    srvErrAt nameStx "`requires system(...)` principal name must be a non-empty string without null bytes"
+  let (mode?, hdr?, pfx?, tol?) ← foldlSrv (rawArgs.extract 1 rawArgs.size) ((none : Option (String × Ident)), (none : Option String), (none : Option String), (none : Option Nat)) fun (m?, h?, p?, t?) arg => do
+    unless arg.getKind == ``qedCallArgNamed do
+      srvErrAt arg s!"`requires system(\"{pName}\", ...)` expects named options (`stripe = ...`, `hmac_sha256 = ...`, `secret = ...`, `bearer = ...`, `header = \"...\"`, `prefix = \"...\"`, `tolerance = ...`)"
+    let k := (arg.getArg 0).getId.eraseMacroScopes.toString; let v := unwrapParens1 (arg.getArg 2)
+    if ["stripe", "hmac_sha256", "secret", "bearer"].contains k then
+      if m?.isSome then srvErrAt arg s!"duplicate verification mode `{k}` in `requires system(\"{pName}\", ...)`"
+      if v.getKind == ``qedLitStr then
+        srvErrAt v s!"`requires system(\"{pName}\", {k} = ...)` forbids hardcoded string literals; declare a `secret` or `env` variable on `server {c.srvName}`"
+      unless v.getKind == ``qedIdent && (v.getArg 0).getId.eraseMacroScopes.isAtomic do
+        srvErrAt v s!"`requires system(\"{pName}\", {k} = ...)` expects a `secret` or `env` variable declared on `server {c.srvName}`"
+      let secId : Ident := ⟨v.getArg 0⟩; let secNm := secId.getId.eraseMacroScopes.toString
+      unless c.envVarNames.contains secNm do
+        srvErrAt secId s!"unknown `secret` or `env` variable `{secNm}` in `requires system(\"{pName}\", {k} = {secNm})`; declare it on `server {c.srvName}`"
+      return (some (k, mkIdentFrom secId (Name.mkSimple secNm)), h?, p?, t?)
+    else if k == "header" then
+      if h?.isSome then srvErrAt arg s!"duplicate `header` option in `requires system(\"{pName}\", ...)`"
+      unless v.getKind == ``qedLitStr do srvErrAt v s!"`header` in `requires system(\"{pName}\", ...)` must be a string literal"
+      let hs := (⟨v.getArg 0⟩ : TSyntax `str).getString
+      if hs.isEmpty then srvErrAt v s!"`header` in `requires system(\"{pName}\", ...)` must be non-empty"
+      return (m?, some hs, p?, t?)
+    else if k == "prefix" then
+      if p?.isSome then srvErrAt arg s!"duplicate `prefix` option in `requires system(\"{pName}\", ...)`"
+      unless v.getKind == ``qedLitStr do srvErrAt v s!"`prefix` in `requires system(\"{pName}\", ...)` must be a string literal"
+      return (m?, h?, some (⟨v.getArg 0⟩ : TSyntax `str).getString, t?)
+    else if k == "tolerance" then
+      if t?.isSome then srvErrAt arg s!"duplicate `tolerance` option in `requires system(\"{pName}\", ...)`"
+      unless v.getKind == ``qedLitNum do srvErrAt v s!"`tolerance` in `requires system(\"{pName}\", ...)` must be a natural number (seconds)"
+      return (m?, h?, p?, some (⟨v.getArg 0⟩ : TSyntax `num).getNat)
+    else srvErrAt arg s!"unknown option `{k}` in `requires system(\"{pName}\", ...)`; expected `stripe`, `hmac_sha256`, `secret`, `bearer`, `header`, `prefix`, or `tolerance`"
+  let some (mode, secId) := mode?
+    | srvErrAt rExpr s!"`requires system(\"{pName}\", ...)` must specify one of `stripe = ...`, `hmac_sha256 = ...`, `secret = ...`, or `bearer = ...`"
+  let specTerm ← match mode with
+    | "stripe" =>
+        if pfx?.isSome then srvErrAt rExpr s!"`prefix` is not valid with `stripe = ...` in `requires system(\"{pName}\", ...)`"
+        runSrvPQ do mkAppC ``Qed.Server.RouteAuthSpec.stripe #[Syntax.mkStrLit (hdr?.getD "stripe-signature"), quote (tol?.getD 300), ← mkAppC ``Qed.Server.ToSecretStr.toSecretStr #[secId]]
+    | "hmac_sha256" =>
+        let some hs := hdr? | srvErrAt rExpr s!"`hmac_sha256 = ...` in `requires system(\"{pName}\", ...)` requires `header = \"...\"`"
+        if tol?.isSome then srvErrAt rExpr s!"`tolerance` is only valid with `stripe = ...` in `requires system(\"{pName}\", ...)`"
+        runSrvPQ do mkAppC ``Qed.Server.RouteAuthSpec.hmacSha256 #[Syntax.mkStrLit hs, Syntax.mkStrLit (pfx?.getD ""), ← mkAppC ``Qed.Server.ToSecretStr.toSecretStr #[secId]]
+    | "secret" =>
+        let some hs := hdr? | srvErrAt rExpr s!"`secret = ...` in `requires system(\"{pName}\", ...)` requires `header = \"...\"`"
+        if pfx?.isSome || tol?.isSome then srvErrAt rExpr s!"`prefix`/`tolerance` are not valid with `secret = ...` in `requires system(\"{pName}\", ...)`"
+        runSrvPQ do mkAppC ``Qed.Server.RouteAuthSpec.headerSecret #[Syntax.mkStrLit hs, ← mkAppC ``Qed.Server.ToSecretStr.toSecretStr #[secId]]
+    | _ =>
+        if hdr?.isSome || pfx?.isSome || tol?.isSome then srvErrAt rExpr s!"`header`/`prefix`/`tolerance` are not valid with `bearer = ...` in `requires system(\"{pName}\", ...)`"
+        runSrvPQ do mkAppC ``Qed.Server.RouteAuthSpec.bearerSecret #[← mkAppC ``Qed.Server.ToSecretStr.toSecretStr #[secId]]
+  let hypId := mkIdent (Name.mkSimple s!"{hypPrefix}_principal")
+  let (principalTerm, hypTy) ← runSrvPQ do
+    let pt ← mkAppC ``Qed.Server.Principal.system #[Syntax.mkStrLit pName]
+    return (pt, ← `(($(c.ctxId)).principal = $pt))
+  return some { hypId, principalTerm, specTerm, hypTy }
 
 @[noinline] def mkAuthExtraTysPure (ctxId uId : Ident) (authInfo? : Option AuthInfo) (includeLen : Bool := true) : PureQuotM (Array Term) := do
   let (uTy, uidExpr) : Term × Term ← match authInfo? with | some ai => pure (mkIdentFrom uId (ai.authName ++ `User), ← `(($uId).id)) | none => pure (mkCIdent ``String, ⟨uId.raw⟩)
@@ -351,7 +432,7 @@ private abbrev ReqFoldAcc := Array Term × Array Ident × Array String × Array 
     let (mCtx, mEnv) := scanCtxEnv c.envVarNames serverLocals conj
     let mAuth := authBind?.any fun ab => (scanCtxEnv #[ab.binderName] clientLocals conj).2
     let rep := conj.reprint.getD ""
-    if trackAuth && (mCtx || mAuth) && !mEnv && (isAuthReqLabel rep || rep.contains "ctx.isSession") then return (ps, hs, ls, cps, cls, true)
+    if trackAuth && (mCtx || mAuth) && !mEnv && (isAuthReqLabel rep || rep.contains "ctx.isSession" || rep.contains "ctx.principal") then return (ps, hs, ls, cps, cls, true)
     if !mCtx && !mEnv && !mAuth && (excludedClientVars.isEmpty || !(scanCtxEnv excludedClientVars clientLocals conj).2) then
       let cp ← lowerSrvExpr { fnName := fnLabel, stateFields := c.stateFieldNames, locals := clientLocals, stateRule := .forbidInRequires, forbidCtxEnv := true } .propInv conj
       return (ps, hs, ls, cps.push cp, cls.push (if rep.isEmpty then "requires" else rep.trimAscii.toString), ra)
@@ -359,25 +440,30 @@ private abbrev ReqFoldAcc := Array Term × Array Ident × Array String × Array 
 
 @[noinline] def elabRequiresClauses (refIdent : Ident) (itemName : Name) (fnLabel hypPrefix reqSuffix : String)
     (serverLocals clientLocals : Array String) (clientBindIds : Array Ident) (clientBindTys : Array Term)
-    (reqExprs : Array Syntax) (excludedClientVars : Array String := #[]) (trackAuth : Bool := true) : SrvElabM LoweredRequires := do
+    (reqExprs : Array Syntax) (excludedClientVars : Array String := #[]) (trackAuth : Bool := true) (allowPrincipalGuard : Bool := false) : SrvElabM LoweredRequires := do
   let c ← read
-  let (authBind?, filteredReqs) ← foldlSrv reqExprs (none, #[]) fun (ab?, fs) rExpr => do
+  let (authBind?, principalGuard?, filteredReqs) ← foldlSrv reqExprs (none, none, #[]) fun (ab?, pg?, fs) rExpr => do
     if let some uId ← liftM <| matchAuthRequireExpr? rExpr c.authDecl?.isSome then
       if ab?.isSome then srvErrAt rExpr s!"duplicate `requires auth` in `{fnLabel}`"
+      if pg?.isSome then srvErrAt rExpr s!"cannot combine `requires auth` with `requires system(...)` in `{fnLabel}`"
       let uStr ← checkSrvParamName s!"`requires auth` in `{fnLabel}`" uId (extraShadow := serverLocals)
       let extraIds := #[uId, mkIdent (Name.mkSimple s!"{hypPrefix}_authEq"), mkIdent (Name.mkSimple s!"{hypPrefix}_authNe"), mkIdent (Name.mkSimple s!"{hypPrefix}_authLen")]
       let ai? := c.authDecl?.map Prod.snd
-      return (some { binderId := uId, binderName := uStr, extraIds, extraTys := ← runSrvPQ (mkAuthExtraTysPure c.ctxId uId ai?), authInfo? := ai? }, fs)
-    return (ab?, fs.push rExpr)
+      return (some { binderId := uId, binderName := uStr, extraIds, extraTys := ← runSrvPQ (mkAuthExtraTysPure c.ctxId uId ai?), authInfo? := ai? }, pg?, fs)
+    if let some pg ← parsePrincipalGuardExpr? fnLabel hypPrefix allowPrincipalGuard rExpr then
+      if pg?.isSome then srvErrAt rExpr s!"duplicate `requires system(...)` in `{fnLabel}`"
+      if ab?.isSome then srvErrAt rExpr s!"cannot combine `requires auth` with `requires system(...)` in `{fnLabel}`"
+      return (ab?, some pg, fs)
+    return (ab?, pg?, fs.push rExpr)
   let sLocs := authBind?.elim serverLocals (serverLocals.push ·.binderName)
   let exVars := authBind?.elim excludedClientVars (excludedClientVars.push ·.binderName)
   let (props, hIds, labels, cliProps, cliLabels, reqAuth) ←
-    foldlSrv filteredReqs.zipIdx (#[], #[], #[], #[], #[], authBind?.isSome) (lowerOneReqExpr fnLabel hypPrefix sLocs clientLocals exVars authBind? trackAuth)
+    foldlSrv filteredReqs.zipIdx (#[], #[], #[], #[], #[], authBind?.isSome || principalGuard?.isSome) (lowerOneReqExpr fnLabel hypPrefix sLocs clientLocals exVars authBind? trackAuth)
   let (clientReqId?, clientReqConst?) ← if cliProps.isEmpty then pure (none, none) else do
     let leaf := itemName.appendAfter reqSuffix; let cid := c.subId leaf refIdent
     elabSrvPure do noUnusedVarsPure (← `(command| @[simp] abbrev $cid $[($clientBindIds:ident : $clientBindTys:term)]* : Prop := $(← Qed.mkConjBody cliProps (ascribeProp := false))))
     pure (some cid, some (c.fullSrvName ++ leaf))
-  return { authBind?, reqPropTerms := props, reqHypIds := hIds, reqLabels := labels, requiresAuth := reqAuth,
+  return { authBind?, principalGuard?, reqPropTerms := props, reqHypIds := hIds, reqLabels := labels, requiresAuth := reqAuth,
            clientReqId?, clientReqConst?, clientReqLabel := String.intercalate " && " cliLabels.toList }
 
 @[noinline] def elabEnsuresAbbrev (ownerIdent : Ident) (fnLabel : String) (binderName : Name)

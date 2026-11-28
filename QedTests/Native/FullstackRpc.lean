@@ -60,8 +60,8 @@ private def runMovedServerChecks (c : TestChecker) : IO Unit := do
   let badDoc := Qed.renderDocument "Default" "<p>ok</p>" "/qed_host.mjs" (headMeta := { canonical := some "javascript:alert(1)" })
   let rawRoom : ServerChecks.RawGameRoom := { code := "ABCD", secretLocation := "Casino", secretPack := "Classic", spyIds := #["bob"] }
   let (params, payload) := (Qed.Proto.encode "ABCD", Qed.Proto.encode rawRoom)
-  let aliceOut := (ServerChecks.RedactedHub.wsProject { userId := some "alice" } "room" params payload).bind id
-  let bobOut := (ServerChecks.RedactedHub.wsProject { userId := some "bob" } "room" params payload).bind id
+  let aliceOut := (ServerChecks.RedactedHub.wsProject (RequestCtx.forUser "alice") "room" params payload).bind id
+  let bobOut := (ServerChecks.RedactedHub.wsProject (RequestCtx.forUser "bob") "room" params payload).bind id
   c.checkAll [
     ("[srv-pure] SetCookie.mkSafe strips CRLF and emits flags",
       hasAll ck ["qed_session=tokX-Evil: 1", "HttpOnly", "SameSite=Lax", "Secure", "Max-Age=3600"] && !ck.toList.contains '\r' && !ck.toList.contains '\n'),

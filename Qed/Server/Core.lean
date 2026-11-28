@@ -38,15 +38,39 @@ inductive AuthMethod where
   | session
   | bearer
   | oidcJwt
-deriving Inhabited, DecidableEq
+deriving Inhabited, DecidableEq, Repr
+
+/-- Typed caller identity carried inside `RequestCtx`. Only minted by framework
+    authenticators (session/JWT/OIDC, verified `requires system(...)` HTTP routes, or `every` jobs). -/
+inductive Principal where
+  | anonymous
+  | user (id : String)
+  | system (name : String)
+deriving Inhabited, DecidableEq, Repr
+
+def Principal.toSqlTag : Principal → String
+  | .anonymous => ""
+  | .user id => "user:" ++ id
+  | .system name => "system:" ++ name
+
+structure AuthToken where
+  principal  : Principal := .anonymous
+  claims     : List (String × String) := []
+  authMethod : AuthMethod := .none
+deriving Inhabited, DecidableEq, Repr
+
+namespace AuthToken
+@[reducible] def ofUser (id : String) (claims : List (String × String) := []) (method : AuthMethod := .bearer) : AuthToken :=
+  { principal := .user id, claims, authMethod := method }
+@[reducible] def ofPrincipal (p : Principal) : AuthToken :=
+  { principal := p, claims := [], authMethod := .none }
+end AuthToken
 
 structure RequestCtx where
   headers     : List (String × String) := []
   cookies     : List (String × String) := []
   bearerToken : Option String := none
-  userId      : Option String := none
-  claims      : List (String × String) := []
-  authMethod  : AuthMethod := .none
+  auth        : AuthToken := {}
   clientIp    : String := "127.0.0.1"
   connId      : String := ""
   query       : String := ""
@@ -54,6 +78,24 @@ structure RequestCtx where
 deriving Inhabited, BEq
 
 namespace RequestCtx
+def principal (ctx : RequestCtx) : Principal := ctx.auth.principal
+def userId (ctx : RequestCtx) : Option String :=
+  match ctx.auth.principal with | .user id => some id | _ => none
+def claims (ctx : RequestCtx) : List (String × String) := ctx.auth.claims
+def authMethod (ctx : RequestCtx) : AuthMethod := ctx.auth.authMethod
+def withAuth (ctx : RequestCtx) (tok : AuthToken) : RequestCtx := { ctx with auth := tok }
+def forPrincipal (p : Principal) : RequestCtx := { auth := AuthToken.ofPrincipal p }
+def forUser (id : String) (claims : List (String × String) := []) (method : AuthMethod := .bearer) : RequestCtx :=
+  { auth := AuthToken.ofUser id claims method }
+
+@[simp] theorem principal_withAuth (ctx : RequestCtx) (tok : AuthToken) : (ctx.withAuth tok).principal = tok.principal := rfl
+@[simp] theorem principal_forPrincipal (p : Principal) : (forPrincipal p).principal = p := rfl
+@[simp] theorem principal_forUser (id : String) (cs : List (String × String)) (m : AuthMethod) : (forUser id cs m).principal = .user id := rfl
+@[simp] theorem userId_forUser (id : String) (cs : List (String × String)) (m : AuthMethod) : (forUser id cs m).userId = some id := rfl
+@[simp] theorem userId_forPrincipal_system (name : String) : (forPrincipal (.system name)).userId = none := rfl
+@[simp] theorem userId_forPrincipal_anonymous : (forPrincipal .anonymous).userId = none := rfl
+@[simp] theorem claims_forUser (id : String) (cs : List (String × String)) (m : AuthMethod) : (forUser id cs m).claims = cs := rfl
+@[simp] theorem authMethod_forUser (id : String) (cs : List (String × String)) (m : AuthMethod) : (forUser id cs m).authMethod = m := rfl
 def header (ctx : RequestCtx) (name : String) : Option String :=
   let target := name.toLower; (ctx.headers.find? fun (k, _) => k.toLower == target).map Prod.snd
 def cookie (ctx : RequestCtx) (name : String) : Option String := ctx.cookies.lookup name
@@ -1292,3 +1334,160 @@ instance {σ : Type} : SafeIO (uuid (m := ThreadProg σ)) := ⟨noAtomic_exec_ma
 end Random
 
 end Qed
+
+namespace Qed.Server
+
+/-! ## Built-In Cryptographic Route Authenticators (`requires system(...)`) -/
+
+class ToSecretStr (α : Type) where
+  toSecretStr : α → String
+@[inline] instance : ToSecretStr String := ⟨id⟩
+@[inline] instance : ToSecretStr Qed.Secret := ⟨Qed.Secret.expose⟩
+
+inductive RouteAuthSpec where
+  | hmacSha256 (headerName : String) (sigPrefix : String) (secretVal : String)
+  | stripe (headerName : String) (toleranceSec : Nat) (secretVal : String)
+  | headerSecret (headerName : String) (secretVal : String)
+  | bearerSecret (secretVal : String)
+deriving Inhabited
+
+private def isHexSigChar (c : Char) : Bool :=
+  ('0' ≤ c && c ≤ '9') || ('a' ≤ c && c ≤ 'f') || ('A' ≤ c && c ≤ 'F')
+
+private def isHexSig (s : String) : Bool :=
+  !s.isEmpty && s.toList.all isHexSigChar
+
+private def splitFirstEqChars : List Char → List Char → Option (String × String)
+  | [], _ => none
+  | '=' :: rest, acc => some (String.ofList acc.reverse, String.ofList rest)
+  | c :: rest, acc => splitFirstEqChars rest (c :: acc)
+
+private def parseStripeParts : List String → Option Nat → List String → Option (Nat × List String)
+  | [], some ts, v1 :: rest => some (ts, (v1 :: rest).reverse)
+  | [], _, _ => none
+  | part :: more, ts?, v1s =>
+      let p := Qed.Str.trim part
+      if p.isEmpty then parseStripeParts more ts? v1s
+      else match splitFirstEqChars p.toList [] with
+        | none => none
+        | some (kRaw, vRaw) =>
+            let k := Qed.Str.trim kRaw; let v := Qed.Str.trim vRaw
+            if k == "t" then
+              match ts?, Qed.Str.parseNat? v with
+              | none, some ts => parseStripeParts more (some ts) v1s
+              | _, _ => none
+            else if k == "v1" then
+              if isHexSig v then parseStripeParts more ts? (Qed.Str.toLower v :: v1s) else none
+            else parseStripeParts more ts? v1s
+
+/-- Parses a Stripe `Stripe-Signature` header (`t=<unix_sec>,v1=<hex>,...`) into `(tsSec, v1HexList)`. -/
+def parseStripeSigHdr (hdr : String) : Option (Nat × List String) :=
+  parseStripeParts (Qed.Str.splitChar hdr ',') none []
+
+private def anyConstEqHex {m : Type → Type} [Monad m] [MonadServer m]
+    (sigs : List String) (expBytes : ByteArray) (acc : Bool := false) : m Bool :=
+  match sigs with
+  | [] => Pure.pure acc
+  | s :: rest => MonadServer.constEq s.toUTF8 expBytes >>= fun eq => anyConstEqHex rest expBytes (acc || eq)
+
+private theorem anyConstEqHex_noAtomic {σ : Type} (sigs : List String) (expBytes : ByteArray) (acc : Bool) :
+    NoAtomic (anyConstEqHex (m := ThreadProg σ) sigs expBytes acc) := by
+  induction sigs generalizing acc with
+  | nil => exact .pure _
+  | cons s rest ih => exact .io (.constEq _ _) _ fun eq => ih (acc || eq)
+
+private def absDiffNat (a b : Nat) : Nat := if a >= b then a - b else b - a
+
+private def RouteAuthSpec.rawSecret : RouteAuthSpec → String
+  | .hmacSha256 _ _ s | .stripe _ _ s | .headerSecret _ s | .bearerSecret s => s
+
+/-- Constant-time fail-closed cryptographic verifier for HTTP webhook and cron routes.
+    Returns `500` when the configured secret is empty/whitespace, `401` on missing/invalid/expired
+    credentials, and only mints a verified `RequestCtx` carrying `principal = p` on success. -/
+def verifyRouteAuth {m : Type → Type} [Monad m] [MonadServer m]
+    (p : Principal) (spec : RouteAuthSpec) (ctx : RequestCtx) :
+    m (Except ApiError { c : RequestCtx // c.principal = p }) :=
+  let key := Qed.Str.trim spec.rawSecret
+  if key.isEmpty then Pure.pure (.error (ApiError.internal "missing required authentication secret"))
+  else
+    let okMint : Except ApiError { c : RequestCtx // c.principal = p } := .ok ⟨ctx.withAuth (AuthToken.ofPrincipal p), rfl⟩
+    let unauth (msg : String) : m (Except ApiError { c : RequestCtx // c.principal = p }) :=
+      Pure.pure (.error (ApiError.unauthorized msg))
+    let finishConstEq (msg : String) (got : String) : m (Except ApiError { c : RequestCtx // c.principal = p }) :=
+      MonadServer.constEq got.toUTF8 key.toUTF8 >>= fun ok =>
+        Pure.pure (if ok then okMint else .error (ApiError.unauthorized msg))
+    match spec with
+    | .headerSecret hdrName _ =>
+        match ctx.header hdrName with
+        | none => unauth "unauthorized"
+        | some got => finishConstEq "unauthorized" (Qed.Str.trim got)
+    | .bearerSecret _ =>
+        let got? := ctx.bearerToken.orElse fun _ =>
+          (ctx.header "authorization").bind fun h =>
+            let t := Qed.Str.trim h
+            if t.length >= 7 && Qed.Str.toLower (Qed.Str.take t 7) == "bearer " then some (Qed.Str.trim (Qed.Str.drop t 7)) else none
+        match got? with
+        | none => unauth "unauthorized"
+        | some got => finishConstEq "unauthorized" got
+    | .hmacSha256 hdrName sigPfx _ =>
+        match ctx.header hdrName with
+        | none => unauth "invalid webhook signature"
+        | some hdr =>
+            let trimmed := Qed.Str.trim hdr
+            if !Qed.Str.startsWith trimmed sigPfx then unauth "invalid webhook signature"
+            else
+              let gotHex := Qed.Str.toLower (Qed.Str.drop trimmed sigPfx.length)
+              if gotHex.length != 64 || !isHexSig gotHex then unauth "invalid webhook signature"
+              else
+                MonadServer.hmacSha256 key.toUTF8 ctx.body.toUTF8 >>= fun mac =>
+                  MonadServer.constEq gotHex.toUTF8 (Qed.Proto.encodeHex mac).toUTF8 >>= fun ok =>
+                    Pure.pure (if ok then okMint else .error (ApiError.unauthorized "invalid webhook signature"))
+    | .stripe hdrName toleranceSec _ =>
+        match ctx.header hdrName with
+        | none => unauth "invalid Stripe signature"
+        | some hdr =>
+            match parseStripeSigHdr hdr with
+            | none => unauth "invalid Stripe signature"
+            | some (ts, v1s) =>
+                MonadServer.nowMs >>= fun nowMs =>
+                  if absDiffNat (nowMs.toNat / 1000) ts > toleranceSec then unauth "expired Stripe signature"
+                  else
+                    let signed := (toString ts ++ ".").toUTF8 ++ ctx.body.toUTF8
+                    MonadServer.hmacSha256 key.toUTF8 signed >>= fun mac =>
+                      anyConstEqHex v1s (Qed.Proto.encodeHex mac).toUTF8 >>= fun ok =>
+                        Pure.pure (if ok then okMint else .error (ApiError.unauthorized "invalid Stripe signature"))
+
+instance {σ : Type} (p : Principal) (spec : RouteAuthSpec) (ctx : RequestCtx) :
+    SafeIO (verifyRouteAuth (m := ThreadProg σ) p spec ctx) := by
+  refine ⟨?_⟩
+  by_cases hEmpty : (Qed.Str.trim spec.rawSecret).isEmpty = true
+  · simp only [verifyRouteAuth, if_pos hEmpty]; exact .pure _
+  · simp only [verifyRouteAuth, if_neg hEmpty]
+    cases spec with
+    | headerSecret hdrName _ | bearerSecret _ =>
+        dsimp only; split
+        · exact .pure _
+        · exact .io (.constEq _ _) _ fun _ => .pure _
+    | hmacSha256 hdrName sigPfx _ =>
+        dsimp only; split
+        · exact .pure _
+        · split
+          · exact .pure _
+          · split
+            · exact .pure _
+            · exact .io (.hmacSha256 _ _) _ fun _ => .io (.constEq _ _) _ fun _ => .pure _
+    | stripe hdrName toleranceSec _ =>
+        dsimp only; split
+        · exact .pure _
+        · split
+          · exact .pure _
+          · exact .io .nowMs _ fun _ => by
+              dsimp only [ThreadProg.bind]; split
+              · exact .pure _
+              · exact .io (.hmacSha256 _ _) _ fun _ =>
+                  noAtomic_bind (.pure _) fun _ => noAtomic_bind (anyConstEqHex_noAtomic _ _ _) fun _ => .pure _
+
+theorem verifyRouteAuth_nonUser_userId_system (ctx : RequestCtx) (name : String) :
+    (ctx.withAuth (AuthToken.ofPrincipal (.system name))).userId = none := rfl
+
+end Qed.Server

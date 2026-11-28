@@ -131,10 +131,10 @@ def qedPatIdent : Parser := leadP `Qed.Lang.qedPatIdent (ident >> pPatArgsOpt)
   qedPatParen <|> qedPatList <|> qedPatDot <|> qedPatIdent)
 @[qedPat_parser 67] def qedPatCons : TrailingParser := opaqueP (trailP `Qed.Lang.qedPatCons 67 (symbol "::" >> pPat 67))
 
-def qedCallArgNamed : Parser := node `Qed.Lang.qedCallArgNamed (atomic (ident >> "=" >> notFollowedBy (symbol "=") "=") >> pExpr)
+def qedCallArgNamed : Parser := node `Qed.Lang.qedCallArgNamed (atomic (rawIdent >> "=" >> notFollowedBy (symbol "=") "=") >> pExpr)
 def qedCallArgPos   : Parser := node `Qed.Lang.qedCallArgPos pExpr
 @[qedCallArg_parser] def qedCallArgP : Parser := opaqueP (
-  qedCallArgNamed <|> node `Qed.Lang.qedCallArgWhere (atomic (symbol "where" >> "=" >> notFollowedBy (symbol "=") "=") >> pExpr) <|> qedCallArgPos)
+  node `Qed.Lang.qedCallArgWhere (atomic (symbol "where" >> "=" >> notFollowedBy (symbol "=") "=") >> pExpr) <|> qedCallArgNamed <|> qedCallArgPos)
 
 def qedCasePats : Parser := sepBy1 (node `Qed.Lang.qedPatAlt (sepBy1 pPat ",")) "|"
 @[combinator_parenthesizer qedCasePats] def qedCasePats.parenthesizer : Parenthesizer := pure ()
@@ -347,8 +347,10 @@ instance : MonadQuotation PureQuotM where
   match k (← getPureQuotCtxMacro) with | .ok v => pure v | .error (ref, msg) => Macro.throwErrorAt ref msg
 
 private def qValId     : Ident := mkCIdent `Qed.Lang.QedVal.val
-private def qMemId     : Ident := mkCIdent `Qed.Lang.QedMem.mem
-private def qMemPropId : Ident := mkCIdent `Qed.Lang.QedMemProp.memProp
+private def qMemId       : Ident := mkCIdent `Qed.Lang.QedMem.mem
+private def qMemPropId   : Ident := mkCIdent `Qed.Lang.QedMemProp.memProp
+private def qInListId    : Ident := mkCIdent `Qed.Lang.qedInList
+private def qInListPrId  : Ident := mkCIdent `Qed.Lang.qedInListProp
 private def qRange1Id  : Ident := mkCIdent `Qed.QedRange.mk1
 private def qRange2Id  : Ident := mkCIdent `Qed.QedRange.mk2
 private def qRange3Id  : Ident := mkCIdent `Qed.QedRange.mk3
@@ -749,7 +751,7 @@ private def assignOpToBinKind? : String → Option String
     | some bk => .ok (qctx.runPure do mkBinOpPure bk (← `($qValId $lhs)) (← `($qValId $rhs)))
     | none    => .error (ref, s!"unsupported assignment operator `{op}`")
 
-@[noinline] private def mkCmpSinglePure (mode : ExprMode) (opStr : String) (a b : Term) : PureQuotM Term := do
+@[noinline] private def mkCmpSinglePure (mode : ExprMode) (opStr : String) (a b : Term) (rhsIsListLit : Bool := false) : PureQuotM Term := do
   if ["==", "!=", "is", "is not"].contains opStr then
     let isEq := opStr == "==" || opStr == "is"
     match mode with
@@ -757,7 +759,10 @@ private def assignOpToBinKind? : String → Option String
     | .propGuard => let p ← `(qedEqProp($a, $b)); if isEq then pure p else mkUnNode `«term¬_» "¬" p
     | _          => if isEq then mkBinNode `«term_==_» "==" a b else mkBinNode `«term_!=_» "!=" a b
   else if opStr == "in" || opStr == "not in" then
-    let mem ← if mode.isProp then `($qMemPropId ($a) ($b)) else `($qMemId ($a) ($b))
+    let mem ← if rhsIsListLit then
+        if mode.isProp then `($qInListPrId ($a) ($b)) else `($qInListId ($a) ($b))
+      else
+        if mode.isProp then `($qMemPropId ($a) ($b)) else `($qMemId ($a) ($b))
     if opStr == "in" then pure mem else if mode.isProp then mkUnNode `«term¬_» "¬" mem else mkUnNode `term!_ "!" mem
   else
     let (kind, tok) := match opStr with | "<=" => (`«term_≤_», "≤") | ">=" => (`«term_≥_», "≥") | "<" => (`«term_<_», "<") | _ => (`«term_>_», ">")
@@ -974,7 +979,12 @@ private def builtinQualCall? : Name → Option (Name × Nat)
     | lk :: rest => do
         let opStr := cmpOpKind (lk.getArg 0); let rhsStx := lk.getArg 1
         let (lS, rS) := if ["==", "!=", "is", "is not"].contains opStr && isNoneExpr prev && !isNoneExpr rhsStx then (rhsStx, prev) else (prev, rhsStx)
-        let cur := qctx.runPure (mkCmpSinglePure mode opStr (← lowerValOp lS) (← lowerValOp rS))
+        let uR := unwrapParens1 rS
+        let cur ← if (opStr == "in" || opStr == "not in") && uR.getKind == ``qedArrLit then do
+            let aT ← lowerValOp lS
+            let elems ← mapArrM (uR.getArg 1).getSepArgs lowerValOp
+            pure (qctx.runPure do mkCmpSinglePure mode opStr aT (← `([$[$elems],*])) true)
+          else pure (qctx.runPure (mkCmpSinglePure mode opStr (← lowerValOp lS) (← lowerValOp rS)))
         let next := match acc? with | none => cur | some acc => qctx.runPure (if mode.isProp then mkBinNode `«term_∧_» "∧" acc cur false else mkBinNode `«term_&&_» "&&" acc cur false)
         goLinks rhsStx (some next) rest
   goLinks (stx.getArg 0) none (stx.getArg 1).getArgs.toList

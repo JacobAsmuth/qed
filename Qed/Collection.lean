@@ -428,6 +428,9 @@ instance {α : Type} [DecidableEq α] (x : α) (xs : List α) : Decidable (QedMe
 @[simp] theorem QedMemProp.memProp_string (c : Char) (s : String) : QedMemProp.memProp c s = (s.contains c = true) := rfl
 instance (c : Char) (s : String) : Decidable (QedMemProp.memProp c s) := inferInstanceAs (Decidable (s.contains c = true))
 
+@[reducible, inline] def qedInList {α : Type} [BEq α] (x : α) (xs : List α) : Bool := QedMem.mem x xs
+@[reducible, inline] def qedInListProp {α : Type} (x : α) (xs : List α) : Prop := QedMemProp.memProp x xs
+
 end Lang
 
 /-! ## Component Primitive, `Array.sortBy`, and `ForEach` Preservation Lemmas -/

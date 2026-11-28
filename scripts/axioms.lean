@@ -84,6 +84,7 @@ Qed.Proto: decodeFrameList_append cursor_strictly_advances skipUnknown_preserves
 Qed.Server: header_no_crlf external_url_preserves_origin readOnly_preserves_state
   concurrent_schedule_preserves_inv safeIO_bind_preservesStepRel concurrent_schedule_ensures
   external_ws_url_preserves_origin srvFinishEmit_err_no_emits srvAtomicCommitEmit_err_no_emits
+  verifyRouteAuth_nonUser_userId_system
 Qed.Server.Net: base64UrlEncode_safe isBlockedIpBytes_loopback_v4 isBlockedIpBytes_metadata_v4
   isBlockedIpBytes_rfc1918_10 isBlockedIpBytes_testnet_v4 isBlockedIpBytes_benchmark_v4
   isBlockedIpBytes_loopback_v6 isBlockedIpBytes_v4mapped_metadata isBlockedIpBytes_nat64_metadata
@@ -192,6 +193,6 @@ open Lean in
       let bad := axs.filter (!allowed.contains ·)
       unless bad.isEmpty do
         throwError "unexpected axiom(s) in {n}: {bad.toList}"
-  unless seen.size == 430 do
-    throwError "expected 430 theorems in axioms manifest, checked {seen.size}"
+  unless seen.size == 431 do
+    throwError "expected 431 theorems in axioms manifest, checked {seen.size}"
   IO.println s!"✓ {seen.size} theorems checked: 0 unexpected axioms"

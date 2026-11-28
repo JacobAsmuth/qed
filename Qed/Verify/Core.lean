@@ -39,6 +39,8 @@ def dbBaseSimpNames : Array Name := boolSimpNames ++ valUnwrapBaseNames ++ optCo
   ``Qed.Lang.QedMem.mem_array, ``Qed.Lang.QedMem.mem_list, ``Qed.Lang.QedMemProp.memProp_array, ``Qed.Lang.QedMemProp.memProp_list,
   ``Qed.Lang.QedSeqLit.ofList_array, ``Qed.Lang.QedSeqLit.ofList_list, ``Array.mem_toArray, ``List.mem_cons, ``List.not_mem_nil,
   `Qed.Str.toLower_length, `Qed.Str.toUpper_length, `Qed.Str.truncate_length, `Qed.Str.take_length, `Qed.Str.drop_length,
+  `Qed.Server.RequestCtx.principal_withAuth, `Qed.Server.RequestCtx.principal_forPrincipal, `Qed.Server.RequestCtx.principal_forUser,
+  `Qed.Server.RequestCtx.userId_forUser, `Qed.Server.RequestCtx.userId_forPrincipal_system, `Qed.Server.RequestCtx.userId_forPrincipal_anonymous,
   ``true_and, ``and_true, ``false_or, ``or_false, ``true_or, ``or_true, ``id_eq, ``ne_eq]
 
 @[noinline] def foldlMeta {α β : Type} (xs : Array α) (init : β) (f : β → α → MetaM β) : MetaM β :=

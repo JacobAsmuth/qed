@@ -156,7 +156,7 @@ server stateless RedactedHub:
     requires ctx.userId != none
     room.emit(code, { code = code, secretLocation = loc, secretPack = pack, spyIds = spies })
 check_decls [RedactedHub.is_stateless, RedactedHub.room_project_ensures, RedactedHub.room_project_blindTo, RedactedHub.room_project_channel_ensures]
-example : RedactedHub.wsProject { userId := some "alice" } "other" ByteArray.empty ByteArray.empty = .passthrough := rfl
+example : RedactedHub.wsProject (Qed.Server.RequestCtx.forUser "alice") "other" ByteArray.empty ByteArray.empty = .passthrough := rfl
 bad_srv "`server stateless BadStatelessSrv` forbids in-memory `state` field `count`" [stateless] BadStatelessSrv : state count : Nat = 0 || rpc getCount() -> Nat: return count
 bad_srv "`blindTo raw.secretLocation` failed in `LeakyProjSrv.room_project`" [stateless] LeakyProjSrv :
   channel room(code: String) -> RedactedGameView:

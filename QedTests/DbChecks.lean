@@ -1115,4 +1115,232 @@ bad_db_tbl "cannot use encrypted column `vault.sec` in `policy read(...) by ...`
 bad_db_def "`row` is not in scope inside `database` `fn`" BadRowInDbFn :
   fn badFn() -> Bool: row.id == "x"
   || table t: id : String primary_key
+
+/-! ## Phase 2: Typed Principals, Cryptographic Webhook/Cron Route Guards & Job Principals -/
+
+database PrincipalDb:
+  sqlite ".qed/principal_checks.db"
+  fn isBuildSystem() -> Bool:
+    ctx.principal in [.system("BuildJobSrv.poll"), .system("reap-and-sweep")]
+  table billing_events:
+    id     : String primary_key immutable where 1 <= id.length <= 64
+    status : String where status in ["paid", "failed"]
+    policy read, insert, update requires ctx.principal == .system("stripe")
+    policy delete requires false
+    example ev1: id = "evt_1", status = "paid"
+    example insert stripeCanInsert:
+      principal = .system("stripe")
+      row = ev1
+    rejects insert userCannotInsert:
+      user = "alice"
+      row = ev1
+    rejects insert githubCannotInsert:
+      principal = .system("github")
+      row = ev1
+  table deployments:
+    id      : String primary_key immutable where 1 <= id.length <= 64
+    ownerId : String immutable where 1 <= ownerId.length <= 64
+    status  : String where status in ["queued", "building", "live", "stale"]
+    policy read, update requires
+      some(row.ownerId) == ctx.userId or
+      isBuildSystem() or
+      ctx.principal == .system("github")
+    policy insert requires
+      some(row.ownerId) == ctx.userId or
+      ctx.principal == .system("github")
+    policy delete requires ctx.principal == .system("cleanup")
+    example dep1: id = "dep_1", ownerId = "alice", status = "queued"
+    example update jobCanClaim:
+      principal = .system("BuildJobSrv.poll")
+      row = dep1
+    example delete cronCanCleanup:
+      principal = .system("cleanup")
+      row = dep1
+    rejects delete jobCannotCleanup:
+      principal = .system("BuildJobSrv.poll")
+      row = dep1
+    rejects delete userCannotCleanup:
+      user = "alice"
+      row = dep1
+
+service PrincipalOps:
+  use db : PrincipalDb
+  fn recordStripeEvent(id: String, status: String) -> PrincipalDb.billing_events!:
+    requires ctx.principal == .system("stripe"), 1 <= id.length <= 64, status in ["paid", "failed"]
+    return await db.billing_events.insert(id = id, status = status)?
+  fn listStripeEvents() -> PrincipalDb.billing_events[]!:
+    requires ctx.principal == .system("stripe")
+    return await db.billing_events.select(orderBy = "id")?
+  example stripeCanRecord:
+    with principal = .system("stripe")
+    call recordStripeEvent("evt_1", "paid")
+    expect ok
+    expect db_count("billing_events") == 1
+  example userRejected403:
+    with user "alice"
+    call recordStripeEvent("evt_1", "paid")
+    expect error(403)
+    expect db_count("billing_events") == 0
+  example wrongSystemRejected403:
+    with principal = .system("github")
+    call recordStripeEvent("evt_1", "paid")
+    expect error(403)
+
+private def testMockHmacHex (key msg : String) : String :=
+  Qed.Proto.encodeHex (Qed.Server.Eval.mockHmacSha256 key.toUTF8 msg.toUTF8)
+
+server stateless PrincipalApi:
+  use db : PrincipalDb
+  use ops : PrincipalOps
+  env stripeSecret = "TEST_STRIPE_WH_SECRET" ?? ""
+  env githubSecret = "TEST_GITHUB_WH_SECRET" ?? ""
+  env cronSecret   = "TEST_CRON_SECRET" ?? ""
+  env bearerSecret = "TEST_BEARER_SECRET" ?? ""
+
+  post "/webhooks/stripe":
+    requires system("stripe", stripe = stripeSecret)
+    let ev = await ops.recordStripeEvent("evt_stripe_1", "paid")?
+    return json({ id = ev.id, status = ev.status })
+
+  post "/webhooks/github":
+    requires system("github", hmac_sha256 = githubSecret, header = "x-hub-signature-256", prefix = "sha256=")
+    let dep = await db.deployments.insert(id = "dep_gh_1", ownerId = "alice", status = "queued")?
+    return json({ id = dep.id, status = dep.status })
+
+  post "/cron/reap":
+    requires system("reap-and-sweep", bearer = bearerSecret)
+    let upd = await db.deployments.updateOne(where = r => r.status == "building", set = { status = "stale" })?
+    return json({ reaped = upd != none })
+
+  post "/cron/cleanup":
+    requires system("cleanup", secret = cronSecret, header = "x-qed-cron-secret")
+    let n = await db.deployments.delete(where = r => r.status == "stale")?
+    return json({ deleted = n })
+
+  example stripeMissingSecret500:
+    with now = 1700000050000
+    with body = "{\"type\":\"invoice.paid\"}"
+    with header "stripe-signature" = "t=1700000000,v1=0000"
+    post "/webhooks/stripe"
+    expect status == 500
+    expect db_count("billing_events") == 0
+
+  example stripeBadSig401:
+    with env "TEST_STRIPE_WH_SECRET" = "whsec_test"
+    with now = 1700000050000
+    with body = "{\"type\":\"invoice.paid\"}"
+    with header "stripe-signature" = "t=1700000000,v1=deadbeef"
+    post "/webhooks/stripe"
+    expect status == 401
+    expect db_count("billing_events") == 0
+
+  example stripeExpiredReplay401:
+    with env "TEST_STRIPE_WH_SECRET" = "whsec_test"
+    with now = 1700000500000
+    with body = "{\"type\":\"invoice.paid\"}"
+    with header "stripe-signature" = "t=1700000000,v1=" ++ testMockHmacHex("whsec_test", "1700000000.{\"type\":\"invoice.paid\"}")
+    post "/webhooks/stripe"
+    expect status == 401
+    expect db_count("billing_events") == 0
+
+  example stripeValidMultiV1Sig200:
+    with env "TEST_STRIPE_WH_SECRET" = "whsec_test"
+    with now = 1700000050000
+    with body = "{\"type\":\"invoice.paid\"}"
+    with header "stripe-signature" = "t=1700000000,v0=bad,v1=deadbeef,v1=" ++ testMockHmacHex("whsec_test", "1700000000.{\"type\":\"invoice.paid\"}") ++ ",v2=abc=="
+    post "/webhooks/stripe"
+    expect status == 200
+    expect db_count("billing_events") == 1
+
+  example githubValidAndInvalidHmac:
+    with env "TEST_GITHUB_WH_SECRET" = "ghsec_test"
+    with body = "{\"ref\":\"main\"}"
+    with header "x-hub-signature-256" = "sha1=" ++ testMockHmacHex("ghsec_test", "{\"ref\":\"main\"}")
+    post "/webhooks/github"
+    expect status == 401
+    with header "x-hub-signature-256" = "sha256=" ++ testMockHmacHex("ghsec_test", "{\"ref\":\"main\"}")
+    post "/webhooks/github"
+    expect status == 200
+    expect db_count("deployments") == 1
+
+  example cronHeaderAndBearerRoutes:
+    with db db.deployments = [{ id = "d1", ownerId = "alice", status = "building" }]
+    post "/cron/cleanup"
+    expect status == 500
+    with env "TEST_BEARER_SECRET" = "cron_bearer_secret"
+    with header "authorization" = "Bearer wrong_secret"
+    post "/cron/reap"
+    expect status == 401
+    with header "authorization" = "Bearer cron_bearer_secret"
+    post "/cron/reap"
+    expect status == 200
+    with env "TEST_CRON_SECRET" = "cron_hdr_secret"
+    with header "x-qed-cron-secret" = "wrong"
+    post "/cron/cleanup"
+    expect status == 401
+    with header "x-qed-cron-secret" = "cron_hdr_secret"
+    post "/cron/cleanup"
+    expect status == 200
+    expect db_count("deployments") == 0
+
+server stateless BuildJobSrv:
+  use db : PrincipalDb
+  every 1s poll -> Bool!:
+    let claimed = await db.deployments.updateOne(where = r => r.status == "queued", set = { status = "building" })?
+    return claimed != none
+  example pollClaimsQueuedDeployment:
+    with db db.deployments = [{ id = "d1", ownerId = "alice", status = "queued" }]
+    call poll()
+    expect ok(true)
+    call poll()
+    expect ok(false)
+
+-- Negative compile-time tests for Phase 2 principals & route guards
+bad_srv "`requires system(...)` is only supported on HTTP routes" [stateless] BadSystemOnRpc :
+  use db : PrincipalDb || env s = "S" ?? "" ||
+  rpc bad() -> Bool!:
+    requires system("stripe", stripe = s)
+    return true
+bad_svc "`ctx` is already implicitly available as `RequestCtx`" BadExplicitCtxSvc :
+  use db : PrincipalDb ||
+  fn spoof(ctx: RequestCtx) -> Bool:
+    return ctx.userId != none
+bad_srv "forbids hardcoded string literals" [stateless] BadLiteralSystemSecret :
+  use db : PrincipalDb ||
+  post "/hook":
+    requires system("stripe", stripe = "hardcoded")
+    return text("ok")
+bad_srv "unknown `secret` or `env` variable `missingSec`" [stateless] BadUnknownSystemSecret :
+  use db : PrincipalDb ||
+  post "/hook":
+    requires system("stripe", stripe = missingSec)
+    return text("ok")
+bad_srv "cannot combine `requires auth` with `requires system(...)`" [stateless] BadMixedAuthSystem :
+  use db : PrincipalDb || env s = "S" ?? "" ||
+  post "/hook":
+    requires auth, system("stripe", stripe = s)
+    return text("ok")
+bad_srv "Database insert policy `PrincipalDb.billing_events.insert` failed" [stateless] BadGithubWritesBilling :
+  use db : PrincipalDb || env s = "S" ?? "" ||
+  post "/webhooks/github":
+    requires system("github", hmac_sha256 = s, header = "x-hub-signature-256", prefix = "sha256=")
+    let _ = await db.billing_events.insert(id = "e1", status = "paid")?
+    return text("ok")
+bad_srv "Database update policy `PrincipalDb.deployments.update` failed" [stateless] WrongJobSrv :
+  use db : PrincipalDb ||
+  every 1s poll -> Bool!:
+    let upd = await db.deployments.updateOne(where = r => r.status == "queued", set = { status = "building" })?
+    return upd != none
+bad_srv "Database delete policy `PrincipalDb.deployments.delete` failed" [stateless] BadJobDeletesDeployments :
+  use db : PrincipalDb ||
+  every 1s poll -> Bool!:
+    let _ = await db.deployments.delete(where = r => r.status == "stale")?
+    return true
+bad_db_tbl "cannot combine `principal = ...` with `user`/`role`/`session`" BadMixedPrincipalEx docs :
+  id : String primary_key || policy read requires ctx.principal == .system("stripe") || example d1: id = "d1" ||
+  example read badMix:
+    user = "alice"
+    principal = .system("stripe")
+    row = d1
+
 end DbChecks

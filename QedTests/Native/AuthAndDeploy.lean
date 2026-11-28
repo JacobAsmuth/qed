@@ -36,8 +36,8 @@ private def testCryptoAndJwtCore (c : TestChecker) : IO Unit := do
     ("base64url round-trip", base64UrlDecode enc == .ok sample),
     ("DeployManifest rejects bad version", !({ version := 2 } : Qed.Deploy.DeployManifest).validate.isOk),
     ("DeployManifest rejects unsafe auth callback", !(Qed.Deploy.validateAuthManifest { name := "Bad", issuerEnv := "QED_AUTH_ISSUER", audienceEnv := "QED_AUTH_AUDIENCE", callbackPath := "//evil.com/cb" }).isOk),
-    ("RequestCtx.isAuthenticated rejects unverified Bearer token", !({ userId := none, bearerToken := some "forged-invalid-token", headers := [("authorization", "Bearer forged-invalid-token")] } : Qed.Server.RequestCtx).isAuthenticated),
-    ("RequestCtx.isAuthenticated accepts verified userId", ({ userId := some "usr_alice" } : Qed.Server.RequestCtx).isAuthenticated),
+    ("RequestCtx.isAuthenticated rejects unverified Bearer token", !({ bearerToken := some "forged-invalid-token", headers := [("authorization", "Bearer forged-invalid-token")] } : Qed.Server.RequestCtx).isAuthenticated),
+    ("RequestCtx.isAuthenticated accepts verified userId", (Qed.Server.RequestCtx.forUser "usr_alice").isAuthenticated),
     ("CloudAuth URLs, AuthRoute, sanitizeReturnTo, fromCtx, & parseJwtClaims email_verified",
       isSafeReturnTo "/dashboard?tab=1" && (AuthChecks.CloudAuth.logoutUrl "/bye").raw == "/_qed/auth/logout?returnTo=%2Fbye" &&
       (AuthChecks.CloudAuth.loginUrl AuthChecks.AuthRoute.dashboard).raw == (AuthChecks.CloudAuth.loginUrl "/dashboard").raw &&
@@ -47,7 +47,7 @@ private def testCryptoAndJwtCore (c : TestChecker) : IO Unit := do
       (AuthChecks.AuthRoute.project "demo").toUrl.raw == "/projects/demo" && AuthChecks.AuthRoute.fromPath "/projects/demo?tab=1" == some (.project "demo") &&
       toString (AuthChecks.AuthRoute.project "demo") == "/projects/demo" && s!"https://qed.cloud{AuthChecks.AuthRoute.project "demo"}" == "https://qed.cloud/projects/demo" &&
       sanitizeReturnTo (some "//evil.com") == "/" && sanitizeReturnTo (some "/dashboard") == "/dashboard" &&
-      AuthChecks.CloudAuth.fromCtx { userId := some "u1", claims := [("email", "a@b.c"), ("role", "admin"), ("orgId", "org_1"), ("email_verified", "true")] } == some { id := "u1", emailVerified := true, email := "a@b.c", role := "admin", orgId := some "org_1", verified := true } &&
+      AuthChecks.CloudAuth.fromCtx (Qed.Server.RequestCtx.forUser "u1" [("email", "a@b.c"), ("role", "admin"), ("orgId", "org_1"), ("email_verified", "true")]) == some { id := "u1", emailVerified := true, email := "a@b.c", role := "admin", orgId := some "org_1", verified := true } &&
       (match parseJwtClaims (.obj [("iss", .str "https://idp.test"), ("sub", .str "u1"), ("aud", .str "app"), ("exp", Qed.toJson (9999999999 : Nat)), ("email_verified", .str "true")]) with | .ok jc => !jc.emailVerified && jc.claim "email_verified" == some "false" | .error _ => false) &&
       (match parseJwtClaims (.obj [("iss", .str "https://idp.test"), ("sub", .str "u1"), ("aud", .str "app"), ("exp", Qed.toJson (9999999999 : Nat)), ("email_verified", .bool true)]) with | .ok jc => jc.emailVerified && jc.claim "email_verified" == some "true" | .error _ => false))]
   let (testSecret, txBody) := ("qed-test-session-secret-32-bytes", "tx1.1700000600.eyJzdGF0ZSI6IjEyMyJ9")
@@ -149,8 +149,8 @@ private def testOidcFlowAndDeployManifest (c : TestChecker) : IO Unit :=
 
 private def testRoadmapRuntimeFeatures (c : TestChecker) : IO Unit := do
   let inst := Native.withStateBox (← Prim.mkStateBox ServerChecks.GuardedApi.initState)
-  let okCtx : RequestCtx := { userId := some "usr_alice", headers := [("authorization", "Bearer good_tok")] }
-  let revCtx : RequestCtx := { userId := some "usr_alice", headers := [("authorization", "Bearer bad_tok")] }
+  let okCtx : RequestCtx := { RequestCtx.forUser "usr_alice" with headers := [("authorization", "Bearer good_tok")] }
+  let revCtx : RequestCtx := { RequestCtx.forUser "usr_alice" with headers := [("authorization", "Bearer bad_tok")] }
   let rpc (ctx : RequestCtx) (fn : String) (body := ByteArray.empty) := @ServerChecks.GuardedApi.dispatchM IO _ _ inst ctx fn body
   let http (ctx : RequestCtx) (m path : String) := @ServerChecks.GuardedApi.httpDispatchM IO _ _ inst ctx m path
   let ws (ctx : RequestCtx) (op : UInt8) (body := ByteArray.empty) := @ServerChecks.GuardedApi.wsDispatchM IO _ _ inst ctx op "feed" ByteArray.empty body
